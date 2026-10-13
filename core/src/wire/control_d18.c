@@ -40,13 +40,17 @@ moq_result_t moq_d18_encode_setup(moq_buf_writer_t *w)
 /* -- vi64 field helpers (draft-18 uses vi64 for these lengths/counts) - */
 
 /* Write Type (vi64) + a reserved 16-bit Length; *len_off receives the patch
- * offset for moq_buf_patch_uint16 once the payload is written. */
+ * offset for moq_buf_patch_uint16 once the payload is written. Rolls back
+ * w->pos if the buffer fits the type vi64 but not the 16-bit length. */
 static moq_result_t d18_write_header(moq_buf_writer_t *w, uint64_t type,
                                      size_t *len_off)
 {
+    size_t saved = w->pos;
     moq_result_t rc = moq_buf_write_vi64(w, type);
     if (rc < 0) return rc;
-    return moq_buf_reserve_uint16(w, len_off);
+    rc = moq_buf_reserve_uint16(w, len_off);
+    if (rc < 0) { w->pos = saved; return rc; }
+    return MOQ_OK;
 }
 
 /* Patch the reserved Length with the payload bytes written since len_off. */
