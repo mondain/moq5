@@ -159,7 +159,7 @@ jobs:
       - name: Deterministic service tests (incl. C/C++ consumers)
         run: >
           ctest --test-dir build/service-surface --output-on-failure
-          -R 'media_sender_catalog|media_sender_lifecycle|service_consumer_cxx|endpoint_resolve'
+          -R 'media_sender_catalog|media_sender_lifecycle|media_sender_pacing|service_consumer_cxx|endpoint_resolve'
 
       - name: Shared service build + initializer symbol check
         run: |
@@ -430,6 +430,9 @@ jobs:
           -DMOQ_BUILD_ADAPTER_PICO_WT=ON
           -DMOQ_BUILD_PICO_WT_MANAGED=ON
           -DMOQ_PICO_WT_BUILD_LOOPBACK=ON
+          -DMOQ_BUILD_SERVICE=ON
+          -DMOQ_BUILD_MSF=ON
+          -DMOQ_BUILD_MEDIA_OBJECT=ON
           -DMOQ_BUILD_TESTS=ON
           -DMOQ_WARNINGS_AS_ERRORS=ON
           -DMOQ_PICOQUIC_SOURCE_DIR="$MOQ_PICOQUIC_SOURCE_DIR"
@@ -446,10 +449,12 @@ jobs:
       # pico_wt_public_compile proves the standalone public header.
       # pq_reset_after_fin pins the patched picoquic's reset-after-FIN
       # behaviour; it needs picoquic-test, which this lane builds.
+      # endpoint_wt_target verifies the service CONNECT target at adapter
+      # creation without starting a transport, including allocation failures.
       - name: Test (pico_wt regression + conformance)
         run: >
           ctest --test-dir build/pico-wt-ci --output-on-failure
-          -R '^(pq_reset_after_fin|pico_wt_public_compile|pico_wt_capsule_sequence|pico_wt_loopback|pico_wt_conformance|pico_wt_managed_keepalive|pico_wt_managed_keepalive_server|pico_wt_managed_stop_close|pico_wt_managed_pump_exit_close|pico_wt_managed_cfg_abi)$'
+          -R '^(pq_reset_after_fin|pico_wt_public_compile|pico_wt_capsule_sequence|pico_wt_loopback|pico_wt_conformance|pico_wt_managed_keepalive|pico_wt_managed_keepalive_server|pico_wt_managed_stop_close|pico_wt_managed_pump_exit_close|pico_wt_managed_cfg_abi|endpoint_resolve|endpoint_wt_target)$'
 
       - name: Configure (mbedTLS-only)
         run: >

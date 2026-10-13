@@ -2983,6 +2983,83 @@ int main(int argc, char **argv)
         moq_pq_threaded_destroy(srv);
     }
 
+    /* == drop_without_demand: demand arriving mid-group waits for the next
+     * group start. The head of a group is dropped with no demand; the
+     * subscriber must not get its tail renumbered as object 0, which a
+     * player would take for a sync sample. */
+    {
+        int port = 0;
+        memset(&g_srv, 0, sizeof(g_srv));
+        atomic_store(&g_srv.no_subscribe, true);
+        moq_pq_threaded_t *srv = start_server(cert, key, &g_srv, &port);
+        MOQ_TEST_CHECK(srv != NULL);
+        if (!srv) return 1;
+        char url[64];
+        moq_endpoint_cfg_t ec = ep_cfg(url, sizeof(url), port);
+        moq_bytes_t parts[2];
+        moq_media_sender_cfg_t cfg;
+        fill_cfg(&cfg, parts);
+        cfg.endpoint = &ec;
+        cfg.drop_without_demand = true;
+        moq_media_sender_t *s = NULL;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_create(&cfg, &s),
+                              (int)MOQ_OK);
+        moq_media_track_t *v = NULL;
+        add_video_track(s, &v);
+        MOQ_TEST_CHECK(wait_ready(s, 300));
+
+        /* The first two objects of a GOP, with no demand. */
+        for (int i = 0; i < 2; i++) {
+            moq_rcbuf_t *b = mkbuf(16, (uint8_t)i);
+            moq_media_send_object_t o = mkobj(b, i == 0, i == 0, false);
+            moq_result_t rc = moq_media_sender_write(s, v, &o);
+            if (rc != MOQ_OK) moq_rcbuf_decref(b);
+            MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
+        }
+        moq_media_sender_stats_t st;
+        for (int i = 0; i < 200; i++) {
+            (void)moq_media_sender_get_stats(s, &st, sizeof(st));
+            if (st.objects_dropped >= 2 && st.objects_queued == 0) break;
+            usleep(50000);
+        }
+        MOQ_TEST_CHECK_EQ_U64(st.objects_dropped, 2);
+
+        atomic_store(&g_srv.no_subscribe, false);
+        for (int i = 0; i < 200 && !moq_media_sender_track_has_subscriber(s, v);
+             i++)
+            usleep(50000);
+        MOQ_TEST_CHECK(moq_media_sender_track_has_subscriber(s, v));
+
+        /* The GOP's tail, then a fresh GOP. */
+        moq_rcbuf_t *tail = mkbuf(16, 2);
+        moq_media_send_object_t to = mkobj(tail, false, false, true);
+        moq_result_t trc = moq_media_sender_write(s, v, &to);
+        if (trc != MOQ_OK) moq_rcbuf_decref(tail);
+        MOQ_TEST_CHECK_EQ_INT((int)trc, (int)MOQ_OK);
+        for (int i = 0; i < 3; i++) {
+            moq_rcbuf_t *b = mkbuf(16, (uint8_t)(0x10 + i));
+            moq_media_send_object_t o = mkobj(b, i == 0, i == 0, i == 2);
+            moq_result_t rc = moq_media_sender_write(s, v, &o);
+            if (rc != MOQ_OK) moq_rcbuf_decref(b);
+            MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
+        }
+        for (int i = 0; i < 200 && srv_count(&g_srv) < 3; i++) usleep(50000);
+        usleep(200000);   /* a wrongly sent tail would have arrived by now */
+        MOQ_TEST_CHECK_EQ_INT(srv_count(&g_srv), 3);
+        pthread_mutex_lock(&g_srv.mu);
+        MOQ_TEST_CHECK_EQ_U64(g_srv.objs[0].object, 0);
+        MOQ_TEST_CHECK(g_srv.objs[0].keyframe);
+        MOQ_TEST_CHECK_EQ_INT((int)g_srv.objs[0].first_byte, 0x10);
+        pthread_mutex_unlock(&g_srv.mu);
+        (void)moq_media_sender_get_stats(s, &st, sizeof(st));
+        MOQ_TEST_CHECK_EQ_U64(st.objects_dropped, 3);   /* the tail too */
+
+        moq_media_sender_destroy(s);
+        moq_pq_threaded_stop(srv);
+        moq_pq_threaded_destroy(srv);
+        MOQ_TEST_PASS("media_sender.no_demand_resumes_at_group_start");
+    }
+
     /* == terminal: a fatal handshake makes write return CLOSED ========= *
      * EXACT draft-18 against a draft-16-only server fails fatally. Two
      * race-equivalent terminal outcomes, both correct: create() may refuse
@@ -4847,11 +4924,12 @@ int main(int argc, char **argv)
         MOQ_TEST_CHECK_EQ_INT(ad, 1);
         MOQ_TEST_CHECK_EQ_U64(as, 0x2u);
 
-        /* All three signals must arrive. Track Ended and catalog objects use
-         * separate QUIC streams, so their receive callbacks need not preserve
-         * emission order, even on loopback. The sender's finish-before-catalog
-         * gate is checked separately by media_sender_catalog and the
-         * production-pump emission test in media_sender_refresh. */
+        /* MSF 11.3 orders the publisher's steps, not arrival across separate
+         * QUIC streams. SUBSCRIBE_DONE may also wait for its media streams
+         * before surfacing as an event. Require all observations, not their
+         * relative arrival order. The finish-before-catalog gate is checked
+         * by media_sender_catalog and the production-pump emission test in
+         * media_sender_refresh. */
         uint64_t v_seq = 0, a_seq = 0;
         srv_done_seqs(&g_srv, &v_seq, &a_seq);
         uint64_t conv_seq = cat_gen_seq(1);

@@ -196,7 +196,10 @@ typedef struct moq_endpoint_cfg {
                                          or insecure_skip_verify) */
     bool        insecure_skip_verify; /* explicit, default false */
     /* WebTransport */
-    moq_bytes_t wt_path;              /* empty = URL path, or "/moq" */
+    /* Complete WebTransport CONNECT target override. Empty: the URL path
+     * (or "/moq" if absent) followed by the URL query, including "?" when
+     * present. URL fragments are never part of the connection target. */
+    moq_bytes_t wt_path;
     moq_perspective_t perspective;    /* client-only in v0; server reserved:
                                          MOQ_ERR_UNSUPPORTED */
     /* The allocator MUST be thread-safe (NULL = default libc allocator,

@@ -83,6 +83,7 @@ typedef struct b_conn_baseline {
     b_ann_t       *anns;
     b_fetch_t     *fetches;
     b_refusal_t   *refusals;
+    uint32_t       refusals_reserved;
     uint64_t       requests_seen;
 } b_conn_baseline_t;
 
@@ -184,7 +185,8 @@ test_bind_capacity_slopes(void)
                         4 * sizeof(b_sg_t) + 4 * sizeof(b_usub_t) +
                         4 * sizeof(b_pub_t) + 4 * sizeof(b_ann_t) +
                         lim.max_fetches * sizeof(b_fetch_t) +
-                        (lim.max_fetches + BIND_PUMP_EVENT_POLL) * sizeof(b_refusal_t);
+                        (BIND_PUMP_EVENT_POLL + lim.max_parked) *
+                            sizeof(b_refusal_t);
     uint64_t scratch = bind_pump_scratch_bytes_test();
 
     uint64_t d1 = describe_bind(&a, core, 1);

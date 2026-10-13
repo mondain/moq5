@@ -351,6 +351,14 @@ if(MOQ_BUILD_TESTS)
             ${CMAKE_SOURCE_DIR}/tests/unit)
         add_test(NAME endpoint_pico_wt_keepalive_default
                  COMMAND test_endpoint_pico_wt_keepalive_default)
+
+        add_executable(test_endpoint_wt_target tests/test_endpoint_wt_target.c)
+        target_link_libraries(test_endpoint_wt_target PRIVATE
+            moq-service-pico-wt-ka-test-internals)
+        target_include_directories(test_endpoint_wt_target PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_SOURCE_DIR}/tests/unit)
+        add_test(NAME endpoint_wt_target COMMAND test_endpoint_wt_target)
     endif()
 
     if(MOQ_BUILD_MSQUIC_MANAGED)

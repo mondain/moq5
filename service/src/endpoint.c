@@ -179,7 +179,13 @@ moq_result_t moq_endpoint_resolve_cfg(const moq_endpoint_cfg_t *cfg,
      * not the protocol field would have overridden it -- the URL itself must
      * be well-formed). */
     if (bytes_empty(cfg->url) || !cfg->url.data) return MOQ_ERR_INVAL;
-    moq_result_t urc = moq_url_parse(cfg->url, &out->url);
+    /* URI fragments are local to the caller, never a connection target
+     * (transport-18 section 3.1.2). Keep the core application parser's
+     * contract unchanged; resolve only the server-visible prefix here. */
+    moq_bytes_t connection_url = cfg->url;
+    const uint8_t *fragment = memchr(connection_url.data, '#', connection_url.len);
+    if (fragment) connection_url.len = (size_t)(fragment - connection_url.data);
+    moq_result_t urc = moq_url_parse(connection_url, &out->url);
     if (urc < 0) return urc;
 
     /* Protocol: an explicit non-AUTO field WINS over the URL scheme (§5.1 --
@@ -286,8 +292,11 @@ moq_result_t moq_endpoint_resolve_cfg(const moq_endpoint_cfg_t *cfg,
      * (an SNI mismatch already cost a debug round -- §5.1). */
     out->sni = bytes_empty(cfg->sni) ? out->url.host : cfg->sni;
 
-    /* WT path: WEBTRANSPORT only. Explicit value, else the URL path, else
-     * "/moq". RAW_QUIC leaves it empty (the URL path is carried in the
+    /* WT target: an explicit value wins. Otherwise preserve the URL query,
+     * including a present but empty "?", after its path (default "/moq").
+     * Separate borrowed spans keep resolution allocation-free even when
+     * the default path comes from static storage. RAW_QUIC leaves both
+     * empty (the URL path is carried in the
      * PATH setup option there, which the endpoint does not emit yet). */
     if (out->protocol == MOQ_TRANSPORT_PROTOCOL_WEBTRANSPORT) {
         if (!bytes_empty(cfg->wt_path)) {
@@ -299,6 +308,13 @@ moq_result_t moq_endpoint_resolve_cfg(const moq_endpoint_cfg_t *cfg,
             out->wt_path.data = k_default_path;
             out->wt_path.len = sizeof(k_default_path) - 1;
         }
+        if (bytes_empty(cfg->wt_path) && out->url.query.data) {
+            out->wt_query.data = out->url.query.data - 1; /* include "?" */
+            out->wt_query.len = out->url.query.len + 1;
+        }
+        if (out->wt_path.len == SIZE_MAX ||
+            out->wt_query.len > SIZE_MAX - out->wt_path.len - 1)
+            return MOQ_ERR_INVAL;
     }
 
     /* WebTransport wire profile: an appended tail field, so read it ONLY when
@@ -1123,6 +1139,21 @@ static char *ep_strdup_bytes(const moq_alloc_t *a, moq_bytes_t b, size_t *len)
     return p;
 }
 
+static char *ep_strdup_wt_target(const moq_alloc_t *a,
+                                 const moq_endpoint_resolved_t *r, size_t *len)
+{
+    /* The resolver has checked the sum, including the terminating NUL. */
+    size_t n = r->wt_path.len + r->wt_query.len;
+    char *p = (char *)a->alloc(n + 1, a->ctx);
+    if (!p) return NULL;
+    memcpy(p, r->wt_path.data, r->wt_path.len);
+    if (r->wt_query.len)
+        memcpy(p + r->wt_path.len, r->wt_query.data, r->wt_query.len);
+    p[n] = '\0';
+    *len = n + 1;
+    return p;
+}
+
 #endif /* any facade */
 
 static void ep_free_strings(moq_endpoint_t *ep)
@@ -1678,7 +1709,7 @@ moq_result_t moq_endpoint_connect(const moq_endpoint_cfg_t *cfg,
     ep->sni  = ep_strdup_bytes(alloc, r.sni, &ep->sni_len);
     bool oom = !ep->host || !ep->sni;
     if (!oom && r.protocol == MOQ_TRANSPORT_PROTOCOL_WEBTRANSPORT) {
-        ep->path = ep_strdup_bytes(alloc, r.wt_path, &ep->path_len);
+        ep->path = ep_strdup_wt_target(alloc, &r, &ep->path_len);
         oom = oom || !ep->path;
     }
     if (!oom && r.protocol == MOQ_TRANSPORT_PROTOCOL_RAW_QUIC) {

@@ -97,7 +97,8 @@ with the [wire reference](draft22-wire-reference.md) and
 | Core/service, warnings as errors | 194/194 CTest |
 | ASan/UBSan with leak detection | 194/194 CTest; allocator sweep passed before these follow-up repairs |
 | Shared libraries and C++ binding | 212/212 CTest |
-| Pinned picoquic, native QUIC and WebTransport | 280/280 CTest |
+| Pinned picoquic, native QUIC and WebTransport | 281/281 CTest, including WebTransport query-target preservation after the main refresh |
+| Relay core, runtime and administration | 246/246 CTest after the main refresh; loopback tests run with networking enabled |
 | Pinned MsQuic | 229/229 CTest before the namespace/GOAWAY follow-up |
 | Swift | Before the follow-up: 386/386 serially; parallel run had 12 timing failures |
 | Fuzzing | Draft-22 control codec and session-control targets completed 30 seconds each with ASan/UBSan |
