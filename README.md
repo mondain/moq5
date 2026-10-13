@@ -198,6 +198,7 @@ surfaces differ in maturity and intended audience:
 | **Core facade API** (lower-level conveniences, used under the service tier) | `publisher.h`, `subscriber.h`, `url.h` | publish/subscribe conveniences over the session; pre-1.0 |
 | **Relay SDK** (`moq::relay-core`, `moq::relay`) | `<moq/relay/relay.h>`, `<moq/relay/moqr_bind.h>`, `<moq/relay/moqr_shards.h>` | optional transport-independent routing and host-pumped runtime; [embedding guide](relay/README.md) and [network example](examples/relay/simple-relay/README.md); pre-1.0 |
 | **Media helpers** | `loc.h`, `cmaf.h`, `msf.h`, `media_object.h`, `playback.h` | pre-1.0 media parse/pipeline helpers |
+| **CMAF writer** (`moq::cmaf-packager`) | `cmaf_packager.h` | optional clear, single-track initialization/chunk writer; enable `MOQ_BUILD_CMAF_PACKAGER=ON`; [contract and limits](media/cmaf_packager/README.md); pre-1.0 |
 | **Simulation harness** (`moq::sim`) | `sim.h` | deterministic SimPair testing helper; installed only when built with `MOQ_BUILD_SIM=ON`; pre-1.0 |
 | **Wire codec / tooling** | `codec.h`, `control.h`, `wire.h`, `buf.h`, `kvp.h` | draft-specific tooling for adapters/tests/tools, **not** the application API; details change across drafts |
 | **picoquic adapter** (raw + threaded) | `picoquic.h`, `picoquic_threaded.h`, `picoquic_verify.h` | transport-specific adapter API; mature but pre-1.0 |
