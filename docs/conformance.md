@@ -176,7 +176,7 @@ counts describe observed rows, not an aggregated conformance score.
 | D22-2-4-3-MUST-NOT-032 | 2.4.3 | Namespace whose first field is `.` is published |
 | D22-6-5-MUST-NOT-181 | 6.5 | Application namespace whose first field is `.session` is published |
 
-At the tested pre-fix commit, namespace-subscription post-request bytes entered
+At commit `c53bf14`, namespace-subscription post-request bytes entered
 request-local teardown instead of the profile's GOAWAY parser. The reserved-name
 results identified missing validation of application publication configuration.
 The repairs described above address both causes while preserving the draft's
