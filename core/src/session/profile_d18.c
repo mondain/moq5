@@ -1374,6 +1374,73 @@ static moq_result_t d18_process_request_stream(
         }
     }
 
+    /* An established publisher-side SUBSCRIBE bidi carries only a
+     * REQUEST_UPDATE (GOAWAY was handled above). It consumes a fresh peer
+     * request id; the response correlates by the stream, so the target is the
+     * committed slot, not a by-id lookup. Handle it definitively here, before
+     * the first-message branches, so a peer cannot send a second SUBSCRIBE or
+     * another initial-request message on the established bidi and overwrite or
+     * re-key the live subscription slot. */
+    if (s->subs[slot].state != MOQ_SUB_RECVING_REQUEST) {
+        if (env.msg_type != MOQ_D18_REQUEST_UPDATE ||
+            s->subs[slot].state != MOQ_SUB_ESTABLISHED ||
+            s->subs[slot].role != MOQ_SUB_ROLE_PUBLISHER)
+            return close_with_error(s, 0x3,
+                "unexpected message on subscribe request bidi");
+
+        moq_d18_request_update_t u;
+        rc = moq_d18_decode_request_update(env.payload, env.payload_len, &u);
+        if (rc == MOQ_D18_ERR_KVP_FORMAT)
+            return close_with_error(s, 0x6, "malformed auth token structure");
+        if (rc < 0)
+            return close_with_error(s, 0x3, "malformed REQUEST_UPDATE");
+
+        moq_request_endpoint_t ep;
+        rc = d18_validate_inbound_request_stream(s, ref, env.msg_type,
+                                                 u.request_id, &ep);
+        if (rc < 0)
+            return rc;
+        if (s->state == MOQ_SESS_CLOSED)
+            return MOQ_OK;
+
+        moq_decoded_request_update_t d;
+        memset(&d, 0, sizeof(d));
+        d.endpoint = ep;
+        d.request_id = u.request_id;
+        d.target_kind = MOQ_REQ_SUBSCRIPTION;
+        d.target_slot = slot;
+        d.has_forward = u.params.has_forward;
+        d.forward = u.params.forward != 0;
+        d.has_subscriber_priority = u.params.has_subscriber_priority;
+        d.subscriber_priority = u.params.subscriber_priority;
+        d.has_filter = u.params.has_filter;
+        d.filter_type = u.params.filter_type;
+        d.start_group = u.params.filter_start_group;
+        d.start_object = u.params.filter_start_object;
+        d.end_group = u.params.filter_end_group;
+        D18_FILL_DT(&d, &u.params);
+        (void)d18_map_delivery_timeout(&u.params, &d.has_delivery_timeout,
+                                       &d.delivery_timeout_us);
+        d.has_new_group_request = u.params.has_new_group_request;
+        d.new_group_request = u.params.new_group_request;
+
+        rc = d18_resolve_auth_tokens(s, &u.params, d.tokens, &d.token_count,
+                                     d.token_staged, &d.auth_txn,
+                                     &d.auth_reject_code);
+        if (rc < 0)
+            return rc;            /* NOMEM */
+        if (s->state == MOQ_SESS_CLOSED)
+            return MOQ_OK;        /* cache overflow / duplicate alias */
+
+        rc = session_core_on_request_update(s, &d);
+        if (rc < 0)
+            return rc;
+        if (s->state == MOQ_SESS_CLOSED)
+            return MOQ_OK;
+        *out_consumed = moq_buf_reader_offset(&r);
+        return MOQ_OK;
+    }
+
     /* The first message on a request stream is the request itself -- i.e. the
      * peer opening a NEW request. After our GOAWAY (§10.4) that is forbidden.
      * Messages on an already-committed bidi (GOAWAY / REQUEST_UPDATE /
@@ -1729,69 +1796,6 @@ static moq_result_t d18_process_request_stream(
         rc = ns_sub_process_recving_publisher(s, ns_slot, fin);
         if (rc < 0)
             return rc;                /* WOULD_BLOCK keeps the entry for a re-feed */
-        return MOQ_OK;
-    }
-
-    /* REQUEST_UPDATE arrives on an established subscription's request bidi (the
-     * core passes the committed slot). It consumes a fresh peer request id; the
-     * response correlates by the stream, so the target is the slot, not a
-     * by-id lookup. It is not a valid first message on a fresh request bidi (a
-     * staging slot is still RECVING) -- accept it only once the subscription is
-     * established on the publisher side; otherwise it falls through to the
-     * unexpected-first-message close below. */
-    if (env.msg_type == MOQ_D18_REQUEST_UPDATE &&
-        s->subs[slot].state == MOQ_SUB_ESTABLISHED &&
-        s->subs[slot].role == MOQ_SUB_ROLE_PUBLISHER) {
-        moq_d18_request_update_t u;
-        rc = moq_d18_decode_request_update(env.payload, env.payload_len, &u);
-        if (rc == MOQ_D18_ERR_KVP_FORMAT)
-            return close_with_error(s, 0x6, "malformed auth token structure");
-        if (rc < 0)
-            return close_with_error(s, 0x3, "malformed REQUEST_UPDATE");
-
-        moq_request_endpoint_t ep;
-        rc = d18_validate_inbound_request_stream(s, ref, env.msg_type,
-                                                 u.request_id, &ep);
-        if (rc < 0)
-            return rc;
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;
-
-        moq_decoded_request_update_t d;
-        memset(&d, 0, sizeof(d));
-        d.endpoint = ep;
-        d.request_id = u.request_id;
-        d.target_kind = MOQ_REQ_SUBSCRIPTION;
-        d.target_slot = slot;
-        d.has_forward = u.params.has_forward;
-        d.forward = u.params.forward != 0;
-        d.has_subscriber_priority = u.params.has_subscriber_priority;
-        d.subscriber_priority = u.params.subscriber_priority;
-        d.has_filter = u.params.has_filter;
-        d.filter_type = u.params.filter_type;
-        d.start_group = u.params.filter_start_group;
-        d.start_object = u.params.filter_start_object;
-        d.end_group = u.params.filter_end_group;
-        D18_FILL_DT(&d, &u.params);
-        (void)d18_map_delivery_timeout(&u.params, &d.has_delivery_timeout,
-                                       &d.delivery_timeout_us);
-        d.has_new_group_request = u.params.has_new_group_request;
-        d.new_group_request = u.params.new_group_request;
-
-        rc = d18_resolve_auth_tokens(s, &u.params, d.tokens, &d.token_count,
-                                     d.token_staged, &d.auth_txn,
-                                     &d.auth_reject_code);
-        if (rc < 0)
-            return rc;            /* NOMEM */
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;        /* cache overflow / duplicate alias */
-
-        rc = session_core_on_request_update(s, &d);
-        if (rc < 0)
-            return rc;
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;
-        *out_consumed = moq_buf_reader_offset(&r);
         return MOQ_OK;
     }
 
