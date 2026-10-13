@@ -42,6 +42,7 @@
 #   PICOTLS_REPO    picotls remote       (default: h2o/picotls)
 #   PICOTLS_REF     picotls commit       (default: pinned below)
 #   OPENSSL_ROOT_DIR  passed to picotls' cmake if set (macOS/brew)
+#   MOQ_PICOTLS_BUILD_CONFIG  dependency configuration (default: Release)
 #
 # The tracked dependency patches are applied after checkout. Already-patched
 # inputs are accepted; conflicting inputs fail before any dependency build.
@@ -49,6 +50,9 @@
 #
 # Requires: git, cmake, a C compiler, and OpenSSL dev headers
 # (Ubuntu: apt-get install -y libssl-dev cmake).
+# --self-test additionally requires Ninja and CMake 3.20 or newer.
+# Configuration selection alone does not provide Windows archive discovery or
+# multi-config consumer exports; those remain separate portability work.
 
 set -euo pipefail
 
@@ -78,20 +82,23 @@ die() { printf '[setup_picoquic_deps] ERROR: %s\n' "$*" >&2; exit 1; }
 
 build_picotls() {
     local source_dir=$1 build_dir=$2
-    local cmake_args=(-S "$source_dir" -B "$build_dir" -DCMAKE_BUILD_TYPE=Release
+    local config=${MOQ_PICOTLS_BUILD_CONFIG:-Release}
+    local cmake_args=(-S "$source_dir" -B "$build_dir" "-DCMAKE_BUILD_TYPE=$config"
         "-DCMAKE_PROJECT_picotls_INCLUDE=$repo_root/cmake/MoqPicotlsBuildPolicy.cmake")
     if [ -n "${OPENSSL_ROOT_DIR:-}" ]; then
         cmake_args+=(-DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR")
     fi
     cmake "${cmake_args[@]}" >/dev/null || return $?
     # Only the library targets used by FindPTLS; not dependency CLI/test tools.
-    cmake --build "$build_dir" \
+    cmake --build "$build_dir" --config "$config" \
         --target picotls-core picotls-openssl picotls-minicrypto \
         -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)" >/dev/null
 }
 
 compiler_policy_selftest() (
     set -eu
+    # Ninja prints compiler diagnostics on stdout, discarded by build_picotls.
+    cmake() { command cmake "$@" 1>&2; }
     tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"' EXIT
     mkdir -p "$tmp/source"
@@ -131,6 +138,86 @@ C
     build_picotls "$tmp/source" "$tmp/cached-build" >> "$tmp/cache.log" 2>&1 || {
         cat "$tmp/cache.log" >&2; die "self-test: cached flags build failed"
     }
+    mkdir -p "$tmp/multi-source" "$tmp/msvc-source"
+    cat > "$tmp/multi-source/CMakeLists.txt" <<'CMAKE'
+cmake_minimum_required(VERSION 3.20)
+project(picotls C)
+if(DEFINED CMAKE_BUILD_TYPE)
+    message(STATUS "Single-config selection: ${CMAKE_BUILD_TYPE}")
+endif()
+foreach(target picotls-core picotls-openssl picotls-minicrypto)
+    add_library(${target} STATIC probe.c)
+    target_compile_options(${target} PRIVATE -Wall)
+    target_compile_definitions(${target} PRIVATE
+        "$<$<CONFIG:Debug>:MOQ_ACTUAL_DEBUG=1>"
+        "$<$<CONFIG:Release>:MOQ_ACTUAL_RELEASE=1>")
+endforeach()
+CMAKE
+    cat > "$tmp/multi-source/probe.c" <<'C'
+#include <assert.h>
+#ifdef NDEBUG
+#error picotls_multiconfig_assertions_must_remain_enabled
+#endif
+#if MOQ_ENV_FLAG != 23 || MOQ_CACHE_FLAG != 17
+#error picotls_multiconfig_caller_flags_must_be_preserved
+#endif
+#if defined(MOQ_EXPECT_DEBUG) && !defined(MOQ_ACTUAL_DEBUG)
+#error picotls_wrong_debug_configuration
+#endif
+#if defined(MOQ_EXPECT_RELEASE) && !defined(MOQ_ACTUAL_RELEASE)
+#error picotls_wrong_release_configuration
+#endif
+int picotls_policy_probe(void) { int value = 1; assert(value); return 0; }
+C
+    for config in Debug Release; do
+        expected=$(printf '%s' "$config" | tr '[:lower:]' '[:upper:]')
+        build="$tmp/multi-$config"
+        CFLAGS='-DMOQ_ENV_FLAG=23 -fPIC' cmake \
+            -G 'Ninja Multi-Config' -S "$tmp/multi-source" -B "$build" \
+            "-DCMAKE_C_FLAGS_${expected}=-DMOQ_CACHE_FLAG=17 -DMOQ_EXPECT_${expected}=1 -DNDEBUG" \
+            > "$tmp/multi-$config.log" 2>&1 || {
+            cat "$tmp/multi-$config.log" >&2; die "self-test: multi-config configure failed"
+        }
+        MOQ_PICOTLS_BUILD_CONFIG=$config build_picotls "$tmp/multi-source" "$build" \
+            >> "$tmp/multi-$config.log" 2>&1 || {
+            cat "$tmp/multi-$config.log" >&2; die "self-test: selected $config build failed"
+        }
+        for target in core openssl minicrypto; do
+            test -f "$build/$config/libpicotls-$target.a" \
+                || die "self-test: selected $config $target archive missing"
+            for other in Debug Release RelWithDebInfo; do
+                [ "$other" = "$config" ] || test ! -f "$build/$other/libpicotls-$target.a" \
+                    || die "self-test: unselected $other archive built"
+            done
+        done
+    done
+    printf '\nstatic int moq_multi_unused_function(void) { return 0; }\n' >> "$tmp/multi-source/probe.c"
+    for config in Debug Release; do
+        if MOQ_PICOTLS_BUILD_CONFIG=$config build_picotls "$tmp/multi-source" \
+            "$tmp/multi-$config" > "$tmp/multi-warning-$config.log" 2>&1; then
+            die "self-test: $config multi-config warning was accepted"
+        fi
+        grep -q 'error:.*moq_multi_unused_function' "$tmp/multi-warning-$config.log" || {
+            cat "$tmp/multi-warning-$config.log" >&2; die "self-test: wrong $config warning refusal"
+        }
+    done
+    # Exercise policy selection only: no host compiler pretends to be MSVC.
+    cat > "$tmp/msvc-source/CMakeLists.txt" <<'CMAKE'
+cmake_minimum_required(VERSION 3.20)
+project(policy_branch NONE)
+set(MSVC TRUE)
+add_compile_options(/DMOQ_CALLER_FLAG=17)
+include("${MOQ_POLICY}")
+get_directory_property(actual COMPILE_OPTIONS)
+if(NOT "${actual}" STREQUAL "/DMOQ_CALLER_FLAG=17;/WX;/UNDEBUG")
+    message(FATAL_ERROR "MSVC policy options changed: ${actual}")
+endif()
+CMAKE
+    cmake -S "$tmp/msvc-source" -B "$tmp/msvc-build" \
+        "-DMOQ_POLICY=$repo_root/cmake/MoqPicotlsBuildPolicy.cmake" \
+        > "$tmp/msvc.log" 2>&1 || {
+        cat "$tmp/msvc.log" >&2; die "self-test: MSVC policy branch control failed"
+    }
     printf '\nstatic int moq_setup_unused_function(void) { return 0; }\n' >> "$tmp/source/probe.c"
     if CFLAGS='-DMOQ_ENV_FLAG=23' build_picotls "$tmp/source" "$tmp/warning-build" > "$tmp/warning.log" 2>&1; then
         die "self-test: compiler warning was accepted"
@@ -138,7 +225,7 @@ C
     grep -q 'error:.*moq_setup_unused_function' "$tmp/warning.log" || {
         cat "$tmp/warning.log" >&2; die "self-test: wrong warning refusal"
     }
-    printf 'picotls compiler policy self-test: assertions, caller flags, three archives, warning refusal PASS\n'
+    printf 'picotls compiler policy self-test: assertions, caller flags, three archives, warning refusal, Debug/Release selection, MSVC source control PASS\n'
 )
 
 apply_picoquic_patch() {
