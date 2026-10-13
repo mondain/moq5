@@ -52,11 +52,11 @@ Reaching the scenario timeout is the normal end of a context and exits 0.
   options so its publisher originates or withholds messages. This adapter does
   not; the roughly 100 draft-22 probes in which the runner acts as the subscriber
   score whatever `media_send` does by default.
-- **WebTransport does not connect to the runner from the `dev` build.** The runner
-  admits only the current WebTransport profile (`webtransport-h3`, HTTP/3
-  WebTransport drafts 15/16). The picoquic WebTransport backend speaks the legacy
-  dialect, so the handshake ends in a transport failure (terminal reason 5) before
-  any MoQT bytes. Only the `wtquic-msquic` backend offers the current profile, and
-  no existing build tree enables it. Native QUIC is unaffected.
-- **Draft 22 connects** (native QUIC): the runner sees SETUP, MOQT_IMPLEMENTATION and the
-  publisher's request streams. Per-scenario scores are the Task 10 acceptance work.
+- **Both transports were exercised on draft 22.** The pinned picoquic native
+  QUIC/WebTransport build established sessions with the current contribution
+  tester. The WebTransport client supplies CONNECT authority from its connection
+  host and port, independently of TLS SNI.
+- **Measured conformance gaps remain.** The full tester sweep found duplicate
+  request-stream GOAWAY handling and reserved application namespace publication
+  failures on both transports. See [conformance.md](../../docs/conformance.md)
+  for the exact draft requirements, counts, and tester limitations.

@@ -108,19 +108,51 @@ its previous binary identified the older `28b2974` source commit. Draft-22 audit
 170/170 required executable coverage, 3/97 optional coverage, static gate passed.
 These are catalog/instrument checks, not a publisher conformance score.
 
-Live driven tests used the maintained `tools/interop-adapter/run.sh` and the
-fresh `media_send` binary: 21 selected contexts per transport, all establishing
-native-QUIC `moqt-22` or WebTransport `moqt-22` sessions. Both transports scored
-`D22-8-7-MUST-269` (empty namespace field) and `D22-8-7-MUST-270` (too many
-namespace fields) as PASS, with no scored FAIL. All run verdicts were INCOMPLETE.
+The full follow-up sweep tested publisher commit `c53bf1435bdf8a8c60efd4a6f431dad3f34c0a32`
+with an isolated copy of the tester's bundled `adapters/moq5` harness. Its only
+invocation change was accepting draft 22 in place of draft 21; the command-line
+mapping and placeholder publisher behavior were retained. The adapted harness's
+contract test passed. Every advertised draft-22 driven profile ran (215 per
+transport), plus the two unscored Location Filter probes. Six special namespace
+fixtures per transport were supplied after the default fixture was rejected.
 
-Several raw probes report accepted byte counts but `operation_accepted=false`,
-so their evaluators leave requirements NOT_RUN despite observing protocol
-closes. Other selected rows need publisher behaviors the placeholder application
-does not originate or token-cache/policy configuration it does not provide.
-Do not interpret these gaps as passed requirements. In particular, typed filter
-byte vectors and session tests establish the codec behavior; the live tester
-does not currently provide a complete filter conformance score for this app.
+The sweep and follow-ups finalized 528 runs across 650 established connections
+(325 per transport). Follow-ups included 45 groups of companion raw-probe
+scenarios per transport and repeated duplicate request-stream GOAWAY probes.
+There were 16 FAIL run verdicts and 512 INCOMPLETE, with no ERROR verdicts.
+Across these separate runs, 58 distinct rows scored PASS over native QUIC and
+60 over WebTransport; five distinct rows scored FAIL on each transport. These
+counts describe observed rows, not an aggregated conformance score.
+
+| Failed requirement | Draft section | Observed behavior on both transports |
+|---|---|---|
+| D22-9-2-MUST-339 | 9.2 | Duplicate GOAWAY on an established SUBSCRIBE_NAMESPACE stream resets that request but leaves the session serving fresh SUBSCRIBE requests; four reproductions per transport |
+| D22-2-4-3-MUST-NOT-028 | 2.4.3 | Application namespace `.interop-unregistered` is published without an IANA-defined meaning |
+| D22-2-4-3-MUST-NOT-030 | 2.4.3 | Namespace whose first field is `.` is used |
+| D22-2-4-3-MUST-NOT-032 | 2.4.3 | Namespace whose first field is `.` is published |
+| D22-6-5-MUST-NOT-181 | 6.5 | Application namespace whose first field is `.session` is published |
+
+The GOAWAY result agrees with the publisher-side namespace-subscription path:
+post-request bytes enter request-local teardown instead of the profile's GOAWAY
+parser (`core/src/session/session_namespace_sub.c`). Reserved namespace results
+identify missing validation of application publication configuration; the draft
+still requires unrecognized reserved incoming requests to reach the Application.
+Neither defect was repaired by this testing pass.
+
+The tester's execution audit returned failure for two `scored_without_binding`
+observations: `D22-9-1-1-MUST-304` in `d22-webtransport-server-sends-authority` and
+`D22-9-1-2-MUST-311` in `d22-webtransport-server-sends-path`. These are tester
+binding errors. Excluding those observations leaves the distinct PASS counts
+above unchanged because both rows also passed in registered companion contexts.
+Twelve contexts hit the tester's evidence limit and remain unscored. Other rows
+require publisher modes, object layouts, or token-cache/policy configuration
+that the placeholder application does not provide. Ordinary write probes
+correctly record `operation_accepted=false`; this flag acknowledges STOP_SENDING
+operations and is not a reason to classify ordinary writes as unaccepted.
+
+The retained run requests, JSON/TAP exports, driver logs, executable hashes,
+identity record and execution audit are in `/tmp/moq5-pr35-harness-test/` on the
+validation host. The runner checkout was left unchanged.
 
 The adapter ignores its media fixture and sends placeholder access units. These
 runs do not establish rendered-media delivery. The live WebTransport run exposed
