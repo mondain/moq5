@@ -13,8 +13,9 @@ offered in that order. Draft 21 is replaced by draft 22.
 Control messages use vi64 Type, a 16-bit Length and the message body. SETUP
 (type 0x2F00) opens the unidirectional control channel. Requests use separate
 bidirectional streams, with even client Request IDs and odd server Request IDs
-(6.3). Responses are correlated by stream. A FIN alone does not cancel a request
-(6.4.2.2); RESET_STREAM and STOP_SENDING cancel it (6.4.2.3).
+(6.3). Responses are correlated by stream. A requester's FIN, with the initial
+request or later, does not cancel it (6.4.2.2); RESET_STREAM and STOP_SENDING
+cancel it (6.4.2.3).
 
 ## Location Filter (9.20.9)
 
@@ -62,6 +63,15 @@ Namespace fields and Track Names are binary (8.7, 8.8). Namespace tuples have
 0 through 32 nonempty fields. Namespace and Full Track Name limits are 4096
 bytes, measured by payload bytes, excluding encoded lengths.
 
+Names whose first namespace field starts with `.` are reserved (2.4.3).
+Unregistered reserved names cannot be used; the first field `.` is prohibited
+for any purpose. `.session` is implementation-owned, and applications must not
+publish tracks or namespaces under it (6.5). The application publication APIs
+return MOQ_ERR_INVAL for reserved namespaces, including publisher track
+registration with namespace advertisement disabled. Dots in later fields and
+binary names remain valid. Unrecognized reserved incoming requests must still
+reach the application unless another draft rule specifies their treatment.
+
 Token structure errors cause KEY_VALUE_FORMATTING_ERROR. Token payload syntax
 belongs to the Token Type (8.9); the draft-22 profile forwards opaque payloads,
 including NUL bytes and empty payloads, to the application. Duplicate resolved
@@ -74,7 +84,13 @@ REQUEST_OK (0x07) is the response to PUBLISH and the other requests without a
 dedicated OK type (9.3). Track Properties are empty except on TRACK_STATUS_OK.
 PUBLISH_SKIPPED (0x0F) replaces PUBLISH_BLOCKED; PUBLISH_STATE_NOTIFY (0x22)
 reports subscription state (9.10, 9.19). GOAWAY carries URI and timeout without
-a Request ID (9.2). Range Filters are refused with INVALID_FILTER because the
+a Request ID (9.2). A request-stream GOAWAY migrates that request. More than one
+GOAWAY on the control stream or on the same request stream requires a session
+close with PROTOCOL_VIOLATION. Publisher-side namespace subscriptions retain
+fragmented GOAWAY bytes and cumulative FIN state across capacity refusals;
+an empty retry processes the retained input.
+
+Range Filters are refused with INVALID_FILTER because the
 implementation advertises the default MAX_FILTER_RANGES of zero (9.1.6).
 
 The data plane uses draft-18-compatible subgroup/object layouts and includes

@@ -24,6 +24,15 @@ owns everything below the API: the network thread, ALPN/WT-protocol version
 negotiation, TLS and certificate verification, and the catalog
 subscription/publication. Your code never touches the session.
 
+For draft-22 application publishing, use a namespace whose first field does
+not start with `.`. The first field `.` is prohibited, and `.session` belongs
+to the transport implementation. The sender's catalog registration enforces
+this before advertising the namespace. Attach/create can return before
+negotiation and registration complete; a refused registration surfaces as
+`MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED` through `moq_media_sender_fatal_code()`.
+The low-level publication APIs return MOQ_ERR_INVAL for these names. See the
+[draft-22 wire reference](../../docs/draft22-wire-reference.md) for the rules.
+
 ### Subscription modes
 
 The receiver has two ways to decide which catalog tracks to receive:

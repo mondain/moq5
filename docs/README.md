@@ -7,5 +7,5 @@
 - [API Boundaries](api-boundaries.md) — Header tiers, naming policy, examples policy
 - [Publisher Retained Catalog Groups](publisher-retained-groups.md) — Origin-local cache support for catalog Joining FETCH, and what it does not guarantee through relays
 - [Conformance](conformance.md) — Per-draft status, including draft 22 and its interop-runner results
-- [Draft 22 plan](draft22-implementation-plan.md) — How draft 22 was added, task by task, with results and open items
+- [Draft 22 implementation](draft22-implementation-plan.md) — Implementation scope, validation workflow and remaining limits
 - [Draft 22 wire reference](draft22-wire-reference.md) — Draft-22 wire facts, ambiguities and worked byte examples

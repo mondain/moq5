@@ -23,6 +23,12 @@ The [wire reference](draft22-wire-reference.md) describes the relevant layouts.
 - Enforce binary namespace field and aggregate byte limits (8.7), and pass
   opaque token payloads to the application (8.9). Keep token-cache transactions
   and duplicate-token checks.
+- Reject reserved namespaces in application publication APIs (2.4.3, 6.5),
+  including publisher track registration without namespace advertisement.
+  Forward unrecognized reserved incoming requests to the application.
+- Parse publisher-side namespace-subscription GOAWAY and close the session on
+  duplicates (9.2). Retain fragmented messages and FIN facts across capacity
+  refusals; an initial requester FIN does not cancel the request (6.4.2.2).
 - Carry forward the request, fill, timeout and data-plane work, integrating
   current main's request reset, held-input and lifecycle changes.
 - Update public headers, C++/Swift bindings, examples and the maintained
@@ -40,8 +46,17 @@ using `tools/interop-adapter/run.sh` and the freshly built `media_send` executab
 Exercise native QUIC and WebTransport separately, including typed Location Filter
 and malformed-input cases. Retain exact outcomes and gaps in
 [conformance.md](conformance.md); a catalog audit is not a live publisher result.
+The tester's bundled moq5 adapter at the validated revision accepts only drafts
+18 and 21; use this repository's maintained adapter for draft 22. The full sweep
+also exercised an isolated adaptation of that bundled harness, with its draft
+selection changed to 22 and its publisher invocation retained.
 The adapter publishes placeholder access units and ignores its media fixture,
 so those results do not demonstrate rendered-media delivery.
+
+`d22_namespace_policy` checks reserved publication names, incoming extension
+forwarding, both endpoint perspectives, GOAWAY fragmentation/duplicates,
+requester FIN, and event/action/drain refusals. Its measured results and the live
+tester's incomplete rows are recorded in the conformance report.
 
 ## Remaining implementation limits
 

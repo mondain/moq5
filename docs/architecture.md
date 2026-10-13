@@ -101,7 +101,7 @@ decrefs all queued owned resources on `close_with_error` and `destroy`.
 
 | Area | Implemented | Deferred |
 |------|-------------|----------|
-| **Session core** | Setup + request credit negotiation, subscribe/accept/reject/unsubscribe, subscription update (priority/forward/timeout), done-subscribe, publish (publisher-initiated), fetch (standalone + joining), track status, namespace advertisement, namespace subscription with prefix overlap + suffix ordering, authorization tokens (inbound + outbound), request updates (subscription full, others NOT_SUPPORTED), object delivery (subgroups + datagrams), GOAWAY drain, idle timeout, forward enforcement, bidi-stream dispatch | d18 wire profile, full publish-initiated update |
+| **Session core** | Draft-16/18/22 profiles; setup + request credit negotiation, subscribe/accept/reject/unsubscribe, supported subscription/publication updates, done-subscribe, publish (publisher-initiated), standalone fetch, joining fetch in drafts 16/18 and subscription fills in draft 22, track status, namespace advertisement/subscription, prefix overlap + suffix ordering, authorization tokens, object delivery (subgroups + datagrams), GOAWAY drain, idle timeout, forward enforcement, bidi-stream dispatch | See [per-draft conformance limits](conformance.md) |
 | **Publisher facade** | Track lifecycle, accept-all/reject-all/callback/defer authorization, deferred resolve with generation-safe handles, subscription update callback, object writes (complete + streaming + datagram), namespace advertisement with refcounting | — (multi-session fan-out is a host loop pattern, not a facade feature — see memory.md) |
 | **Subscriber facade** | Subscribe/unsubscribe, subscription update, whole objects, streaming chunks, track status, fetch (standalone + joining), auth tokens, done-subscribe handling, GOAWAY URI callback | — |
 | **Picoquic adapter** | Transport bridge for picoquic QUIC stack ([adapter guide](adapters.md)) | — |
@@ -112,9 +112,10 @@ decrefs all queued owned resources on `close_with_error` and `destroy`.
 Inbound bidi streams are classified by the wire profile before
 session core routes them. In D16, only namespace subscription is a
 valid bidi request stream; unknown stream types close the session.
-The dispatch scaffold (`classify_bidi_stream` profile op) exists so
-future profiles (d18+) can route additional request types without
-changing session core.
+Drafts 18 and 22 use a dedicated bidi stream per request. The profile parses
+its messages, while the session core owns buffering, capacity retries and the
+request lifecycle. Draft 22 also parses publisher-side namespace-subscription
+GOAWAY through its profile hook; duplicate GOAWAY closes the session.
 
 ### Version / Profile Selection
 
@@ -124,9 +125,9 @@ to a `moq_profile_ops_t` vtable. `0` defaults to draft-16; an unsupported
 value fails `moq_session_create` with `MOQ_ERR_INVAL`. The profile is
 immutable for the session lifetime (profile state is co-allocated in the
 session's contiguous block) — there is no runtime profile switch and no
-"try each decoder until one parses." A future draft is added as a new
-`profile_*.c` + a `moq_version_t` value + a `moq_profile_lookup` case,
-with no change to session core.
+"try each decoder until one parses." The current profiles support drafts 16,
+18 and 22. A future draft provides another profile implementation and version
+registry entry, extending semantic core capabilities when necessary.
 
 The version is **chosen by transport negotiation, not by sniffing wire
 bytes**. For native MoQ-over-QUIC and WebTransport-over-QUIC the QUIC ALPN

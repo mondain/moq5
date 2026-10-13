@@ -68,8 +68,8 @@ RELAY_URL=moqt://relay:4443 TESTCASE=setup-only MOQT_DRAFT=16 TLS_DISABLE_VERIFY
 
 CLI flags override environment variables. With no test named (neither `--test`
 nor `TESTCASE`) the client runs every case and exits 0 as long as it ran;
-per-case pass/fail is in the TAP. `--draft` / `MOQT_DRAFT` must be exactly `16`
-or `18`.
+per-case pass/fail is in the TAP. `--draft` / `MOQT_DRAFT` must be exactly `16`,
+`18` or `22`.
 
 ## Backend selection (testing)
 
@@ -83,7 +83,7 @@ cross-checks the name against the URL scheme and rejects a mismatch up front:
 |---|---|---|
 | `auto` | raw QUIC + WebTransport | picoquic family (default) |
 | `picoquic` | raw QUIC + WebTransport | |
-| `msquic` | raw QUIC only | exact-version — pin `--draft 16`/`18` (a single ALPN) |
+| `msquic` | raw QUIC only | exact-version — pin `--draft 16`/`18`/`22` (a single ALPN) |
 | `mvfst` | raw QUIC only | exact-version; when compiled in |
 | `proxygen` | WebTransport only | when compiled in |
 | `wtquic-msquic` | WebTransport only | WebTransport over MsQuic (cross-platform) |

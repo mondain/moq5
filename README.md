@@ -18,6 +18,9 @@ adapters are marked experimental. Not "production complete"; verify against your
 own endpoint before depending on it.
 
 Draft 22 uses explicit Location Filter types and subscription fill streams.
+Application publication rejects reserved namespaces, including `.session`;
+duplicate GOAWAY on one request stream closes the session. See the
+[draft-22 wire reference](docs/draft22-wire-reference.md) for the protocol rules.
 See [conformance.md](docs/conformance.md) for validation and remaining limits.
 
 **Media consumers start here:** [`examples/service/README.md`](examples/service/README.md).

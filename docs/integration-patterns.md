@@ -156,9 +156,9 @@ objects based on LOC properties and CMAF packaging. It runs on
 the network thread inside `on_lane_pump`.
 
 The track info must carry the transport draft the SESSION negotiated:
-LOC object properties are Key-Value-Pairs, and draft-16 and draft-18
-encode a KVP's integers differently (draft-16 §1.4 `(i)`, draft-18
-§1.4.1 `(vi64)`). The two agree only below 64, so a wrong draft is
+LOC object properties are Key-Value-Pairs. Draft 16 uses QUIC variable integers
+(§1.4 `(i)`); drafts 18 and 22 use vi64 (draft-18 §1.4.1, draft-22 §8.1).
+The encodings agree only below 64, so a wrong draft is
 invisible on small values and wrong on everything else. A catalog
 describes the track, never the session carrying it, so the version
 comes from `moq_session_version(session)` — never from endpoint

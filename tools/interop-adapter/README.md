@@ -7,22 +7,45 @@ publisher and not the runner, decide what is compliant.
 
 ## Use
 
-Build the publisher, then start the runner with this adapter as its driver:
+Use a build configured with the service examples and managed picoquic backends
+(`MOQ_BUILD_PQ_THREADED` for native QUIC and `MOQ_BUILD_PICO_WT_MANAGED` for
+WebTransport). Build the publisher, create the certificate/key as described in
+the tester's `docs/publisher-harness-guide.md`, then start the runner with this
+adapter as its driver. Run these commands from the moq5 repository root:
 
 ```sh
 cmake --build build/dev --target moq_example_media_send
-export MOQ5_MEDIA_SEND_BIN=$PWD/build/dev/examples/service/moq_example_media_send
+export MOQ5_MEDIA_SEND_BIN="$PWD/build/dev/examples/service/moq_example_media_send"
 ../moq-contribution-interop-runner/build/moq-interop-runner \
   --bind 127.0.0.1 --port 8080 --database work/runs.sqlite3 \
   --publisher-bind 127.0.0.1 --publisher-advertise 127.0.0.1 \
   --publisher-port-start 4443 --publisher-port-end 4452 \
-  --tls-cert work/cert.pem --tls-key work/key.pem \
-  --driver-executable $PWD/tools/interop-adapter/run.sh \
+  --tls-cert "$PWD/work/cert.pem" --tls-key "$PWD/work/key.pem" \
+  --driver-executable "$PWD/tools/interop-adapter/run.sh" \
   --driver-fixture /path/to/any/readable/file --driver-log-root work/drv-logs
 ```
 
 Then create driven runs with `POST /api/v1/runs` as described in the runner's
-`docs/publisher-harness-guide.md`. Use `"transport": "native-quic"`.
+`docs/publisher-harness-guide.md`. Select `"draft": 22` and
+`"transport": "native-quic"` or `"webtransport"`. For example, create a native
+QUIC context from another terminal:
+
+```sh
+curl --silent --show-error --fail http://127.0.0.1:8080/api/v1/runs \
+  -H 'Content-Type: application/json' --data-binary '{
+    "draft": 22, "transport": "native-quic", "mode": "driven",
+    "scenarios": ["d22-publisher-request-stream-placement"],
+    "timeout_ms": 12000,
+    "track": {"namespace_hex": ["6d65646961"], "name_hex": "766964655f31"}
+  }'
+```
+
+Read the returned run ID through `/api/v1/runs/ID` and `/results/ID.json`.
+An INCOMPLETE verdict records unscored requirements; it is not a passing
+conformance score. At tester revision `ae0364d`, its bundled `adapters/moq5`
+accepts only drafts 18 and 21 and refuses 22. Use this repository's `run.sh`
+for draft 22; the validated isolated copy of the older harness retained its
+command-line mapping while replacing draft 21 selection with 22.
 
 `test-adapter.sh` checks the request-to-command-line mapping and the refusals
 without any network (a capture stub replaces the publisher); it is registered with
@@ -45,7 +68,7 @@ Reaching the scenario timeout is the normal end of a context and exits 0.
 ## Limits worth knowing
 
 - **The fixture is ignored.** `media_send` publishes placeholder access units in
-  GOPs of 30, about 10 seconds at 30 fps. A scenario that needs a specific object
+  30-frame GOPs, attempting 300 frames over about 10 seconds at 30 fps. A scenario that needs a specific object
   layout (for example "two small groups") will not get it from this publisher.
   Score such rows as publisher gaps, then decide whether to add a mode.
 - **No per-scenario modes yet.** The moqxr adapter passes scenario-specific
@@ -63,3 +86,6 @@ Reaching the scenario timeout is the normal end of a context and exits 0.
   transports; some requirements remain unscored because this example exits
   after refusing invalid configuration or lacks the companion publisher mode.
   See [conformance.md](../../docs/conformance.md) for measured results and limits.
+- **Name mapping is limited by the example CLI.** Namespace fields must be
+  nonempty printable text without `/`; the track name must be nonempty printable
+  text. Root namespaces and binary names are exercised through API tests.
