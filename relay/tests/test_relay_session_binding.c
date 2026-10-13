@@ -328,6 +328,12 @@ static uint32_t g_test_max_fetches = 0;
 static uint32_t g_test_max_tracks = 0;
 /* 0 = leave the core's default namespace-trie size. */
 static uint32_t g_test_max_ns_nodes = 0;
+/* 0 = leave the core's default parked-authorization pool. */
+static uint32_t g_test_max_parked = 0;
+/* 0 = leave the binding's default announce-table size. */
+static uint32_t g_test_max_announces = 0;
+/* 0 = leave the core's default namespace-subscription pool. */
+static uint32_t g_test_max_ns_subs = 0;
 
 static moqr_result_t
 rig_create_ex(rig_t *r, ca_t *a, uint32_t bind_dsubs, uint32_t bind_usubs,
@@ -362,6 +368,12 @@ rig_create_ex(rig_t *r, ca_t *a, uint32_t bind_dsubs, uint32_t bind_usubs,
     if (g_test_max_ns_nodes != 0) {
         cfg.max_ns_nodes = g_test_max_ns_nodes;
     }
+    if (g_test_max_parked != 0) {
+        cfg.max_parked = g_test_max_parked;
+    }
+    if (g_test_max_ns_subs != 0) {
+        cfg.max_ns_subs = g_test_max_ns_subs;
+    }
     if (moqr_core_create(&cfg, &r->core) != MOQR_OK) {
         moqr_trace_destroy(r->trace);
         return MOQR_ERR_NOMEM;
@@ -373,6 +385,7 @@ rig_create_ex(rig_t *r, ca_t *a, uint32_t bind_dsubs, uint32_t bind_usubs,
     bcfg.max_downstream_subs = bind_dsubs;
     bcfg.max_upstream_subs = bind_usubs;
     bcfg.max_publishes = bind_pubs;
+    bcfg.max_announces = g_test_max_announces;            /* 0 = default */
     bcfg.max_open_subgroups = g_test_max_open_subgroups; /* 0 = default */
     bcfg.request_grant_window = g_test_grant_window;      /* 0 = default */
     bcfg.fetch_forward_bytes = g_test_fetch_forward_bytes; /* 0 = default */
@@ -483,6 +496,9 @@ typedef struct peer_state {
     bool               sub_error_reason_truncated;
     uint8_t            sub_error_reason[64];
     uint64_t           publish_error_code;
+    bool               publish_error_can_retry;
+    uint64_t           publish_error_retry_ms;
+    int                publish_errors;
     uint64_t           ts_error_code;
     int                ns_rejected;
     uint64_t           ns_rejected_code;
@@ -493,6 +509,8 @@ typedef struct peer_state {
     uint64_t           ns_sub_error_code;
     int                fetch_error;
     uint64_t           fetch_error_code;
+    bool               fetch_error_can_retry;
+    uint64_t           fetch_error_retry_ms;
     /* FETCH response capture */
     bool               fetch_ok;
     bool               fok_eot;             /* FETCH_OK End Of Track          */
@@ -515,6 +533,8 @@ typedef struct peer_state {
     uint64_t           tracks_error_code;
     bool               namespace_accepted;   /* PUBLISH_NAMESPACE accepted   */
     bool               ns_sub_ok;            /* SUBSCRIBE_NAMESPACE accepted */
+    int                namespace_accepts;    /* NAMESPACE_ACCEPTED count     */
+    int                ns_sub_oks;           /* NS_SUB_OK count              */
     /* subgroup-stream churn observation: a (group, subgroup) that FIN'd and then
      * received another object means the relay closed and reopened the stream. */
     uint64_t           finished_gsg[16][2];  /* (group, subgroup) FIN'd       */
@@ -581,7 +601,11 @@ peer_drain(rig_t *r, conn_t *cn, peer_state_t *ps, bool auto_accept,
                 break;
             case MOQ_EVENT_PUBLISH_ERROR:
                 ps->publish_error = true;
+                ps->publish_errors++;
                 ps->publish_error_code = ev->u.publish_error.error_code;
+                ps->publish_error_can_retry = ev->u.publish_error.can_retry;
+                ps->publish_error_retry_ms =
+                    ev->u.publish_error.retry_after_ms;
                 break;
             case MOQ_EVENT_SESSION_CLOSED:
                 ps->session_closed = true;
@@ -596,6 +620,7 @@ peer_drain(rig_t *r, conn_t *cn, peer_state_t *ps, bool auto_accept,
                 break;
             case MOQ_EVENT_NAMESPACE_ACCEPTED:
                 ps->namespace_accepted = true;
+                ps->namespace_accepts++;
                 break;
             case MOQ_EVENT_NS_SUB_ERROR:
                 ps->ns_sub_error++;
@@ -604,6 +629,8 @@ peer_drain(rig_t *r, conn_t *cn, peer_state_t *ps, bool auto_accept,
             case MOQ_EVENT_FETCH_ERROR:
                 ps->fetch_error++;
                 ps->fetch_error_code = ev->u.fetch_error.error_code;
+                ps->fetch_error_can_retry = ev->u.fetch_error.can_retry;
+                ps->fetch_error_retry_ms = ev->u.fetch_error.retry_after_ms;
                 break;
             case MOQ_EVENT_FETCH_OK:
                 ps->fetch_ok = true;
@@ -652,6 +679,7 @@ peer_drain(rig_t *r, conn_t *cn, peer_state_t *ps, bool auto_accept,
                 break;
             case MOQ_EVENT_NS_SUB_OK:
                 ps->ns_sub_ok = true;
+                ps->ns_sub_oks++;
                 break;
             case MOQ_EVENT_SUBSCRIBE_OK:
                 ps->subscribe_ok = true;
@@ -1184,9 +1212,13 @@ small_caps_flow(void)
         peer_drain(&rig, sub, &sub_ps, false, false, 0, 0);
         R_CHECK(&rig, sub_ps.subscribe_ok);            /* t1 established */
         R_CHECK(&rig, sub_ps.subscribe_errors == 1);   /* t2 refused      */
+        /* A full tracking table is a capacity refusal (d18 Section 10.6). */
         R_CHECK(&rig, sub_ps.sub_error_code ==
-                          MOQ_REQUEST_ERROR_INTERNAL_ERROR);
-        R_CHECK(&rig, sub_reason_eq(&sub_ps, "internal error"));
+                          MOQ_REQUEST_ERROR_EXCESSIVE_LOAD);
+        R_CHECK(&rig, sub_reason_eq(&sub_ps, "excessive load"));
+        R_CHECK(&rig, sub_ps.sub_error_can_retry &&
+                          sub_ps.sub_error_retry_ms >= 750 &&
+                          sub_ps.sub_error_retry_ms <= 1250);
         moqr_core_stats_t cs;
         moqr_core_get_stats(rig.core, &cs);
         R_CHECK(&rig, cs.subs == 1);   /* refused sub left no live state */
@@ -1234,6 +1266,13 @@ small_caps_flow(void)
         peer_drain(&rig, pub, &pub_ps, false, false, 0, 0);
         R_CHECK(&rig, pub_ps.publish_ok);      /* first accepted     */
         R_CHECK(&rig, pub_ps.publish_error);   /* second refused     */
+        /* A full publish table is a capacity refusal (d18 Section 10.6). */
+        R_CHECK(&rig, pub_ps.publish_errors == 1 &&
+                          pub_ps.publish_error_code ==
+                              MOQ_REQUEST_ERROR_EXCESSIVE_LOAD);
+        R_CHECK(&rig, pub_ps.publish_error_can_retry &&
+                          pub_ps.publish_error_retry_ms >= 750 &&
+                          pub_ps.publish_error_retry_ms <= 1250);
         failures += rig.failures;
         rig_destroy(&rig);
         R_CHECK(&rig, a.live == 0);
@@ -1280,9 +1319,13 @@ small_caps_flow(void)
         rig_pump(&rig, 6);   /* t2's upstream cannot be tracked -> ERROR  */
         peer_drain(&rig, sub, &sub_ps, false, false, 0, 0);
         R_CHECK(&rig, sub_ps.subscribe_errors == 1);
+        /* A full upstream table is a capacity refusal (d18 Section 10.6). */
         R_CHECK(&rig, sub_ps.sub_error_code ==
-                          MOQ_REQUEST_ERROR_INTERNAL_ERROR);
-        R_CHECK(&rig, sub_reason_eq(&sub_ps, "internal error"));
+                          MOQ_REQUEST_ERROR_EXCESSIVE_LOAD);
+        R_CHECK(&rig, sub_reason_eq(&sub_ps, "excessive load"));
+        R_CHECK(&rig, sub_ps.sub_error_can_retry &&
+                          sub_ps.sub_error_retry_ms >= 750 &&
+                          sub_ps.sub_error_retry_ms <= 1250);
         failures += rig.failures;
         rig_destroy(&rig);
         R_CHECK(&rig, a.live == 0);
@@ -13255,6 +13298,7 @@ jf_teardown(jf_t *j, const char *row)
     }
     g_test_fetch_forward_bytes = 0;
     g_test_max_fetches = 0;
+    g_test_max_parked = 0;
     g_test_max_actions = 0;
     g_test_max_events = 0;
     g_test_authorize = NULL;
@@ -14378,8 +14422,12 @@ jf_slot_exhaustion(moq_version_t version)
     }
     R_CHECK(&j.rig, rejected >= 0);
     if (rejected >= 0) {
+        /* Capacity refusal: d18 EXCESSIVE_LOAD, d16 INTERNAL_ERROR. */
         j.rig.failures += jf_check_rejected(&j, &j.d[rejected],
-                                            MOQ_REQUEST_ERROR_INTERNAL_ERROR, "slot exhaustion");
+                                            version == MOQ_VERSION_DRAFT_18
+                                                ? MOQ_REQUEST_ERROR_EXCESSIVE_LOAD
+                                                : MOQ_REQUEST_ERROR_INTERNAL_ERROR,
+                                            "slot exhaustion");
     }
     jf_origin_answer_exact(&j, 0, false);
     jf_origin_answer_exact(&j, 1, false);
@@ -14768,10 +14816,16 @@ jf_refusal_held(moq_version_t version, int mode, int after)
     R_CHECK(&j.rig, st.refusals_blocked == 1 && st.refusals_sent == 0);
     R_CHECK(&j.rig, d->ledger_n == 0 && d->foreign == 0);
     R_CHECK(&j.rig, st.admitted == (mode == JR_POOL ? 2u : 0u));
+    /* Transaction-pool exhaustion is a capacity refusal: d18 EXCESSIVE_LOAD,
+     * d16 INTERNAL_ERROR (its registry has no load code). */
+    uint64_t pool_code = version == MOQ_VERSION_DRAFT_18
+                             ? MOQ_REQUEST_ERROR_EXCESSIVE_LOAD
+                             : MOQ_REQUEST_ERROR_INTERNAL_ERROR;
     uint64_t code = mode == JR_AUTH ? MOQ_REQUEST_ERROR_UNAUTHORIZED
                   : mode == JR_DESCENDING ? MOQ_REQUEST_ERROR_NOT_SUPPORTED
                   : mode == JR_NO_SOURCE ? MOQ_REQUEST_ERROR_DOES_NOT_EXIST
                   : mode == JR_UNRESOLVED ? MOQ_REQUEST_ERROR_INVALID_JOINING_REQUEST_ID
+                  : mode == JR_POOL ? pool_code
                   : MOQ_REQUEST_ERROR_INTERNAL_ERROR;
     if (after == JR_CANCEL) {
         R_CHECK(&j.rig, moq_session_fetch_cancel(d->cn->peer, d->fh, j.rig.now) == MOQ_OK);
@@ -14821,14 +14875,15 @@ jf_refusal_held(moq_version_t version, int mode, int after)
     return jf_teardown(&j, label);
 }
 
-/* Refusal capacity beyond the binding's fetch pool: the relay is declared
- * for ONE fetch (max_fetches = 1, so two refusal entries) while the peer's
- * session may hold 16 pending requests. Three joins arrive under the full
- * 3-deep downstream queue (announce trick as above): two refusals are held,
- * which leaves no entry for the third -- its event stays queued in the
- * session (the connection's polling pauses) instead of being consumed
- * without an owner. While they are held, the peer cancels the first, issues
- * a fourth join that reuses that request slot, and announces one more
+/* Held-refusal capacity: the relay is declared for ONE parked authorization
+ * (max_parked = 1, so two entries: one poll and one parkable authorization)
+ * while the peer's session may hold 16 pending requests. Four joins arrive
+ * under the full 3-deep downstream queue (announce trick as above): two
+ * refusals are held, which leaves no entry for the third and fourth -- their
+ * events stay queued in the session (the connection's polling pauses)
+ * instead of being consumed without an owner. While they are held,
+ * the peer cancels the first, issues a fifth join that reuses that request
+ * slot, and announces one more
  * namespace -- all queued behind. Required outcome: every request receives
  * exactly its refusal or is retired by its cancel, no request is abandoned,
  * no session closes, the other connection keeps flowing meanwhile, and
@@ -14841,6 +14896,7 @@ jf_refusal_capacity(moq_version_t version)
     g_test_authorize = jf_auth_hook;
     g_test_authorize_ctx = &au;
     g_test_max_fetches = 1;
+    g_test_max_parked = 1;
     g_test_max_actions = 3;
     static jf_trace_t tr;
     memset(&tr, 0, sizeof(tr));
@@ -14866,7 +14922,7 @@ jf_refusal_capacity(moq_version_t version)
     moqr_bind_stats_t bs0;
     moqr_bind_get_stats(j.rig.bind, &bs0);
     rig_step_pair(&j.rig, d->cn);
-    /* Three joins (A = d->fh, B = req_fh[0], C = req_fh[1]). */
+    /* Four joins (A = d->fh, B..D = req_fh[0..2]). */
     jf_join(&j, d);
     moq_fetch_t fa = d->fh;
     moq_fetch_cfg_t fc;
@@ -14877,22 +14933,25 @@ jf_refusal_capacity(moq_version_t version)
     fc.joining_sub = d->sh;
     R_CHECK(&j.rig, moq_session_fetch(d->cn->peer, &fc, j.rig.now, &d->req_fh[0]) == MOQ_OK);
     R_CHECK(&j.rig, moq_session_fetch(d->cn->peer, &fc, j.rig.now, &d->req_fh[1]) == MOQ_OK);
-    d->req_n = 2;
+    rig_step_pair(&j.rig, d->cn);   /* the peer's own 3-deep queue */
+    R_CHECK(&j.rig, moq_session_fetch(d->cn->peer, &fc, j.rig.now, &d->req_fh[2]) == MOQ_OK);
+    d->req_n = 3;
     rig_step_pair(&j.rig, d->cn);
     rig_bind_pump_once(&j.rig);
     moqr_bind_fwd_debug_t st;
     jf_stats(&j, &st);
     jf_down_drain(&j.rig, d);
-    /* A and B refused and held (both entries); C's request stays queued in
-     * the session: the pump paused this connection rather than consume a
-     * request it could not own. */
+    /* A and B refused and held (every entry); C's and D's requests stay
+     * queued in the session: the pump paused this connection rather than
+     * consume a request it could not own. */
     R_CHECK(&j.rig, st.refusals_blocked == 2 && st.refusals_sent == 0 &&
                     st.refusals_unparked == 0 && st.refusals_pending == 2 && st.polls_paused >= 1);
-    R_CHECK(&j.rig, d->ledger_n == 0 && d->req_err[0] == 0 && d->req_err[1] == 0 && d->ns_accepted == 0);
-    /* Held: cancel A, issue D on the freed request slot, announce t3. */
+    R_CHECK(&j.rig, d->ledger_n == 0 && d->req_err[0] == 0 && d->req_err[1] == 0 &&
+                    d->req_err[2] == 0 && d->ns_accepted == 0);
+    /* Held: cancel A, issue E on the freed request slot, announce t3. */
     R_CHECK(&j.rig, moq_session_fetch_cancel(d->cn->peer, fa, j.rig.now) == MOQ_OK);
-    R_CHECK(&j.rig, moq_session_fetch(d->cn->peer, &fc, j.rig.now, &d->req_fh[2]) == MOQ_OK);
-    d->req_n = 3;
+    R_CHECK(&j.rig, moq_session_fetch(d->cn->peer, &fc, j.rig.now, &d->req_fh[3]) == MOQ_OK);
+    d->req_n = 4;
     {
         moq_bytes_t parts[2] = { JR_H, { (const uint8_t *)tails[3], 2 } };
         moq_publish_namespace_cfg_t pcfg;
@@ -14906,8 +14965,8 @@ jf_refusal_capacity(moq_version_t version)
     rig_bind_pump_once(&j.rig);
     jf_stats(&j, &st);
     jf_down_drain(&j.rig, d);
-    /* With two refusals held against a one-fetch pool the connection's
-     * event consumption was paused in that pump: the cancel, C and t3 stayed
+    /* With every refusal entry held the connection's event consumption was
+     * paused in that pump: the cancel, D, E and t3 stayed
      * queued (t3 not accepted; the three earlier acceptances, drained by the
      * step, are what the peer sees), and nothing was abandoned. The held
      * refusals themselves commit in the same pump once the step emptied the
@@ -14927,19 +14986,20 @@ jf_refusal_capacity(moq_version_t version)
     tr.armed = false;
     R_CHECK(&j.rig, st.polls_paused >= 2 && st.refusals_unparked == 0 && st.refusals_pending <= 2);
     R_CHECK(&j.rig, d->ns_accepted == 3 && d->ledger_n == 0 && d->req_err[0] == 0 &&
-                    d->req_err[1] == 0 && d->req_err[2] == 0);
+                    d->req_err[1] == 0 && d->req_err[2] == 0 && d->req_err[3] == 0);
     /* The other connection keeps flowing meanwhile (its own pumps drain the
      * downstream queue too, so the refusals commit along the way). */
     jf_live_control(&j);
     for (int i = 0; i < 8; i++) jf_cycle(&j);
     jf_stats(&j, &st);
     /* A: retired by its cancel (the held refusal found the request gone);
-     * B, C and D: exactly one refusal each; t0..t3 accepted; nothing held. */
+     * B, C, D and E: exactly one refusal each; t0..t3 accepted; nothing
+     * held. */
     R_CHECK(&j.rig, d->ledger_n == 0);                       /* A: no error */
     R_CHECK(&j.rig, d->req_err[0] == 1 && d->req_err[1] == 1 && d->req_err[2] == 1 &&
-                    d->foreign == 0);
+                    d->req_err[3] == 1 && d->foreign == 0);
     R_CHECK(&j.rig, d->ns_accepted == 4);
-    R_CHECK(&j.rig, st.refusals_sent == 3 && st.refusals_gone + st.refusals_dropped == 1 &&
+    R_CHECK(&j.rig, st.refusals_sent == 4 && st.refusals_gone + st.refusals_dropped == 1 &&
                     st.refusals_pending == 0 && st.refusals_unparked == 0);
     R_CHECK(&j.rig, moq_session_state(d->cn->peer) == MOQ_SESS_ESTABLISHED &&
                     moq_session_state(d->cn->rsess) == MOQ_SESS_ESTABLISHED);
@@ -15598,6 +15658,759 @@ test_ns_capacity_code(void)
     return f;
 }
 
+/* An acceptance that meets a full session action queue is still sent. The
+ * accepted connection's relay-side queue holds three actions; three
+ * PUBLISH_NAMESPACE acceptances fill it in the same pump that admits a
+ * PUBLISH_NAMESPACE or SUBSCRIBE_NAMESPACE into the core (or, for a deferred
+ * authorization, before it resolves), so moq_session_accept_* returns
+ * WOULD_BLOCK with the request pending. Once the queue drains the peer must
+ * see exactly one REQUEST_OK for it, and for a namespace subscription the
+ * matching NAMESPACE only after that REQUEST_OK (the session would refuse
+ * it before), with no session closed and nothing left held. When the request
+ * is gone before the acceptance commits (injected at the retry, since a
+ * peer cannot withdraw a request it has not had answered), the core
+ * admission is undone: the announce is withdrawn, or the namespace
+ * subscription removed together with the NAMESPACE already parked behind
+ * its acceptance, with the connection kept. */
+enum { AH_NAMESPACE, AH_NS_SUB };
+enum { AH_INLINE, AH_RESUMED, AH_GONE };
+
+static int
+accept_held_case(moq_version_t version, int family, int mode)
+{
+    static const char *const fam[] = { "namespace", "ns_sub" };
+    static const char *const md[] = { "inline", "resumed", "gone" };
+    char label[64];
+    (void)snprintf(label, sizeof(label), "%s %s %s", fam[family], md[mode],
+                   version == MOQ_VERSION_DRAFT_18 ? "d18" : "d16");
+    ca_t a;
+    ca_init(&a);
+    rig_t rig;
+    if (mode == AH_RESUMED) {
+        g_test_authorize = defer_hook;
+        g_defer_action = family == AH_NAMESPACE
+                             ? MOQR_AUTH_PUBLISH_NAMESPACE
+                             : MOQR_AUTH_SUBSCRIBE_NAMESPACE;
+        g_defer_last = 0;
+    }
+    moqr_result_t crc = rig_create(&rig, &a);
+    if (crc != MOQR_OK) {
+        g_test_authorize = NULL;
+        g_defer_action = 0xFFFFFFFFu;
+        printf("FAIL: accept_held(%s): rig\n", label);
+        return 1;
+    }
+    /* A live announce the namespace subscription matches. */
+    (void)fetch_pub_open(&rig);
+    g_test_max_actions = 3;   /* read by rig_connect: this connection only */
+    conn_t *v = rig_connect(&rig, version);
+    g_test_max_actions = 0;
+    R_CHECK(&rig, v != NULL);
+    rig_pump(&rig, 6);
+    peer_state_t ps;
+    memset(&ps, 0, sizeof(ps));
+    peer_drain(&rig, v, &ps, false, false, 0, 0);
+    moqr_core_stats_t st0;
+    moqr_core_get_stats(rig.core, &st0);
+
+    moq_bytes_t xns[1] = { B("x") };
+    moq_bytes_t dns[1] = { B("demo") };
+    moq_announcement_t xh = { 0 };
+    moq_ns_sub_handle_t nsh = { 0 };
+    bool sent = false;
+    if (mode == AH_RESUMED) {
+        /* Park the request first; it resolves under the full queue. */
+        if (family == AH_NAMESPACE) {
+            moq_publish_namespace_cfg_t pcfg;
+            moq_publish_namespace_cfg_init(&pcfg);
+            pcfg.track_namespace = (moq_namespace_t){ .parts = xns, .count = 1 };
+            R_CHECK(&rig, moq_session_publish_namespace(v->peer, &pcfg, rig.now,
+                                                        &xh) == MOQ_OK);
+        } else {
+            moq_subscribe_namespace_cfg_t nc;
+            memset(&nc, 0, sizeof(nc));
+            moq_subscribe_namespace_cfg_init(&nc);
+            nc.track_namespace_prefix =
+                (moq_namespace_t){ .parts = dns, .count = 1 };
+            nc.namespace_interest = MOQ_NAMESPACE_INTEREST_NAMESPACE_STATE;
+            R_CHECK(&rig, moq_session_subscribe_namespace(v->peer, &nc, rig.now,
+                                                          &nsh) == MOQ_OK);
+        }
+        sent = true;
+        rig_pump(&rig, 4);
+        R_CHECK(&rig, g_defer_last != 0);
+        g_defer_action = 0xFFFFFFFFu;   /* the filler announces are allowed */
+    }
+    uint64_t ticket = g_defer_last;
+    /* Three announces, delivered without a bind pump. */
+    static const moq_bytes_t AH = { (const uint8_t *)"h", 1 };
+    const char *tails[3] = { "t0", "t1", "t2" };
+    for (int t = 0; t < 3; t++) {
+        moq_bytes_t parts[2] = { AH, { (const uint8_t *)tails[t], 2 } };
+        moq_publish_namespace_cfg_t pcfg;
+        moq_publish_namespace_cfg_init(&pcfg);
+        pcfg.track_namespace = (moq_namespace_t){ .parts = parts, .count = 2 };
+        moq_announcement_t ann;
+        R_CHECK(&rig, moq_session_publish_namespace(v->peer, &pcfg, rig.now,
+                                                    &ann) == MOQ_OK);
+    }
+    rig_step_pair(&rig, v);
+    if (!sent) {
+        if (family == AH_NAMESPACE) {
+            moq_publish_namespace_cfg_t pcfg;
+            moq_publish_namespace_cfg_init(&pcfg);
+            pcfg.track_namespace = (moq_namespace_t){ .parts = xns, .count = 1 };
+            R_CHECK(&rig, moq_session_publish_namespace(v->peer, &pcfg, rig.now,
+                                                        &xh) == MOQ_OK);
+        } else {
+            moq_subscribe_namespace_cfg_t nc;
+            memset(&nc, 0, sizeof(nc));
+            moq_subscribe_namespace_cfg_init(&nc);
+            nc.track_namespace_prefix =
+                (moq_namespace_t){ .parts = dns, .count = 1 };
+            nc.namespace_interest = MOQ_NAMESPACE_INTEREST_NAMESPACE_STATE;
+            R_CHECK(&rig, moq_session_subscribe_namespace(v->peer, &nc, rig.now,
+                                                          &nsh) == MOQ_OK);
+        }
+        rig_step_pair(&rig, v);
+    }
+    rig_bind_pump_once(&rig);   /* filler acceptances fill the queue */
+    if (mode == AH_RESUMED) {
+        R_CHECK(&rig, moqr_bind_auth_resolve(
+                          rig.bind, ticket,
+                          &(moqr_auth_verdict_t){ .decision = MOQR_AUTH_ALLOW },
+                          rig.now) == MOQR_OK);
+    }
+    moqr_bind_fwd_debug_t dbg;
+    moqr_bind_debug_fwd_stats(rig.bind, &dbg);
+    R_CHECK(&rig, dbg.accepts_blocked == 1 && dbg.accepts_pending == 1 &&
+                      dbg.refusals_unparked == 0);
+    moqr_core_stats_t st1;
+    moqr_core_get_stats(rig.core, &st1);
+    if (family == AH_NAMESPACE) {
+        R_CHECK(&rig, st1.ns_nodes == st0.ns_nodes + 1u + 3u + 1u);   /* x, h, h/t* */
+    } else {
+        R_CHECK(&rig, st1.ns_subs == st0.ns_subs + 1u);
+    }
+
+    if (mode == AH_GONE) {
+        moqr_bind_debug_accept_gone(1);   /* the next acceptance retry */
+    }
+    rig_pump(&rig, 8);
+    memset(&ps, 0, sizeof(ps));
+    peer_drain(&rig, v, &ps, false, false, 0, 0);
+    rig_pump(&rig, 4);
+    peer_drain(&rig, v, &ps, false, false, 0, 0);
+    moqr_bind_debug_fwd_stats(rig.bind, &dbg);
+    moqr_core_stats_t st2;
+    moqr_core_get_stats(rig.core, &st2);
+    if (mode == AH_GONE) {
+        R_CHECK(&rig, dbg.accepts_sent == 3u && dbg.accepts_undone == 1);
+        if (family == AH_NAMESPACE) {
+            R_CHECK(&rig, ps.namespace_accepts == 3);
+            /* "x" withdrawn and its node reclaimable; h and h/t* stay. */
+            R_CHECK(&rig, st2.ns_nodes - st2.ns_nodes_reclaimable ==
+                              st0.ns_nodes + 1u + 3u);
+        } else {
+            /* The NAMESPACE for "demo" was parked behind the held acceptance
+             * and is dropped with the subscription. */
+            moqr_bind_stats_t bs;
+            moqr_bind_get_stats(rig.bind, &bs);
+            R_CHECK(&rig, bs.nsu_retained >= 1 && bs.nsu_live == 0 &&
+                              bs.nsu_failed_closed == 0);
+            R_CHECK(&rig, ps.ns_sub_oks == 0 && ps.ns_found == 0);
+            R_CHECK(&rig, st2.ns_subs == st0.ns_subs);
+        }
+    } else if (family == AH_NAMESPACE) {
+        R_CHECK(&rig, ps.namespace_accepts == 4 && ps.ns_rejected == 0);
+        R_CHECK(&rig, dbg.accepts_sent == 4);
+    } else {
+        R_CHECK(&rig, ps.namespace_accepts == 3);
+        R_CHECK(&rig, ps.ns_sub_oks == 1 && ps.ns_sub_error == 0);
+        R_CHECK(&rig, ps.ns_found == 1);   /* "demo", after the REQUEST_OK */
+        R_CHECK(&rig, dbg.accepts_sent == 4);
+    }
+    R_CHECK(&rig, dbg.accepts_pending == 0 && dbg.refusals_pending == 0);
+    R_CHECK(&rig, !ps.session_closed &&
+                      moq_session_state(v->rsess) == MOQ_SESS_ESTABLISHED);
+
+    int f = rig.failures;
+    rig_destroy(&rig);
+    g_test_authorize = NULL;
+    g_defer_action = 0xFFFFFFFFu;
+    if (a.live != 0) {
+        printf("FAIL: accept_held(%s): leak %ld\n", label, a.live);
+        f++;
+    }
+    printf("%s: accept_held(%s)\n", f == 0 ? "PASS" : "FAIL", label);
+    return f;
+}
+
+/* The relay session's own ref for the namespace-subscription request stream,
+ * read from the SimPair trace: the bidi delivered to the relay while armed. A
+ * test then drives the real RESET / STOP ingress on it through the public
+ * session API. */
+static struct {
+    bool             armed;
+    int              refs;   /* distinct refs seen while armed */
+    moq_stream_ref_t ref;
+} g_nsref;
+
+static void
+nsref_trace(void *ctx, const moq_sim_trace_record_t *r)
+{
+    (void)ctx;
+    if (!g_nsref.armed || r->kind != MOQ_SIM_TRACE_INPUT ||
+        r->to != MOQ_PERSPECTIVE_SERVER ||
+        r->input_kind != MOQ_SIM_INPUT_BIDI_BYTES ||
+        r->struct_size < offsetof(moq_sim_trace_record_t, stream_ref) +
+                             sizeof(r->stream_ref)) {
+        return;
+    }
+    if (g_nsref.refs == 0 || g_nsref.ref._v != r->stream_ref._v) {
+        g_nsref.ref = r->stream_ref;
+        g_nsref.refs++;
+    }
+}
+
+/* The peer's stream ends, as the relay's session sees it. */
+enum { NSE_CANCEL, NSE_RESET, NSE_STOP };
+
+static void
+ns_sub_end(rig_t *rig, conn_t *v, moq_ns_sub_handle_t nsh, int how)
+{
+    if (how == NSE_CANCEL) {
+        R_CHECK(rig, moq_session_cancel_namespace_sub(v->peer, nsh,
+                                                      rig->now) == MOQ_OK);
+    } else if (how == NSE_RESET) {
+        R_CHECK(rig, moq_session_on_bidi_stream_reset(v->rsess, g_nsref.ref,
+                                                      0, rig->now) == MOQ_OK);
+    } else {
+        R_CHECK(rig, moq_session_on_bidi_stream_stop(v->rsess, g_nsref.ref,
+                                                     0, rig->now) == MOQ_OK);
+    }
+}
+
+/* An accepted namespace subscription ends while two NAMESPACE updates for it
+ * are parked behind a full action queue, and the connection must stay open.
+ *   cancel: the peer cancels (a FIN on its request stream). The session keeps
+ *           the subscription until its response half closes, so the parked
+ *           updates are still accepted by the session and discarded by the
+ *           peer.
+ *   reset / stop: the peer resets or stops the stream, and the session
+ *           retires the subscription (real ingress). The updates are owed
+ *           to nobody: the first send meets STALE_HANDLE and is dropped, the
+ *           subscription leaves the core, and the second is purged, instead
+ *           of the connection failing. */
+static int
+ns_sub_cancel_parked_case(moq_version_t version, int how)
+{
+    static const char *const hn[] = { "cancel", "reset", "stop" };
+    char label[32];
+    (void)snprintf(label, sizeof(label), "%s %s", hn[how],
+                   version == MOQ_VERSION_DRAFT_18 ? "d18" : "d16");
+    ca_t a;
+    ca_init(&a);
+    rig_t rig;
+    if (rig_create(&rig, &a) != MOQR_OK) {
+        printf("FAIL: ns_sub_cancel_parked(%s): rig\n", label);
+        return 1;
+    }
+    moqr_binding_t pb = fetch_pub_open(&rig);   /* announces "demo" */
+    g_test_max_actions = 3;
+    g_test_trace_fn = nsref_trace;
+    memset(&g_nsref, 0, sizeof(g_nsref));
+    conn_t *v = rig_connect(&rig, version);
+    g_test_trace_fn = NULL;
+    g_test_max_actions = 0;
+    R_CHECK(&rig, v != NULL);
+    rig_pump(&rig, 6);
+    peer_state_t ps;
+    memset(&ps, 0, sizeof(ps));
+    peer_drain(&rig, v, &ps, false, false, 0, 0);
+
+    moq_bytes_t dns[1] = { B("demo") };
+    moq_subscribe_namespace_cfg_t nc;
+    memset(&nc, 0, sizeof(nc));
+    moq_subscribe_namespace_cfg_init(&nc);
+    nc.track_namespace_prefix = (moq_namespace_t){ .parts = dns, .count = 1 };
+    nc.namespace_interest = MOQ_NAMESPACE_INTEREST_NAMESPACE_STATE;
+    moq_ns_sub_handle_t nsh;
+    R_CHECK(&rig, moq_session_subscribe_namespace(v->peer, &nc, rig.now,
+                                                  &nsh) == MOQ_OK);
+    g_nsref.armed = true;
+    rig_pump(&rig, 6);
+    g_nsref.armed = false;
+    R_CHECK(&rig, g_nsref.refs == 1 && g_nsref.ref._v != 0);
+    peer_drain(&rig, v, &ps, false, false, 0, 0);
+    R_CHECK(&rig, ps.ns_sub_oks == 1 && ps.ns_found == 1);
+
+    /* Fill the relay's queue for this connection, then announce a second
+     * matching namespace: its NAMESPACE is parked. */
+    static const moq_bytes_t CH = { (const uint8_t *)"h", 1 };
+    const char *tails[3] = { "t0", "t1", "t2" };
+    for (int t = 0; t < 3; t++) {
+        moq_bytes_t parts[2] = { CH, { (const uint8_t *)tails[t], 2 } };
+        moq_publish_namespace_cfg_t pcfg;
+        moq_publish_namespace_cfg_init(&pcfg);
+        pcfg.track_namespace = (moq_namespace_t){ .parts = parts, .count = 2 };
+        moq_announcement_t ann;
+        R_CHECK(&rig, moq_session_publish_namespace(v->peer, &pcfg, rig.now,
+                                                    &ann) == MOQ_OK);
+    }
+    rig_step_pair(&rig, v);
+    rig_bind_pump_once(&rig);   /* the three acceptances fill the queue */
+    moq_bytes_t late[2] = { B("demo"), B("late") };
+    moq_bytes_t late2[2] = { B("demo"), B("later") };
+    R_CHECK(&rig, moqr_core_announce(rig.core, pb,
+                                     (moqr_ns_t){ late, 2 }) == MOQR_OK);
+    R_CHECK(&rig, moqr_core_announce(rig.core, pb,
+                                     (moqr_ns_t){ late2, 2 }) == MOQR_OK);
+    rig_bind_pump_once(&rig);   /* both NAMESPACE updates park */
+    moqr_bind_stats_t bs;
+    moqr_bind_get_stats(rig.bind, &bs);
+    R_CHECK(&rig, bs.nsu_live == 2);
+
+    ns_sub_end(&rig, v, nsh, how);
+    rig_step_pair(&rig, v);
+    rig_pump(&rig, 8);
+    peer_drain(&rig, v, &ps, false, false, 0, 0);
+    moqr_bind_get_stats(rig.bind, &bs);
+    R_CHECK(&rig, bs.nsu_live == 0 && bs.nsu_failed_closed == 0);
+    R_CHECK(&rig, ps.namespace_accepts == 3 && ps.ns_found == 1);
+    if (how != NSE_CANCEL) {
+        moqr_core_stats_t cs;
+        moqr_core_get_stats(rig.core, &cs);
+        R_CHECK(&rig, cs.ns_subs == 0);
+    }
+    R_CHECK(&rig, !ps.session_closed &&
+                      moq_session_state(v->rsess) == MOQ_SESS_ESTABLISHED);
+
+    int f = rig.failures;
+    rig_destroy(&rig);
+    if (a.live != 0) {
+        printf("FAIL: ns_sub_cancel_parked(%s): leak %ld\n", label, a.live);
+        f++;
+    }
+    printf("%s: ns_sub_cancel_parked(%s)\n", f == 0 ? "PASS" : "FAIL", label);
+    return f;
+}
+
+/* A namespace subscription the session has retired (real RESET ingress on
+ * its request stream) leaves the core at the first update that finds it gone;
+ * the session reports no event for the retirement, so a quiet prefix keeps
+ * its core subscription until an update is sent or the connection closes.
+ * Cycling subscribe -> reset -> update on one long-lived connection therefore
+ * never exhausts a small core pool (max_ns_subs = 2, four cycles), and a
+ * retired subscription is sent no later update. */
+static int
+ns_sub_retire_cycles_case(moq_version_t version)
+{
+    const char *label = version == MOQ_VERSION_DRAFT_18 ? "d18" : "d16";
+    ca_t a;
+    ca_init(&a);
+    rig_t rig;
+    g_test_max_ns_subs = 2;
+    moqr_result_t crc = rig_create(&rig, &a);
+    g_test_max_ns_subs = 0;
+    if (crc != MOQR_OK) {
+        printf("FAIL: ns_sub_retire_cycles(%s): rig\n", label);
+        return 1;
+    }
+    moqr_binding_t pb;
+    R_CHECK(&rig, moqr_core_binding_open(rig.core, 900, &pb) == MOQR_OK);
+    g_test_trace_fn = nsref_trace;
+    memset(&g_nsref, 0, sizeof(g_nsref));
+    conn_t *v = rig_connect(&rig, version);
+    g_test_trace_fn = NULL;
+    R_CHECK(&rig, v != NULL);
+    rig_pump(&rig, 6);
+    peer_state_t ps;
+    memset(&ps, 0, sizeof(ps));
+    peer_drain(&rig, v, &ps, false, false, 0, 0);
+    static const char *const pfx[4] = { "p0", "p1", "p2", "p3" };
+    for (int c = 0; c < 4; c++) {
+        moq_bytes_t root[1] = { B(pfx[c]) };
+        moq_bytes_t n1[2] = { B(pfx[c]), B("a") };
+        moq_bytes_t n2[2] = { B(pfx[c]), B("b") };
+        moq_bytes_t n3[2] = { B(pfx[c]), B("c") };
+        R_CHECK(&rig, moqr_core_announce(rig.core, pb,
+                                         (moqr_ns_t){ n1, 2 }) == MOQR_OK);
+        moq_subscribe_namespace_cfg_t nc;
+        memset(&nc, 0, sizeof(nc));
+        moq_subscribe_namespace_cfg_init(&nc);
+        nc.track_namespace_prefix =
+            (moq_namespace_t){ .parts = root, .count = 1 };
+        nc.namespace_interest = MOQ_NAMESPACE_INTEREST_NAMESPACE_STATE;
+        moq_ns_sub_handle_t nsh;
+        g_nsref.refs = 0;
+        g_nsref.armed = true;
+        R_CHECK(&rig, moq_session_subscribe_namespace(v->peer, &nc, rig.now,
+                                                      &nsh) == MOQ_OK);
+        rig_pump(&rig, 6);
+        g_nsref.armed = false;
+        R_CHECK(&rig, g_nsref.refs == 1);
+        memset(&ps, 0, sizeof(ps));
+        peer_drain(&rig, v, &ps, false, false, 0, 0);
+        R_CHECK(&rig, ps.ns_sub_oks == 1 && ps.ns_sub_error == 0);
+        R_CHECK(&rig, ps.ns_found == 1);   /* p<c>/a */
+        /* The peer resets the stream; the next update finds it retired. */
+        ns_sub_end(&rig, v, nsh, NSE_RESET);
+        R_CHECK(&rig, moqr_core_announce(rig.core, pb,
+                                         (moqr_ns_t){ n2, 2 }) == MOQR_OK);
+        rig_pump(&rig, 6);
+        /* Later updates are not sent to it. */
+        R_CHECK(&rig, moqr_core_announce(rig.core, pb,
+                                         (moqr_ns_t){ n3, 2 }) == MOQR_OK);
+        rig_pump(&rig, 6);
+        memset(&ps, 0, sizeof(ps));
+        peer_drain(&rig, v, &ps, false, false, 0, 0);
+        R_CHECK(&rig, ps.ns_found == 0);
+        moqr_core_stats_t cs;
+        moqr_core_get_stats(rig.core, &cs);
+        R_CHECK(&rig, cs.ns_subs == 0);
+        R_CHECK(&rig, !ps.session_closed &&
+                          moq_session_state(v->rsess) == MOQ_SESS_ESTABLISHED);
+    }
+    moqr_bind_stats_t bs;
+    moqr_bind_get_stats(rig.bind, &bs);
+    R_CHECK(&rig, bs.nsu_failed_closed == 0);
+
+    int f = rig.failures;
+    rig_destroy(&rig);
+    if (a.live != 0) {
+        printf("FAIL: ns_sub_retire_cycles(%s): leak %ld\n", label, a.live);
+        f++;
+    }
+    printf("%s: ns_sub_retire_cycles(%s)\n", f == 0 ? "PASS" : "FAIL", label);
+    return f;
+}
+
+static int
+test_accept_held(void)
+{
+    int f = 0;
+    for (int family = AH_NAMESPACE; family <= AH_NS_SUB; family++) {
+        for (int mode = AH_INLINE; mode <= AH_GONE; mode++) {
+            f += accept_held_case(MOQ_VERSION_DRAFT_18, family, mode);
+            f += accept_held_case(MOQ_VERSION_DRAFT_16, family, mode);
+        }
+    }
+    for (int how = NSE_CANCEL; how <= NSE_STOP; how++) {
+        f += ns_sub_cancel_parked_case(MOQ_VERSION_DRAFT_18, how);
+        f += ns_sub_cancel_parked_case(MOQ_VERSION_DRAFT_16, how);
+    }
+    f += ns_sub_retire_cycles_case(MOQ_VERSION_DRAFT_18);
+    f += ns_sub_retire_cycles_case(MOQ_VERSION_DRAFT_16);
+    return f;
+}
+
+/* A connection's announce table full of live announces refuses the next
+ * PUBLISH_NAMESPACE with the draft's capacity code and a Retry Interval
+ * (d18 EXCESSIVE_LOAD, d16 INTERNAL_ERROR); the live announce is kept. */
+static int
+ann_table_capacity_case(moq_version_t version, uint64_t want_code,
+                        const char *label)
+{
+    int f = 0;
+    ca_t a;
+    ca_init(&a);
+    rig_t rig;
+    g_test_max_announces = 1;
+    moqr_result_t crc = rig_create(&rig, &a);
+    g_test_max_announces = 0;
+    if (crc != MOQR_OK) {
+        printf("FAIL: ann_table_capacity(%s): rig\n", label);
+        return 1;
+    }
+    conn_t *pub = rig_connect(&rig, version);
+    peer_state_t ps;
+    memset(&ps, 0, sizeof(ps));
+    rig_pump(&rig, 4);
+    moq_bytes_t a1[1] = { B("one") };
+    moq_publish_namespace_cfg_t pc;
+    moq_publish_namespace_cfg_init(&pc);
+    pc.track_namespace = (moq_namespace_t){ .parts = a1, .count = 1 };
+    moq_announcement_t h1, h2;
+    R_CHECK(&rig, moq_session_publish_namespace(pub->peer, &pc, rig.now,
+                                                &h1) == MOQ_OK);
+    rig_pump(&rig, 6);
+    peer_drain(&rig, pub, &ps, false, false, 0, 0);
+    R_CHECK(&rig, ps.namespace_accepted && ps.ns_rejected == 0);
+    moq_bytes_t a2[1] = { B("two") };
+    pc.track_namespace = (moq_namespace_t){ .parts = a2, .count = 1 };
+    R_CHECK(&rig, moq_session_publish_namespace(pub->peer, &pc, rig.now,
+                                                &h2) == MOQ_OK);
+    rig_pump(&rig, 6);
+    memset(&ps, 0, sizeof(ps));
+    peer_drain(&rig, pub, &ps, false, false, 0, 0);
+    R_CHECK(&rig, ps.ns_rejected == 1);
+    R_CHECK(&rig, ps.ns_rejected_code == want_code);
+    R_CHECK(&rig, ps.ns_rejected_can_retry);
+    R_CHECK(&rig, ps.ns_rejected_retry_ms >= 750 &&
+                      ps.ns_rejected_retry_ms <= 1250);
+    moqr_core_stats_t st;
+    moqr_core_get_stats(rig.core, &st);
+    R_CHECK(&rig, st.ns_nodes == 2);   /* root + the live announce */
+
+    f += rig.failures;
+    rig_destroy(&rig);
+    if (a.live != 0) {
+        printf("FAIL: ann_table_capacity(%s): leak %ld\n", label, a.live);
+        f++;
+    }
+    if (f == 0) {
+        printf("PASS: ann_table_capacity(%s)\n", label);
+    }
+    return f;
+}
+
+static int
+test_ann_table_capacity(void)
+{
+    int f = 0;
+    f += ann_table_capacity_case(MOQ_VERSION_DRAFT_18,
+                                 MOQ_REQUEST_ERROR_EXCESSIVE_LOAD, "d18");
+    f += ann_table_capacity_case(MOQ_VERSION_DRAFT_16,
+                                 MOQ_REQUEST_ERROR_INTERNAL_ERROR, "d16");
+    return f;
+}
+
+/* A capacity refusal that meets a full session action queue is still
+ * answered. The refused connection's relay-side queue holds three actions;
+ * three PUBLISH_NAMESPACE acceptances fill it in the same pump that refuses
+ * the request (or, for a deferred authorization, before it resolves), so
+ * moq_session_reject_* returns WOULD_BLOCK with the request pending. Once
+ * the queue drains the peer must see exactly one rejection carrying the
+ * draft's capacity code (d18 EXCESSIVE_LOAD, d16 INTERNAL_ERROR) and a
+ * nonzero Retry Interval, with the live track or fetch that filled the pool
+ * untouched and nothing held or leaked afterwards. Kinds: SUBSCRIBE and
+ * PUBLISH against a full track table, FETCH against a full fetch pool, a
+ * SUBSCRIBE resumed after a deferred authorization, and the same resumed
+ * SUBSCRIBE when an inline refusal has taken every unreserved entry of the
+ * held-terminal table (one poll, one parkable authorization): one inline
+ * refusal is held, two more requests wait in the session, and the
+ * resolution's refusal still finds the entry reserved for it at park time. */
+enum { CRH_SUB, CRH_PUB, CRH_FETCH, CRH_SUB_AUTH, CRH_SUB_AUTH_FULL };
+
+static int
+capacity_refusal_held_case(moq_version_t version, int kind)
+{
+    static const char *const kn[] = { "subscribe", "publish", "fetch",
+                                      "subscribe_auth",
+                                      "subscribe_auth_full_table" };
+    bool auth = kind == CRH_SUB_AUTH || kind == CRH_SUB_AUTH_FULL;
+    int want_errors = kind == CRH_SUB_AUTH_FULL ? 4 : 1;
+    char label[64];
+    (void)snprintf(label, sizeof(label), "%s %s", kn[kind],
+                   version == MOQ_VERSION_DRAFT_18 ? "d18" : "d16");
+    uint64_t want_code = version == MOQ_VERSION_DRAFT_18
+                             ? MOQ_REQUEST_ERROR_EXCESSIVE_LOAD
+                             : MOQ_REQUEST_ERROR_INTERNAL_ERROR;
+    ca_t a;
+    ca_init(&a);
+    rig_t rig;
+    if (kind == CRH_FETCH) {
+        g_test_max_fetches = 1;
+    } else {
+        g_test_max_tracks = 1;
+    }
+    if (auth) {
+        g_test_authorize = defer_hook;
+        g_defer_action = MOQR_AUTH_SUBSCRIBE;
+        g_defer_last = 0;
+    }
+    if (kind == CRH_SUB_AUTH_FULL) {
+        g_test_max_parked = 1;
+    }
+    moqr_result_t crc = rig_create(&rig, &a);
+    g_test_max_fetches = 0;
+    g_test_max_tracks = 0;
+    g_test_max_parked = 0;
+    if (crc != MOQR_OK) {
+        g_test_authorize = NULL;
+        g_defer_action = 0xFFFFFFFFu;
+        printf("FAIL: capacity_refusal_held(%s): rig\n", label);
+        return 1;
+    }
+    /* The pool filler: a live pushed track (the only track slot), and for
+     * FETCH a live retained fetch on it (the only fetch slot). */
+    moqr_binding_t pb = fetch_pub_open(&rig);
+    moqr_track_t live = fetch_pub_track(&rig, pb, "v1");
+    fetch_ing(&rig, live, 0, 0, 0, 0x11);
+    moqr_fetch_t held_fetch = MOQR_FETCH_INVALID;
+    if (kind == CRH_FETCH) {
+        moq_bytes_t nsb[1] = { B("demo") };
+        moqr_fetch_req_t fr;
+        moqr_fetch_req_init(&fr);
+        fr.ns = (moqr_ns_t){ nsb, 1 };
+        fr.name = B("v1");
+        fr.end_group = 0;
+        fr.end_object = 1;
+        fr.cookie = 77;
+        moqr_fetch_plan_t plan;
+        R_CHECK(&rig, moqr_core_fetch_open(rig.core, pb, &fr, rig.now,
+                                           &held_fetch, &plan) == MOQR_OK);
+        R_CHECK(&rig, plan.admit != MOQR_FETCH_REJECT);
+    }
+    g_test_max_actions = 3;   /* read by rig_connect: this connection only */
+    conn_t *v = rig_connect(&rig, version);
+    g_test_max_actions = 0;
+    R_CHECK(&rig, v != NULL);
+    rig_pump(&rig, 6);
+    peer_state_t ps;
+    memset(&ps, 0, sizeof(ps));
+    peer_drain(&rig, v, &ps, false, false, 0, 0);
+
+    moq_bytes_t dns[1] = { B("demo") };
+    if (auth) {
+        /* Park the request first; it resolves under the full queue. */
+        moq_subscribe_cfg_t sc;
+        moq_subscribe_cfg_init(&sc);
+        sc.track_namespace = (moq_namespace_t){ .parts = dns, .count = 1 };
+        sc.track_name = B("other");
+        sc.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
+        moq_subscription_t sh;
+        R_CHECK(&rig, moq_session_subscribe(v->peer, &sc, rig.now, &sh) ==
+                          MOQ_OK);
+        rig_pump(&rig, 4);
+        R_CHECK(&rig, g_defer_last != 0);
+        if (kind == CRH_SUB_AUTH_FULL) {
+            g_defer_action = 0xFFFFFFFFu;   /* the inline requests are allowed */
+        }
+    }
+    uint64_t ticket = g_defer_last;
+    /* Three announces, delivered without a bind pump. */
+    static const moq_bytes_t CH = { (const uint8_t *)"h", 1 };
+    const char *tails[3] = { "t0", "t1", "t2" };
+    for (int t = 0; t < 3; t++) {
+        moq_bytes_t parts[2] = { CH, { (const uint8_t *)tails[t], 2 } };
+        moq_publish_namespace_cfg_t pcfg;
+        moq_publish_namespace_cfg_init(&pcfg);
+        pcfg.track_namespace = (moq_namespace_t){ .parts = parts, .count = 2 };
+        moq_announcement_t ann;
+        R_CHECK(&rig, moq_session_publish_namespace(v->peer, &pcfg, rig.now,
+                                                    &ann) == MOQ_OK);
+    }
+    rig_step_pair(&rig, v);
+    if (kind == CRH_SUB) {
+        moq_subscribe_cfg_t sc;
+        moq_subscribe_cfg_init(&sc);
+        sc.track_namespace = (moq_namespace_t){ .parts = dns, .count = 1 };
+        sc.track_name = B("other");
+        sc.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
+        moq_subscription_t sh;
+        R_CHECK(&rig, moq_session_subscribe(v->peer, &sc, rig.now, &sh) ==
+                          MOQ_OK);
+    } else if (kind == CRH_PUB) {
+        moq_bytes_t pns[1] = { B("pushns") };
+        moq_publish_cfg_t pc;
+        memset(&pc, 0, sizeof(pc));
+        moq_publish_cfg_init(&pc);
+        pc.track_namespace = (moq_namespace_t){ .parts = pns, .count = 1 };
+        pc.track_name = B("pv");
+        moq_publication_t ph;
+        R_CHECK(&rig, moq_session_publish(v->peer, &pc, rig.now, &ph) ==
+                          MOQ_OK);
+    } else if (kind == CRH_FETCH) {
+        moq_fetch_t fh;
+        fetch_issue(&rig, v, "v1", 0, 0, 0, 1, &fh);
+    } else if (kind == CRH_SUB_AUTH_FULL) {
+        const char *names[3] = { "x0", "x1", "x2" };
+        for (int k = 0; k < 3; k++) {
+            moq_subscribe_cfg_t sc;
+            moq_subscribe_cfg_init(&sc);
+            sc.track_namespace = (moq_namespace_t){ .parts = dns, .count = 1 };
+            sc.track_name = B(names[k]);
+            sc.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
+            moq_subscription_t sh;
+            R_CHECK(&rig, moq_session_subscribe(v->peer, &sc, rig.now,
+                                                &sh) == MOQ_OK);
+        }
+    }
+    rig_step_pair(&rig, v);
+    rig_bind_pump_once(&rig);   /* acceptances fill the queue, then refusal */
+    if (auth) {
+        R_CHECK(&rig, moqr_bind_auth_resolve(
+                          rig.bind, ticket,
+                          &(moqr_auth_verdict_t){ .decision = MOQR_AUTH_ALLOW },
+                          rig.now) == MOQR_OK);
+    }
+    moqr_bind_fwd_debug_t st;
+    moqr_bind_debug_fwd_stats(rig.bind, &st);
+    uint64_t want_held = kind == CRH_SUB_AUTH_FULL ? 2u : 1u;
+    R_CHECK(&rig, st.refusals_blocked == want_held &&
+                      st.refusals_pending == want_held &&
+                      st.refusals_unparked == 0);
+
+    rig_pump(&rig, 8);
+    memset(&ps, 0, sizeof(ps));
+    peer_drain(&rig, v, &ps, false, false, 0, 0);
+    rig_pump(&rig, 4);
+    peer_drain(&rig, v, &ps, false, false, 0, 0);
+    int errors = kind == CRH_PUB     ? ps.publish_errors
+                 : kind == CRH_FETCH ? ps.fetch_error
+                                     : ps.subscribe_errors;
+    uint64_t code = kind == CRH_PUB     ? ps.publish_error_code
+                    : kind == CRH_FETCH ? ps.fetch_error_code
+                                        : ps.sub_error_code;
+    bool can_retry = kind == CRH_PUB     ? ps.publish_error_can_retry
+                     : kind == CRH_FETCH ? ps.fetch_error_can_retry
+                                         : ps.sub_error_can_retry;
+    uint64_t retry = kind == CRH_PUB     ? ps.publish_error_retry_ms
+                     : kind == CRH_FETCH ? ps.fetch_error_retry_ms
+                                         : ps.sub_error_retry_ms;
+    if (errors != want_errors || code != want_code || !can_retry ||
+        retry < 750 || retry > 1250) {
+        printf("  capacity_refusal_held(%s): errors=%d code=%llu retry=%d/%llu\n",
+               label, errors, (unsigned long long)code, (int)can_retry,
+               (unsigned long long)retry);
+    }
+    R_CHECK(&rig, errors == want_errors);
+    R_CHECK(&rig, code == want_code);
+    R_CHECK(&rig, can_retry && retry >= 750 && retry <= 1250);
+    moqr_bind_debug_fwd_stats(rig.bind, &st);
+    R_CHECK(&rig, st.refusals_sent == (uint64_t)want_errors &&
+                      st.refusals_pending == 0 && st.refusals_unparked == 0);
+    R_CHECK(&rig, !ps.session_closed &&
+                      moq_session_state(v->rsess) == MOQ_SESS_ESTABLISHED);
+
+    /* The pool filler is untouched. */
+    moqr_core_stats_t cs;
+    moqr_core_get_stats(rig.core, &cs);
+    R_CHECK(&rig, cs.tracks == 1);
+    fetch_ing(&rig, live, 0, 0, 1, 0x12);
+    if (kind == CRH_FETCH) {
+        R_CHECK(&rig, moqr_core_fetch_close(rig.core, held_fetch) == MOQR_OK);
+    }
+
+    int f = rig.failures;
+    rig_destroy(&rig);
+    g_test_authorize = NULL;
+    g_defer_action = 0xFFFFFFFFu;
+    if (a.live != 0) {
+        printf("FAIL: capacity_refusal_held(%s): leak %ld\n", label, a.live);
+        f++;
+    }
+    if (f == 0) {
+        printf("PASS: capacity_refusal_held(%s)\n", label);
+    } else {
+        printf("FAIL: capacity_refusal_held(%s)\n", label);
+    }
+    return f;
+}
+
+static int
+test_capacity_refusal_held(void)
+{
+    int f = 0;
+    for (int kind = CRH_SUB; kind <= CRH_SUB_AUTH_FULL; kind++) {
+        f += capacity_refusal_held_case(MOQ_VERSION_DRAFT_18, kind);
+        f += capacity_refusal_held_case(MOQ_VERSION_DRAFT_16, kind);
+    }
+    return f;
+}
+
 /* An announce retried after an intent drain uses the binding's own copy of
  * the namespace. The schedule: a publisher that also watches every namespace
  * withdraws "a" and announces "b" in one pump, into a full trie. The NS_GONE
@@ -15840,6 +16653,9 @@ main(int argc, char **argv)
     failures += small_caps_flow();
     failures += test_track_capacity_code();
     failures += test_ns_capacity_code();
+    failures += test_capacity_refusal_held();
+    failures += test_ann_table_capacity();
+    failures += test_accept_held();
     failures += test_announce_retry_reads_own_copy();
     failures += test_newest_wins_drops_pending_upstream();
     failures += teardown_pending_intent_flow();

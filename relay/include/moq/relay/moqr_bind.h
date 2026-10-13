@@ -69,6 +69,8 @@ typedef struct moqr_bind_limits {
     uint32_t pending_cap;            /* derived deferral ring              */
     uint32_t nsu_cap;                /* derived retained namespace ring    */
     uint32_t request_grant_window;
+    uint32_t n_refusals;             /* held-terminal entries per
+                                      * connection: 1 + core max_parked    */
 } moqr_bind_limits_t;
 
 /* Bind-tier capacity: the allocation-request ceiling of one binding's

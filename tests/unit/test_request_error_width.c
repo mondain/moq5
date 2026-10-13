@@ -1752,6 +1752,187 @@ static int outbound_reject_retry_bytes(moq_version_t version)
     return failures;
 }
 
+/*
+ * Retry Interval sentinels and boundaries, inbound. The wire value is the
+ * minimum retry delay in milliseconds plus one, and 0 means "do not retry"
+ * (d16 §9.8, d18 §10.6), so wire 0 surfaces can_retry=false, wire 1 an
+ * immediate retry (0 ms), wire 1001 one second, and the largest wire value
+ * each draft's integer can carry (d16 QUIC varint 2^62-1, d18 vi64
+ * 2^64-1) surfaces that value minus one without wrapping.
+ */
+static int inbound_retry_wire(moq_version_t version, uint64_t wire,
+                              bool exp_can_retry, uint64_t exp_ms)
+{
+    int failures = 0;
+    moq_session_t *c = NULL, *sv = NULL;
+    struct request_ident id;
+    struct inbound_obs o;
+    uint8_t msg[128];
+    moq_buf_writer_t w;
+
+    memset(&o, 0, sizeof(o));
+    failures += make_pair(version, &c, &sv);
+    if (c == NULL || sv == NULL)
+        return failures;
+    failures += issue_subscribe(c, version, &id);
+    moq_buf_writer_init(&w, msg, sizeof(msg));
+    if (version == MOQ_VERSION_DRAFT_18) {
+        MOQ_TEST_CHECK_EQ_INT(moq_d18_encode_request_error(
+            &w, MOQ_REQUEST_ERROR_EXCESSIVE_LOAD, wire,
+            (moq_bytes_t){ k_reason_bytes, sizeof(k_reason_bytes) }), MOQ_OK);
+        o.feed_rc = moq_session_on_bidi_stream_bytes(
+            c, id.ref, msg, moq_buf_writer_offset(&w), false, 1000);
+    } else {
+        MOQ_TEST_CHECK_EQ_INT(moq_d16_encode_request_error(
+            &w, id.request_id, MOQ_REQUEST_ERROR_INTERNAL_ERROR, wire,
+            k_reason_bytes, sizeof(k_reason_bytes)), MOQ_OK);
+        o.feed_rc = moq_session_on_control_bytes(
+            c, msg, moq_buf_writer_offset(&w), 1000);
+    }
+    collect_error_event(c, &o);
+    MOQ_TEST_CHECK_EQ_INT(o.feed_rc, MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(o.sub_errors, 1);
+    MOQ_TEST_CHECK(o.can_retry == exp_can_retry);
+    MOQ_TEST_CHECK(o.retry_after_ms == exp_ms);
+    MOQ_TEST_CHECK(moq_session_state(c) == MOQ_SESS_ESTABLISHED);
+    moq_session_destroy(c);
+    moq_session_destroy(sv);
+    if (failures != 0)
+        printf("FAIL: inbound_retry_wire(%s, wire=%llu)\n",
+               version == MOQ_VERSION_DRAFT_18 ? "d18" : "d16",
+               (unsigned long long)wire);
+    return failures;
+}
+
+/*
+ * Retry Interval sentinels and boundaries, outbound: the wire value the
+ * session emits for a rejection's (can_retry, retry_after_ms), read back
+ * through the draft's own decoder, and the encoded message length across
+ * the first width transition of each draft's integer (d16 QUIC varint 63 ->
+ * 64, d18 vi64 127 -> 128). A Retry Interval the wire cannot carry is
+ * refused with MOQ_ERR_INVAL and no state change: the request stays pending
+ * and a valid rejection still commits.
+ */
+static int outbound_retry_wire(moq_version_t version, bool can_retry,
+                               uint64_t retry_ms, moq_result_t exp_rc,
+                               uint64_t exp_wire, size_t *msg_len)
+{
+    int failures = 0;
+    moq_session_t *c = NULL, *sv = NULL;
+    struct request_ident id;
+    moq_subscription_t inbound = MOQ_SUBSCRIPTION_INVALID;
+    moq_event_t ev;
+    struct act_tally t;
+    moq_reject_subscribe_cfg_t rcfg;
+
+    failures += make_pair(version, &c, &sv);
+    if (c == NULL || sv == NULL)
+        return failures;
+    failures += issue_subscribe(c, version, &id);
+    if (version == MOQ_VERSION_DRAFT_18)
+        MOQ_TEST_CHECK_EQ_INT(
+            moq_session_on_bidi_stream_bytes(sv, id.ref, id.bytes,
+                                             id.bytes_len, false, 0), MOQ_OK);
+    else
+        MOQ_TEST_CHECK_EQ_INT(
+            moq_session_on_control_bytes(sv, id.bytes, id.bytes_len, 0),
+            MOQ_OK);
+    while (moq_session_poll_events(sv, &ev, 1) > 0) {
+        if (ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST)
+            inbound = ev.u.subscribe_request.sub;
+        moq_event_cleanup(&ev);
+    }
+    moq_reject_subscribe_cfg_init(&rcfg);
+    rcfg.error_code = MOQ_REQUEST_ERROR_INTERNAL_ERROR;
+    rcfg.can_retry = can_retry;
+    rcfg.retry_after_ms = retry_ms;
+    MOQ_TEST_CHECK_EQ_INT(moq_session_reject_subscribe(sv, inbound, &rcfg, 0),
+                          exp_rc);
+    tally_actions(sv, &t);
+    if (exp_rc != MOQ_OK) {
+        MOQ_TEST_CHECK_EQ_INT(t.total, 0);
+        rcfg.can_retry = false;
+        rcfg.retry_after_ms = 0;
+        MOQ_TEST_CHECK_EQ_INT(
+            moq_session_reject_subscribe(sv, inbound, &rcfg, 0), MOQ_OK);
+    } else {
+        moq_buf_reader_t r;
+        moq_control_envelope_t env;
+        uint64_t wire = UINT64_MAX - 7u;   /* overwritten by the decode */
+
+        MOQ_TEST_CHECK(!t.bytes_truncated && t.bytes_len != 0);
+        moq_buf_reader_init(&r, t.bytes, t.bytes_len);
+        if (version == MOQ_VERSION_DRAFT_18) {
+            moq_d18_request_error_t err;
+
+            memset(&err, 0, sizeof(err));
+            MOQ_TEST_CHECK_EQ_INT(moq_d18_decode_envelope(&r, &env), MOQ_OK);
+            MOQ_TEST_CHECK(env.msg_type == MOQ_D18_REQUEST_ERROR);
+            MOQ_TEST_CHECK_EQ_INT(moq_d18_decode_request_error(
+                env.payload, env.payload_len, &err), MOQ_OK);
+            wire = err.retry_interval;
+        } else {
+            moq_d16_request_error_t err;
+
+            memset(&err, 0, sizeof(err));
+            MOQ_TEST_CHECK_EQ_INT(moq_control_decode_envelope(&r, &env),
+                                  MOQ_OK);
+            MOQ_TEST_CHECK(env.msg_type == MOQ_D16_REQUEST_ERROR);
+            MOQ_TEST_CHECK_EQ_INT(moq_d16_decode_request_error(
+                env.payload, env.payload_len, &err), MOQ_OK);
+            wire = err.retry_interval;
+        }
+        MOQ_TEST_CHECK(wire == exp_wire);
+        if (msg_len != NULL)
+            *msg_len = t.bytes_len;
+    }
+    moq_session_destroy(c);
+    moq_session_destroy(sv);
+    if (failures != 0)
+        printf("FAIL: outbound_retry_wire(%s, %d, %llu)\n",
+               version == MOQ_VERSION_DRAFT_18 ? "d18" : "d16",
+               (int)can_retry, (unsigned long long)retry_ms);
+    return failures;
+}
+
+static int retry_wire_boundaries(moq_version_t version)
+{
+    int failures = 0;
+    bool d18 = version == MOQ_VERSION_DRAFT_18;
+    uint64_t wire_max = d18 ? UINT64_MAX : MOQ_QUIC_VARINT_MAX;
+    uint64_t width_edge = d18 ? 127u : 63u;   /* last one-byte wire value */
+    size_t narrow = 0, wide = 0;
+
+    failures += inbound_retry_wire(version, 0, false, 0);
+    failures += inbound_retry_wire(version, 1, true, 0);
+    failures += inbound_retry_wire(version, 1001, true, 1000);
+    failures += inbound_retry_wire(version, width_edge + 1u, true, width_edge);
+    failures += inbound_retry_wire(version, wire_max, true, wire_max - 1u);
+
+    /* offered immediate retry; no retry overrides a stored interval */
+    failures += outbound_retry_wire(version, true, 0, MOQ_OK, 1, NULL);
+    failures += outbound_retry_wire(version, false, 500, MOQ_OK, 0, NULL);
+    failures += outbound_retry_wire(version, true, 1000, MOQ_OK, 1001, NULL);
+    /* the first width transition of the draft's integer */
+    failures += outbound_retry_wire(version, true, width_edge - 1u, MOQ_OK,
+                                    width_edge, &narrow);
+    failures += outbound_retry_wire(version, true, width_edge, MOQ_OK,
+                                    width_edge + 1u, &wide);
+    MOQ_TEST_CHECK_EQ_SIZE(wide, narrow + 1u);
+    /* The SUBSCRIBE rejection API bounds the interval for both drafts so
+     * that wire = ms + 1 fits the QUIC varint: the largest accepted interval
+     * reaches 2^62-1 on the wire and the next is refused. */
+    failures += outbound_retry_wire(version, true, MOQ_QUIC_VARINT_MAX - 1u,
+                                    MOQ_OK, MOQ_QUIC_VARINT_MAX, NULL);
+    failures += outbound_retry_wire(version, true, MOQ_QUIC_VARINT_MAX,
+                                    MOQ_ERR_INVAL, 0, NULL);
+    failures += outbound_retry_wire(version, true, UINT64_MAX,
+                                    MOQ_ERR_INVAL, 0, NULL);
+    if (failures == 0)
+        printf("PASS: retry_wire_boundaries(%s)\n", d18 ? "d18" : "d16");
+    return failures;
+}
+
 int main(void)
 {
     int failures = 0;
@@ -1910,6 +2091,8 @@ int main(void)
     failures += outbound_reject(MOQ_VERSION_DRAFT_18);
     failures += outbound_reject_retry_bytes(MOQ_VERSION_DRAFT_16);
     failures += outbound_reject_retry_bytes(MOQ_VERSION_DRAFT_18);
+    failures += retry_wire_boundaries(MOQ_VERSION_DRAFT_16);
+    failures += retry_wire_boundaries(MOQ_VERSION_DRAFT_18);
     /* a real code above UINT32_MAX, within draft-16's own ceiling */
     failures += outbound_reject_code(MOQ_VERSION_DRAFT_16,
                                      UINT64_C(0x1FFFFFFFF));

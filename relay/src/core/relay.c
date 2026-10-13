@@ -617,18 +617,58 @@ struct moqr_core {
 
 /* -- small helpers ------------------------------------------------------------- */
 
-/* Pool slot generations live in the 28-bit generation field of a packed
- * handle (moq_handle_pack refuses anything wider). Every relay pool steps its
- * slot generation with this one helper: odd = live, even = free, wrapping
- * within 28 bits so a slot never runs out of generations. The cost of the wrap
- * is the ordinary generational-handle bound: a handle held across 2^27 reuses
- * of the same slot could alias. */
-#define R_GEN_MASK 0x0FFFFFFFu
+/* Pool slot generations: odd = live, even = free. A live generation must fit
+ * the 28-bit generation field of a packed handle (moq_handle_pack returns 0
+ * for anything wider), so live generations run 1, 3, ... R_GEN_LAST_LIVE and
+ * never wrap: a wrap would let a handle held across 2^27 reuses of one slot
+ * alias the slot's new occupant. Releasing the last live generation leaves
+ * the slot at R_GEN_RETIRED (even, wider than any handle), and a retired slot
+ * is never handed out again, so a pool shrinks by one slot per 2^27 reuses of
+ * a single slot. Every relay pool steps generations through these helpers. */
+#define R_GEN_LAST_LIVE 0x0FFFFFFFu
+#define R_GEN_RETIRED   (R_GEN_LAST_LIVE + 1u)
 
-static uint32_t
-r_gen_next(uint32_t gen)
+/* A free slot that can still take a live generation. */
+static bool
+r_gen_openable(uint32_t gen)
 {
-    return (gen + 1u) & R_GEN_MASK;
+    return (gen & 1u) == 0 && gen < R_GEN_LAST_LIVE;
+}
+
+/* Free -> live. Precondition: r_gen_openable(gen). */
+static uint32_t
+r_gen_open(uint32_t gen)
+{
+    return gen + 1u;
+}
+
+/* Live -> free; the last live generation becomes R_GEN_RETIRED. */
+static uint32_t
+r_gen_close(uint32_t gen)
+{
+    return gen + 1u;
+}
+
+/* Whether a live slot can move straight to a fresh live generation (keeping
+ * the slot, staling every handle to the old one). */
+static bool
+r_gen_renewable(uint32_t gen)
+{
+    return (gen & 1u) != 0 && gen <= R_GEN_LAST_LIVE - 2u;
+}
+
+/* Live -> the next live generation. Precondition: r_gen_renewable(gen). */
+static uint32_t
+r_gen_renew(uint32_t gen)
+{
+    return gen + 2u;
+}
+
+/* Whether releasing a live slot leaves it openable (not retired). */
+static bool
+r_gen_reopens(uint32_t gen)
+{
+    return (gen & 1u) != 0 && r_gen_openable(r_gen_close(gen));
 }
 
 static void *
@@ -1931,7 +1971,7 @@ track_free_slot_reason(moqr_core_t *c, uint32_t slot, uint32_t reason)
         i = next;
     }
     t->subs_head = R_SUB_NIL;
-    t->gen = r_gen_next(t->gen);   /* odd -> even */
+    t->gen = r_gen_close(t->gen);
     r_room_changed(c);
     r_bump_route_epoch(c);
     r_trace(c, MOQR_TRACE_ROUTE_REMOVE, 1 /* track */, slot, reason, 0, 0);
@@ -1964,13 +2004,16 @@ track_reclaimable(const moqr_core_t *c, uint32_t slot)
 }
 
 /* The least recently used reclaimable track, or UINT32_MAX when every live
- * track is in use. Ties cannot occur: interest_seq values are unique. */
+ * track is in use. With for_slot, only a track whose release leaves its slot
+ * openable qualifies: reclaiming a track on its last generation retires the
+ * slot and frees no slot. Ties cannot occur: interest_seq values are unique. */
 static uint32_t
-track_lru_reclaimable(const moqr_core_t *c)
+track_lru_reclaimable(const moqr_core_t *c, bool for_slot)
 {
     uint32_t best = UINT32_MAX;
     for (uint32_t i = 0; i < c->max_tracks; i++) {
         if (track_reclaimable(c, i) &&
+            (!for_slot || r_gen_reopens(c->tracks[i].gen)) &&
             (best == UINT32_MAX ||
              c->tracks[i].interest_seq < c->tracks[best].interest_seq)) {
             best = i;
@@ -2023,7 +2066,7 @@ fetch_retire(moqr_core_t *c, r_fetch_t *f)
         c->tracks[f->track].fetch_count != 0) {
         c->tracks[f->track].fetch_count--;
     }
-    f->gen = r_gen_next(f->gen);   /* odd -> even */
+    f->gen = r_gen_close(f->gen);
     r_room_changed(c);   /* a fetch slot, and maybe a reclaimable track */
 }
 
@@ -2058,7 +2101,7 @@ track_replace_retained_generation(moqr_core_t *c, uint32_t slot,
     t->largest_group = 0;
     t->largest_object = 0;
     t->linger_deadline_us = 0;
-    t->gen = r_gen_next(r_gen_next(t->gen));   /* odd -> odd: keep slot, invalidate old readers/handles */
+    t->gen = r_gen_renew(t->gen);   /* keep the slot, stale old readers/handles */
     r_bump_route_epoch(c);
 }
 
@@ -2066,7 +2109,7 @@ static uint32_t
 track_free_slot_find(const moqr_core_t *c)
 {
     for (uint32_t i = 0; i < c->max_tracks; i++) {
-        if ((c->tracks[i].gen & 1u) == 0) {
+        if (r_gen_openable(c->tracks[i].gen)) {
             return i;
         }
     }
@@ -2113,12 +2156,12 @@ r_room_check(const moqr_core_t *c, bool need_slot, uint32_t need_nodes,
     if (node_short != 0 || byte_short != 0) {
         trie_free_room(c, keep, &tn_now, &tb_now, &tn_all, &tb_all);
     }
-    uint32_t tracks = 0;
+    uint32_t tracks = 0;   /* reclaimable tracks whose slot reopens */
     uint64_t track_bytes = 0;
     if (slot_short || byte_short != 0) {
         for (uint32_t i = 0; i < c->max_tracks; i++) {
             if (track_reclaimable(c, i)) {
-                tracks++;
+                tracks += r_gen_reopens(c->tracks[i].gen) ? 1u : 0u;
                 track_bytes += c->tracks[i].key.len;
             }
         }
@@ -2165,13 +2208,14 @@ r_make_room(moqr_core_t *c, bool need_slot, uint32_t need_nodes,
         (void)trie_reclaim(c, &keep);
     }
     for (;;) {
+        bool slot_more = slot_short && track_free_slot_find(c) == UINT32_MAX;
         bool need_more =
-            (slot_short && track_free_slot_find(c) == UINT32_MAX) ||
+            slot_more ||
             (uint64_t)c->intern_used + need_bytes > c->intern_budget;
         if (!need_more) {
             break;
         }
-        uint32_t victim = track_lru_reclaimable(c);
+        uint32_t victim = track_lru_reclaimable(c, slot_more);
         if (victim == UINT32_MAX) {
             break;   /* unreachable: the preflight counted the supply */
         }
@@ -2189,6 +2233,9 @@ r_make_room(moqr_core_t *c, bool need_slot, uint32_t need_nodes,
  * holds more than max_tracks logs or name_intern_bytes of names, even
  * transiently; an allocation failure after an eviction therefore loses the
  * evicted track's cache (cache only, which the relay may drop). */
+static void track_install(moqr_core_t *c, uint32_t slot, r_key_t key,
+                          uint64_t hash, moqr_log_t *log);
+
 static moqr_result_t
 track_create(moqr_core_t *c, moqr_ns_t ns, moq_bytes_t name, uint64_t hash,
              uint32_t *out_slot)
@@ -2207,15 +2254,24 @@ track_create(moqr_core_t *c, moqr_ns_t ns, moq_bytes_t name, uint64_t hash,
     if (rc != MOQR_OK) {
         return rc;
     }
-    r_track_t *t = &c->tracks[slot];
     moqr_log_t *log = NULL;
     rc = track_make_log(c, slot, &log);
     if (rc != MOQR_OK) {
         key_release(c, &key);
         return rc;
     }
+    track_install(c, slot, key, hash, log);
+    *out_slot = slot;
+    return MOQR_OK;
+}
 
-    uint32_t gen = r_gen_next(t->gen);   /* even -> odd */
+/* Take the openable slot `slot` for a new track that owns `key` and `log`. */
+static void
+track_install(moqr_core_t *c, uint32_t slot, r_key_t key, uint64_t hash,
+              moqr_log_t *log)
+{
+    r_track_t *t = &c->tracks[slot];
+    uint32_t gen = r_gen_open(t->gen);
     memset(t, 0, sizeof(*t));
     t->gen = gen;
     t->subs_head = R_SUB_NIL;
@@ -2225,10 +2281,8 @@ track_create(moqr_core_t *c, moqr_ns_t ns, moq_bytes_t name, uint64_t hash,
     t->track_gen = 0;
     t->src_ann_node = UINT32_MAX;   /* 0 is the valid root node, so set explicitly */
     track_touch(c, slot);
-    *out_slot = slot;
     r_bump_route_epoch(c);
     r_trace(c, MOQR_TRACE_ROUTE_ADD, 1 /* track */, slot, hash, 0, 0);
-    return MOQR_OK;
 }
 
 static moqr_track_t
@@ -2664,9 +2718,9 @@ moqr_core_binding_open(moqr_core_t *c, uint64_t session_cookie,
     }
     *out = MOQR_BINDING_INVALID;
     for (uint32_t i = 0; i < c->max_bindings; i++) {
-        if ((c->bindings[i].gen & 1u) == 0) {
+        if (r_gen_openable(c->bindings[i].gen)) {
             r_binding_t *b = &c->bindings[i];
-            uint32_t gen = r_gen_next(b->gen);
+            uint32_t gen = r_gen_open(b->gen);
             memset(b, 0, sizeof(*b));
             b->gen = gen;
             b->cookie = session_cookie;
@@ -2895,7 +2949,7 @@ sub_retire(moqr_core_t *c, uint32_t slot, uint64_t now_us)
         ready_mark(c, s->binding);
     }
     gpos_free(c, s);
-    s->gen = r_gen_next(s->gen);   /* odd -> even */
+    s->gen = r_gen_close(s->gen);
 }
 
 
@@ -3158,7 +3212,7 @@ moqr_core_binding_close(moqr_core_t *c, moqr_binding_t bh, uint64_t now_us)
     /* The slot is reusable after the gen bump: a stale ready bit would
      * resolve to the REPLACEMENT binding's cookie on a later drain. */
     ready_clear(c, bslot);
-    b->gen = r_gen_next(b->gen);   /* odd -> even */
+    b->gen = r_gen_close(b->gen);
     r_trace(c, MOQR_TRACE_ROUTE_REMOVE, 2 /* binding */, bslot, 0, 0, 0);
     return MOQR_OK;
 }
@@ -3737,7 +3791,7 @@ static uint32_t
 sub_slot_find(moqr_core_t *c)
 {
     for (uint32_t i = 0; i < c->max_subs; i++) {
-        if ((c->subs[i].gen & 1u) == 0) {
+        if (r_gen_openable(c->subs[i].gen)) {
             return i;
         }
     }
@@ -3815,7 +3869,7 @@ moqr_core_subscribe(moqr_core_t *c, moqr_binding_t bh,
         t->src_ann_binding_gen = c->nodes[pub_node].ann_binding_gen;
 
         r_sub_t *s = &c->subs[sslot];
-        uint32_t gen = r_gen_next(s->gen);
+        uint32_t gen = r_gen_open(s->gen);
         memset(s, 0, sizeof(*s));
         s->gen = gen;
         s->binding = bslot;
@@ -3834,7 +3888,7 @@ moqr_core_subscribe(moqr_core_t *c, moqr_binding_t bh,
         s->end_group = req->filter.end_group_delta;   /* delta until resolve */
         rc = gpos_alloc(c, s, t->log);
         if (rc != MOQR_OK) {
-            s->gen = r_gen_next(s->gen);
+            s->gen = r_gen_close(s->gen);
             track_free_slot(c, tslot);
             return rc;
         }
@@ -3858,7 +3912,7 @@ moqr_core_subscribe(moqr_core_t *c, moqr_binding_t bh,
         return r_refuse(c, MOQR_REFUSE_SUBS);
     }
     r_sub_t *s = &c->subs[sslot];
-    uint32_t gen = r_gen_next(s->gen);
+    uint32_t gen = r_gen_open(s->gen);
     memset(s, 0, sizeof(*s));
     s->gen = gen;
     s->binding = bslot;
@@ -3871,7 +3925,7 @@ moqr_core_subscribe(moqr_core_t *c, moqr_binding_t bh,
     s->cookie = req->cookie;
     moqr_result_t crc = gpos_alloc(c, s, t->log);
     if (crc != MOQR_OK) {
-        s->gen = r_gen_next(s->gen);
+        s->gen = r_gen_close(s->gen);
         return crc;
     }
     sub_list_push(c, bslot, sslot);
@@ -4367,8 +4421,23 @@ moqr_core_publish_open(moqr_core_t *c, moqr_binding_t bh, moqr_ns_t ns,
         if (!intent_space(c, old_subs + 1u)) {
             return MOQR_ERR_WOULD_BLOCK;
         }
+        /* The new generation normally keeps the slot. A slot on its last
+         * live generation cannot renew; the new source then moves to another
+         * slot, found (or reclaimed) before anything changes, and when none
+         * exists the publish is refused with the retained track untouched.
+         * The slot on its last generation is never a reclaim candidate for a
+         * slot, so making room cannot free the track being replaced. */
+        bool renew = r_gen_renewable(t->gen);
+        uint32_t dst = tslot;
+        if (!renew) {
+            rc = r_make_room(c, true, 0, 0, NULL);
+            if (rc != MOQR_OK) {
+                return rc;
+            }
+            dst = track_free_slot_find(c);
+        }
         moqr_log_t *new_log = NULL;
-        rc = track_make_log(c, tslot, &new_log);
+        rc = track_make_log(c, dst, &new_log);
         if (rc != MOQR_OK) {
             return rc;
         }
@@ -4393,8 +4462,23 @@ moqr_core_publish_open(moqr_core_t *c, moqr_binding_t bh, moqr_ns_t ns,
             }
             i = next;
         }
-        track_replace_retained_generation(c, tslot, new_log);
-        track_touch(c, tslot);
+        if (renew) {
+            track_replace_retained_generation(c, tslot, new_log);
+            track_touch(c, tslot);
+        } else {
+            /* The name moves with its interned key (no new bytes charged);
+             * the old slot retires and every handle to it goes stale. */
+            r_key_t key = t->key;
+            uint64_t thash = t->hash;
+            uint32_t source_gen = t->track_gen;
+            t->key = (r_key_t){ NULL, 0 };
+            track_fetch_invalidate(c, tslot, old_track_gen);
+            track_free_slot(c, tslot);
+            track_install(c, dst, key, thash, new_log);
+            tslot = dst;
+            t = &c->tracks[tslot];
+            t->track_gen = source_gen;
+        }
         t->state = R_TRACK_ACTIVE;
         t->source_kind = R_TRACK_SOURCE_PUSH;
         t->track_gen++;
@@ -5938,7 +6022,7 @@ static uint32_t
 fetch_slot_find(moqr_core_t *c)
 {
     for (uint32_t i = 0; i < c->max_fetches; i++) {
-        if ((c->fetches[i].gen & 1u) == 0) {
+        if (r_gen_openable(c->fetches[i].gen)) {
             return i;
         }
     }
@@ -6134,7 +6218,7 @@ moqr_core_fetch_open(moqr_core_t *c, moqr_binding_t bh,
         return r_refuse(c, MOQR_REFUSE_FETCHES);
     }
     r_fetch_t *f = &c->fetches[fslot];
-    uint32_t gen = r_gen_next(f->gen);   /* even -> odd */
+    uint32_t gen = r_gen_open(f->gen);
     memset(f, 0, sizeof(*f));
     f->gen = gen;
     f->binding = bslot;
@@ -6977,8 +7061,8 @@ parked_free_slot(moqr_core_t *c, uint32_t slot)
     r_free_material(c, &p->mat, &c->parked_bytes_used);
     uint32_t gen = p->gen;
     memset(p, 0, sizeof(*p));
-    p->gen = r_gen_next(gen); /* even = free; internal slot liveness only — external
-                        * ticket reuse is the verifier's contract (see relay.h) */
+    p->gen = r_gen_close(gen); /* internal slot liveness only — external ticket
+                                * reuse is the verifier's contract (see relay.h) */
 }
 
 /* Live (odd-gen) parked slot holding external ticket `t`, or -1. */
@@ -7012,7 +7096,7 @@ moqr_core_park(moqr_core_t *c, const moqr_park_req_t *req, uint64_t ext_ticket,
     }
     int slot = -1;
     for (uint32_t i = 0; i < c->max_parked; i++) {
-        if ((c->parked[i].gen & 1u) == 0) {
+        if (r_gen_openable(c->parked[i].gen)) {
             slot = (int)i;
             break;
         }
@@ -7027,9 +7111,9 @@ moqr_core_park(moqr_core_t *c, const moqr_park_req_t *req, uint64_t ext_ticket,
         return rc; /* INVAL / CAPACITY / NOMEM: fail closed, no state change */
     }
     r_parked *p = &c->parked[slot];
-    uint32_t  gen = p->gen; /* even (free) */
+    uint32_t  gen = p->gen;
     memset(p, 0, sizeof(*p));
-    p->gen = r_gen_next(gen); /* odd = live */
+    p->gen = r_gen_open(gen);
     p->ext_ticket = ext_ticket;
     p->binding_cookie = req->binding_cookie;
     p->session_cookie = req->session_cookie;
@@ -7158,7 +7242,7 @@ grant_free_slot(moqr_core_t *c, uint32_t slot)
     r_free_material(c, &g->mat, &c->grant_bytes_used);
     uint32_t gen = g->gen;
     memset(g, 0, sizeof(*g));
-    g->gen = r_gen_next(gen); /* even = free */
+    g->gen = r_gen_close(gen);
 }
 
 moqr_result_t
@@ -7183,7 +7267,7 @@ moqr_core_grant_reserve(moqr_core_t *c, const moqr_park_req_t *req,
     }
     int slot = -1;
     for (uint32_t i = 0; i < c->max_grants; i++) {
-        if ((c->grants[i].gen & 1u) == 0) {
+        if (r_gen_openable(c->grants[i].gen)) {
             slot = (int)i;
             break;
         }
@@ -7198,9 +7282,9 @@ moqr_core_grant_reserve(moqr_core_t *c, const moqr_park_req_t *req,
         return rc; /* INVAL / CAPACITY / NOMEM: fail closed, no state change */
     }
     r_grant *g = &c->grants[slot];
-    uint32_t gen = g->gen; /* even (free) */
+    uint32_t gen = g->gen;
     memset(g, 0, sizeof(*g));
-    g->gen = r_gen_next(gen);      /* odd = live, but committed=false (reserved) */
+    g->gen = r_gen_open(gen);      /* live, but committed=false (reserved) */
     g->binding_cookie = req->binding_cookie;
     g->session_cookie = req->session_cookie;
     g->action = req->action;
