@@ -1631,6 +1631,9 @@ moq_result_t moq_pub_add_track(moq_publisher_t *pub,
             &cfg->track_namespace, cfg->track_name,
             pub->session->profile->min_track_namespace_fields) < 0)
         return MOQ_ERR_INVAL;
+    if (pub->session->profile->validate_application_namespace &&
+        pub->session->profile->validate_application_namespace(&cfg->track_namespace) < 0)
+        return MOQ_ERR_INVAL;
 
     /* Reject duplicate track identity. */
     if (find_track(pub, &cfg->track_namespace, cfg->track_name))

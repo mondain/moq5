@@ -1430,6 +1430,25 @@ static moq_result_t d22_request_goaway(moq_session_t *s, moq_stream_ref_t ref,
     return MOQ_OK;
 }
 
+static moq_result_t d22_process_ns_sub_publisher_stream(
+    moq_session_t *s, moq_stream_ref_t ref, int slot,
+    const uint8_t *buf, size_t len, bool fin, size_t *out_consumed)
+{
+    *out_consumed = 0;
+    moq_buf_reader_t r;
+    moq_buf_reader_init(&r, buf, len);
+    moq_control_envelope_t env;
+    moq_result_t rc = moq_d22_decode_envelope(&r, &env);
+    if (rc == MOQ_ERR_BUFFER) return MOQ_OK;
+    if (rc < 0)
+        return close_with_error(s, 0x3, "malformed namespace request envelope");
+    if (env.msg_type != MOQ_D22_GOAWAY) return MOQ_ERR_UNSUPPORTED;
+    /* Namespace subscriptions have their own stream-ref index, so this owner
+     * supplies the family/slot instead of using the generic request registry. */
+    return d22_request_goaway(s, ref, MOQ_REQUEST_FAMILY_NS_SUB, slot,
+                             &env, &r, len, fin, out_consumed);
+}
+
 static moq_result_t d22_process_request_stream(
     moq_session_t *s, moq_stream_ref_t ref, int slot,
     const uint8_t *buf, size_t len, bool fin, size_t *out_consumed)
@@ -3371,6 +3390,16 @@ static moq_request_error_t d22_semantic_request_error(uint64_t raw)
     return MOQ_REQUEST_ERROR_INTERNAL_ERROR;
 }
 
+/* Sections 2.4.3 and 6.5: draft 22 registers .session for the implementation,
+ * and registers no reserved namespace for application publication. Future
+ * registered application extensions need an explicit policy here. This does
+ * not restrict incoming extension names or binary names starting elsewhere. */
+static moq_result_t d22_validate_application_namespace(const moq_namespace_t *ns)
+{
+    if (ns->count > 0 && ns->parts[0].data[0] == '.') return MOQ_ERR_INVAL;
+    return MOQ_OK;
+}
+
 static const moq_profile_ops_t d22_ops = {
     .version                 = MOQ_VERSION_DRAFT_22,
     /* The wire is draft 22, but the session semantics above it are not finished
@@ -3385,6 +3414,8 @@ static const moq_profile_ops_t d22_ops = {
     .start                   = d22_start,
     .process_control_data    = d22_process_control_data,
     .min_track_namespace_fields = 0,
+    .validate_application_namespace = d22_validate_application_namespace,
+    .process_ns_sub_publisher_stream = d22_process_ns_sub_publisher_stream,
     .uses_request_streams    = true,
     .object_payload_len_max  = MOQ_VI64_MAX,
     .location_varint_max     = MOQ_VI64_MAX,

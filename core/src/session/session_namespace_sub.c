@@ -862,6 +862,39 @@ static moq_result_t ns_sub_publisher_graceful_close(moq_session_t *s,
     return MOQ_OK;
 }
 
+static moq_result_t ns_sub_publisher_messages(moq_session_t *s, int32_t slot,
+    const uint8_t *buf, size_t len, bool fin)
+{
+    moq_ns_sub_entry_t *e = &s->ns_subs[slot];
+    e->pending_fin = ns_sub_fin_observed(e, fin);
+    if (e->local_teardown_pending)
+        return ns_sub_local_teardown(s, (size_t)slot, e->pending_fin);
+    if (len > e->recv_cap - e->recv_len) return MOQ_ERR_BUFFER;
+    if (len > 0) memcpy(e->recv_buf + e->recv_len, buf, len);
+    e->recv_len += len;
+    if (e->recv_len == 0) {
+        /* A requester's FIN is not cancellation in this profile (6.4.2.2).
+         * Keep the FIN fact for GOAWAY/teardown drain ownership nonetheless. */
+        return e->pending_fin && !s->profile->request_fin_is_not_cancel
+            ? ns_sub_publisher_graceful_close(s, slot) : MOQ_OK;
+    }
+
+    size_t consumed = 0;
+    moq_result_t rc = s->profile->process_ns_sub_publisher_stream(s,
+        e->stream_ref, slot, e->recv_buf, e->recv_len, e->pending_fin, &consumed);
+    if (s->state == MOQ_SESS_CLOSED) return MOQ_OK;
+    if (rc == MOQ_ERR_UNSUPPORTED) {
+        e->local_teardown_pending = true;
+        return ns_sub_local_teardown(s, (size_t)slot, e->pending_fin);
+    }
+    if (rc < 0) return rc;  /* owned bytes survive a capacity refusal */
+    /* GOAWAY retires the entry; do not inspect its reset buffer/FIN fields. */
+    if (e->state == MOQ_NS_SUB_FREE) return MOQ_OK;
+    if (consumed == 0 && e->pending_fin)
+        return close_with_error(s, 0x3, "truncated namespace request message at FIN");
+    return MOQ_OK;
+}
+
 /* Decode the buffered SUBSCRIBE_NAMESPACE on an ns_sub entry in RECVING_PUBLISHER,
  * validate the request id, resolve auth, emit NS_SUB_REQUEST, and commit the
  * entry to PENDING_PUBLISHER. The draft-16 bidi router and the draft-18
@@ -1125,6 +1158,9 @@ moq_result_t ns_sub_process_recving_publisher(moq_session_t *s,
     e->handle = handle;
     request_registry_insert_by_id(s, e->request_ep.request_id, e->request_ep);
     s->profile->commit_inbound_request(s, &e->request_ep);
+    /* The initial request is committed and its event owns copied fields.
+     * Reuse the bounded buffer for subsequent profile-decoded messages. */
+    if (s->profile->process_ns_sub_publisher_stream) e->recv_len = 0;
 
     return MOQ_OK;
 }
@@ -1272,6 +1308,8 @@ moq_result_t handle_bidi_stream_bytes(moq_session_t *s,
          * has no post-request message, so extra bytes are a protocol violation. */
         if (e->state == MOQ_NS_SUB_PENDING_PUBLISHER ||
             e->state == MOQ_NS_SUB_ESTABLISHED) {
+            if (s->profile->process_ns_sub_publisher_stream)
+                return ns_sub_publisher_messages(s, ns_slot, buf, len, fin);
             /* Extra bytes -- or a re-feed of a teardown already owed. The
              * teardown closes just this bidi (§10.9.1), so the bytes are NOT
              * buffered; instead the OBLIGATION is made durable before the
@@ -1335,7 +1373,8 @@ moq_result_t handle_bidi_stream_bytes(moq_session_t *s,
         e = &s->ns_subs[ns_slot];
         if (e->state == MOQ_NS_SUB_PENDING_PUBLISHER &&
             ns_sub_fin_observed(e, fin) &&
-            moq_session_uses_request_streams(s))
+            moq_session_uses_request_streams(s) &&
+            !s->profile->request_fin_is_not_cancel)
             return ns_sub_publisher_graceful_close(s, ns_slot);
         return prc;
     }

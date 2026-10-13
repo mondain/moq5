@@ -1059,6 +1059,9 @@ moq_result_t moq_session_publish(moq_session_t *s,
             &cfg->track_namespace, cfg->track_name,
             s->profile->min_track_namespace_fields) < 0)
         return MOQ_ERR_INVAL;
+    if (s->profile->validate_application_namespace &&
+        s->profile->validate_application_namespace(&cfg->track_namespace) < 0)
+        return MOQ_ERR_INVAL;
     if (moq_validate_auth_tokens(auth_tokens, auth_token_count) < 0)
         return MOQ_ERR_INVAL;
 #undef PUB_CFG_HAS

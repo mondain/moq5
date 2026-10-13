@@ -2524,6 +2524,8 @@ MOQ_API void moq_publish_cfg_init_sized(moq_publish_cfg_t *cfg, size_t cfg_size)
 /*
  * Initiate a publisher-initiated subscription. Advancing call.
  * Returns MOQ_ERR_REQUEST_BLOCKED if no request capacity.
+ * Draft 22 returns MOQ_ERR_INVAL for application publication under a reserved
+ * namespace (first field starts with '.', including implementation-owned .session).
  */
 MOQ_API moq_result_t moq_session_publish(moq_session_t *s,
                                           const moq_publish_cfg_t *cfg,
@@ -2698,6 +2700,8 @@ typedef struct moq_publish_namespace_cfg {
 
 MOQ_API void moq_publish_namespace_cfg_init(moq_publish_namespace_cfg_t *cfg);
 
+/* Application namespace advertisement. Draft 22 returns MOQ_ERR_INVAL when
+ * the first field starts with '.' (including implementation-owned .session). */
 MOQ_API moq_result_t moq_session_publish_namespace(moq_session_t *s,
     const moq_publish_namespace_cfg_t *cfg, uint64_t now_us,
     moq_announcement_t *out_handle);

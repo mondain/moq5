@@ -264,6 +264,8 @@ MOQ_API void moq_pub_track_cfg_init(moq_pub_track_cfg_t *cfg);
 MOQ_API void moq_pub_track_cfg_init_sized(moq_pub_track_cfg_t *cfg,
                                           size_t cfg_size);
 
+/* Application track registration. Draft 22 refuses reserved namespaces (first
+ * field starts with '.') even when advertise_namespace is false. */
 MOQ_API moq_result_t moq_pub_add_track(
     moq_publisher_t *pub,
     const moq_pub_track_cfg_t *cfg,

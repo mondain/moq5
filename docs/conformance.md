@@ -81,7 +81,7 @@ with the [wire reference](draft22-wire-reference.md) and
 | Negotiation and control | Draft-22 ALPN/protocol, SETUP, request streams, REQUEST_OK, PUBLISH_STATE_NOTIFY, PUBLISH_SKIPPED and GOAWAY |
 | Location Filter | Explicit types 0 through 5, relative starts, absolute origin, inclusive end object, overflow and unknown-type rejection |
 | FETCH and fills | Standalone FETCH; SUBSCRIBE/REQUEST_UPDATE fills; exact history resolution; Next Object FETCH rejection and relative-start clamping |
-| Names | Binary fields, 0..32 namespace fields, nonempty individual fields, 4096-byte aggregate limits |
+| Names | Binary fields, 0..32 namespace fields, nonempty individual fields, 4096-byte aggregate limits; reserved names rejected for application publication |
 | Authorization | Opaque token payloads; alias registration/use/delete, transactional cache changes, duplicate resolved token checks |
 | PUBLISH | Non-default accepted parameters sent as REQUEST_UPDATE; initial parameters queryable |
 | Data | Subgroup/object layouts, FIRST_OBJECT and FETCH End of Range markers |
@@ -94,12 +94,12 @@ with the [wire reference](draft22-wire-reference.md) and
 
 | Configuration | Result |
 |---|---|
-| Core/service, warnings as errors | 193/193 CTest |
-| ASan/UBSan with leak detection | 193/193 CTest; draft-22 allocator failure sweep passed |
-| Shared libraries and C++ binding | 211/211 CTest |
-| Pinned picoquic, native QUIC and WebTransport | 279/279 CTest |
-| Pinned MsQuic | 229/229 CTest |
-| Swift | 386/386 tests when run serially; the parallel run had 12 timing failures |
+| Core/service, warnings as errors | 194/194 CTest |
+| ASan/UBSan with leak detection | 194/194 CTest; allocator sweep passed before these follow-up repairs |
+| Shared libraries and C++ binding | 212/212 CTest |
+| Pinned picoquic, native QUIC and WebTransport | 280/280 CTest |
+| Pinned MsQuic | 229/229 CTest before the namespace/GOAWAY follow-up |
+| Swift | Before the follow-up: 386/386 serially; parallel run had 12 timing failures |
 | Fuzzing | Draft-22 control codec and session-control targets completed 30 seconds each with ASan/UBSan |
 | Dependency setup | Patch-list/idempotence and picotls compiler-policy self-tests passed |
 
@@ -107,6 +107,50 @@ The contribution tester was freshly built from `ae0364dfe013610ef4e399efae82ffb3
 its previous binary identified the older `28b2974` source commit. Draft-22 audit:
 170/170 required executable coverage, 3/97 optional coverage, static gate passed.
 These are catalog/instrument checks, not a publisher conformance score.
+
+### Namespace and GOAWAY repairs
+
+Both defects from the initial sweep below are repaired. The namespace-subscription
+publisher path buffers subsequent messages for the draft-22 profile, so GOAWAY
+migrates its request and a duplicate closes the session with PROTOCOL_VIOLATION.
+The buffer and cumulative FIN facts survive event/action/drain-capacity refusals.
+A requester FIN remains legal without cancellation, including initial handoff and
+an empty retry after a full event queue (6.4.2.2).
+
+The session PUBLISH/PUBLISH_NAMESPACE APIs and publisher track registration reject
+reserved application namespaces before creating a request or committing track
+state. The draft-22 profile supplies this policy: `.session` is implementation-owned
+and no registered application namespace is implemented. Binary names, dots in
+later fields, root namespaces and unrecognized reserved incoming requests retain
+their existing behavior. The earlier profiles do not enable these private hooks.
+
+`d22_namespace_policy` covers these publication APIs and both endpoint perspectives,
+fragmented/coalesced/duplicate GOAWAY, invalid client migration URIs, truncated FIN,
+queue/drain refusals, initial requester FIN, binary/root namespaces and draft-18
+compatibility. The test reproduced 51 assertions on the original defects before
+repair; the added requester-FIN cases separately reproduced three failures before
+the FIN adjustment. All regressions and the full configurations above passed.
+An independent review found no remaining issues in these repairs.
+
+The fresh live rerun finalized 440 runs across 446 connections (223 per transport),
+covering all 215 advertised driven profiles, the two unscored probes, required
+reserved-name fixtures, and three repeated GOAWAY companion pairs per transport.
+No run had a scored FAIL or ERROR; all verdicts were INCOMPLETE. Each transport
+observed four duplicate-GOAWAY session closes with application code 3. All six
+reserved-name attempts per transport emitted no PUBLISH_NAMESPACE.
+
+The tester cannot score the complete GOAWAY row because its distinct-request
+companion does not reach its stimulus with the placeholder publisher. Reserved-name
+absence rows remain NOT_RUN because the example exits after rejecting the
+configuration rather than staying alive for the whole observation window.
+The API regressions prove MOQ_ERR_INVAL and absence of queued publication actions.
+Across the separate live runs, 45 distinct rows scored PASS over native QUIC and
+48 over WebTransport. These are observed row counts, not an aggregate score.
+The two known tester binding errors below remain; ten contexts hit evidence limits.
+Requests, JSON/TAP exports, driver logs, hashes, wire assertions and the execution
+audit are retained in `/tmp/moq5-pr35-harness-fixed/` on the validation host.
+
+### Initial sweep before the repairs
 
 The full follow-up sweep tested publisher commit `c53bf1435bdf8a8c60efd4a6f431dad3f34c0a32`
 with an isolated copy of the tester's bundled `adapters/moq5` harness. Its only
@@ -132,12 +176,11 @@ counts describe observed rows, not an aggregated conformance score.
 | D22-2-4-3-MUST-NOT-032 | 2.4.3 | Namespace whose first field is `.` is published |
 | D22-6-5-MUST-NOT-181 | 6.5 | Application namespace whose first field is `.session` is published |
 
-The GOAWAY result agrees with the publisher-side namespace-subscription path:
-post-request bytes enter request-local teardown instead of the profile's GOAWAY
-parser (`core/src/session/session_namespace_sub.c`). Reserved namespace results
-identify missing validation of application publication configuration; the draft
-still requires unrecognized reserved incoming requests to reach the Application.
-Neither defect was repaired by this testing pass.
+At the tested pre-fix commit, namespace-subscription post-request bytes entered
+request-local teardown instead of the profile's GOAWAY parser. The reserved-name
+results identified missing validation of application publication configuration.
+The repairs described above address both causes while preserving the draft's
+forwarding rule for unrecognized reserved incoming requests.
 
 The tester's execution audit returned failure for two `scored_without_binding`
 observations: `D22-9-1-1-MUST-304` in `d22-webtransport-server-sends-authority` and

@@ -274,6 +274,14 @@ typedef struct moq_profile_ops {
                                             uint64_t expected_request_id,
                                             struct moq_decoded_ns_sub_response *out);
 
+    /* Publisher-side messages after SUBSCRIBE_NAMESPACE. The core owns the
+     * buffer and FIN fact; zero consumed waits for more bytes, WOULD_BLOCK
+     * retries those bytes, and UNSUPPORTED uses request-local teardown.
+     * NULL retains the earlier profiles' post-request behavior. */
+    moq_result_t (*process_ns_sub_publisher_stream)(moq_session_t *s,
+        moq_stream_ref_t ref, int slot, const uint8_t *data, size_t len,
+        bool fin, size_t *out_consumed);
+
     /* -- Inbound data-plane decode ops -------------------------------- */
 
     moq_result_t (*decode_subgroup_header)(moq_session_t *s,
@@ -342,6 +350,10 @@ typedef struct moq_profile_ops {
      * requires 1..32 fields; draft-18 permits the root namespace (0 fields).
      * Present fields are non-empty in both profiles. */
     size_t min_track_namespace_fields;
+
+    /* Optional policy for application-originated publication, after structural
+     * namespace validation. Incoming reserved extension names remain valid. */
+    moq_result_t (*validate_application_namespace)(const moq_namespace_t *ns);
 
     /*
      * Capability: when true, this profile correlates requests by the identity

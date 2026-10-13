@@ -56,7 +56,10 @@ Reaching the scenario timeout is the normal end of a context and exits 0.
   QUIC/WebTransport build established sessions with the current contribution
   tester. The WebTransport client supplies CONNECT authority from its connection
   host and port, independently of TLS SNI.
-- **Measured conformance gaps remain.** The full tester sweep found duplicate
-  request-stream GOAWAY handling and reserved application namespace publication
-  failures on both transports. See [conformance.md](../../docs/conformance.md)
-  for the exact draft requirements, counts, and tester limitations.
+- **Draft-22 namespace guards and GOAWAY handling are enforced.** Application
+  publication APIs reject reserved namespaces with MOQ_ERR_INVAL. Duplicate
+  GOAWAY on a namespace-subscription request closes the session with
+  PROTOCOL_VIOLATION. The live rerun observed these corrections over both
+  transports; some requirements remain unscored because this example exits
+  after refusing invalid configuration or lacks the companion publisher mode.
+  See [conformance.md](../../docs/conformance.md) for measured results and limits.
