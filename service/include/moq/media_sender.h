@@ -176,7 +176,11 @@ typedef struct moq_media_sender_cfg {
     bool                                 publish_tracks;
 
     /* Media written while its track has no demand: false (default) holds it
-     * queued until demand appears; true drops it to stay at the live edge. */
+     * queued until demand appears; true drops it to stay at the live edge.
+     * After a no-demand drop, the remainder of that group is also discarded,
+     * even if demand returns. Media resumes at the next sync-anchored group
+     * (starts_group, or the first object after ends_group), not at a sync
+     * object within the same group. Other tracks and END_OF_TRACK still drain. */
     bool                                 drop_without_demand;
 
     /* OPT-IN interval between automatic independent catalog refreshes, in

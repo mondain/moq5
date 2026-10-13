@@ -159,7 +159,7 @@ jobs:
       - name: Deterministic service tests (incl. C/C++ consumers)
         run: >
           ctest --test-dir build/service-surface --output-on-failure
-          -R 'media_sender_catalog|media_sender_lifecycle|service_consumer_cxx|endpoint_resolve'
+          -R 'media_sender_catalog|media_sender_lifecycle|media_sender_pacing|service_consumer_cxx|endpoint_resolve'
 
       - name: Shared service build + initializer symbol check
         run: |

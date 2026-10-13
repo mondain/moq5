@@ -4924,16 +4924,14 @@ int main(int argc, char **argv)
         MOQ_TEST_CHECK_EQ_INT(ad, 1);
         MOQ_TEST_CHECK_EQ_U64(as, 0x2u);
 
-        /* Strict ordering (§11.3): both Track Ended signals were observed BEFORE
-         * the conversion catalog generation [1]. The pump gates the catalog
-         * republish on the finish, so the dones are emitted first; on the
-         * in-order loopback that ordering is preserved at the subscriber. */
+        /* MSF 11.3 orders the publisher's steps, not arrival across separate
+         * QUIC streams. SUBSCRIBE_DONE may also wait for its media streams
+         * before surfacing as an event. Require all observations, not their
+         * relative arrival order; deterministic tests check the finish gate. */
         uint64_t v_seq = 0, a_seq = 0;
         srv_done_seqs(&g_srv, &v_seq, &a_seq);
         uint64_t conv_seq = cat_gen_seq(1);
         MOQ_TEST_CHECK(v_seq != 0 && a_seq != 0 && conv_seq != 0);
-        MOQ_TEST_CHECK(v_seq < conv_seq);
-        MOQ_TEST_CHECK(a_seq < conv_seq);
 
         /* Not terminal: no END_OF_TRACK was emitted, and the VOD catalog still
          * advertises both tracks -- they stay joinable (retained replay is the
