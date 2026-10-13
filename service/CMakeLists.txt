@@ -636,6 +636,24 @@ if(MOQ_BUILD_TESTS)
             ${CMAKE_SOURCE_DIR}/tests/unit)
         add_test(NAME media_sender_catalog COMMAND test_media_sender_catalog)
 
+        add_executable(test_media_track_cfg_init tests/test_media_track_cfg_init.c)
+        target_link_libraries(test_media_track_cfg_init PRIVATE moq::service)
+        target_compile_options(test_media_track_cfg_init PRIVATE
+            $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+        add_test(NAME media_track_cfg_init COMMAND test_media_track_cfg_init)
+
+        if(TARGET moq::sim)
+            add_executable(test_media_sender_priority
+                tests/test_media_sender_priority.c)
+            target_link_libraries(test_media_sender_priority PRIVATE
+                moq-service-sender-test-internals moq::sim)
+            target_include_directories(test_media_sender_priority PRIVATE
+                ${CMAKE_SOURCE_DIR}/tests/unit)
+            target_compile_options(test_media_sender_priority PRIVATE
+                $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+            add_test(NAME media_sender_priority COMMAND test_media_sender_priority)
+        endif()
+
         # MSF 5.1.2 generatedAt must not decide no-op dedup. Deterministic:
         # the catalog clock is pinned through the sender's instance-owned test
         # seam, so nothing here waits on a millisecond boundary. The refresh

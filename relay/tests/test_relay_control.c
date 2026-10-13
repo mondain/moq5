@@ -2377,6 +2377,111 @@ test_chunked_delivery_core(void)
     return failures;
 }
 
+/* Issue #41 (skaspi3/5183d7b): the reusable chunk-pin array belongs to the
+ * binding slot, not its current session. Two slots with the publisher kept
+ * open force every successful subscriber reopen into the just-closed slot;
+ * no opaque-handle layout assumptions are needed. */
+static int
+binding_pin_reuse_case(unsigned cycles, bool chunked, bool reopen_last)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_relay_cfg_t cfg;
+    moqr_core_relay_cfg_init_sized(&cfg, sizeof(cfg), &a.vt);
+    cfg.max_bindings = 2;
+    cfg.log_budget.max_groups = 4;
+    cfg.log_budget.max_bytes = 1 << 20;
+    cfg.linger_us = 1000;
+    moqr_core_t *c = NULL;
+    MOQ_TEST_CHECK(moqr_core_create(&cfg, &c) == MOQR_OK);
+    if (!c) return failures;
+    moqr_binding_t pub = MOQR_BINDING_INVALID, sb = MOQR_BINDING_INVALID;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 100, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 200, &sb) == MOQR_OK);
+    for (unsigned cycle = 0; cycle < cycles; cycle++) {
+        if (chunked) {
+            moqr_sub_t sub = { 0 };
+            /* A new track each cycle avoids warm-rejoin/linger selection
+             * changing which record this lifetime test delivers. */
+            char name[32];
+            (void)snprintf(name, sizeof(name), "video%u", cycle);
+            moqr_track_t track = cycle == 0
+                ? chunked_sub_setup(c, pub, sb, &sub)
+                : sub_on_binding(c, sb, B(name), 11 + cycle, &sub);
+            MOQ_TEST_CHECK(track._opaque != 0 && sub._opaque != 0);
+            for (uint64_t object = 0; object < 2; object++) {
+                MOQ_TEST_CHECK(ing_chunked(c, &a, track, 5, 0, object,
+                                           128, 3, 20, 0xA0) == MOQR_OK);
+                long before_pin = a.live;
+                moqr_delivery_t d;
+                memset(&d, 0, sizeof(d));
+                moqr_result_t rc = moqr_core_next_delivery(c, sb, CTRL_NOW, &d);
+                MOQ_TEST_CHECK(rc == MOQR_OK);
+                if (rc != MOQR_OK) break;
+                MOQ_TEST_CHECK_EQ_U64(d.rec.group_id, 5);
+                MOQ_TEST_CHECK_EQ_U64(d.rec.object_id, object);
+                MOQ_TEST_CHECK_EQ_U64(d.rec.chunk_count, 3);
+                MOQ_TEST_CHECK(d.rec.obj_state == MOQR_OBJ_COMPLETE);
+                MOQ_TEST_CHECK_EQ_U64(d.rec.declared_len, 60);
+                MOQ_TEST_CHECK(d.rec.payload == NULL);
+                /* A second same-sized delivery on one occupant reuses its
+                 * array; pinning references must allocate no further bytes. */
+                if (object == 1) MOQ_TEST_CHECK(a.live == before_pin);
+                for (uint32_t k = 0; k < 3; k++) {
+                    const moq_rcbuf_t *buf = NULL;
+                    uint64_t len = 0;
+                    MOQ_TEST_CHECK(moqr_core_delivery_chunk(c, sb, k, &buf,
+                                                           &len) == MOQR_OK);
+                    MOQ_TEST_CHECK_EQ_U64(len, 20);
+                    MOQ_TEST_CHECK(buf != NULL);
+                    if (buf) {
+                        MOQ_TEST_CHECK_EQ_SIZE(moq_rcbuf_len(buf), 20);
+                        if (moq_rcbuf_len(buf) == 20) {
+                            uint8_t expected[20];
+                            memset(expected, (int)(0xA0 + k), sizeof(expected));
+                            MOQ_TEST_CHECK(memcmp(moq_rcbuf_data(buf), expected,
+                                                  sizeof(expected)) == 0);
+                        }
+                    }
+                }
+                /* Alternate close-after-confirm and close-with-pins-held.
+                 * Both must release all rcbuf references at close/destroy. */
+                if (object == 0 || (cycle & 1u) == 0)
+                    MOQ_TEST_CHECK(moqr_core_delivery_done(c, sb,
+                        MOQR_DELIVERY_DELIVERED, CTRL_NOW) == MOQR_OK);
+            }
+        }
+        MOQ_TEST_CHECK(moqr_core_binding_close(c, sb, CTRL_NOW) == MOQR_OK);
+        moqr_intent_t its[16];
+        while (moqr_core_poll_intents(c, its, 16) != 0) { }
+        if (cycle + 1 < cycles || reopen_last) {
+            moqr_binding_t previous = sb;
+            MOQ_TEST_CHECK(moqr_core_binding_open(c, 300 + cycle, &sb) == MOQR_OK);
+            MOQ_TEST_CHECK(sb._opaque != previous._opaque);
+            MOQ_TEST_CHECK(moqr_core_binding_close(c, previous, CTRL_NOW) ==
+                           MOQR_ERR_STALE_HANDLE);
+        }
+    }
+    moqr_core_destroy(c);
+    printf("ORACLE binding_pin_reuse cycles=%u chunked=%d reopen_last=%d live=%ld\n",
+           cycles, (int)chunked, (int)reopen_last, a.live);
+    MOQ_TEST_CHECK(a.live == 0);
+    return failures;
+}
+
+static int
+test_binding_reuse_keeps_pin_array(void)
+{
+    int failures = 0;
+    failures += binding_pin_reuse_case(3, false, true); /* no array to lose */
+    failures += binding_pin_reuse_case(1, true, false); /* destroy can find it */
+    failures += binding_pin_reuse_case(1, true, true);  /* reporter sequence */
+    failures += binding_pin_reuse_case(3, true, true);  /* grows each reuse */
+    MOQ_TEST_PASS("binding_reuse_keeps_pin_array");
+    return failures;
+}
+
 /* The REFUSED_UNBEGUN confirm contract, pinned at the CORE boundary (the
  * integrated scenarios exercise the behavior; this pins the API): a
  * pre-begin refusal RELEASES a chunked outstanding delivery (re-derived,
@@ -5867,6 +5972,7 @@ main(void)
     failures += test_grant_reval_stale_owner();
     failures += test_grant_retire_no_reval();
     failures += test_chunked_delivery_core();
+    failures += test_binding_reuse_keeps_pin_array();
     failures += test_refused_unbegun_contract();
     failures += test_forward_pause_release();
     failures += test_forward_pause_partial_resume();

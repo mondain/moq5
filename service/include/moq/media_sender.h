@@ -379,9 +379,34 @@ typedef struct moq_media_track_cfg {
      * an older caller's struct_size prefix never reinterprets these bytes. */
     bool        has_alt_group;
     int         alt_group;
+
+    /* Publisher scheduling preference (0 is highest, 255 lowest). Subscriber
+     * priority takes precedence; cross-stream arrival order is not promised.
+     * has_publisher_priority=false keeps the default 128, regardless of the
+     * value field. Generated timeline tracks always keep that default.
+     * Read only when struct_size covers the complete presence/value pair. */
+#ifdef __cplusplus
+    alignas(uint64_t)
+#else
+    _Alignas(uint64_t)
+#endif
+    bool        has_publisher_priority;
+    uint8_t     publisher_priority;
 } moq_media_track_cfg_t;
 
+#define MOQ_MEDIA_TRACK_CFG_V0_SIZE \
+    offsetof(moq_media_track_cfg_t, has_track_duration)
+
+/* The exported pointer-only symbol clears and stamps the complete historical
+ * layout through alt_group. Source calls use the caller-sized macro below.
+ * Initializers set is_live when its complete field fits. */
 MOQ_API void moq_media_track_cfg_init(moq_media_track_cfg_t *cfg);
+/* Clears and stamps min(cfg_size, library size); leaves future trailing storage
+ * untouched. NULL or storage too small for struct_size is a no-op. */
+MOQ_API void moq_media_track_cfg_init_sized(moq_media_track_cfg_t *cfg,
+                                          size_t cfg_size);
+#define moq_media_track_cfg_init(cfg) \
+    moq_media_track_cfg_init_sized((cfg), sizeof(*(cfg)))
 
 /* Add a track. Legal both before and after readiness: a post-ready add
  * registers the track and triggers an independent catalog republish (a new

@@ -2721,7 +2721,12 @@ moqr_core_binding_open(moqr_core_t *c, uint64_t session_cookie,
         if (r_gen_openable(c->bindings[i].gen)) {
             r_binding_t *b = &c->bindings[i];
             uint32_t gen = r_gen_open(b->gen);
+            /* The slot owns reusable pin storage across binding lifetimes. */
+            r_pin_chunk_t *pin_chunks = b->pin_chunks;
+            uint32_t pin_chunks_cap = b->pin_chunks_cap;
             memset(b, 0, sizeof(*b));
+            b->pin_chunks = pin_chunks;
+            b->pin_chunks_cap = pin_chunks_cap;
             b->gen = gen;
             b->cookie = session_cookie;
             b->subs_head = R_SUB_NIL;   /* empty (memset left it 0) */
