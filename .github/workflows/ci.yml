@@ -454,7 +454,7 @@ jobs:
       - name: Test (pico_wt regression + conformance)
         run: >
           ctest --test-dir build/pico-wt-ci --output-on-failure
-          -R '^(pq_reset_after_fin|pico_wt_public_compile|pico_wt_capsule_sequence|pico_wt_loopback|pico_wt_conformance|pico_wt_managed_keepalive|pico_wt_managed_keepalive_server|pico_wt_managed_stop_close|pico_wt_managed_pump_exit_close|pico_wt_managed_cfg_abi|endpoint_resolve|endpoint_wt_target)$'
+          -R '^(pq_close_reason|pq_close_reason_oom|pq_reset_after_fin|pico_wt_public_compile|pico_wt_capsule_sequence|pico_wt_loopback|pico_wt_conformance|pico_wt_managed_keepalive|pico_wt_managed_keepalive_server|pico_wt_managed_stop_close|pico_wt_managed_pump_exit_close|pico_wt_managed_cfg_abi|endpoint_resolve|endpoint_wt_target)$'
 
       - name: Configure (mbedTLS-only)
         run: >

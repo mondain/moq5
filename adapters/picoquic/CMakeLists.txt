@@ -446,6 +446,48 @@ if(MOQ_BUILD_TESTS)
     # configures scratch trees and reads their generated link lines, so it is
     # independent of the host linker's warnings.
     if(MOQ_PICOQUIC_SOURCE_DIR)
+        add_executable(test_pq_close_reason tests/test_pq_close_reason.c)
+        target_include_directories(test_pq_close_reason PRIVATE
+            "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+        target_link_libraries(test_pq_close_reason PRIVATE moq::adapter-picoquic)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pq_close_reason PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME pq_close_reason COMMAND test_pq_close_reason)
+        set_tests_properties(pq_close_reason PROPERTIES TIMEOUT 30)
+        get_target_property(_pq_close_provider_type ${_PQ} TYPE)
+        if(_pq_close_provider_type STREQUAL "STATIC_LIBRARY")
+        add_library(pq_close_reason_sender OBJECT
+            "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic/sender.c")
+        target_link_libraries(pq_close_reason_sender PRIVATE ${_PQ})
+        target_include_directories(pq_close_reason_sender PRIVATE
+            $<TARGET_PROPERTY:${_PQ},INCLUDE_DIRECTORIES>)
+        target_compile_definitions(pq_close_reason_sender PRIVATE
+            $<TARGET_PROPERTY:${_PQ},COMPILE_DEFINITIONS>
+            picoquic_string_duplicate=moq_test_reason_duplicate)
+        target_compile_options(pq_close_reason_sender PRIVATE
+            $<TARGET_PROPERTY:${_PQ},COMPILE_OPTIONS>)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(pq_close_reason_sender PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_executable(test_pq_close_reason_oom
+            tests/test_pq_close_reason_oom.c
+            $<TARGET_OBJECTS:pq_close_reason_sender>)
+        target_include_directories(test_pq_close_reason_oom PRIVATE
+            "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+        target_link_libraries(test_pq_close_reason_oom PRIVATE ${_PQ})
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pq_close_reason_oom PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME pq_close_reason_oom COMMAND test_pq_close_reason_oom)
+        set_tests_properties(pq_close_reason_oom PROPERTIES TIMEOUT 30)
+        endif()
         add_test(NAME picoquic_source_mode_link_policy
             COMMAND ${CMAKE_COMMAND}
                 -DSRC=${CMAKE_SOURCE_DIR}

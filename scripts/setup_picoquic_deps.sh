@@ -62,6 +62,7 @@ PICOQUIC_PATCHES=(
     0001-h3zero-reset-capsule-value-read.patch
     0002-reset-stream-after-fin.patch
     0005-reliable-reset-prefix-ack-range.patch
+    0006-own-application-close-reason.patch
 )
 
 script_dir=$(cd "$(dirname "$0")" && pwd)

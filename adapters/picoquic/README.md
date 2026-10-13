@@ -214,3 +214,13 @@ target_link_libraries(myapp PRIVATE moq::adapter-picoquic-threaded)
 
 The threaded target transitively links `moq::adapter-picoquic`
 and `Threads::Threads`.
+
+## Provider close-reason ownership
+
+The adapter requires picoquic to copy accepted `picoquic_close_ex` reasons
+before returning and retain them through connection deletion callbacks.
+`scripts/setup_picoquic_deps.sh` applies patch 0006 to the pinned provider.
+External provider packages must carry the equivalent implementation and
+advertise `PICOQUIC_CLOSE_REASON_COPIED=1` in their matching public header.
+The adapter rejects headers without this contract. Rebuild private-header
+consumers and provider binaries together after applying the patch.
