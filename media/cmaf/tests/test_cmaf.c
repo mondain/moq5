@@ -1531,7 +1531,7 @@ int main(void)
         CHECK(moq_cmaf_parse_init((moq_bytes_t){ buf, len }, &info)
               == MOQ_ERR_PROTO);
 
-        /* (b) trailing tenc (body 27 > 23) -> OK, same fields extracted. */
+        /* (b) trailing tenc (body 28 > 24) -> OK, same fields extracted. */
         len = moq_test_build_cmaf_init_cenc(buf, 1, 90000, 64, 64,
             avcc, sizeof(avcc), "cenc", 1, 8, kid, 0,
             MOQ_TEST_CENC_TRAILING_TENC);
