@@ -151,6 +151,7 @@ typedef enum moq_sub_role {
 } moq_sub_role_t;
 
 typedef struct moq_sub_entry {
+    uint8_t           subscriber_priority;
     moq_sub_state_t    state;
     moq_sub_role_t     role;
     uint32_t           generation;
@@ -415,6 +416,7 @@ typedef struct moq_fetch_prior_object {
 } moq_fetch_prior_object_t;
 
 typedef struct moq_fetch_entry {
+    uint8_t              subscriber_priority;
     moq_fetch_state_t  state;
     moq_fetch_role_t   role;
     uint32_t           generation;
@@ -902,6 +904,7 @@ typedef enum moq_sg_state {
 } moq_sg_state_t;
 
 typedef struct moq_sg_entry {
+    uint8_t               publisher_priority;
     moq_sg_state_t         state;
     uint32_t               generation;
     moq_subscription_t     sub;
@@ -1006,7 +1009,7 @@ typedef struct moq_auth_txn {
 
 #define MOQ_DECODED_MAX_TOKENS 16
 
-/* -- No-slot admission carrier (#245b) ------------------------------- *
+/* -- No-slot admission carrier ------------------------------------- *
  * The minimal durable record of a no-slot request-bidi terminal owed but not
  * yet emittable for local resource pressure. The terminal is fixed and
  * content-independent, so only the stream identity and the observed FIN fact
@@ -1053,7 +1056,7 @@ typedef struct moq_ns_sub_entry {
      * not buffer the bytes, so the obligation -- not the raw bytes -- is what
      * must survive: this durable marker re-drives ns_sub_local_teardown on the
      * documented empty re-feed, with no peer-byte redelivery. Cleared in the
-     * selective free (#245c). */
+     * selective free. */
     bool                local_teardown_pending;
     bool                closing_remote_error;
     bool                forward;
@@ -1299,6 +1302,18 @@ typedef enum moq_rx_parse_state {
      * retried on the next drive, by any route, until it lands, then the entry
      * is freed. */
     MOQ_RX_PENDING_RESET    = 9,
+    /* The session STOPped this stream (STOP_DATA queued) but the peer has not
+     * yet FIN'd or RESET it. STOP_SENDING cannot recall bytes already sent,
+     * so the entry keeps the stream's identity -- its buffers, bindings and
+     * any pending object are released at the STOP -- and every later chunk
+     * is consumed without parsing or emitting until the peer's FIN or RESET
+     * frees the entry (neither counts as a completed stream; the FIN is still
+     * noted as the transport stream's end, so later bytes on the ref are
+     * data after FIN). The entry holds
+     * its receive slot meanwhile; a stream that finds no free slot is STOPped
+     * without one and its identity kept in rx_stopped_refs instead
+     * (rx_get_or_create_stream). */
+    MOQ_RX_STOPPED          = 10,
 } moq_rx_parse_state_t;
 
 typedef struct moq_rx_stream {
@@ -1431,7 +1446,7 @@ static inline bool ns_sub_fin_observed(const moq_ns_sub_entry_t *e, bool fin) {
     return fin || e->pending_fin || e->handoff_fin_pending;
 }
 
-/* No-slot admission carriers (#245b). */
+/* No-slot admission carriers. */
 int  noslot_carrier_find(const moq_session_t *s, moq_stream_ref_t ref);
 bool noslot_carrier_install(moq_session_t *s, moq_stream_ref_t ref, bool fin);
 void noslot_carrier_remove(moq_session_t *s, moq_stream_ref_t ref);
@@ -1627,6 +1642,18 @@ struct moq_session {
     size_t           rx_fin_head;
     size_t           rx_fin_count;
 
+    /* Streams STOPped while every receive entry was held: a STOP_DATA was
+     * queued and the stream's identity is kept here (arena-backed, bounded
+     * like rx_finished, never evicted) so every later chunk is consumed
+     * without parsing until the peer's FIN or RESET releases the record.
+     * The session owns these streams (moq_session_has_transport_stream).
+     * With the records exhausted a new stream is refused with WOULD_BLOCK
+     * and nothing retained -- no STOP, no ownership -- which the bridge
+     * treats as an unowned refusal and discards that stream itself. */
+    uint64_t        *rx_stopped_refs;
+    size_t           rx_stopped_cap;
+    size_t           rx_stopped_count;
+
     uint64_t        *unsub_tombstones;
     size_t           unsub_tomb_cap;
     size_t           unsub_tomb_count;
@@ -1641,6 +1668,20 @@ struct moq_session {
     size_t           fetch_cancel_tomb_cap;
     size_t           fetch_cancel_tomb_count;
 
+    /* Bounded grace cache of request IDs of publisher-role fetches this side
+     * ABORTED (moq_session_abort_fetch): the slot is freed at abort, and on
+     * profiles whose cancellation is a control message (draft-16 FETCH_CANCEL)
+     * the peer's cancel may cross the reset in flight. A cancel naming a
+     * recorded id is consumed instead of being treated as an unknown request.
+     * Separate from fetch_cancel_tombs on purpose: that ring holds ids this
+     * side originated as a FETCHER, this one holds peer-originated ids this
+     * side answered as a PUBLISHER, so neither ring's lookups can alias the
+     * other's. Drop-oldest when full (capacity = fetch pool size): an evicted
+     * id's late cancel fails closed on the unknown-request path. */
+    uint64_t        *fetch_abort_tombs;
+    size_t           fetch_abort_tomb_cap;
+    size_t           fetch_abort_tomb_count;
+
     /* Request-bidi stream_refs locally cancelled (unsubscribe / fetch cancel)
      * on stream-correlated profiles, draining any late in-flight response until
      * the bidi FINs or the peer resets it. Draft-16 leaves this empty. */
@@ -1649,7 +1690,7 @@ struct moq_session {
     size_t           drain_ref_cap;
     size_t           drain_ref_count;
 
-    /* No-slot admission carriers (#245b). A draft-18 request bidi that arrives
+    /* No-slot admission carriers. A draft-18 request bidi that arrives
      * with the subscription pool full owes a fixed, content-independent
      * terminal (pre-setup STOP+RESET, post-setup REQUEST_ERROR+FIN). When drain/
      * action/send capacity cannot admit that terminal yet, the OPERATION -- not
@@ -2068,8 +2109,18 @@ void session_resume_deferred_for_alias(moq_session_t *s, uint64_t alias);
  * event-queue backpressure (called after poll frees capacity). */
 void session_retry_resumed_deferred(moq_session_t *s);
 
-/* Stop + free all streams still deferred on an unestablished alias. */
+/* STOP every stream still deferred on an unestablished alias. A STOP the
+ * action queue refuses stays owed on its entry (NEED_STOP);
+ * session_retry_owed_stops issues it once capacity returns. */
 void session_discard_deferred_streams(moq_session_t *s);
+
+/* Issue the STOP_DATA owed by every NEED_STOP receive entry that action
+ * capacity now admits (called after a poll drains actions): a refused STOP
+ * must progress without further peer input on its stream. */
+void session_retry_owed_stops(moq_session_t *s);
+
+/* Index of `ref_v` among the streams stopped without a receive entry, or -1. */
+int rx_stopped_ref_find(const moq_session_t *s, uint64_t ref_v);
 void sg_recompute_deadline(moq_session_t *s);
 int sg_find_free(moq_session_t *s);
 moq_subgroup_handle_t sg_make_handle(moq_session_t *s, size_t slot);
@@ -2213,8 +2264,8 @@ typedef struct moq_request_update_ok_encode_args {
 
 /* PUBLISH_OK response: the subscriber's delivery parameters plus
  * the raw SUBSCRIPTION_FILTER and FORWARD it chose. One args struct instead of
- * a growing positional vtable signature. Outbound EXPIRES stays unsupported
- * (D2) -- no field. */
+ * a growing positional vtable signature. Outbound EXPIRES is not supported,
+ * so there is no field for it. */
 typedef struct moq_publish_ok_encode_args {
     uint64_t               request_id;
     uint8_t                subscriber_priority;  /* 128 = omitted */
@@ -2465,7 +2516,8 @@ typedef struct moq_decoded_ns_sub_response {
 
     /* For ERROR: */
     uint64_t error_code;
-    uint64_t retry_interval;         /* REQUEST_ERROR Retry Interval (0 = none) */
+    uint64_t retry_interval;         /* REQUEST_ERROR wire Retry Interval:
+                                      * milliseconds + 1; 0 = no retry */
     const uint8_t *reason;           /* borrowed from recv_buf */
     size_t reason_len;
     bool has_trailing_bytes;         /* trailing after ERROR = close */
@@ -3218,6 +3270,15 @@ typedef enum moq_drain_reason {
 } moq_drain_reason_t;
 
 bool drain_ref_add(moq_session_t *s, moq_stream_ref_t ref);
+void fetch_abort_tomb_add(moq_session_t *s, uint64_t request_id);
+/* Fetcher-side terminal for a peer RESET of the identified response data stream
+ * of fetch `slot`: emits FETCH_RESET and retires the request (reserve-before-
+ * mutate; MOQ_ERR_WOULD_BLOCK leaves the entry and the obligation intact). A
+ * slot that already surfaced its terminal, or is not an active fetcher-role
+ * request, is left alone and reports MOQ_OK. */
+moq_result_t fetch_on_data_stream_reset(moq_session_t *s, int slot,
+                                        uint64_t error_code);
+bool fetch_abort_tomb_consume(moq_session_t *s, uint64_t request_id);
 bool drain_ref_add_strict(moq_session_t *s, moq_stream_ref_t ref);
 /* Reason of a present ref (MOQ_DRAIN_NORMAL if absent). */
 moq_drain_reason_t drain_ref_reason(const moq_session_t *s, moq_stream_ref_t ref);
@@ -3335,15 +3396,21 @@ moq_result_t handle_bidi_stream_bytes(moq_session_t *s,
 moq_result_t request_streams_refeed_deferred(moq_session_t *s);
 
 moq_result_t handle_bidi_stream_reset(moq_session_t *s,
-                                       moq_stream_ref_t stream_ref);
+                                       moq_stream_ref_t stream_ref,
+                                       uint64_t error_code);
 moq_result_t handle_bidi_stream_stop(moq_session_t *s,
-                                      moq_stream_ref_t stream_ref);
+                                      moq_stream_ref_t stream_ref,
+                                      uint64_t error_code);
 
 /* Terminate a stream-correlated request (SUBSCRIPTION or FETCH) whose request
  * bidi was torn down by the peer: free the entry and remove its registry keys,
  * surfacing a best-effort local event. Returns true if `stream_ref` matched a
  * stream-correlated request (so the caller need not look elsewhere). */
+/* Peer teardown of a request bidi: `reset` distinguishes RESET_STREAM from
+ * STOP_SENDING and `error_code` is the peer's stream code, both surfaced on the
+ * fetcher-side FETCH_RESET terminal; the other request families ignore them. */
 moq_result_t request_stream_teardown(moq_session_t *s,
-                                     moq_stream_ref_t stream_ref);
+                                     moq_stream_ref_t stream_ref,
+                                     bool reset, uint64_t error_code);
 
 #endif /* MOQ_SESSION_INTERNAL_H */

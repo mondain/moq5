@@ -324,12 +324,15 @@ typedef struct moq_media_track_event {
     moq_media_track_t            *track; /* stable handle; NULL for
                                             CATALOG_READY. Valid from TRACK_ADDED
                                             until the receiver is destroyed
-                                            (handles are never recycled). After a
-                                            track ENDs OR is REMOVED from the
-                                            catalog the handle stays valid but
-                                            inert -- subscribe_track() /
-                                            unsubscribe_track() / track_state()
-                                            refuse it with MOQ_ERR_WRONG_STATE. */
+                                            (handles are never recycled). An
+                                            ENDED track stays valid: subscribe_track()
+                                            refuses it with MOQ_ERR_WRONG_STATE,
+                                            unsubscribe_track() still succeeds
+                                            (disable), track_state() reports
+                                            ENDED. A track REMOVED from the
+                                            catalog stays valid but inert: all
+                                            three refuse it with
+                                            MOQ_ERR_WRONG_STATE. */
     const moq_media_track_desc_t *desc;  /* handle-owned (see lifetime note
                                             above); NULL for CATALOG_READY */
     uint32_t config_generation;          /* reserved for dynamic config;
@@ -365,9 +368,46 @@ typedef struct moq_media_track_event {
 } moq_media_track_event_t;
 
 /* The description for a track handle (handle-owned; same lifetime as the
- * TRACK_ADDED event's desc). NULL for a NULL track. */
+ * TRACK_ADDED event's desc). NULL for a NULL track.
+ *
+ * Borrowed access is lock-free. Immutable fields (spans, arrays, structured
+ * info, catalog passthroughs) may be read through this pointer for the
+ * handle's lifetime. The mutable fields -- is_live, has_track_duration,
+ * track_duration_ms -- are rewritten in place by the service thread on a
+ * live-to-VOD conversion (MSF §11.3) and MUST NOT be read through this
+ * pointer concurrently with service: that is a data race. Read them with
+ * moq_media_receiver_track_desc_copy() instead. */
 MOQ_API const moq_media_track_desc_t *moq_media_track_desc_get(
     const moq_media_track_t *track);
+
+/* Frozen v0 prefix of moq_media_receiver_track_desc_copy()'s output: the
+ * description through is_live, the last field the copy operation guarantees.
+ * Callers pass sizeof(moq_media_track_desc_t) or any size >= this value. */
+#define MOQ_MEDIA_TRACK_DESC_V0_SIZE \
+    (offsetof(moq_media_track_desc_t, is_live) + sizeof(bool))
+
+/* Copy a track's CURRENT description into `out` under the receiver mutex --
+ * the same mutex the live-to-VOD writer holds -- so the mutable triple is
+ * read coherently. This is a snapshot of the present state, not the image
+ * the TRACK_ADDED/UPDATED event carried.
+ *
+ * `track` must be a handle of `r`: membership is checked against the
+ * receiver's own handle table without dereferencing an unowned pointer.
+ * Removed and ended tracks, and a terminal (fatal/closed) receiver, remain
+ * readable until moq_media_receiver_destroy(). Spans and arrays in the copy
+ * stay BORROWED from the handle (handle lifetime), exactly as through
+ * moq_media_track_desc_get(); nested struct_size stamps (info, init) are
+ * carried verbatim and are meaningful only inside the outer prefix.
+ *
+ * Writes min(out_size, sizeof(moq_media_track_desc_t)) bytes and stamps
+ * out->struct_size with that size; bytes beyond it are untouched. Refusals
+ * write nothing: MOQ_ERR_INVAL for a NULL receiver/track/out, an out_size
+ * below MOQ_MEDIA_TRACK_DESC_V0_SIZE, or a handle `r` does not own. Never
+ * allocates. Callable from any thread. An additive public function (new
+ * export); existing struct layouts are unchanged. */
+MOQ_API moq_result_t moq_media_receiver_track_desc_copy(
+    const moq_media_receiver_t *r, const moq_media_track_t *track,
+    moq_media_track_desc_t *out, size_t out_size);
 
 /* Resolve a content-protection reference id (from
  * desc.content_protection_ref_ids, CMSF §4.1.2) to its root content protection
@@ -496,9 +536,10 @@ MOQ_API moq_result_t moq_media_receiver_track_state(
     moq_media_track_state_t *out);
 
 /* -- Objects (§6.3) ---------------------------------------------------- *
- * The validated parsed shape (moq_media_parsed_object_t fields) plus
- * exactly two additions: the TRACK_ADDED handle and the config
- * generation. poll_object returning MOQ_OK TRANSFERS EXCLUSIVE OWNERSHIP
+ * The validated parsed shape (moq_media_parsed_object_t fields) plus the
+ * track and wire metadata: the TRACK_ADDED handle, the config generation,
+ * and the object's wire identity. Objects surface in arrival order.
+ * poll_object returning MOQ_OK TRANSFERS EXCLUSIVE OWNERSHIP
  * of the object's backing buffers to the caller: the payload/fragment
  * spans stay valid until moq_media_object_cleanup(&obj), which releases
  * them on the calling thread (legal because the handoff is a shard
@@ -558,6 +599,32 @@ typedef struct moq_media_object {
     moq_rcbuf_t          *payload_ref;
     moq_rcbuf_t          *properties_ref;
     moq_cmaf_sample_t    *samples_owned;
+
+    /* Appended after the v0 prefix: the object's wire identity, as the session
+     * delivered it. All three ids are full width and zero is a valid value.
+     * The identity is available only when the returned prefix covers the
+     * complete record, that is when the stamped struct_size reaches the end of
+     * has_subgroup. A shorter stamp, whether the caller's buffer was smaller or
+     * the library older, leaves the earlier fields as they are and says nothing
+     * about any id: it never means an id is absent. Nothing here is owned.
+     *
+     *   group_id / object_id   the object's location in its track;
+     *   has_subgroup           the wire carried a subgroup: true for an object
+     *                          from a subgroup stream (subgroup_id is the
+     *                          SUBGROUP_HEADER's value, resolved to the first
+     *                          object's id or zero per its mode), false for a
+     *                          datagram, which has no subgroup on the wire.
+     *                          subgroup_id is then zero, and only this flag
+     *                          says so: zero is also a real subgroup id;
+     *   publisher_priority     the effective priority the session delivered:
+     *                          the header or datagram byte when present, else
+     *                          the session's default for an inherited priority.
+     *                          It is not a claim that a byte was on the wire. */
+    uint64_t              group_id;
+    uint64_t              subgroup_id;
+    uint64_t              object_id;
+    uint8_t               publisher_priority;
+    bool                  has_subgroup;
 } moq_media_object_t;
 
 /* Release the buffers a successful poll transferred. Safe on a zeroed

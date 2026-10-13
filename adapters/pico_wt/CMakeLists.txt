@@ -185,9 +185,22 @@ endif()
 # build-tree package is consumable end to end. Needs picoquic source
 # (the consumer's FindPicoquic re-resolves it) and
 # MOQ_BUILD_ADAPTER_PICO_WT=ON so BUILD_HTTP defines picohttp-core.
+# Nested consumer builds configure picoquic again: give them this tree's C++
+# compiler too (see tests/cmake/NestedToolchain.cmake).
+include("${PROJECT_SOURCE_DIR}/tests/cmake/NestedToolchain.cmake")
+moq_nested_cxx_args(_picowt_nested_cxx FLAGS)
+moq_nested_cxx_env(_picowt_nested_cxx_env)
+
 if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR)
     set(_picowt_consumer_src "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer")
     set(_picowt_consumer_bld "${CMAKE_CURRENT_BINARY_DIR}/consumer-test-build")
+    set(_picowt_consumer_deps "")
+    foreach(_dep IN ITEMS PTLS_INCLUDE_DIR MOQ_PTLS_LIB_DIR OPENSSL_INCLUDE_DIR
+                          OPENSSL_SSL_LIBRARY OPENSSL_CRYPTO_LIBRARY)
+        if(${_dep})
+            string(APPEND _picowt_consumer_deps " -D${_dep}='${${_dep}}'")
+        endif()
+    endforeach()
     # Forward the parent's compile/link flags and build type so an
     # ASAN parent build produces an ASAN-consistent consumer (it links
     # the parent's instrumented .a files; mismatched instrumentation
@@ -203,12 +216,17 @@ if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR)
                  -DMOQ_PICOQUIC_SOURCE_DIR='${MOQ_PICOQUIC_SOURCE_DIR}' \
                  -DMOQ_PICOTLS_PREFIX='${MOQ_PICOTLS_PREFIX}' \
                  -DCMAKE_C_COMPILER='${CMAKE_C_COMPILER}' \
-                 -DCMAKE_C_FLAGS='${CMAKE_C_FLAGS}' \
+                 -DCMAKE_C_FLAGS='${CMAKE_C_FLAGS}'${_picowt_nested_cxx} \
                  -DCMAKE_EXE_LINKER_FLAGS='${CMAKE_EXE_LINKER_FLAGS}' \
-                 -DCMAKE_BUILD_TYPE='${CMAKE_BUILD_TYPE}' && \
+                 -DCMAKE_BUILD_TYPE='${CMAKE_BUILD_TYPE}' \
+                 -DCMAKE_OSX_SYSROOT='${CMAKE_OSX_SYSROOT}' \
+                 -DMOQ_CONSUMER_WARNINGS_AS_ERRORS='${MOQ_WARNINGS_AS_ERRORS}' \
+                 ${_picowt_consumer_deps} && \
              '${CMAKE_COMMAND}' --build '${_picowt_consumer_bld}' && \
              '${_picowt_consumer_bld}/moq_pico_wt_adapter_consumer_test'")
     set_tests_properties(pico_wt_adapter_consumer PROPERTIES TIMEOUT 180)
+    include("${PROJECT_SOURCE_DIR}/tests/cmake/RejectConsumerWarnings.cmake")
+    moq_test_reject_consumer_warnings(pico_wt_adapter_consumer)
 endif()
 
 # Install-tree consumer test: installs a BUILD_HTTP picoquic and libmoq
@@ -223,7 +241,7 @@ if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR)
         get_filename_component(_picowt_openssl_root "${_o}" DIRECTORY)
     endif()
     add_test(NAME pico_wt_install_consumer
-        COMMAND bash
+        COMMAND ${CMAKE_COMMAND} -E env ${_picowt_nested_cxx_env} bash
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_install_consumer.sh"
             "${CMAKE_COMMAND}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer"
@@ -243,7 +261,7 @@ if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR)
     find_program(PKG_CONFIG_EXECUTABLE pkg-config)
     if(PKG_CONFIG_EXECUTABLE)
         add_test(NAME pico_wt_pkgconfig_consumer
-            COMMAND bash
+            COMMAND ${CMAKE_COMMAND} -E env ${_picowt_nested_cxx_env} bash
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_pkgconfig_consumer.sh"
                 "${CMAKE_COMMAND}"
                 "libmoq-pico-wt"
@@ -289,10 +307,18 @@ if(MOQ_BUILD_TESTS AND TARGET picoquic-test AND MOQ_PICOQUIC_SOURCE_DIR)
     # Draft-18 over the real WT transport in the deterministic sim:
     # symmetric uni-control establish, request-bidi routing, subgroup
     # data delivery (draft-16 run as the harness control).
+    # Recompiles the adapter sources so the test build can observe the
+    # peer's RESET/STOP callbacks at their boundary (MOQ_PICO_WT_TESTING);
+    # the observers are absent from the shipped library.
     add_executable(test_pico_wt_d18
         tests/test_pico_wt_d18.c
         tests/pico_wt_harness.c
+        pico_wt_adapter.c
+        pico_wt_endpoint.c
+        ../common/moq_pq_send_queue.c
     )
+    target_compile_definitions(test_pico_wt_d18 PRIVATE
+        MOQ_PICO_WT_TESTING)
     target_include_directories(test_pico_wt_d18 PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
@@ -357,11 +383,19 @@ if(MOQ_BUILD_TESTS AND TARGET picoquic-test AND MOQ_PICOQUIC_SOURCE_DIR)
     set_tests_properties(pico_wt_conformance PROPERTIES TIMEOUT 60)
 
     # Inbound receive backpressure + capacity invariance. Needs the adapter's
-    # internal header for the per-stream receive state assertions.
+    # internal header for the per-stream receive state assertions and the
+    # send queue's internal occupancy query, so it compiles the adapter and
+    # queue sources into the test (as the lifecycle and draft-18 tests do)
+    # instead of relying on symbols the shipped library does not export.
     add_executable(test_pico_wt_backpressure
         tests/test_pico_wt_backpressure.c
         tests/pico_wt_harness.c
+        pico_wt_adapter.c
+        pico_wt_endpoint.c
+        ../common/moq_pq_send_queue.c
     )
+    target_compile_definitions(test_pico_wt_backpressure PRIVATE
+        MOQ_PICO_WT_TESTING)
     target_include_directories(test_pico_wt_backpressure PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
@@ -409,6 +443,43 @@ if(MOQ_BUILD_TESTS AND TARGET picoquic-test AND MOQ_PICOQUIC_SOURCE_DIR)
     endif()
     add_test(NAME pico_wt_rx_lifecycle COMMAND test_pico_wt_rx_lifecycle)
     set_tests_properties(pico_wt_rx_lifecycle PROPERTIES TIMEOUT 180)
+endif()
+
+# Receive admission does not need the picoquic simulation harness.
+if(MOQ_BUILD_TESTS)
+    # Receive admission (MOQ_TRANSPORT_CAP_HOLD_INPUT): the fetcher attached
+    # to the adapter through the real bridge, picoquic/h3zero stubbed, a raw
+    # publisher over the fake transport endpoint relayed in. Recompiles the
+    # adapter sources with MOQ_PICO_WT_TESTING for the capability seam; links
+    # no picoquic library (headers only), needs no simulation harness, and
+    # exports nothing.
+    if(TARGET picoquic::picoquic-core)
+        set(_PW_HOLD_CORE_INC picoquic::picoquic-core)
+    else()
+        set(_PW_HOLD_CORE_INC picoquic-core)
+    endif()
+    add_executable(test_pico_wt_hold_input
+        tests/test_pico_wt_hold_input.c
+        pico_wt_adapter.c
+        pico_wt_endpoint.c
+        ../common/moq_pq_send_queue.c
+    )
+    target_compile_definitions(test_pico_wt_hold_input PRIVATE
+        MOQ_BUILDING MOQ_PICO_WT_TESTING)
+    target_include_directories(test_pico_wt_hold_input PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${PROJECT_SOURCE_DIR}/tests/support
+        $<TARGET_PROPERTY:${_PICOHTTP},INTERFACE_INCLUDE_DIRECTORIES>
+        $<TARGET_PROPERTY:${_PW_HOLD_CORE_INC},INTERFACE_INCLUDE_DIRECTORIES>
+    )
+    target_link_libraries(test_pico_wt_hold_input PRIVATE moq::core)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_pico_wt_hold_input PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+    endif()
+    add_test(NAME pico_wt_hold_input COMMAND test_pico_wt_hold_input)
 endif()
 
 # -- Managed facade -------------------------------------------------
@@ -560,7 +631,7 @@ endif()\n")
                      -DMOQ_PICOQUIC_SOURCE_DIR='${MOQ_PICOQUIC_SOURCE_DIR}' \
                      -DMOQ_PICOTLS_PREFIX='${MOQ_PICOTLS_PREFIX}' \
                      -DCMAKE_C_COMPILER='${CMAKE_C_COMPILER}' \
-                     -DCMAKE_C_FLAGS='${CMAKE_C_FLAGS}' \
+                     -DCMAKE_C_FLAGS='${CMAKE_C_FLAGS}'${_picowt_nested_cxx} \
                      -DCMAKE_EXE_LINKER_FLAGS='${CMAKE_EXE_LINKER_FLAGS}' \
                      -DCMAKE_BUILD_TYPE='${CMAKE_BUILD_TYPE}' && \
                  '${CMAKE_COMMAND}' --build '${_picowtm_consumer_bld}' && \
@@ -578,7 +649,7 @@ endif()\n")
             get_filename_component(_picowtm_openssl_root "${_om}" DIRECTORY)
         endif()
         add_test(NAME pico_wt_managed_install_consumer
-            COMMAND bash
+            COMMAND ${CMAKE_COMMAND} -E env ${_picowt_nested_cxx_env} bash
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_install_consumer_managed.sh"
                 "${CMAKE_COMMAND}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer-managed"
@@ -600,7 +671,7 @@ endif()\n")
         find_program(PKG_CONFIG_EXECUTABLE pkg-config)
         if(PKG_CONFIG_EXECUTABLE)
             add_test(NAME pico_wt_managed_pkgconfig_consumer
-                COMMAND bash
+                COMMAND ${CMAKE_COMMAND} -E env ${_picowt_nested_cxx_env} bash
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_pkgconfig_consumer.sh"
                     "${CMAKE_COMMAND}"
                     "libmoq-pico-wt-managed"
@@ -640,7 +711,7 @@ endif()\n")
                      -DMOQ_PICOQUIC_SOURCE_DIR='${MOQ_PICOQUIC_SOURCE_DIR}' \
                      -DMOQ_PICOTLS_PREFIX='${MOQ_PICOTLS_PREFIX}' \
                      -DCMAKE_C_COMPILER='${CMAKE_C_COMPILER}' \
-                     -DCMAKE_C_FLAGS='${CMAKE_C_FLAGS}' \
+                     -DCMAKE_C_FLAGS='${CMAKE_C_FLAGS}'${_picowt_nested_cxx} \
                      -DCMAKE_EXE_LINKER_FLAGS='${CMAKE_EXE_LINKER_FLAGS}' \
                      -DCMAKE_BUILD_TYPE='${CMAKE_BUILD_TYPE}' && \
                  '${CMAKE_COMMAND}' --build '${_picowtmv_consumer_bld}' && \
@@ -654,7 +725,7 @@ endif()\n")
         # its dependency in the static link line). Temp-prefix install.
         if(PKG_CONFIG_EXECUTABLE)
             add_test(NAME pico_wt_managed_verify_pkgconfig_consumer
-                COMMAND bash
+                COMMAND ${CMAKE_COMMAND} -E env ${_picowt_nested_cxx_env} bash
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_pkgconfig_consumer.sh"
                     "${CMAKE_COMMAND}"
                     "libmoq-pico-wt-managed libmoq"
@@ -671,6 +742,44 @@ endif()\n")
                     "${CMAKE_INSTALL_LIBDIR}")
             set_tests_properties(pico_wt_managed_verify_pkgconfig_consumer
                 PROPERTIES TIMEOUT 600)
+        endif()
+    endif()
+
+    # Keepalive arming oracle for the managed WT client and accepted-server
+    # paths. White-box: drives the MOQ_PICO_WT_TESTING keepalive seam to prove
+    # keep_alive_interval_ms is applied with the converted microsecond interval,
+    # and that a short struct_size never reads the appended field. The client
+    # arm uses no relay or wall-clock idle timeout; the optional server arm uses
+    # local loopback only when picoquic's test certs are present.
+    if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR)
+        add_executable(test_pico_wt_managed_keepalive
+            tests/test_pico_wt_managed_keepalive.c
+            pico_wt_managed.c)
+        target_compile_definitions(test_pico_wt_managed_keepalive PRIVATE
+            MOQ_PICO_WT_TESTING)
+        target_include_directories(test_pico_wt_managed_keepalive PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+        target_link_libraries(test_pico_wt_managed_keepalive PRIVATE
+            moq::adapter-pico-wt-managed)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pico_wt_managed_keepalive PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+        endif()
+        add_test(NAME pico_wt_managed_keepalive
+            COMMAND test_pico_wt_managed_keepalive)
+        set_tests_properties(pico_wt_managed_keepalive PROPERTIES
+            TIMEOUT 30 LABELS "pico_wt;managed")
+        if(EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem" AND
+           EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+            add_test(NAME pico_wt_managed_keepalive_server
+                COMMAND test_pico_wt_managed_keepalive --server
+                    "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                    "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+            set_tests_properties(pico_wt_managed_keepalive_server PROPERTIES
+                TIMEOUT 30 LABELS "network;pico_wt;managed")
         endif()
     endif()
 
@@ -929,6 +1038,30 @@ endif()\n")
             TIMEOUT 30
             LABELS "network;pico_wt;managed")
 
+        # Stop-close terminal semantics: app-thread stop() must send a bounded
+        # QUIC CONNECTION_CLOSE before the client packet loop exits, so the
+        # server observes a clean close promptly rather than retaining a ghost
+        # WT session until idle timeout.
+        add_test(NAME pico_wt_managed_stop_close
+            COMMAND test_pico_wt_managed_loopback --mode stop_close
+                --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                --key  "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        set_tests_properties(pico_wt_managed_stop_close PROPERTIES
+            TIMEOUT 30
+            LABELS "network;pico_wt;managed")
+
+        # Pump-exit close terminal semantics: on_pump returning nonzero must
+        # take the same bounded local CONNECTION_CLOSE path as app-thread
+        # stop(), so callback-requested loop termination is not an abrupt peer
+        # ghost-session path.
+        add_test(NAME pico_wt_managed_pump_exit_close
+            COMMAND test_pico_wt_managed_loopback --mode pump_exit_close
+                --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                --key  "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        set_tests_properties(pico_wt_managed_pump_exit_close PROPERTIES
+            TIMEOUT 30
+            LABELS "network;pico_wt;managed")
+
         # Edge cases: config validation, NULL safety, connect failure,
         # cert-verification failure, stop/wake/wait lifecycle, and
         # stop-from-on_pump rejection.
@@ -956,9 +1089,9 @@ endif()\n")
             TIMEOUT 60
             LABELS "network;pico_wt;managed")
 
-        # cfg init contract + whole-block field test: the pointer init stamps the
-        # full current struct (a current-header caller can set app_deadline); the
-        # sized init honors an explicit (possibly partial) size. Built normally;
+        # cfg init contract + whole-block field test: the pointer init stamps
+        # only the frozen v0 prefix; the sized init honors an explicit
+        # (possibly partial) size. Built normally;
         # the canonical ASan configuration instruments it too.
         add_executable(test_pico_wt_managed_cfg_abi
             tests/test_pico_wt_managed_cfg_abi.c)

@@ -180,7 +180,8 @@ typedef struct moq_pico_wt_managed_cfg {
      * NULL: no negotiation either way (legacy draft-16 behavior). */
     const char        *wt_protocols;
 
-    /* Appended (struct_size append-only ABI, read as ONE block through
+    /* Appended — application service deadline (struct_size append-only ABI,
+     * read as ONE block through
      * app_deadline_ctx). Optional application service-deadline query: returns
      * the app's earliest pending time-based deadline in this facade's clock
      * domain (µs), or UINT64_MAX for none. Consulted after each pump to fold
@@ -191,10 +192,17 @@ typedef struct moq_pico_wt_managed_cfg {
      * the value this query would return, the owner MUST issue a facade wake
      * (moq_pico_wt_managed_wake) so the next pump recomputes the next-wake time;
      * an idle loop will not observe the new deadline on its own.
-     * Set it after either initializer; both include this historical block.
-     * The block is read only when struct_size covers through app_deadline_ctx. */
+     * Set it after moq_pico_wt_managed_cfg_init_sized(cfg, sizeof(*cfg));
+     * the block is read only when struct_size covers through app_deadline_ctx. */
     uint64_t         (*app_deadline_us)(void *ctx);
     void              *app_deadline_ctx;
+
+    /* Appended — QUIC keepalive interval for otherwise-idle connections (0 =
+     * disabled). A nonzero value calls picoquic_enable_keep_alive with the
+     * interval converted to microseconds on the client connection and on each
+     * accepted server connection. This is transport keepalive only; it does not
+     * imply any MoQ/session deadline. */
+    uint32_t           keep_alive_interval_ms;
 
     /* SETUP credentials are copied before create returns. Use the sized
      * initializer to enable this append-only block. Both list fields must
@@ -209,8 +217,10 @@ typedef struct moq_pico_wt_managed_cfg {
     size_t setup_auth_token_count;
 } moq_pico_wt_managed_cfg_t;
 
-/* Pointer initializer: clears and stamps the frozen pre-authentication prefix,
- * including app_deadline. Use the sized initializer for SETUP credentials. */
+/* Pointer-only initializer: clears and stamps the original frozen prefix
+ * through wt_protocols. Use _init_sized(cfg, sizeof(*cfg)) before setting
+ * appended fields such as app_deadline_us, keep_alive_interval_ms, or
+ * SETUP credentials. */
 MOQ_API void moq_pico_wt_managed_cfg_init(moq_pico_wt_managed_cfg_t *cfg);
 
 /* Explicit caller-sized initializer: clears and stamps
@@ -234,8 +244,12 @@ MOQ_API moq_result_t moq_pico_wt_managed_create(
 
 /*
  * Stop and join the network thread. Idempotent. MUST NOT be called
- * from on_pump/on_activity (returns MOQ_ERR_WRONG_STATE). After return,
- * no more callbacks fire; then call _destroy.
+ * from on_pump/on_activity (returns MOQ_ERR_WRONG_STATE). If a QUIC
+ * connection is still open, stop() asks the network thread to send a
+ * best-effort QUIC CONNECTION_CLOSE with application code 0 and gives the
+ * packet loop a bounded flush window before joining. This is a transport-level
+ * close, distinct from MoQ GOAWAY / WT CLOSE_SESSION. After return, no more
+ * callbacks fire; then call _destroy.
  */
 MOQ_API moq_result_t moq_pico_wt_managed_stop(moq_pico_wt_managed_t *m);
 

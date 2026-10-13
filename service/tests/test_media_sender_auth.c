@@ -1,7 +1,8 @@
 #include <moq/media_sender.h>
 #include <moq/auth.h>
 #include <moq/sim.h>
-#include "test_session_support.h"
+#include "test_support.h"
+#include "test_alloc_support.h"
 #include <string.h>
 
 static int failures;

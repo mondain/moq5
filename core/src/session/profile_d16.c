@@ -1828,6 +1828,14 @@ static moq_result_t d16_decode_fetch_cancel(
 
     moq_request_endpoint_t ep = request_registry_find_by_id(s, request_id);
     if (ep.kind != MOQ_REQ_FETCH) {
+        /* A cancel that crossed our own abort of that fetch: the id is no
+         * longer registered but is remembered in the bounded abort cache, so
+         * consume it (the reset already answered the request). Any other
+         * unknown id keeps failing closed. */
+        if (fetch_abort_tomb_consume(s, request_id)) {
+            *out_consumed = true;
+            return MOQ_OK;
+        }
         *out_consumed = true;
         return close_with_error(s, 0x4, "FETCH_CANCEL unknown request ID");
     }
@@ -3532,6 +3540,10 @@ static moq_result_t d16_encode_request_error(moq_session_t *s,
     (void)s;
     /* Draft-16 has no REQUEST_ERROR Redirect structure; refuse a redirect tail. */
     if (args->has_redirect) return MOQ_ERR_INVAL;
+    /* Wire = milliseconds + 1; an interval with no representable wire form
+     * is refused, never wrapped to 0 ("do not retry"). */
+    if (args->can_retry && args->retry_after_ms >= MOQ_QUIC_VARINT_MAX)
+        return MOQ_ERR_INVAL;
     uint64_t wire_retry = args->can_retry ? (args->retry_after_ms + 1) : 0;
     return moq_d16_encode_request_error(w, args->request_id, args->error_code,
         wire_retry, args->reason, args->reason_len);

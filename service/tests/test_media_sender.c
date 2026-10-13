@@ -1533,8 +1533,8 @@ int main(int argc, char **argv)
     /* == drops still evict real media around a queued terminal (cap 2) ==== *
      * Anti-over-broad guard: a terminal marker plus an evictable media group
      * are queued; a later anchored write evicts the MEDIA group (a real drop)
-     * and succeeds, while the terminal marker is preserved. This proves the fix
-     * did not "disable all drops whenever a terminal exists". */
+     * and succeeds, while the terminal marker is preserved. This proves terminal
+     * preservation does not "disable all drops whenever a terminal exists". */
     {
         char url[64];
         moq_endpoint_cfg_t ec = ep_cfg(url, sizeof(url), 9);

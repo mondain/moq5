@@ -16,7 +16,7 @@
 #include "msquic_internal.h"
 
 #include "support/fake_msq_table.h"
-#include "support/fake_endpoint.h" /* raw peer for the receive-pending pair */
+#include "support/held_bridge_driver.h" /* raw peer for the receive-pending pair */
 
 #include <moq/rcbuf.h>
 #include <moq/session.h>
@@ -410,8 +410,8 @@ static void t_budget_depth_not_size(void)
  * -> 0), NOT fed onward — StreamReceiveSetEnabled(FALSE) is asynchronous
  * and cannot stop an already-queued RECEIVE. Proof: with the stream marked
  * paused, a delivered RECEIVE leaves its bytes HELD by the transport (the
- * fake models MsQuic holding unconsumed bytes) rather than consumed. On the
- * pre-fix adapter the bytes were fed and fully consumed (held_len == 0).
+ * fake models MsQuic holding unconsumed bytes) rather than consumed. An
+ * adapter that fed them onward would leave held_len == 0.
  */
 static void t_receive_arrest_holds_while_paused(void)
 {
@@ -448,8 +448,8 @@ static void t_receive_arrest_holds_while_paused(void)
 
 /* A failed resume (StreamReceiveSetEnabled(TRUE)) is unrecoverable: the
  * stream can never deliver again, so the adapter must go fatal rather than
- * silently stall. The pre-fix adapter cleared paused before the call and
- * ignored the failure. */
+ * silently stall. Clearing paused before the call, or ignoring the failure,
+ * would leave the stream stalled. */
 static void t_receive_resume_failure_fatal(void)
 {
     int before = failures;
@@ -569,7 +569,7 @@ static void t_receive_terminal_while_paused(void)
 
     /* Arm a resume failure: if the reset path wrongly tried to re-enable
      * the aborted receive direction, the failing StreamReceiveSetEnabled
-     * would turn a valid peer reset into a transport fatal. The fix clears
+     * would turn a valid peer reset into a transport fatal. The adapter clears
      * the pause/hold state BEFORE servicing, so no resume is attempted. */
     int rse_before = st->receive_set_enabled;
     r.fake.recv_set_enabled_fails = 1;
@@ -652,7 +652,7 @@ static void rx_relay(struct rx_pair *p)
     }
     while (fake_msq_deliver_send_complete(f, false))
         ;
-    (void)moq_transport_bridge_service(p->peer_bridge, 0);
+    (void)held_bridge_service(p->peer_bridge, 0);
     fake_endpoint_t *ep = &p->peer_ep;
     for (; p->peer_op_cur < ep->count; p->peer_op_cur++) {
         fake_op_t *o = &ep->ops[p->peer_op_cur];
@@ -686,7 +686,7 @@ static void rx_pump(struct rx_pair *p, int rounds)
 static void rx_pair_down(struct rx_pair *p)
 {
     if (p->peer_bridge != NULL)
-        moq_transport_bridge_destroy(p->peer_bridge);
+        held_bridge_destroy(p->peer_bridge);
     if (p->peer != NULL)
         moq_session_destroy(p->peer);
     rig_down(&p->aut);
@@ -709,10 +709,10 @@ static int rx_pair_up(struct rx_pair *p, uint32_t aut_max_events,
     scfg.initial_request_capacity = 16;
     if (moq_session_create(&scfg, 0, &p->peer) < 0)
         return -1;
-    fake_endpoint_init(&p->peer_ep, 3, 1);
+    held_endpoint_init(&p->peer_ep, 3, 1);
     moq_transport_bridge_cfg_t bcfg;
     moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
-    if (moq_transport_bridge_create(&bcfg, p->peer, &p->peer_ep.vtable,
+    if (held_bridge_create(&bcfg, p->peer, &p->peer_ep.vtable,
                                     &p->peer_ep, &p->peer_bridge) != MOQ_OK)
         return -1;
 
@@ -821,7 +821,7 @@ static void rx_collect(struct rx_pair *p, int *count, uint8_t *seen,
  * (TotalBufferLength lowered) and redelivered exactly once after resume.
  * Four objects are laid into four buffers; with a 2-deep event queue
  * objects 0 and 1 fill it and object 2 backs the bridge up, so the fourth
- * buffer must be held, then delivered once. Pre-fix, every buffer was fed.
+ * buffer must be held, then delivered once; feeding every buffer fails it.
  */
 static void t_receive_multibuffer_partial_hold(void)
 {
@@ -832,7 +832,11 @@ static void t_receive_multibuffer_partial_hold(void)
     /* event queue of 2: the handshake's two events (SETUP_COMPLETE,
      * SUBSCRIBE_OK) fit and drain cleanly, then two objects fill it so a
      * later object in the multi-buffer RECEIVE backs the bridge up. */
-    CHECK(rx_pair_up(&p, 2, &server_sub) == 0);
+    if (rx_pair_up(&p, 2, &server_sub) != 0) {
+        CHECK(false && "rx pair setup");
+        rx_pair_down(&p);
+        return;
+    }
     CHECK(moq_subscription_is_valid(server_sub));
     if (!moq_subscription_is_valid(server_sub)) {
         rx_pair_down(&p);
@@ -1044,7 +1048,11 @@ static void t_event_progress_token_semantics(void)
 
     /* event queue of 2: the handshake events drain, then a burst of objects
      * fills it (2 emitted) and the rest are buffered inside the session. */
-    CHECK(rx_pair_up(&p, 2, &server_sub) == 0);
+    if (rx_pair_up(&p, 2, &server_sub) != 0) {
+        CHECK(false && "rx pair setup");
+        rx_pair_down(&p);
+        return;
+    }
     if (!moq_subscription_is_valid(server_sub)) {
         rx_pair_down(&p);
         return;

@@ -84,6 +84,11 @@ target_include_directories(test_transport_bridge PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/unit)
 add_test(NAME transport_bridge COMMAND test_transport_bridge)
 
+add_executable(test_pq_priority ../adapters/common/test_pq_priority.c
+    ../adapters/common/moq_pq_send_queue.c)
+target_link_libraries(test_pq_priority PRIVATE moq::core)
+add_test(NAME pq_priority COMMAND test_pq_priority)
+
 # Fake-endpoint fidelity: every recorded-operation capacity loss and every
 # byte-bearing truncation is observable and sticky, so a fixture cannot
 # assert an exact operation set or exact bytes on evidence that was dropped.
@@ -130,6 +135,66 @@ add_test(NAME session_subscribe COMMAND test_session_subscribe)
 add_executable(test_session_fetch unit/test_session_fetch.c)
 target_link_libraries(test_session_fetch PRIVATE moq-core-test-internals)
 add_test(NAME session_fetch COMMAND test_session_fetch)
+
+# These rows establish their peers through SimPair and exist only when the
+# sim harness is built.
+if(TARGET moq::sim)
+    add_executable(test_session_rx_admission unit/test_session_rx_admission.c)
+    target_link_libraries(test_session_rx_admission PRIVATE moq-core-test-internals moq::sim)
+    add_test(NAME session_rx_admission COMMAND test_session_rx_admission)
+    # Core contract: a cancelling fetcher must absorb the late response
+    # stream (STOP at the header, discard the bytes already behind it).
+    add_executable(test_session_fetch_cancel_late_bytes unit/test_session_fetch_cancel_late_bytes.c)
+    target_link_libraries(test_session_fetch_cancel_late_bytes PRIVATE moq::core moq::sim)
+    add_test(NAME session_fetch_cancel_late_bytes COMMAND test_session_fetch_cancel_late_bytes)
+    # Receive-stream lifetime after a local STOP: stopped/discard state until the
+    # peer's FIN/RESET, exactly-once STOP, capacity and slot reuse.
+    add_executable(test_session_rx_stopped_stream unit/test_session_rx_stopped_stream.c)
+    target_link_libraries(test_session_rx_stopped_stream PRIVATE moq-core-test-internals moq::sim)
+    add_test(NAME session_rx_stopped_stream COMMAND test_session_rx_stopped_stream)
+    # No-entry input is retained by the caller,
+    # then replayed before the late FETCH_OK with exactly one completion.
+    add_test(NAME session_rx_stopped_stream_replay COMMAND test_session_rx_stopped_stream --replay)
+endif()
+# Receive admission backpressure through the real bridge with an endpoint
+# that retains refused input, including the lifetime-capability control.
+add_executable(test_bridge_hold_input unit/test_bridge_hold_input.c)
+add_executable(test_bridge_required_hold unit/test_bridge_required_hold.c)
+target_link_libraries(test_bridge_required_hold PRIVATE moq::core)
+add_test(NAME bridge_required_hold COMMAND test_bridge_required_hold)
+target_link_libraries(test_bridge_hold_input PRIVATE moq-core-test-internals)
+target_include_directories(test_bridge_hold_input PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME bridge_hold_input COMMAND test_bridge_hold_input)
+# Receive-capacity saturation through the real bridge over fake endpoints:
+# fill receive entries, retain later deliveries, and replay after capacity
+# returns. No request loses its response or receives a fabricated terminal.
+add_executable(test_bridge_rx_saturation unit/test_bridge_rx_saturation.c)
+target_link_libraries(test_bridge_rx_saturation PRIVATE moq-core-test-internals)
+target_include_directories(test_bridge_rx_saturation PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME bridge_rx_saturation COMMAND test_bridge_rx_saturation)
+# Historical failure schedules migrated to mandatory lossless admission.
+add_test(NAME bridge_rx_saturation_live_replay COMMAND test_bridge_rx_saturation --live-request)
+add_test(NAME bridge_rx_saturation_live_record_replay COMMAND test_bridge_rx_saturation --live-record)
+add_test(NAME bridge_rx_saturation_live_fragmented_replay COMMAND test_bridge_rx_saturation --live-fragmented)
+add_test(NAME bridge_rx_saturation_admission_replay COMMAND test_bridge_rx_saturation --admission)
+# Preserve the former explicit --hold invocation as a compatibility alias.
+add_test(NAME bridge_rx_saturation_hold_cancelled COMMAND test_bridge_rx_saturation --hold)
+add_test(NAME bridge_rx_saturation_hold_live COMMAND test_bridge_rx_saturation --hold --live-request)
+add_test(NAME bridge_rx_saturation_hold_live_record COMMAND test_bridge_rx_saturation --hold --live-record)
+add_test(NAME bridge_rx_saturation_hold_live_fragmented COMMAND test_bridge_rx_saturation --hold --live-fragmented)
+add_test(NAME bridge_rx_saturation_hold_admission COMMAND test_bridge_rx_saturation --hold --admission)
+# Publisher-side FETCH abort/reset terminals over the shared SimPair rig.
+if(TARGET moq::sim)
+    add_executable(test_session_fetch_abort unit/test_session_fetch_abort.c)
+    target_link_libraries(test_session_fetch_abort PRIVATE moq-core-test-internals moq::sim)
+    add_test(NAME session_fetch_abort COMMAND test_session_fetch_abort)
+    add_executable(test_session_fetch_reset_terminal unit/test_session_fetch_reset_terminal.c)
+    target_link_libraries(test_session_fetch_reset_terminal PRIVATE moq-core-test-internals moq::sim)
+    add_test(NAME session_fetch_reset_terminal COMMAND test_session_fetch_reset_terminal)
+    add_executable(test_subscriber_fetch_reset unit/test_subscriber_fetch_reset.c)
+    target_link_libraries(test_subscriber_fetch_reset PRIVATE moq-core-test-internals moq::sim)
+    add_test(NAME subscriber_fetch_reset COMMAND test_subscriber_fetch_reset)
+endif()
 
 add_executable(test_session_publish unit/test_session_publish.c)
 target_link_libraries(test_session_publish PRIVATE moq-core-test-internals)
@@ -231,7 +296,15 @@ add_executable(test_d18_fetch unit/test_d18_fetch.c)
 target_link_libraries(test_d18_fetch PRIVATE moq-core-test-internals)
 add_test(NAME d18_fetch COMMAND test_d18_fetch)
 
+add_executable(test_priority_layout unit/test_priority_layout.c)
+target_link_libraries(test_priority_layout PRIVATE moq::core)
+add_test(NAME priority_layout COMMAND test_priority_layout)
+
 if(TARGET moq::sim)
+    add_executable(test_priority_metadata unit/test_priority_metadata.c)
+    target_link_libraries(test_priority_metadata PRIVATE moq::sim)
+    add_test(NAME priority_metadata COMMAND test_priority_metadata)
+
     add_executable(test_simpair unit/test_simpair.c)
     target_link_libraries(test_simpair PRIVATE moq::sim)
     add_test(NAME simpair COMMAND test_simpair)
@@ -526,7 +599,7 @@ endif()
 # is the shared core (PRNG, env, replay, counting allocator); each format's
 # generator+oracle is its own TU so a runner links only the libs it exercises.
 # Binary name is test_${runner} so future run_seed_sweeps.sh integration is
-# drop-in. Generate-only (byte mutation is a later slice).
+# drop-in. Generate-only: the runners do not mutate bytes.
 if(TARGET moq::loc)
     add_executable(test_scenario_media_loc
         scenario/test_scenario_media_loc.c
@@ -579,11 +652,12 @@ if(BUILD_SHARED_LIBS)
             -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_bridge_symbols.cmake)
 endif()
 
-# -- Negotiated-profile substrate (step 5) ---------------------------
+# -- Negotiated-profile substrate ------------------------------------
 #
-# Four roles, kept apart on purpose (0659/0661): the PURE ORACLE re-derives the
+# Four roles, kept apart on purpose: the PURE ORACLE re-derives the
 # draft encodings with libc only, the tables/corpus declare the topology, and
-# the future scripted builder / product adapter / closure runner are staged.
+# the scripted builder / product adapter / closure runner roles are declared
+# in cmake/check_np_roles.cmake.
 # The oracle+tables+corpus objects are built ONCE here and reused by the C++
 # reader test, so the C parser is the single parser.
 # Role 1 gets its OWN object library: the policy check scans exactly this
@@ -728,3 +802,26 @@ add_test(NAME negotiated_profile_roles
         -DNP_ADAPTER_OBJ=$<TARGET_OBJECTS:np_adapter_obj>
         -DNP_NM=${CMAKE_NM}
         -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_np_roles.cmake)
+
+# Relay rows that drive the publisher/subscriber facades over the production
+# relay binding live here, outside relay/ (the relay boundary forbids the
+# facades in relay sources, tests included).
+if(TARGET moq::relay AND TARGET moq::sim)
+    add_executable(test_scenario_relay_bootstrap
+        scenario/test_scenario_relay_bootstrap.c)
+    target_link_libraries(test_scenario_relay_bootstrap PRIVATE moq::relay moq::sim)
+    add_test(NAME scenario_relay_bootstrap COMMAND test_scenario_relay_bootstrap)
+endif()
+
+# The real media_receiver behind the production relay binding with a real
+# origin facade: catalog bootstrap through a forwarded Joining FETCH.
+if(TARGET moq::relay AND TARGET moq::sim AND TARGET moq-service-receiver-test-internals)
+    add_executable(test_media_receiver_relay_bootstrap
+        ${CMAKE_SOURCE_DIR}/service/tests/test_media_receiver_relay_bootstrap.c)
+    target_link_libraries(test_media_receiver_relay_bootstrap PRIVATE
+        moq-service-receiver-test-internals moq::sim moq::relay)
+    target_include_directories(test_media_receiver_relay_bootstrap PRIVATE
+        ${CMAKE_SOURCE_DIR}/tests/unit)
+    add_test(NAME media_receiver_relay_bootstrap
+        COMMAND test_media_receiver_relay_bootstrap)
+endif()

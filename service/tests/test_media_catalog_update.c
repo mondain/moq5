@@ -278,7 +278,10 @@ int main(void)
         n = drain(r, k, tr, 16);
         moq_media_track_t *a = NULL;
         (void)count_kind(k, tr, n, MOQ_MEDIA_TRACK_ADDED, "a", &a);
-        moq_media_track_state_t st;
+        /* Seeded with a VALID state that is not the expected one, before each
+         * query, so a query that never writes its output cannot pass on a
+         * previous answer. */
+        moq_media_track_state_t st = MOQ_MEDIA_TRACK_STATE_DISCOVERED;
         MOQ_TEST_CHECK(a && moq_media_receiver_track_state(r, a, &st) == MOQ_OK);
         MOQ_TEST_CHECK(st == MOQ_MEDIA_TRACK_STATE_PENDING);   /* auto-seeded */
         /* A track added in a LATER generation is auto-seeded too. */
@@ -286,6 +289,7 @@ int main(void)
         n = drain(r, k, tr, 16);
         moq_media_track_t *b = NULL;
         (void)count_kind(k, tr, n, MOQ_MEDIA_TRACK_ADDED, "b", &b);
+        st = MOQ_MEDIA_TRACK_STATE_DISCOVERED;
         MOQ_TEST_CHECK(b && moq_media_receiver_track_state(r, b, &st) == MOQ_OK);
         MOQ_TEST_CHECK(st == MOQ_MEDIA_TRACK_STATE_PENDING);
         moq_media_receiver_test_free(r);
@@ -1130,9 +1134,9 @@ int main(void)
         MOQ_TEST_PASS("catalog_update.wait_level_triggered_on_media_timeline");
     }
 
-    /* -- inbound identity validation on receiver ingest (0319 F3) --------- *
+    /* -- inbound identity validation on receiver ingest ------------------- *
      * A duplicate Namespace|Name tuple in an INDEPENDENT catalog is rejected
-     * before adoption (previously coalesced first-wins). Both CAT2 tracks are
+     * before adoption rather than coalesced first-wins. Both CAT2 tracks are
      * name-only, so two "a" entries are the same tuple. */
     {
         moq_media_receiver_t *r = moq_media_receiver_test_new(false);

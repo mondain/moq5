@@ -704,6 +704,7 @@ moq_result_t session_core_on_subscribe(moq_session_t *s,
     /* Allocated: join the occupancy list the preamble scans walk. */
     sub_occ_link(s, (size_t)slot);
     entry->state = MOQ_SUB_PENDING_PUBLISHER;
+    entry->subscriber_priority = d->subscriber_priority;
     entry->role = MOQ_SUB_ROLE_PUBLISHER;
     entry->handle = handle;
     entry->request_id = d->request_id;
@@ -1149,8 +1150,9 @@ static moq_result_t handle_publish_stream_bytes(moq_session_t *s, int slot,
  * there as transitional ownership and drive that family's own FIN handling --
  * the same handler a later wire FIN would reach. Nothing here decides the
  * outcome: a family whose teardown blocks on capacity keeps the marker and is
- * resumed by an empty re-feed, which routes back to the same handler. Families
- * outside this slice keep their existing behavior. */
+ * resumed by an empty re-feed, which routes back to the same handler. Only the
+ * families dispatched below take part; any other kind returns MOQ_OK
+ * untouched. */
 static moq_result_t request_stream_handoff_fin(moq_session_t *s,
                                                 moq_stream_ref_t stream_ref,
                                                 moq_request_endpoint_t dest)
@@ -1203,7 +1205,7 @@ static bool request_stream_handoff_fin_install(moq_session_t *s,
     }
 }
 
-/* -- No-slot admission carriers (#245b) ----------------------------- *
+/* -- No-slot admission carriers ------------------------------------ *
  * A bounded, session-owned record of a no-slot request-bidi terminal that is
  * owed but not yet emittable. Storage is arena-backed in the session slab at
  * create time (never lazily allocated), so installing one during ingress cannot
@@ -1418,7 +1420,7 @@ moq_result_t handle_request_stream_bytes(moq_session_t *s,
     int slot = (ep.kind == MOQ_REQ_SUBSCRIPTION) ? ep.slot : -1;
 
     if (slot < 0) {
-        /* A no-slot terminal already owed on this bidi (#245b): re-drive it
+        /* A no-slot terminal already owed on this bidi: re-drive it
          * from the durable carrier, folding in whatever FIN was recorded, and
          * without ever re-staging or redelivering peer bytes. Checked BEFORE
          * the empty-input early return so the documented empty re-feed reaches
@@ -1741,7 +1743,8 @@ moq_result_t request_streams_refeed_deferred(moq_session_t *s)
  * MOQ_OK for a ref that is not a stream-correlated request (the caller handles
  * other stream kinds). */
 moq_result_t request_stream_teardown(moq_session_t *s,
-                                     moq_stream_ref_t stream_ref)
+                                     moq_stream_ref_t stream_ref,
+                                     bool reset, uint64_t error_code)
 {
     moq_request_endpoint_t ep =
         request_registry_find_by_streamref(s, stream_ref);
@@ -1792,9 +1795,16 @@ moq_result_t request_stream_teardown(moq_session_t *s,
          * fetch_request_bidi_cancel(), which already stops the incoming
          * response stream for the fetcher role. */
         bool fetcher = (fe->role == MOQ_FETCH_ROLE_FETCHER);
+        /* A fetcher-role request that already surfaced its terminal (FETCH_ERROR
+         * or REQUEST_REDIRECT, entry draining the response stream's FIN) owes
+         * the application nothing more: the peer's teardown just retires it,
+         * with the same stream cleanup (STOP of a still-open data uni, cancel
+         * tombstone) and no event slot, so a full event queue cannot strand it. */
+        bool already_terminal = fetcher &&
+                                fe->state == MOQ_FETCH_DRAINING_RESPONSE;
         /* Reserve everything before mutating: the data abort MUST be queued, so
          * a full action queue defers the whole teardown for a later retry. */
-        if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+        if (!already_terminal && event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
         if (need_data_abort && action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
         if (need_data_abort) {
             moq_action_t a;
@@ -1814,12 +1824,31 @@ moq_result_t request_stream_teardown(moq_session_t *s,
             }
             (void)push_action(s, &a);
         }
+        /* The event names the role: the publisher learns its peer CANCELLED
+         * the request; the fetcher learns its request was torn down by the
+         * peer and surfaces the stream terminal with the peer's code and
+         * which signal carried it (the request stream, never the data uni). */
         moq_event_t e;
         memset(&e, 0, sizeof(e));
-        e.kind = MOQ_EVENT_FETCH_CANCELLED;
-        e.detail_size = (uint32_t)sizeof(moq_fetch_cancelled_event_t);
-        e.borrow_epoch = s->borrow_epoch;
-        e.u.fetch_cancelled.fetch = fe->handle;
+        if (already_terminal) {
+            fetch_cancel_tomb_add(s, fe->request_id);
+            fetch_free_entry(s, ep.slot);
+            return MOQ_OK;
+        }
+        if (fetcher) {
+            e.kind = MOQ_EVENT_FETCH_RESET;
+            e.detail_size = (uint32_t)sizeof(moq_fetch_reset_event_t);
+            e.borrow_epoch = s->borrow_epoch;
+            e.u.fetch_reset.fetch = fe->handle;
+            e.u.fetch_reset.error_code = error_code;
+            e.u.fetch_reset.data_stream = false;
+            e.u.fetch_reset.stop_sending = !reset;
+        } else {
+            e.kind = MOQ_EVENT_FETCH_CANCELLED;
+            e.detail_size = (uint32_t)sizeof(moq_fetch_cancelled_event_t);
+            e.borrow_epoch = s->borrow_epoch;
+            e.u.fetch_cancelled.fetch = fe->handle;
+        }
         (void)push_event(s, &e);
         /* A fetcher's data uni may not have presented its FETCH_HEADER yet.
          * Tombstone the request id so late data is absorbed and stopped instead
@@ -2765,6 +2794,8 @@ moq_result_t session_core_on_request_update(moq_session_t *s,
     /* Commit. */
     if (d->has_forward)
         e->forward = d->forward;
+    if (d->has_subscriber_priority)
+        e->subscriber_priority = d->subscriber_priority;
     if (d->dt_has_object) {
         e->dt_sub_has_object = true;
         e->dt_sub_object_ms = d->dt_object_ms;

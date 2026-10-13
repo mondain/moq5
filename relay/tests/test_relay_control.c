@@ -1495,7 +1495,7 @@ test_parked_storage(void)
     moqr_core_auth_finish_resolve(c, 6);
 
     /* Zero-length namespace part / token value must not do NULL + off pointer
-     * arithmetic (UBSan flags it without the fix); the view returns {NULL, 0}. */
+     * arithmetic (UBSan flags it); the view returns {NULL, 0}. */
     {
         moq_bytes_t       ep[1] = { { NULL, 0 } };
         moqr_auth_token_t et[1];
@@ -2504,7 +2504,7 @@ test_refused_unbegun_contract(void)
 }
 
 /* Forward pause releases a held ORDINARY-record delivery and clears
- * binding-wide HOL (corrections #2 + #3, deterministic at the core boundary).
+ * binding-wide HOL (deterministic at the core boundary).
  * Two subscriptions to different tracks share ONE binding. sub_v holds a
  * chunked delivery across WOULD_BLOCK, then pauses; the held delivery MUST be
  * released (cursor unadvanced) so the binding is not monopolized, sub_v MUST
@@ -2600,7 +2600,7 @@ test_forward_pause_release(void)
 }
 
 /* Pause with a PARTIAL held chunked delivery — normal completion path
- * (correction #1). The bind has emitted >=1 chunk (checkpointed via
+ * The bind has emitted >=1 chunk (checkpointed via
  * moqr_core_delivery_note_emitted) before the downstream WOULD_BLOCK; the sub
  * then pauses. The partial's begun-downstream watermark MUST persist across the
  * release (so the object is known begun), and on resume the record re-derives
@@ -2662,14 +2662,14 @@ test_forward_pause_partial_resume(void)
 }
 
 /* Pause with a PARTIAL held chunked delivery — abandon-while-paused path
- * (corrections #1 + #2). The bind emitted >=1 chunk (checkpointed) before the
+ * The bind emitted >=1 chunk (checkpointed) before the
  * hold, the sub pauses, THEN the source abandons the group. Because the begun
  * watermark persisted, the required downstream RESET MUST still surface (an
  * ABANDONED delivery is stream maintenance, eligible while paused) rather than
- * being skipped as never-begun — the exact truncation hazard correction #1
+ * being skipped as never-begun — the truncation hazard the persisted watermark
  * closes. The subscription survives and the begun accounting is balanced.
- * RED: neuter moqr_core_delivery_note_emitted and the abandon is skipped
- * (watermark 0), so next_delivery returns DONE instead of the reset. */
+ * The reset depends on moqr_core_delivery_note_emitted: without it the
+ * watermark stays 0, the abandon is skipped and next_delivery returns DONE. */
 static int
 test_forward_pause_partial_abandon(void)
 {
@@ -2736,7 +2736,7 @@ test_forward_pause_partial_abandon(void)
     return failures;
 }
 
-/* Begin-with-ZERO-chunks still needs its RESET (round-3 correction #1): the bind
+/* Begin-with-ZERO-chunks still needs its RESET: the bind
  * can enqueue begin_object (the object header is committed downstream, obj_begun
  * = true) and then hit WOULD_BLOCK on the FIRST chunk with next_chunk == 0. The
  * checkpoint records begun with emitted == 0. If Forward then pauses and the
@@ -2744,8 +2744,8 @@ test_forward_pause_partial_abandon(void)
  * its downstream RESET — it must NOT be treated as never-begun (which would leave
  * the peer with an open object header and no close). "Begun" is tracked distinctly
  * from the chunk count, so this works without faking a count of 1 (which would
- * skip chunk 0 on re-derivation). RED: with note_emitted's emitted==0 treated as
- * a no-op, the abandon is skipped and next_delivery returns DONE. */
+ * skip chunk 0 on re-derivation). If note_emitted treated emitted==0 as a no-op,
+ * the abandon would be skipped and next_delivery would return DONE. */
 static int
 test_forward_pause_begun_zero_abandon(void)
 {
@@ -2794,11 +2794,11 @@ test_forward_pause_begun_zero_abandon(void)
     return failures;
 }
 
-/* moqr_core_delivery_note_emitted range contract (round-3 correction #2):
+/* moqr_core_delivery_note_emitted range contract:
  * emitted must be 0..chunk_count of the outstanding record. An out-of-range
  * count is rejected MOQR_ERR_INVAL (it would otherwise become a bogus pin base /
  * watermark that pins zero chunks and silently advances); the boundary and zero
- * are accepted. RED: drop the upper-bound check and note_emitted(3) returns OK. */
+ * are accepted. note_emitted(3) is refused only by the upper-bound check. */
 static int
 test_note_emitted_range_contract(void)
 {
@@ -2839,12 +2839,12 @@ test_note_emitted_range_contract(void)
     return failures;
 }
 
-/* Forward pause keeps stream MAINTENANCE eligible (correction #2): a SEAL close
+/* Forward pause keeps stream MAINTENANCE eligible: a SEAL close
  * is discovered AND, once held across a WOULD_BLOCK, survives the pause rather
  * than being dropped — so a downstream FIN is never deferred to resume (which
- * would retain the subgroup slot against siblings). RED: revert the selection
- * gate to a blanket paused-sub skip and the notice is never discovered; revert
- * the binding_drop_held maintenance guard and the held notice is dropped. */
+ * would retain the subgroup slot against siblings). Discovery depends on the
+ * selection gate not skipping paused subs wholesale; survival of the held
+ * notice depends on the binding_drop_held maintenance guard. */
 static int
 test_forward_pause_seal_maintenance(void)
 {
@@ -2901,12 +2901,12 @@ test_forward_pause_seal_maintenance(void)
     return failures;
 }
 
-/* Forward pause keeps the EVICT-RESET sweep eligible (correction #2): a group a
+/* Forward pause keeps the EVICT-RESET sweep eligible: a group a
  * paused sub had begun downstream (emitted >=1 chunk, checkpointed) is evicted;
  * the required reset MUST still surface while paused so the peer's begun-but-
- * unfinishable subgroup is closed rather than left hanging until resume. RED:
- * re-add the paused-sub skip in the evict-reset sweep (or neuter
- * note_emitted, dropping begun_count to 0) and no reset surfaces. */
+ * unfinishable subgroup is closed rather than left hanging until resume. The
+ * reset depends on the evict-reset sweep not skipping paused subs, and on
+ * note_emitted keeping begun_count above 0. */
 static int
 test_forward_pause_evict_maintenance(void)
 {
@@ -2962,12 +2962,12 @@ test_forward_pause_evict_maintenance(void)
     return failures;
 }
 
-/* Prefix-size (ABI) contract for moqr_subscribe_req_t (correction #4): a caller
+/* Prefix-size (ABI) contract for moqr_subscribe_req_t: a caller
  * that predates the trailing `forward` field (struct_size ending before it) is
  * still valid and defaults to forward=true — the field it never set must be
- * ignored, not read. A struct_size below that minimum is rejected. RED: revert
- * the gate to `< sizeof(moqr_subscribe_req_t)` and the prefix-sized subscribe
- * returns MOQR_ERR_INVAL. */
+ * ignored, not read. A struct_size below that minimum is rejected. The gate is
+ * the prefix end, not `sizeof(moqr_subscribe_req_t)`: a full-size gate would
+ * refuse the prefix-sized subscribe with MOQR_ERR_INVAL. */
 static int
 test_subscribe_prefix_compat(void)
 {
@@ -3830,9 +3830,9 @@ deliver_count(moqr_core_t *c, moqr_binding_t b)
 /* The per-binding subscription index. Several bindings subscribe to
  * ONE track; each binding's next_delivery must serve only its own sub. Closing
  * one binding must not disturb another's indexed subs, and a retired sub's slot,
- * reused on the SAME binding, must not corrupt the list. RED: neuter
- * sub_list_push and the isolation delivery drops to 0; neuter sub_list_remove and
- * the same-binding slot-reuse spins (a self-cycle in the list). */
+ * reused on the SAME binding, must not corrupt the list. The isolation delivery
+ * depends on sub_list_push (without it, 0 deliveries); the same-binding slot
+ * reuse depends on sub_list_remove (without it, a self-cycle in the list). */
 static int
 test_per_binding_sub_index(void)
 {
@@ -3953,7 +3953,7 @@ gpos_setup(moqr_core_t *c, moqr_binding_t *pub, moqr_binding_t *sub,
 
 /* The group_id-keyed O(1) gpos index.
  * (a) Many retained groups all deliver in ascending order (hash find/insert
- *     across groups). RED: neuter gpos_hash_insert -> lookups miss, entries
+ *     across groups). Without gpos_hash_insert lookups miss, entries
  *     duplicate until the array fills, and delivery stalls short.
  * (b) An evicted UNBEGUN group reclaims + skips, and its slot — reused by a new
  *     group — resolves to the NEW group with no stale group_id (rebuild-on-
@@ -4070,8 +4070,8 @@ sub_named(moqr_core_t *c, moqr_binding_t sub_b, const char *name, uint64_t cooki
  * under whole-object delivery (even with eviction), arms only once a sub has
  * begun an OPEN object, and stands down once the reset is confirmed. evict_sweeps
  * (stats) counts sweep-body runs, making the gate directly observable.
- * RED: neuter sub_begun_add (the STALLED arm) -> begun_subs stays 0 -> the sweep
- * is gated off even when a begun group evicts -> part (b) loses its reset. */
+ * Part (b)'s reset depends on sub_begun_add (the STALLED arm): without it
+ * begun_subs stays 0 and the sweep is gated off even when a begun group evicts. */
 static int
 test_evict_sweep_gate(void)
 {
@@ -4234,9 +4234,10 @@ mkcore_shard(ca_t *a, moqr_trace_t *trace, uint16_t idx, uint16_t count)
  * structurally refused by another shard's core (per-core shard tag); (b) the
  * control-plane epochs set via moqr_core_set_epochs stamp trace records and
  * route dumps and survive a route mutation.
- * RED: revert r_pack to a fixed shard tag -> (a) foreign handles are accepted;
- * revert r_publish_epochs to MOQR_EPOCHS_INIT -> (b) the post-set route mutation
- * zeroes the stamped node/shard epochs. */
+ * (a) depends on r_pack carrying the per-core shard tag (a fixed tag accepts
+ * foreign handles); (b) depends on r_publish_epochs keeping the set epochs (a
+ * reset to MOQR_EPOCHS_INIT zeroes the stamped node/shard epochs on the
+ * post-set route mutation). */
 static int
 test_shard_seams(void)
 {

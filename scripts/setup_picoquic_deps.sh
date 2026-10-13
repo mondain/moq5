@@ -43,9 +43,9 @@
 #   PICOTLS_REF     picotls commit       (default: pinned below)
 #   OPENSSL_ROOT_DIR  passed to picotls' cmake if set (macOS/brew)
 #
-# The tracked capsule-parser patch is applied after checkout. Already-patched
+# The tracked dependency patches are applied after checkout. Already-patched
 # inputs are accepted; conflicting inputs fail before any dependency build.
-# --self-test checks this step without fetching or building dependencies.
+# --self-test checks patching and the compiler policy with offline fixtures.
 #
 # Requires: git, cmake, a C compiler, and OpenSSL dev headers
 # (Ubuntu: apt-get install -y libssl-dev cmake).
@@ -58,6 +58,12 @@ PICOQUIC_REF="${PICOQUIC_REF:-55b473e207e436d06ea9a2895cc1fc555d42c81c}"
 PICOTLS_REPO="${PICOTLS_REPO:-https://github.com/h2o/picotls.git}"
 PICOTLS_REF="${PICOTLS_REF:-7c32032f91449d695b24b82955f20d04d47e6cff}"
 
+PICOQUIC_PATCHES=(
+    0001-h3zero-reset-capsule-value-read.patch
+    0002-reset-stream-after-fin.patch
+    0005-reliable-reset-prefix-ack-range.patch
+)
+
 script_dir=$(cd "$(dirname "$0")" && pwd)
 repo_root=$(cd "$script_dir/.." && pwd)
 MOQ_DEPS_DIR="${MOQ_DEPS_DIR:-$repo_root/.deps/picoquic-ci}"
@@ -69,24 +75,114 @@ picotls_build="$picotls_dir/build"
 log() { printf '[setup_picoquic_deps] %s\n' "$*" >&2; }
 die() { printf '[setup_picoquic_deps] ERROR: %s\n' "$*" >&2; exit 1; }
 
-apply_capsule_patch() {
-    local dir=$1
-    local patch="$repo_root/patches/picoquic/0001-h3zero-reset-capsule-value-read.patch"
-    [ -f "$patch" ] || die "missing capsule patch: $patch"
-    if git -C "$dir" apply --check "$patch" >/dev/null 2>&1; then
-        git -C "$dir" apply "$patch" || die "capsule patch application failed"
-        log "applied capsule reset patch"
-    elif git -C "$dir" apply --reverse --check "$patch" >/dev/null 2>&1; then
-        log "capsule reset patch already applied"
-    else
-        die "capsule reset patch conflicts with $dir"
+build_picotls() {
+    local source_dir=$1 build_dir=$2
+    local cmake_args=(-S "$source_dir" -B "$build_dir" -DCMAKE_BUILD_TYPE=Release
+        "-DCMAKE_PROJECT_picotls_INCLUDE=$repo_root/cmake/MoqPicotlsBuildPolicy.cmake")
+    if [ -n "${OPENSSL_ROOT_DIR:-}" ]; then
+        cmake_args+=(-DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR")
     fi
+    cmake "${cmake_args[@]}" >/dev/null || return $?
+    # Only the library targets used by FindPTLS; not dependency CLI/test tools.
+    cmake --build "$build_dir" \
+        --target picotls-core picotls-openssl picotls-minicrypto \
+        -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)" >/dev/null
+}
+
+compiler_policy_selftest() (
+    set -eu
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    mkdir -p "$tmp/source"
+    cat > "$tmp/source/CMakeLists.txt" <<'CMAKE'
+cmake_minimum_required(VERSION 3.13)
+project(picotls C)
+foreach(target picotls-core picotls-openssl picotls-minicrypto)
+    add_library(${target} STATIC probe.c)
+    target_compile_options(${target} PRIVATE -Wall)
+endforeach()
+CMAKE
+    cat > "$tmp/source/probe.c" <<'C'
+#include <assert.h>
+#ifdef NDEBUG
+#error picotls_assertions_must_remain_enabled
+#endif
+#ifdef MOQ_EXPECT_CACHED
+#if MOQ_CACHE_FLAG != 17
+#error picotls_cached_flags_must_be_preserved
+#endif
+#elif MOQ_ENV_FLAG != 23
+#error picotls_environment_flags_must_be_preserved
+#endif
+int picotls_policy_probe(void) { int value = 1; assert(value); return 0; }
+C
+    CFLAGS='-DMOQ_ENV_FLAG=23 -fPIC' build_picotls "$tmp/source" "$tmp/build" > "$tmp/positive.log" 2>&1 || {
+        cat "$tmp/positive.log" >&2; die "self-test: assertion-enabled build failed"
+    }
+    for target in core openssl minicrypto; do
+        test -f "$tmp/build/libpicotls-$target.a" || die "self-test: missing $target archive"
+    done
+    cmake -S "$tmp/source" -B "$tmp/cached-build" \
+        '-DCMAKE_C_FLAGS=-DMOQ_CACHE_FLAG=17 -fPIC' \
+        '-DCMAKE_C_FLAGS_RELEASE=-O2 -DNDEBUG -DMOQ_EXPECT_CACHED=1' > "$tmp/cache.log" 2>&1 || {
+        cat "$tmp/cache.log" >&2; die "self-test: cache fixture configure failed"
+    }
+    build_picotls "$tmp/source" "$tmp/cached-build" >> "$tmp/cache.log" 2>&1 || {
+        cat "$tmp/cache.log" >&2; die "self-test: cached flags build failed"
+    }
+    printf '\nstatic int moq_setup_unused_function(void) { return 0; }\n' >> "$tmp/source/probe.c"
+    if CFLAGS='-DMOQ_ENV_FLAG=23' build_picotls "$tmp/source" "$tmp/warning-build" > "$tmp/warning.log" 2>&1; then
+        die "self-test: compiler warning was accepted"
+    fi
+    grep -q 'error:.*moq_setup_unused_function' "$tmp/warning.log" || {
+        cat "$tmp/warning.log" >&2; die "self-test: wrong warning refusal"
+    }
+    printf 'picotls compiler policy self-test: assertions, caller flags, three archives, warning refusal PASS\n'
+)
+
+apply_picoquic_patch() {
+    local dir=$1 name=$2
+    local patch="$repo_root/patches/picoquic/$name"
+    [ -f "$patch" ] || die "missing picoquic patch: $patch"
+    # A non-repository child of libmoq can silently skip every patch path.
+    [ "$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" = "$(cd "$dir" && pwd -P)" ] \
+        || die "picoquic patch input is not its own git root: $dir"
+    if git -C "$dir" apply --check "$patch" >/dev/null 2>&1; then
+        git -C "$dir" apply "$patch" || die "picoquic patch $name failed to apply"
+        log "applied picoquic patch $name"
+    elif git -C "$dir" apply --reverse --check "$patch" >/dev/null 2>&1; then
+        log "picoquic patch $name already applied"
+    else
+        die "picoquic patch $name conflicts with $dir"
+    fi
+}
+
+apply_picoquic_patches() {
+    local dir=$1 name i
+    local files=("$repo_root/patches/picoquic/"*.patch)
+    for name in "${PICOQUIC_PATCHES[@]}"; do
+        [ -f "$repo_root/patches/picoquic/$name" ] \
+            || die "missing picoquic patch: $repo_root/patches/picoquic/$name"
+    done
+    [ "${#files[@]}" -eq "${#PICOQUIC_PATCHES[@]}" ] \
+        || die "declared picoquic patch list does not match tracked patches"
+    for ((i=0; i<${#files[@]}; ++i)); do
+        [ "${files[$i]##*/}" = "${PICOQUIC_PATCHES[$i]}" ] \
+            || die "declared picoquic patch list does not match tracked order"
+    done
+    for name in "${PICOQUIC_PATCHES[@]}"; do
+        apply_picoquic_patch "$dir" "$name"
+    done
 }
 
 patch_selftest() (
     set -eu
     tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"' EXIT
+    for name in "${PICOQUIC_PATCHES[@]}"; do
+        [ -f "$repo_root/patches/picoquic/$name" ] || die "self-test: missing $name"
+    done
+    local capsule_patch=0001-h3zero-reset-capsule-value-read.patch
     mkdir -p "$tmp/tree/picohttp"
     git -C "$tmp/tree" init -q
     # Minimal upstream context; the behavioral regression links picohttp-core.
@@ -97,26 +193,83 @@ patch_selftest() (
         'capsule->capsule_type = 0;' \
         'capsule->capsule_length = 0;' \
         'capsule->is_stored = 0;' > "$tmp/tree/picohttp/h3zero_common.c"
-    apply_capsule_patch "$tmp/tree"
+    apply_picoquic_patch "$tmp/tree" "$capsule_patch"
     grep -qF 'capsule->value_read = 0;' "$tmp/tree/picohttp/h3zero_common.c"
     cp "$tmp/tree/picohttp/h3zero_common.c" "$tmp/expected"
-    apply_capsule_patch "$tmp/tree"
+    apply_picoquic_patch "$tmp/tree" "$capsule_patch"
     cmp "$tmp/expected" "$tmp/tree/picohttp/h3zero_common.c"
     printf 'conflicting source\n' > "$tmp/tree/picohttp/h3zero_common.c"
-    if (apply_capsule_patch "$tmp/tree") > "$tmp/log" 2>&1; then
+    if (apply_picoquic_patch "$tmp/tree" "$capsule_patch") > "$tmp/log" 2>&1; then
         die "self-test: conflicting source was accepted"
     fi
-    grep -qF 'capsule reset patch conflicts' "$tmp/log"
+    grep -qF "picoquic patch $capsule_patch conflicts" "$tmp/log"
     test "$(cat "$tmp/tree/picohttp/h3zero_common.c")" = 'conflicting source'
-    if (repo_root="$tmp/missing"; apply_capsule_patch "$tmp/tree") > "$tmp/log" 2>&1; then
+    if (repo_root="$tmp/missing"; apply_picoquic_patch "$tmp/tree" "$capsule_patch") > "$tmp/log" 2>&1; then
         die "self-test: missing patch was accepted"
     fi
-    grep -qF 'missing capsule patch' "$tmp/log"
+    grep -qF 'missing picoquic patch' "$tmp/log"
+    mkdir -p "$tmp/tree/child"
+    if (apply_picoquic_patch "$tmp/tree/child" "$capsule_patch") > "$tmp/log" 2>&1; then
+        die "self-test: non-root patch input was accepted"
+    fi
+    grep -qF 'picoquic patch input is not its own git root' "$tmp/log"
     printf 'capsule patch self-test: apply, repeat, conflict, missing PASS\n'
+)
+
+patch_list_selftest() (
+    set -eu
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    repo_root=$tmp/root
+    PICOQUIC_PATCHES=(0001-one.patch 0002-two.patch)
+    mkdir -p "$repo_root/patches/picoquic" "$tmp/tree"
+    git -C "$tmp/tree" init -q
+    for pair in 0001-one 0002-two; do
+        name=${pair#*-}
+        printf 'old\n' > "$tmp/tree/$name.txt"
+        printf '%s\n' "diff --git a/$name.txt b/$name.txt" \
+            "--- a/$name.txt" "+++ b/$name.txt" '@@ -1 +1 @@' '-old' '+new' \
+            > "$repo_root/patches/picoquic/$pair.patch"
+    done
+    apply_picoquic_patches "$tmp/tree"
+    test "$(cat "$tmp/tree/one.txt")" = new
+    test "$(cat "$tmp/tree/two.txt")" = new
+    apply_picoquic_patches "$tmp/tree"
+    test "$(cat "$tmp/tree/one.txt")" = new
+    test "$(cat "$tmp/tree/two.txt")" = new
+    printf 'old\n' > "$tmp/tree/one.txt"
+    printf 'old\n' > "$tmp/tree/two.txt"
+    mv "$repo_root/patches/picoquic/0002-two.patch" "$tmp/two.patch"
+    if (apply_picoquic_patches "$tmp/tree") > "$tmp/log" 2>&1; then
+        die "self-test: missing second patch was accepted"
+    fi
+    grep -qF 'missing picoquic patch:' "$tmp/log"
+    test "$(cat "$tmp/tree/one.txt")" = old
+    mv "$tmp/two.patch" "$repo_root/patches/picoquic/0002-two.patch"
+    if (PICOQUIC_PATCHES=(0002-two.patch 0001-one.patch); \
+        apply_picoquic_patches "$tmp/tree") > "$tmp/log" 2>&1; then
+        die "self-test: reversed patch list was accepted"
+    fi
+    grep -qF 'does not match tracked order' "$tmp/log"
+    if (PICOQUIC_PATCHES=(0001-one.patch); \
+        apply_picoquic_patches "$tmp/tree") > "$tmp/log" 2>&1; then
+        die "self-test: omitted patch was accepted"
+    fi
+    grep -qF 'does not match tracked patches' "$tmp/log"
+    test "$(cat "$tmp/tree/one.txt")" = old
+    printf 'conflicting source\n' > "$tmp/tree/two.txt"
+    if (apply_picoquic_patches "$tmp/tree") > "$tmp/log" 2>&1; then
+        die "self-test: conflicting second patch was accepted"
+    fi
+    grep -qF 'picoquic patch 0002-two.patch conflicts' "$tmp/log"
+    test "$(cat "$tmp/tree/two.txt")" = 'conflicting source'
+    printf 'patch list self-test: all members, repeat, missing, order, omission, conflict PASS\n'
 )
 
 if [ "${1:-}" = "--self-test" ]; then
     patch_selftest
+    patch_list_selftest
+    compiler_policy_selftest
     exit $?
 fi
 
@@ -157,7 +310,7 @@ mkdir -p "$MOQ_DEPS_DIR"
 log "deps dir: $MOQ_DEPS_DIR"
 
 fetch_at "$PICOQUIC_REPO" "$PICOQUIC_REF" "$picoquic_dir"
-apply_capsule_patch "$picoquic_dir"
+apply_picoquic_patches "$picoquic_dir"
 fetch_at "$PICOTLS_REPO"  "$PICOTLS_REF"  "$picotls_dir"
 
 # picotls carries minicrypto backends as submodules pinned by the parent
@@ -166,18 +319,7 @@ log "picotls submodules"
 git -C "$picotls_dir" submodule update --init --recursive --depth 1
 
 log "building picotls -> $picotls_build"
-cmake_args=(-S "$picotls_dir" -B "$picotls_build" -DCMAKE_BUILD_TYPE=Release)
-if [ -n "${OPENSSL_ROOT_DIR:-}" ]; then
-    cmake_args+=(-DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR")
-fi
-cmake "${cmake_args[@]}" >/dev/null
-# Build ONLY the picotls libraries that picoquic's FindPTLS consumes.
-# picotls' own test/cli executables are not needed and pull in extra
-# OpenSSL link requirements (e.g. they fail against macOS LibreSSL);
-# building just the lib targets is faster and portable.
-cmake --build "$picotls_build" \
-    --target picotls-core picotls-openssl picotls-minicrypto \
-    -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)" >/dev/null
+build_picotls "$picotls_dir" "$picotls_build"
 
 # Sanity: picotls-core archive must exist where FindPicoquic expects it.
 ls "$picotls_build"/libpicotls-core.* >/dev/null 2>&1 \

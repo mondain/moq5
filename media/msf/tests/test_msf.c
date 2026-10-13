@@ -5,12 +5,6 @@
 #include <string.h>
 #include <stdlib.h>
 
-/* White-box seam: the parser's internal overflow-safe array sizer. Not part of
- * the public API (hidden visibility); declared here so the boundary can be
- * tested directly, which a real 64-bit JSON input cannot reach. */
-extern bool moq_msf_checked_array_bytes(size_t count, size_t elem,
-                                        size_t *out_bytes);
-
 static int failures = 0;
 
 #define CHECK(expr) do { \
@@ -2839,39 +2833,16 @@ int main(void)
 
     /* -- Array-size overflow guards (parser/apply_delta hardening) ----- */
 
-    /* Direct boundary test of the internal checked sizer. A real JSON input
-     * cannot reach a SIZE_MAX-overflowing array on a 64-bit host (the JSON DOM
-     * itself would need that many elements), so exercise the helper directly. */
-    {
-        const size_t elem = sizeof(moq_msf_track_t);
-        size_t bytes = 12345;
-
-        /* Just over the representable limit -> overflow rejected. */
-        CHECK(!moq_msf_checked_array_bytes(SIZE_MAX / elem + 1, elem, &bytes));
-
-        /* Exactly the limit -> representable, computes the product. */
-        size_t boundary = SIZE_MAX / elem;
-        bytes = 0;
-        CHECK(moq_msf_checked_array_bytes(boundary, elem, &bytes));
-        CHECK(bytes == boundary * elem);
-
-        /* Small, normal counts compute as expected. */
-        bytes = 0;
-        CHECK(moq_msf_checked_array_bytes(4, elem, &bytes));
-        CHECK(bytes == 4 * elem);
-
-        /* elem == 0 never overflows (and yields 0 bytes). */
-        bytes = 1;
-        CHECK(moq_msf_checked_array_bytes(SIZE_MAX, 0, &bytes));
-        CHECK(bytes == 0);
-    }
+    /* The internal checked sizer's own boundary is exercised in
+     * test_msf_checked_array.c, which compiles msf.c directly: the helper is
+     * hidden in the shipped library this test links. */
 
     /* apply_delta: the effective-track capacity multiplication must be guarded
      * BEFORE allocation. A base whose track_count is large enough that
      * cap * sizeof(track) wraps size_t must fail (NOMEM) without ever calling
-     * the allocator. The recording allocator returns NULL on first use, so the
-     * neutered code path fails cleanly too -- the discriminator is alloc_count.
-     * (RED: with the guard removed, the wrapped size is allocated -> count 1.) */
+     * the allocator. The recording allocator returns NULL on first use, so an
+     * unguarded code path would also fail cleanly -- the discriminator is
+     * alloc_count: without the guard the wrapped size is allocated (count 1). */
     {
         moq_msf_track_t rt;
         memset(&rt, 0, sizeof(rt));
@@ -2951,7 +2922,7 @@ int main(void)
         CHECK(os.alloc_count == 0);
     }
 
-    /* apply_delta_ex / validate_identities: public NULL-array guards (0319 F2).
+    /* apply_delta_ex / validate_identities: public NULL-array guards.
      * A nonzero count with a NULL array is invalid input, rejected before any
      * dereference (no crash). */
     {
@@ -2998,7 +2969,7 @@ int main(void)
         CHECK(moq_msf_catalog_validate_identities(alloc, &c) == MOQ_ERR_INVAL);
     }
 
-    /* -- MSF delta security residuals (0317) ------------------------------- *
+    /* -- MSF delta identity and wildcard rules ------------------------------ *
      * §5.2.2/§5.2.3: identity is the Namespace|Name tuple; an omitted op
      * namespace is catalog-namespace inheritance, NOT a wildcard over explicit
      * namespaces. This layer cannot resolve the catalog namespace, so a
@@ -3026,7 +2997,7 @@ int main(void)
         base.version = MOQ_MSF_VERSION;
         base.tracks = bt; base.track_count = 2;
 
-        /* RED 1 -- namespace-less REMOVE is not a wildcard: it must NOT delete
+        /* Case 1 -- namespace-less REMOVE is not a wildcard: it must NOT delete
          * an arbitrary explicit-namespace track. No name-only track exists, so
          * the remove target is absent -> MOQ_ERR_PROTO. */
         {
@@ -3043,7 +3014,7 @@ int main(void)
             if (rc == MOQ_OK) moq_msf_catalog_cleanup(alloc, &out);
         }
 
-        /* RED 2 -- namespace-less CLONE parent is not a wildcard. parentName
+        /* Case 2 -- namespace-less CLONE parent is not a wildcard. parentName
          * only, no parentNamespace -> the parent is ambiguous/absent among
          * explicit-namespace tracks -> MOQ_ERR_PROTO. */
         {
@@ -3120,7 +3091,7 @@ int main(void)
         #undef MK_TRK
     }
 
-    /* -- apply_delta_ex cap-before-apply (0317 item 1a) -------------------- *
+    /* -- apply_delta_ex cap-before-apply ------------------------------------ *
      * A delta that is valid but exceeds the caller's limits must be refused
      * (MOQ_ERR_PROTO) BEFORE the effective catalog is built. Differential: the
      * SAME delta succeeds unlimited (apply_delta) and is rejected under a small
@@ -3194,7 +3165,7 @@ int main(void)
         #undef MK_TRK2
     }
 
-    /* -- validate_identities: inbound duplicate rejection (0317 item 3) ---- *
+    /* -- validate_identities: inbound duplicate rejection ------------------ *
      * The raw parser is lenient; the receiver-facing validator rejects
      * duplicate Namespace|Name tuples, initDataList ids, and contentProtection
      * refIDs in an INDEPENDENT catalog. */
@@ -3259,7 +3230,7 @@ int main(void)
         CHECK(moq_msf_catalog_validate_identities(alloc, &dcat) == MOQ_ERR_INVAL);
     }
 
-    /* Public identity-span guards (0321): a span that claims content with a
+    /* Public identity-span guards: a span that claims content with a
      * NULL data pointer, or uses the byte-span empty-slot sentinel
      * (len == SIZE_MAX), is invalid input -> MOQ_ERR_INVAL, no hash/deref. */
     {

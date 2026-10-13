@@ -124,7 +124,7 @@ backend parity.
 **Interfaces:** implement the exact public types/signature in the design. Append `const moq_auth_source_t *setup_auth` to `moq_endpoint_cfg_t`. Private source storage clones descriptors/static bytes with the endpoint allocator and retains selector/context. Private selection returns an owned bounded token list for one logical operation; its release routine is used on every terminal path.
 
 - [x] Add table-driven tests for null source, static binary data, provider-selected data, empty present source, both sources set, callback error, invalid pointers, type overflow, 17 tokens, 16 KiB+1 token, total >32 KiB and allocator failure at each clone. Verify provider calls receive the requested action/resource and no token data enters diagnostics.
-- [x] Add a fake-backend endpoint test where setup provider failure produces zero transport-create calls; another where a successful CLIENT_SETUP selection reaches the facade before auto-start. Run the new tests to establish RED.
+- [x] Add a fake-backend endpoint test where setup provider failure produces zero transport-create calls; another where a successful CLIENT_SETUP selection reaches the facade before auto-start. Run the new tests to confirm the unsupported behavior.
 - [x] Implement bounded source copy/selection. Invoke setup selection synchronously before choosing/starting transport; own the selected list across deferred negotiation. Source failures are terminal; never retry as anonymous. Provision bounded SETUP send capacity for the selected list and route options. Use raw-QUIC URL authority/path for Task 2; preserve existing WebTransport CONNECT routing and SNI policy.
 
   ```c

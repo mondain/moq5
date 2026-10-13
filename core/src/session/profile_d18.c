@@ -16,6 +16,14 @@
 
 /* -- D18 profile state --------------------------------------------- */
 
+typedef struct d18_id_range {
+    uint64_t first;
+    uint64_t last;
+} d18_id_range_t;
+
+/* Limits retained gaps, not the numeric distance to a reordered request. */
+#define D18_PEER_ID_MAX_RANGES 1024u
+
 typedef struct moq_d18_profile_state {
     moq_version_t version;
     bool          setup_sent;
@@ -24,6 +32,11 @@ typedef struct moq_d18_profile_state {
      * no MAX_REQUEST_ID; QUIC stream limits provide flow control. */
     uint64_t      next_local_request_id;
     uint64_t      peer_next_request_id;
+    d18_id_range_t *peer_seen_later;
+    size_t          peer_seen_count;
+    size_t          peer_seen_cap;
+    moq_alloc_t   alloc;
+    bool          peer_ids_exhausted;
     uint64_t      next_track_alias;
 } moq_d18_profile_state_t;
 
@@ -36,12 +49,17 @@ static void d18_init_in_place(void *profile_state, const moq_session_cfg_t *cfg)
         (cfg->perspective == MOQ_PERSPECTIVE_CLIENT) ? 0 : 1;
     d18->peer_next_request_id =
         (cfg->perspective == MOQ_PERSPECTIVE_CLIENT) ? 1 : 0;
+    d18->alloc = *cfg->alloc;
     d18->next_track_alias = 1;
 }
 
 static void d18_destroy(void *profile_state)
 {
-    (void)profile_state;
+    moq_d18_profile_state_t *d18 = (moq_d18_profile_state_t *)profile_state;
+    if (d18->peer_seen_later)
+        d18->alloc.free(d18->peer_seen_later,
+                        d18->peer_seen_cap * sizeof(d18_id_range_t),
+                        d18->alloc.ctx);
 }
 
 /* -- Setup handshake ----------------------------------------------- */
@@ -478,22 +496,66 @@ static void d18_advance_track_alias(moq_session_t *s, uint64_t next_after)
         d18->next_track_alias = next_after + 1;
 }
 
-/* Validate an inbound request that arrived on its own bidi stream: the wire
- * request id must follow the peer's parity and be the next in sequence. The
- * endpoint binds both the request id and the bidi stream_ref. */
+/* Later request bidis can arrive first. Keep merged ranges above the lowest
+ * missing peer ID; resource use follows disjoint gaps, not ID distance. */
+static size_t d18_peer_seen_position(const moq_d18_profile_state_t *d18,
+                                     uint64_t request_id)
+{
+    size_t lo = 0, hi = d18->peer_seen_count;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (d18->peer_seen_later[mid].last < request_id)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
 static moq_result_t d18_validate_inbound_request_stream(
     moq_session_t *s, moq_stream_ref_t ref, uint64_t msg_type,
     uint64_t wire_request_id, struct moq_request_endpoint *out)
 {
     (void)msg_type;
-    const moq_d18_profile_state_t *d18 =
-        (const moq_d18_profile_state_t *)s->profile_state;
+    moq_d18_profile_state_t *d18 = (moq_d18_profile_state_t *)s->profile_state;
     bool peer_is_client = (s->perspective == MOQ_PERSPECTIVE_SERVER);
     uint64_t expected_parity = peer_is_client ? 0 : 1;
     if ((wire_request_id & 1) != expected_parity)
         return close_with_error(s, 0x4, "wrong request ID parity");
-    if (wire_request_id != d18->peer_next_request_id)
-        return close_with_error(s, 0x4, "request ID not next in sequence");
+    if (d18->peer_ids_exhausted ||
+        wire_request_id < d18->peer_next_request_id)
+        return close_with_error(s, 0x4, "duplicate request ID");
+    if (wire_request_id > d18->peer_next_request_id) {
+        size_t pos = d18_peer_seen_position(d18, wire_request_id);
+        if (pos < d18->peer_seen_count &&
+            d18->peer_seen_later[pos].first <= wire_request_id)
+            return close_with_error(s, 0x4, "duplicate request ID");
+        bool join_before = pos > 0 &&
+            d18->peer_seen_later[pos - 1].last == wire_request_id - 2;
+        bool join_after = pos < d18->peer_seen_count &&
+            wire_request_id <= UINT64_MAX - 2 &&
+            d18->peer_seen_later[pos].first == wire_request_id + 2;
+        /* Commit is void and must remain allocation-free after the request
+         * handler has performed its other fallible work. */
+        if (!join_before && !join_after &&
+            d18->peer_seen_count == d18->peer_seen_cap) {
+            if (d18->peer_seen_count == D18_PEER_ID_MAX_RANGES)
+                return close_with_error(s, 0x1, "request ID ranges exhausted");
+            size_t cap = d18->peer_seen_cap ? d18->peer_seen_cap * 2 : 8;
+            if (cap > D18_PEER_ID_MAX_RANGES)
+                cap = D18_PEER_ID_MAX_RANGES;
+            d18_id_range_t *ranges = d18->peer_seen_later
+                ? d18->alloc.realloc(d18->peer_seen_later,
+                    d18->peer_seen_cap * sizeof(d18_id_range_t),
+                    cap * sizeof(d18_id_range_t), d18->alloc.ctx)
+                : d18->alloc.alloc(cap * sizeof(d18_id_range_t),
+                                   d18->alloc.ctx);
+            if (!ranges)
+                return close_with_error(s, 0x1, "request ID storage exhausted");
+            d18->peer_seen_later = ranges;
+            d18->peer_seen_cap = cap;
+        }
+    }
     memset(out, 0, sizeof(*out));
     out->has_request_id = true;
     out->request_id = wire_request_id;
@@ -505,9 +567,51 @@ static moq_result_t d18_validate_inbound_request_stream(
 static void d18_commit_inbound_request(moq_session_t *s,
                                        const struct moq_request_endpoint *ep)
 {
-    (void)ep;
     moq_d18_profile_state_t *d18 = (moq_d18_profile_state_t *)s->profile_state;
+    if (ep->request_id != d18->peer_next_request_id) {
+        size_t pos = d18_peer_seen_position(d18, ep->request_id);
+        bool join_before = pos > 0 &&
+            d18->peer_seen_later[pos - 1].last == ep->request_id - 2;
+        bool join_after = pos < d18->peer_seen_count &&
+            ep->request_id <= UINT64_MAX - 2 &&
+            d18->peer_seen_later[pos].first == ep->request_id + 2;
+        if (join_before && join_after) {
+            d18->peer_seen_later[pos - 1].last = d18->peer_seen_later[pos].last;
+            memmove(&d18->peer_seen_later[pos],
+                    &d18->peer_seen_later[pos + 1],
+                    (d18->peer_seen_count - pos - 1) * sizeof(d18_id_range_t));
+            d18->peer_seen_count--;
+        } else if (join_before) {
+            d18->peer_seen_later[pos - 1].last = ep->request_id;
+        } else if (join_after) {
+            d18->peer_seen_later[pos].first = ep->request_id;
+        } else {
+            memmove(&d18->peer_seen_later[pos + 1],
+                    &d18->peer_seen_later[pos],
+                    (d18->peer_seen_count - pos) * sizeof(d18_id_range_t));
+            d18->peer_seen_later[pos] =
+                (d18_id_range_t){ ep->request_id, ep->request_id };
+            d18->peer_seen_count++;
+        }
+        return;
+    }
+    if (d18->peer_next_request_id > UINT64_MAX - 2) {
+        d18->peer_ids_exhausted = true;
+        return;
+    }
     d18->peer_next_request_id += 2;
+    while (d18->peer_seen_count &&
+           d18->peer_seen_later[0].first == d18->peer_next_request_id) {
+        uint64_t last = d18->peer_seen_later[0].last;
+        d18->peer_seen_count--;
+        memmove(&d18->peer_seen_later[0], &d18->peer_seen_later[1],
+                d18->peer_seen_count * sizeof(d18_id_range_t));
+        if (last > UINT64_MAX - 2) {
+            d18->peer_ids_exhausted = true;
+            return;
+        }
+        d18->peer_next_request_id = last + 2;
+    }
 }
 
 /* Map the representable SUBSCRIBE/FETCH settings onto draft-18 Message
@@ -1752,16 +1856,20 @@ static moq_result_t d18_encode_subscribe_ok(
     return moq_d18_encode_subscribe_ok(w, args->track_alias, &p, props);
 }
 
-/* REQUEST_ERROR encode. No request id (stream-correlated); retry_interval is 0
- * when retry is not offered. The optional Redirect structure (§10.6.1) is encoded
- * when args->has_redirect (an all-empty Redirect is valid). */
+/* REQUEST_ERROR encode. No request id (stream-correlated). The wire Retry
+ * Interval is "the minimum time (in milliseconds) before the request SHOULD be
+ * sent again, plus one. If the value is 0, the request SHOULD NOT be retried"
+ * (§10.6), so an offered retry of N ms is N + 1 on the wire and no retry is 0.
+ * The optional Redirect structure (§10.6.1) is encoded when args->has_redirect
+ * (an all-empty Redirect is valid). */
 static moq_result_t d18_encode_request_error(
     moq_session_t *s, struct moq_buf_writer *w,
     const struct moq_request_error_encode_args *args)
 {
     (void)s;
     moq_bytes_t reason = { args->reason, args->reason_len };
-    uint64_t retry = args->can_retry ? args->retry_after_ms : 0;
+    if (args->can_retry && args->retry_after_ms == UINT64_MAX) return MOQ_ERR_INVAL;
+    uint64_t retry = args->can_retry ? args->retry_after_ms + 1u : 0;
     if (args->has_redirect) {
         moq_d18_redirect_t rd = {
             .connect_uri     = { args->connect_uri, args->connect_uri_len },
@@ -2202,7 +2310,9 @@ static moq_result_t d18_process_response_stream(
         if (rc < 0)
             return close_with_error(s, 0x3, "malformed REQUEST_ERROR");
         size_t off = moq_buf_reader_offset(&r);
+        /* §10.6: wire Retry Interval = minimum milliseconds + 1; 0 = no retry. */
         bool can_retry = er.retry_interval != 0;
+        uint64_t retry_ms = can_retry ? er.retry_interval - 1u : 0;
 
         /* REDIRECT (§10.6) carries a Redirect tail and is valid only for SUBSCRIBE,
          * FETCH, TRACK_STATUS and PUBLISH_NAMESPACE here (SUBSCRIBE_NAMESPACE is on
@@ -2238,7 +2348,7 @@ static moq_result_t d18_process_response_stream(
                 return close_with_error(s, 0x3, "extra bytes after REQUEST_ERROR");
             /* Defer the free: the core drains the request stream's FIN. */
             rc = session_core_on_fetch_error(s, slot, er.error_code, can_retry,
-                er.retry_interval, er.reason.data, er.reason.len, false, redirect);
+                retry_ms, er.reason.data, er.reason.len, false, redirect);
         } else if (kind == (uint32_t)MOQ_REQ_ANNOUNCEMENT) {
             /* Terminal rejection of a pending PUBLISH_NAMESPACE. A REQUEST_ERROR
              * after the announcement is established is not a valid response. */
@@ -2252,7 +2362,7 @@ static moq_result_t d18_process_response_stream(
             d.target_slot = slot;
             d.error_code = er.error_code;
             d.can_retry = can_retry;
-            d.retry_after_ms = er.retry_interval;
+            d.retry_after_ms = retry_ms;
             d.reason = er.reason.data;
             d.reason_len = er.reason.len;
             rc = session_core_on_announcement_error(s, &d, redirect);
@@ -2261,7 +2371,7 @@ static moq_result_t d18_process_response_stream(
             if (off < len)
                 return close_with_error(s, 0x3, "extra bytes after REQUEST_ERROR");
             rc = session_core_on_track_status_error(s, slot, er.error_code,
-                can_retry, er.retry_interval, er.reason.data, er.reason.len,
+                can_retry, retry_ms, er.reason.data, er.reason.len,
                 redirect);
         } else if (kind == (uint32_t)MOQ_REQ_SUBSCRIBE_TRACKS) {
             /* Terminal first-response rejection of a pending SUBSCRIBE_TRACKS.
@@ -2272,7 +2382,7 @@ static moq_result_t d18_process_response_stream(
             if (off < len)
                 return close_with_error(s, 0x3, "extra bytes after REQUEST_ERROR");
             rc = session_core_on_subscribe_tracks_error(s, slot, er.error_code,
-                can_retry, er.retry_interval, er.reason.data, er.reason.len);
+                can_retry, retry_ms, er.reason.data, er.reason.len);
         } else if (kind == (uint32_t)MOQ_REQ_PUBLISH) {
             /* Terminal rejection of a pending outbound PUBLISH. REDIRECT is not
              * permitted here (excluded above). */
@@ -2284,7 +2394,7 @@ static moq_result_t d18_process_response_stream(
             /* Defer the free: the core drains the request stream's FIN and closes
              * our send half reciprocally. */
             rc = session_core_on_publish_error(s, slot, er.error_code, can_retry,
-                er.retry_interval, er.reason.data, er.reason.len, false);
+                retry_ms, er.reason.data, er.reason.len, false);
         } else if (s->subs[slot].state == MOQ_SUB_ESTABLISHED) {
             /* A REQUEST_ERROR on an established subscription is an update
              * failure: clear the pending update. The publisher must follow with
@@ -2304,7 +2414,7 @@ static moq_result_t d18_process_response_stream(
             d.target_slot = slot;
             d.error_code = er.error_code;
             d.can_retry = can_retry;
-            d.retry_after_ms = er.retry_interval;
+            d.retry_after_ms = retry_ms;
             d.reason = er.reason.data;
             d.reason_len = er.reason.len;
             rc = session_core_on_subscribe_error(s, &d, false, redirect);

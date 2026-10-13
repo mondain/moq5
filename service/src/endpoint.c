@@ -1233,6 +1233,9 @@ static moq_result_t ep_create_wt(moq_endpoint_t *ep,
     fc.configure_quic_ctx = ep;
     fc.on_pump = ep_wt_pump;
     fc.on_pump_ctx = ep;
+    /* Same idle-publisher policy as raw QUIC: emit QUIC keepalive before
+     * common relay idle timers can reap a quiet WebTransport publisher. */
+    fc.keep_alive_interval_ms = 15000;
     fc.setup_auth_tokens = ep->setup_tokens.count ? ep->setup_tokens.tokens : NULL;
     fc.setup_auth_token_count = ep->setup_tokens.count;
     moq_pico_wt_managed_t *fac = NULL;
@@ -1350,6 +1353,9 @@ static moq_result_t ep_create_msquic(moq_endpoint_t *ep,
     fc.version = version;
     fc.on_lane_pump = ep_msquic_pump;
     fc.on_lane_pump_user = ep;
+    /* Same idle-publisher policy as the picoquic raw-QUIC backend: emit QUIC
+     * keepalive before common relay idle timers can reap a quiet publisher. */
+    fc.keep_alive_interval_ms = 15000;
     /* app service-deadline (media_sender catalog refresh, etc.): folded into
      * each lane doorbell's next-wait computation. Sized init covered the block. */
     fc.app_deadline_us = moq_endpoint_app_deadline_us;
@@ -2229,5 +2235,15 @@ void moq_endpoint_test_pump_cycle(moq_endpoint_t *ep, moq_session_t *session,
 void moq_endpoint_test_drain_terminal(moq_endpoint_t *ep)
 {
     ep_drain_terminal(ep);
+}
+
+/* Current media-service attachment count (the value stop() gates on). */
+int moq_endpoint_test_attachments(moq_endpoint_t *ep);
+int moq_endpoint_test_attachments(moq_endpoint_t *ep)
+{
+    pthread_mutex_lock(&ep->mu);
+    int n = ep->attachments;
+    pthread_mutex_unlock(&ep->mu);
+    return n;
 }
 #endif /* MOQ_MEDIA_SENDER_TESTING || MOQ_MEDIA_RECEIVER_TESTING */

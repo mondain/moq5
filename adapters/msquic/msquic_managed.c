@@ -1680,8 +1680,8 @@ static void mgd_copy_cfg(moq_msquic_managed_t *m,
  * endpoint is willing to receive and notes that larger datagrams are unlikely
  * to be processed; §14 permits a receiver to discard datagrams that exceed its
  * size constraints and forbids closing the connection solely for that. So the
- * peer's behavior is permitted, not mandated -- the fix is ours to make because
- * a conservative listener interoperates and an oversized one does not.
+ * peer's behavior is permitted, not mandated -- bounding the listener is ours
+ * to do because a conservative listener interoperates and an oversized one does not.
  *
  * Why BOTH bounds are set: MaximumMtu and MinimumMtu are both IP-path MTUs, and
  * this MsQuic revision defaults MinimumMtu to 1288 (QUIC_INITIAL_PACKET_LENGTH
@@ -1718,6 +1718,11 @@ MGD_SETTINGS_LINKAGE void mgd_build_settings(const moq_msquic_managed_cfg_t *cfg
         out->IsSet.IdleTimeoutMs = TRUE;
         out->HandshakeIdleTimeoutMs = cfg->idle_timeout_ms;
         out->IsSet.HandshakeIdleTimeoutMs = TRUE;
+    }
+    if (MGD_CFG_HAS(cfg, keep_alive_interval_ms) &&
+        cfg->keep_alive_interval_ms != 0) {
+        out->KeepAliveIntervalMs = cfg->keep_alive_interval_ms;
+        out->IsSet.KeepAliveIntervalMs = TRUE;
     }
     if (cfg->perspective == MOQ_PERSPECTIVE_SERVER) {
         out->MinimumMtu = MGD_LISTENER_PATH_MTU;
