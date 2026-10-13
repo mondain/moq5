@@ -250,6 +250,10 @@ if(MOQ_BUILD_TESTS)
              COMMAND test_negotiated_profile_offer)
 
     add_executable(test_endpoint_resolve tests/test_endpoint_resolve.c)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(test_endpoint_resolve PRIVATE -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
     target_link_libraries(test_endpoint_resolve PRIVATE
         moq-service-test-internals)
     # The test's compile-guarded cases (#ifdef MOQ_SERVICE_HAVE_*_MANAGED) must
@@ -422,7 +426,7 @@ if(MOQ_BUILD_TESTS)
             ${CMAKE_SOURCE_DIR}/tests/unit)
         add_test(NAME media_catalog_update COMMAND test_media_catalog_update)
 
-        # Publication-race RED (MOQ-MEDIA-CP-LOOKUP-RACE): deterministic
+        # Publication-race test (MOQ-MEDIA-CP-LOOKUP-RACE): deterministic
         # try-lock phase oracle for the effective-catalog publication vs the
         # public content-protection lookup, plus a TSan stress companion.
         add_executable(test_media_catalog_publication_race
@@ -541,8 +545,30 @@ if(MOQ_BUILD_TESTS)
             add_test(NAME media_receiver_fetch_catalog
                 COMMAND test_media_receiver_fetch_catalog)
 
+            # Catalog FETCH data stream RESET by the peer: the RESET terminal
+            # clears the receiver's catalog-fetch correlation handle.
+            add_executable(test_media_receiver_fetch_catalog_reset
+                tests/test_media_receiver_fetch_catalog_reset.c)
+            target_link_libraries(test_media_receiver_fetch_catalog_reset PRIVATE
+                moq-service-receiver-test-internals moq::sim)
+            target_include_directories(test_media_receiver_fetch_catalog_reset PRIVATE
+                ${CMAKE_SOURCE_DIR}/tests/unit)
+            add_test(NAME media_receiver_fetch_catalog_reset
+                COMMAND test_media_receiver_fetch_catalog_reset)
+
+            # Catalog Joining FETCH rejected NOT_SUPPORTED with no catalog ever
+            # delivered: not fatal, correlation handle cleared, and no track
+            # discovery -- the relay-side bootstrap gap as the receiver sees it.
+            add_executable(test_media_receiver_fetch_catalog_rejected
+                tests/test_media_receiver_fetch_catalog_rejected.c)
+            target_link_libraries(test_media_receiver_fetch_catalog_rejected PRIVATE
+                moq-service-receiver-test-internals moq::sim)
+            target_include_directories(test_media_receiver_fetch_catalog_rejected PRIVATE
+                ${CMAKE_SOURCE_DIR}/tests/unit)
+            add_test(NAME media_receiver_fetch_catalog_rejected
+                COMMAND test_media_receiver_fetch_catalog_rejected)
             # Late join: the catalog arrives as a past object, by Joining FETCH
-            # under draft 18 and by a fill on the SUBSCRIBE under draft 21.
+            # under draft 18 and by a fill on the SUBSCRIBE under draft 22.
             add_executable(test_media_receiver_fill_catalog
                 tests/test_media_receiver_fill_catalog.c)
             target_link_libraries(test_media_receiver_fill_catalog PRIVATE
@@ -750,7 +776,7 @@ if(MOQ_BUILD_TESTS)
             add_test(NAME media_sender_refresh
                 COMMAND test_media_sender_refresh)
 
-            # Negotiated-profile closure REDs (step 6). Two independent directions
+            # Negotiated-profile closure tests. Two independent directions
             # over the SAME substrate: a real sender's LOC-01 property bytes
             # checked against the pure oracle, and independently built bytes fed
             # to a real receiver. Both need the sender AND receiver seams plus a
@@ -760,7 +786,8 @@ if(MOQ_BUILD_TESTS)
             #
             # These tests assert the CORRECT per-draft contract, so the draft-18
             # halves FAIL until the encoder/decoder become version-aware. That is
-            # deliberate: they are the RED, not a pending feature.
+            # deliberate: the failure records the contract gap; it is not a
+            # pending feature.
             add_executable(test_np_closure_sender
                 tests/test_np_closure_sender.c)
             target_link_libraries(test_np_closure_sender PRIVATE
@@ -1096,17 +1123,18 @@ if(MOQ_BUILD_TESTS)
         endif()
     endif()
 
-    # Explicit wtquic Network.framework backend selection over a real WT
-    # loopback: the endpoint client (backend = WTQUIC_NETWORK) against a
-    # wtquic MsQuic attach server peer, one SUBSCRIBE + object + clean close
-    # with real multi-version negotiation. Apple-only (the facade). Certs are
-    # this test's own fixture; port 0 (ephemeral), no port lock.
+    # Explicit Network selection must propagate synchronous policy refusal.
+    # No server, certificate, or MsQuic component is needed by this test.
     if(MOQ_BUILD_WTQUIC_NETWORK_MANAGED)
         add_executable(test_endpoint_wtquic_network_smoke
             tests/test_endpoint_wtquic_network_smoke.c)
+        if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(test_endpoint_wtquic_network_smoke PRIVATE -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
         target_link_libraries(test_endpoint_wtquic_network_smoke PRIVATE
             moq::service moq::adapter-wtquic-network-managed
-            moq::adapter-wtquic wtq::msquic Threads::Threads)
+            moq::adapter-wtquic Threads::Threads)
         target_include_directories(test_endpoint_wtquic_network_smoke PRIVATE
             ${CMAKE_SOURCE_DIR}/tests/unit)
         find_program(MOQ_OPENSSL openssl)
@@ -1120,14 +1148,11 @@ if(MOQ_BUILD_TESTS)
             set_tests_properties(service_wtquic_network_gen_certs PROPERTIES
                 FIXTURES_SETUP service_wtquic_network_certs
                 LABELS "network")
-            add_test(NAME endpoint_wtquic_network_smoke
-                COMMAND test_endpoint_wtquic_network_smoke
-                    --cert ${CMAKE_CURRENT_BINARY_DIR}/wtquic_network_cert.pem
-                    --key ${CMAKE_CURRENT_BINARY_DIR}/wtquic_network_key.pem)
-            set_tests_properties(endpoint_wtquic_network_smoke PROPERTIES
-                FIXTURES_REQUIRED service_wtquic_network_certs
-                LABELS "network" TIMEOUT 120)
         endif()
+        add_test(NAME endpoint_wtquic_network_smoke
+            COMMAND test_endpoint_wtquic_network_smoke)
+        set_tests_properties(endpoint_wtquic_network_smoke PROPERTIES
+            LABELS "policy" TIMEOUT 30)
 
         # One-shot WT smoke server for the .wtquicNetwork runtime proof
         # (test support only, never installed). It is a wtquic MsQuic
@@ -1168,11 +1193,15 @@ if(MOQ_BUILD_TESTS)
                 get_filename_component(_svc_wtq_o "${OPENSSL_SSL_LIBRARY}" DIRECTORY)
                 get_filename_component(_svc_wtq_ossl "${_svc_wtq_o}" DIRECTORY)
             endif()
+            include("${PROJECT_SOURCE_DIR}/tests/cmake/ConsumerBuildContext.cmake")
+            set(_svc_consumer_context "${CMAKE_CURRENT_BINARY_DIR}/consumer-context.cmake")
+            moq_write_consumer_context("${_svc_consumer_context}")
             add_test(NAME service_wtquic_network_install_consumer
                 COMMAND ${CMAKE_COMMAND}
                     -DBUILD=${PROJECT_BINARY_DIR}
                     -DSRC=${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer
                     -DWORK=${CMAKE_CURRENT_BINARY_DIR}/wtquic-network-consumer-work
+                    "-DCONSUMER_CONTEXT=${_svc_consumer_context}"
                     "-DWTQUIC_PREFIX=${_svc_wtq_prefix}"
                     "-DMSQUIC_DIR_HINT=${msquic_DIR}"
                     "-DPICOQUIC_SOURCE_DIR=${MOQ_PICOQUIC_SOURCE_DIR}"

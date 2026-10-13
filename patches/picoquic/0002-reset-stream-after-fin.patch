@@ -1,0 +1,127 @@
+Preserve reset-after-FIN and reliable-reset validation on picoquic b4075dd.
+
+RFC 9000 Section 3.1 permits a reset until all sent bytes and FIN are ACKed.
+Use sent_offset, preserve context on refusal, and retain the provider's newer
+misc-frame reset scheduling. A zero-length non-FIN ACK must record no range.
+Reject a received Reliable Size exceeding Final Size, and let the common
+stream-retirement check handle RESET_STREAM_AT ACKs on local UNI streams.
+Retirement waits for both the reset ACK and all reliable-prefix byte ACKs,
+including a stream whose FIN previously marked it closed.
+Deliver arriving reliable-prefix bytes before signalling reset to the application.
+
+The inclusive reliable-prefix boundary from the older 0005 patch is already
+implemented upstream by picoquic_reliable_prefix_is_acked.
+Tests: pq_reset_after_fin, constructed boundaries and simulated wire packets.
+
+diff --git a/picoquic/frames.c b/picoquic/frames.c
+index 1d2f942..d27d409 100644
+--- a/picoquic/frames.c
++++ b/picoquic/frames.c
+@@ -97,7 +97,7 @@ int picoquic_is_stream_acked(picoquic_stream_head_t* stream)
+ 
+     if (stream->is_closed) {
+         if (stream->reset_sent) {
+-            is_acked = stream->reset_acked;
++            is_acked = stream->reset_acked && picoquic_reliable_prefix_is_acked(stream);
+         } 
+         else {
+         /* Check whether the ack was already received, including the FIN bit */
+@@ -503,6 +503,11 @@ const uint8_t* picoquic_decode_reset_stream_at_frame(picoquic_cnx_t* cnx, const
+             picoquic_frame_type_reset_stream);
+         bytes = NULL;
+     }
++    else if (reliable_size > final_offset) {
++        picoquic_connection_error(cnx, PICOQUIC_TRANSPORT_FRAME_FORMAT_ERROR,
++            picoquic_frame_type_reset_stream_at);
++        bytes = NULL;
++    }
+     else {
+         bytes = picoquic_apply_reset_stream_frame(cnx, bytes, error_code_64, stream_id, final_offset, reliable_size);
+     }
+@@ -538,9 +543,7 @@ int picoquic_process_ack_of_reset_stream_at_frame(picoquic_cnx_t* cnx, const uin
+             /* mark reset as acked by peer */
+             stream->reset_acked = 1;
+             /* Delete stream if closed. */
+-            if (stream->consumed_offset >= stream->reliable_size) {
+-                (void)picoquic_delete_stream_if_closed(cnx, stream);
+-            }
++            (void)picoquic_delete_stream_if_closed(cnx, stream);
+         }
+     }
+     return ret;
+@@ -1259,24 +1262,27 @@ static void picoquic_stream_data_chunk_callback(picoquic_cnx_t* cnx, picoquic_st
+     stream->consumed_offset += data_length;
+     cnx->data_received += data_length;
+ 
+-    if (stream->reset_received && !stream->reset_signalled && stream->consumed_offset >= stream->reset_offset) {
++    /* Deliver the reliable prefix before signalling its reset. */
++    int reset_now = stream->reset_received && !stream->reset_signalled &&
++        stream->consumed_offset >= stream->reset_offset;
++    if (!stream->reset_received && stream->consumed_offset >= stream->fin_offset &&
++        stream->fin_received && !stream->fin_signalled) {
++        fin_now = picoquic_callback_stream_fin;
++        stream->fin_signalled = 1;
++        call_back_needed = 1;
++    }
++
++    if (call_back_needed && !stream->reset_signalled && !stream->stop_sending_requested &&
++        !stream->is_discarded &&
++        cnx->callback_fn(cnx, stream->stream_id, (uint8_t*)bytes, data_length, fin_now,
++            cnx->callback_ctx, stream->app_stream_ctx) != 0) {
++        picoquic_log_app_message(cnx, "Data callback (%d, l=%zu) on stream %" PRIu64 " returns error 0x%x",
++            fin_now, data_length, stream->stream_id, PICOQUIC_TRANSPORT_INTERNAL_ERROR);
++        picoquic_connection_error(cnx, PICOQUIC_TRANSPORT_INTERNAL_ERROR, 0);
++    }
++    if (reset_now) {
+         picoquic_signal_stream_reset(cnx, stream);
+     }
+-    else {
+-        if (stream->consumed_offset >= stream->fin_offset && stream->fin_received && !stream->fin_signalled) {
+-            fin_now = picoquic_callback_stream_fin;
+-            stream->fin_signalled = 1;
+-            call_back_needed = 1;
+-        }
+-
+-        if (call_back_needed && !stream->stop_sending_requested && !stream->is_discarded &&
+-            cnx->callback_fn(cnx, stream->stream_id, (uint8_t*)bytes, data_length, fin_now,
+-                cnx->callback_ctx, stream->app_stream_ctx) != 0) {
+-            picoquic_log_app_message(cnx, "Data callback (%d, l=%zu) on stream %" PRIu64 " returns error 0x%x",
+-                fin_now, data_length, stream->stream_id, PICOQUIC_TRANSPORT_INTERNAL_ERROR);
+-            picoquic_connection_error(cnx, PICOQUIC_TRANSPORT_INTERNAL_ERROR, 0);
+-        }
+-    }
+ }
+ 
+ void picoquic_stream_data_callback(picoquic_cnx_t* cnx, picoquic_stream_head_t* stream)
+@@ -3600,7 +3606,7 @@ int picoquic_process_ack_of_stream_frame(picoquic_cnx_t* cnx, uint8_t* bytes,
+ 
+         /* record the ack range for the stream */
+         stream = picoquic_find_stream(cnx, stream_id);
+-        if (stream != NULL) {
++        if (stream != NULL && (data_length != 0 || fin)) {
+             (void)picoquic_update_sack_list(&stream->sack_list,
+                 offset, offset + data_length - ((fin) ? 0 : 1), 0);
+ 
+diff --git a/picoquic/streams.c b/picoquic/streams.c
+index 04e6a21..3ed48b5 100644
+--- a/picoquic/streams.c
++++ b/picoquic/streams.c
+@@ -457,8 +457,8 @@ int picoquic_reset_stream_at(picoquic_cnx_t* cnx,
+         ret = PICOQUIC_ERROR_INVALID_STREAM_ID;
+     }
+     else {
+-        stream->app_stream_ctx = NULL;
+-        if (stream->fin_sent && picoquic_check_sack_list(&stream->sack_list, 0, stream->fin_offset) == 0) {
++        if (!stream->reset_requested && stream->fin_sent &&
++            picoquic_check_sack_list(&stream->sack_list, 0, stream->sent_offset)) {
+             ret = PICOQUIC_ERROR_STREAM_ALREADY_CLOSED;
+         }
+         else if (!stream->reset_requested) {
+@@ -466,6 +466,7 @@ int picoquic_reset_stream_at(picoquic_cnx_t* cnx,
+                 ret = PICOQUIC_ERROR_OFFSET_TOO_BIG;
+             }
+             else {
++                stream->app_stream_ctx = NULL;
+                 stream->reliable_size = reliable_size;
+                 stream->local_error = local_stream_error;
+                 stream->reset_requested = 1;

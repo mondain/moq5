@@ -117,11 +117,11 @@ struct TransportVersionTests {
                 "draft-18 bytes must not decode to 33333 under draft-16")
     }
 
-    @Test("Draft 21 reads the timestamp at LOC-04's id, not LOC-01's")
-    func draft21UsesLoc04TimestampId() throws {
-        // Draft 21 keeps draft 18's vi64 codec (draft-21 section 8.1), so
-        // the corpus d18 value bytes are the d21 value bytes too. What
-        // changes is the property id: draft 21 registers LOC-04's (section
+    @Test("Draft 22 reads the timestamp at LOC-04's id, not LOC-01's")
+    func draft22UsesLoc04TimestampId() throws {
+        // Draft 22 keeps draft 18's vi64 codec (draft-22 section 8.1), so
+        // the corpus d18 value bytes are the d22 value bytes too. What
+        // changes is the property id: draft 22 registers LOC-04's (section
         // 16.8; draft-ietf-moq-loc-04 section 2.3), where the timestamp is
         // 0x10 rather than LOC-01's 0x02.
         let records = try loadTimestampRecords()
@@ -135,19 +135,19 @@ struct TransportVersionTests {
                                    payload: Data([0x01]))
         let loc01 = try makeObject(properties: propertyBlock(for: rec),
                                    payload: Data([0x01]))
-        let d21 = MediaTrackInfo(mediaType: .video, packaging: .raw,
-                                 transportVersion: .draft21)
+        let d22 = MediaTrackInfo(mediaType: .video, packaging: .raw,
+                                 transportVersion: .draft22)
         let d18 = MediaTrackInfo(mediaType: .video, packaging: .raw,
                                  transportVersion: .draft18)
 
-        let parsed = try MediaObjectParser.parse(track: d21, object: loc04)
+        let parsed = try MediaObjectParser.parse(track: d22, object: loc04)
         #expect(parsed.hasCaptureTime)
         #expect(parsed.captureTimeUS == 33333)
 
         // Each id is meaningful only under its own draft. Either may throw
         // or report no timestamp; reproducing the value would mean the
         // version never reached the id table.
-        for (track, obj, what) in [(d21, loc01, "LOC-01 id under d21"),
+        for (track, obj, what) in [(d22, loc01, "LOC-01 id under d22"),
                                    (d18, loc04, "LOC-04 id under d18")] {
             var reproduced = false
             if let other = try? MediaObjectParser.parse(track: track,
@@ -204,7 +204,7 @@ struct TransportVersionTests {
         // than an indirect parse failure somewhere downstream.
         #expect(cTransportVersion(.draft16) == MOQ_VERSION_DRAFT_16)
         #expect(cTransportVersion(.draft18) == MOQ_VERSION_DRAFT_18)
-        #expect(cTransportVersion(.draft21) == MOQ_VERSION_DRAFT_21)
+        #expect(cTransportVersion(.draft22) == MOQ_VERSION_DRAFT_22)
         #expect(cTransportVersion(.draft16) != cTransportVersion(.draft18))
 
         // Every case the shared type declares must map to a DISTINCT C

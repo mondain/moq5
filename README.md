@@ -2,7 +2,7 @@
 
 C library for [Media over QUIC Transport](https://datatracker.ietf.org/doc/draft-ietf-moq-transport/):
 a sans-I/O protocol core plus transport adapters, with a high-level **media
-service tier** for applications. Supports **draft-16 and draft-18**, selected by
+service tier** for applications. Supports **draft-22, draft-18 and draft-16**, selected by
 transport version negotiation.
 
 **Status:** the draft-16 and draft-18 protocol surfaces are substantially
@@ -17,6 +17,9 @@ below). This is pre-1.0: the core is stable and well-tested; the WebTransport
 adapters are marked experimental. Not "production complete"; verify against your
 own endpoint before depending on it.
 
+Draft 22 uses explicit Location Filter types and subscription fill streams.
+See [conformance.md](docs/conformance.md) for validation and remaining limits.
+
 **Media consumers start here:** [`examples/service/README.md`](examples/service/README.md).
 
 ## Design
@@ -29,11 +32,11 @@ own endpoint before depending on it.
 - **Deterministic simulation:** built for FoundationDB-style
   seed-replayable testing with fault injection, OOM loops, and
   bounded-output invariants (`moq-sim` / SimPair).
-- **Versioned profiles, negotiated not guessed:** draft-16 and draft-18 are
-  both implemented as profiles. The session's wire version is fixed at creation
+- **Versioned profiles, negotiated not guessed:** draft-22, draft-18 and draft-16 are
+  implemented as profiles. The session's wire version is fixed at creation
   and immutable; there is **no** version auto-detection. The version comes from
-  the negotiated transport context: raw QUIC selects a MoQ ALPN (`moqt-16` /
-  `moqt-18`); H3 WebTransport uses the `h3` ALPN plus WebTransport-protocol
+  the negotiated transport context: raw QUIC selects a MoQ ALPN (`moqt-22` /
+  `moqt-18` / `moqt-16`); H3 WebTransport uses the `h3` ALPN plus WebTransport-protocol
   selection. The service tier and managed adapters drive this negotiation for
   you (offer the set, create the session for the agreed version). An
   unknown/unoffered version fails rather than guessing.
@@ -92,8 +95,8 @@ supports and the shared scenarios run against it.
 
 | Adapter | Transport | Stack | Modes | Status |
 |---|---|---|---|---|
-| **picoquic** | raw QUIC (`moqt-16`/`moqt-18`) | picoquic (C) | attach + managed (`moq_pq_threaded_t`) | stable; lightest footprint |
-| **mvfst** | raw QUIC (`moqt-16`/`moqt-18`) | Meta mvfst (C++/folly) | attach + managed (`moq_mvfst_managed_t`) | stable; multi-connection server |
+| **picoquic** | raw QUIC (`moqt-22`/`moqt-18`/`moqt-16`) | picoquic (C) | attach + managed (`moq_pq_threaded_t`) | stable; lightest footprint |
+| **mvfst** | raw QUIC (`moqt-22`/`moqt-18`/`moqt-16`) | Meta mvfst (C++/folly) | attach + managed (`moq_mvfst_managed_t`) | stable; multi-connection server |
 | **picoquic WebTransport** | WebTransport / HTTP-3 (`h3`) | picoquic h3zero/picowt (C) | attach + managed (`moq_pico_wt_managed_t`) | **experimental** |
 | **proxygen WebTransport** | WebTransport | proxygen (C++) | attach + managed (`moq_proxygen_wt_managed_t`) | **experimental** |
 

@@ -1,5 +1,5 @@
 /*
- * Negotiated-profile substrate (Step 5): the ENDPOINT-OFFER half of the
+ * Negotiated-profile substrate: the ENDPOINT-OFFER half of the
  * future-draft drift gate.
  *
  * The declared transport rows carry three INDEPENDENT facts -- profile
@@ -120,7 +120,7 @@ int main(void)
                 t[i].endpoint_offered = false;
                 t[i].auto_rank = NP_AUTO_RANK_NONE;
             }
-        /* the remaining ranks (D21 = 1, D18 = 2) stay contiguous */
+        /* the remaining ranks (D22 = 1, D18 = 2) stay contiguous */
 
         np_topology_t v;
         v.transports = t; v.n_transports = d.n_transports;

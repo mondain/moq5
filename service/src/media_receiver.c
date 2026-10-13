@@ -255,7 +255,7 @@ struct moq_media_receiver {
     moq_subscriber_t  *sub;
     moq_sub_track_t   *catalog_sub;
     moq_sub_fetch_req_t *catalog_fetch;   /* joining FETCH(offset=0), or the fill on
-                                           * the catalog SUBSCRIBE (draft 21); MSF-01 §5 */
+                                           * the catalog SUBSCRIBE (draft 22); MSF-01 §5 */
     bool               catalog_fetch_issued;  /* issued exactly once */
 
     /* The current effective independent catalog (MSF-01 §5). `has_effective`
@@ -1359,8 +1359,8 @@ static bool receiver_update_within_limits(const moq_media_receiver_t *r,
 }
 
 /* Shared independent/delta adoption: immutable check, then the no-fail commit
- * (CP slot reserved before reconcile, per R1's no-mutation-before-fallible-
- * commit rule). On ADOPT_OK the caller must NOT clean up cand. */
+ * (CP slot reserved before reconcile, so nothing is mutated before the last
+ * fallible step). On ADOPT_OK the caller must NOT clean up cand. */
 static adopt_result_t receiver_adopt(moq_media_receiver_t *r,
                                      moq_msf_catalog_t *cand, uint64_t now_us)
 {
@@ -1552,7 +1552,7 @@ static void receiver_ingest_catalog(moq_media_receiver_t *r,
  * the receiver (receiver_on_subscribe_error). A relay/origin that does not serve
  * FETCH either errors it or leaves it unanswered; neither is fatal here -- the
  * SUBSCRIBE still delivers live catalog updates, and the unanswered request is
- * bounded (issued exactly once). Under draft 21 the same objects come from the
+ * bounded (issued exactly once). Under draft 22 the same objects come from the
  * fill requested on the catalog SUBSCRIBE (already issued, drained here). */
 static void receiver_pump_catalog_fetch(moq_media_receiver_t *r,
                                         uint64_t now_us)
@@ -1586,7 +1586,8 @@ static void receiver_pump_catalog_fetch(moq_media_receiver_t *r,
              * items; drop our handle (only on our own fetch) so a recycled slot
              * can't later match. */
             if (item.kind == MOQ_SUB_FETCH_ERROR ||
-                item.kind == MOQ_SUB_FETCH_COMPLETE)
+                item.kind == MOQ_SUB_FETCH_COMPLETE ||
+                item.kind == MOQ_SUB_FETCH_RESET)
                 r->catalog_fetch = NULL;
         }
         moq_sub_fetch_item_cleanup(&item);
@@ -2501,7 +2502,7 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
         tcfg.track_namespace = r->namespace_;
         tcfg.track_name = (moq_bytes_t){ r->catalog_name,
                                          r->catalog_name_len };
-        /* Draft 21 has no Joining FETCH; its replacement is a fill on the
+        /* Draft 22 has no Joining FETCH; its replacement is a fill on the
          * SUBSCRIBE (3.4). A one-field Location Filter starting at 1 is the
          * Largest Object's group from its first object: what the Joining
          * FETCH(offset=0) retrieves. Drafts without fills refuse it with nothing
@@ -2509,7 +2510,7 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
         moq_fill_request_t fill;
         memset(&fill, 0, sizeof(fill));
         fill.has_location = true;
-        fill.field_count = 1;
+        fill.location_type = 1;
         fill.start_group = 1;
         moq_result_t src = moq_sub_subscribe_with_fill(r->sub, &tcfg, &fill,
             now_us, &r->catalog_sub, &r->catalog_fetch);
@@ -2725,6 +2726,13 @@ void moq_media_receiver_test_set_alloc(const moq_alloc_t *alloc);
 void moq_media_receiver_test_set_alloc(const moq_alloc_t *alloc)
 {
     g_test_alloc = alloc;
+}
+/* Test-only observation of the catalog Joining-FETCH correlation handle: true
+ * while the receiver still correlates fetch items to its catalog fetch. */
+bool moq_media_receiver_test_catalog_fetch_pending(const moq_media_receiver_t *r);
+bool moq_media_receiver_test_catalog_fetch_pending(const moq_media_receiver_t *r)
+{
+    return r != NULL && r->catalog_fetch != NULL;
 }
 void moq_media_receiver_test_entry_sizes(size_t *event_entry, size_t *obj_entry);
 void moq_media_receiver_test_entry_sizes(size_t *event_entry, size_t *obj_entry)
@@ -3707,7 +3715,11 @@ moq_media_receiver_t *moq_media_receiver_test_new(bool auto_subscribe)
 
 void moq_media_receiver_test_free(moq_media_receiver_t *r)
 {
-    if (r) receiver_free(r);
+    if (r) {
+        if (r->sub) moq_sub_destroy(r->sub);
+        r->sub = NULL;
+        receiver_free(r);
+    }
 }
 
 void moq_media_receiver_test_ingest(moq_media_receiver_t *r, uint64_t group,

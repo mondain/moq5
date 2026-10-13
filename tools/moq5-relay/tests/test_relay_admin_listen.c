@@ -12,6 +12,10 @@
  * Every wait in this file is bounded and every bound fails the run. A test that
  * hangs reports nothing.
  */
+#if defined(__linux__) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "../cli/admin_listen.h"
 #include "../cli/broker.h"
 #include <moq/relay/moqr_obs.h>
@@ -4145,7 +4149,7 @@ test_nocarrier_release_is_its_own_call(void)
  * Two sites sharing an id is not a cosmetic problem: arming one silently
  * selects whichever wrapper the owner reaches first, and an oracle that
  * compares only the integer cannot tell that it never reached the site it
- * named. That is a false green, and it is exactly what happened.
+ * named. That is a false pass.
  *
  * The values come from an enumeration in one header, so a collision cannot be
  * written; this proves the property that construction is supposed to give, and

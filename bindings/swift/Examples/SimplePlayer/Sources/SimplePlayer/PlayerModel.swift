@@ -89,7 +89,7 @@ final class PlayerModel: ObservableObject {
     }
     enum VersionChoice: String, CaseIterable, Identifiable {
         case automatic = "Auto"          // offer all supported versions
-        case draft21 = "Draft 21"
+        case draft22 = "Draft 22"
         case draft18 = "Draft 18"
         case draft16 = "Draft 16"
         var id: String { rawValue }
@@ -438,7 +438,7 @@ final class PlayerModel: ObservableObject {
         }
         switch version {
         case .automatic: break
-        case .draft21:   configuration.versions = .list([.draft21])
+        case .draft22:   configuration.versions = .list([.draft22])
         case .draft18:   configuration.versions = .list([.draft18])
         case .draft16:   configuration.versions = .list([.draft16])
         }

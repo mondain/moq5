@@ -993,7 +993,8 @@ static int run_inbound_d18(uint64_t wire_code, struct inbound_obs *o)
     tally_actions(c, &o->acts);
     o->state = moq_session_state(c);
 
-    failures += check_error_shape(o, &id, RETRY_WIRE);
+    /* d18 §10.6, as d16 §9.8: the wire value is milliseconds plus one. */
+    failures += check_error_shape(o, &id, RETRY_WIRE - 1);
     /* our own send half closes, on the EXACT predeclared request ref, and
      * nothing else is emitted */
     MOQ_TEST_CHECK_EQ_INT(o->acts.total, 1);
@@ -1190,8 +1191,7 @@ static int advance_snap_unchanged(const struct advance_snap *before,
  * assigned into the field must round-trip. That is a width statement only --
  * whether a given code is ACCEPTED also depends on the profile's wire
  * ceiling (see the refusal cells) and on pre-existing family rules such as
- * PUBLISH and SUBSCRIBE_TRACKS refusing REDIRECT, which this slice does not
- * change.
+ * PUBLISH and SUBSCRIBE_TRACKS refusing REDIRECT.
  */
 static int outbound_public_width_is_64_bit(void)
 {
@@ -1377,9 +1377,9 @@ static int outbound_reject_code(moq_version_t version, uint64_t send_code)
             moq_d18_decode_request_error(env.payload, env.payload_len, &err),
             MOQ_OK);
         MOQ_TEST_CHECK(err.error_code == send_code);   /* exact, full width */
-        /* d18 emits the ms value unchanged where d16 applies the spec's
-         * "plus one"; pinned per draft, see the retry note in main() */
-        MOQ_TEST_CHECK(err.retry_interval == OUT_RETRY_MS);
+        /* §10.6: "The minimum time (in milliseconds) before the request
+         * SHOULD be sent again, plus one" -- the same rule as d16 below. */
+        MOQ_TEST_CHECK(err.retry_interval == OUT_RETRY_MS + 1);
         MOQ_TEST_CHECK_EQ_SIZE(err.reason.len, sizeof(k_reason_bytes));
         MOQ_TEST_CHECK(err.reason.data != NULL);
         if (err.reason.data != NULL)
@@ -1682,6 +1682,76 @@ static int d16_family_refuses_before_advance(void)
 
 /* ------------------------------------------------------------------ */
 
+/*
+ * Retry Interval on the wire, byte for byte. Both drafts define it as "The
+ * minimum time (in milliseconds) before the request SHOULD be sent again,
+ * plus one. If the value is 0, the request SHOULD NOT be retried" (d16 §9.8,
+ * d18 §10.6), so a 1000 ms retry is the integer 1001 in each draft's own
+ * varint: d18 vi64 0x83 0xE9, d16 QUIC varint 0x43 0xE9.
+ */
+static int outbound_reject_retry_bytes(moq_version_t version)
+{
+    int failures = 0;
+    moq_session_t *c = NULL, *sv = NULL;
+    struct request_ident id;
+    moq_subscription_t inbound = MOQ_SUBSCRIPTION_INVALID;
+    moq_event_t ev;
+    struct act_tally t;
+    moq_reject_subscribe_cfg_t rcfg;
+    static const uint8_t reason[] = { 'l', 'o', 'a', 'd' };
+
+    failures += make_pair(version, &c, &sv);
+    if (c == NULL || sv == NULL)
+        return failures;
+    failures += issue_subscribe(c, version, &id);
+    if (version == MOQ_VERSION_DRAFT_18)
+        MOQ_TEST_CHECK_EQ_INT(
+            moq_session_on_bidi_stream_bytes(sv, id.ref, id.bytes,
+                                             id.bytes_len, false, 0), MOQ_OK);
+    else
+        MOQ_TEST_CHECK_EQ_INT(
+            moq_session_on_control_bytes(sv, id.bytes, id.bytes_len, 0),
+            MOQ_OK);
+    while (moq_session_poll_events(sv, &ev, 1) > 0) {
+        if (ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST)
+            inbound = ev.u.subscribe_request.sub;
+        moq_event_cleanup(&ev);
+    }
+    moq_reject_subscribe_cfg_init(&rcfg);
+    rcfg.error_code = version == MOQ_VERSION_DRAFT_18
+                          ? MOQ_REQUEST_ERROR_EXCESSIVE_LOAD
+                          : MOQ_REQUEST_ERROR_INTERNAL_ERROR;
+    rcfg.reason = (moq_bytes_t){ reason, sizeof(reason) };
+    rcfg.can_retry = true;
+    rcfg.retry_after_ms = 1000;
+    MOQ_TEST_CHECK_EQ_INT(moq_session_reject_subscribe(sv, inbound, &rcfg, 0),
+                          MOQ_OK);
+    tally_actions(sv, &t);
+    if (version == MOQ_VERSION_DRAFT_18) {
+        /* type 0x05 | length 0x0008 | code 0x09 | retry 1001 | reason "load" */
+        static const uint8_t want[] = { 0x05, 0x00, 0x08, 0x09, 0x83, 0xE9,
+                                        0x04, 'l', 'o', 'a', 'd' };
+        MOQ_TEST_CHECK_EQ_SIZE(t.bytes_len, sizeof(want));
+        MOQ_TEST_CHECK(t.bytes_len == sizeof(want) &&
+                       memcmp(t.bytes, want, sizeof(want)) == 0);
+    } else {
+        /* type 0x05 | length 0x0009 | request id | code 0x00 | retry 1001 |
+         * reason "load" */
+        MOQ_TEST_CHECK(id.request_id < 64);   /* one-byte varint below */
+        const uint8_t want[] = { 0x05, 0x00, 0x09, (uint8_t)id.request_id,
+                                 0x00, 0x43, 0xE9, 0x04, 'l', 'o', 'a', 'd' };
+        MOQ_TEST_CHECK_EQ_SIZE(t.bytes_len, sizeof(want));
+        MOQ_TEST_CHECK(t.bytes_len == sizeof(want) &&
+                       memcmp(t.bytes, want, sizeof(want)) == 0);
+    }
+    moq_session_destroy(c);
+    moq_session_destroy(sv);
+    if (failures == 0)
+        printf("PASS: outbound_reject_retry_bytes(%s)\n",
+               version == MOQ_VERSION_DRAFT_18 ? "d18" : "d16");
+    return failures;
+}
+
 int main(void)
 {
     int failures = 0;
@@ -1704,15 +1774,15 @@ int main(void)
         MOQ_TEST_CHECK(o.code == COLLIDING_LOW32);
     }
 
-    /* -- RED: draft-18 normalization, three independent shapes -------- */
-    {   /* wide unknown: truncation AND missing normalization */
+    /* -- Draft-18 normalization, three independent shapes ------------- */
+    {   /* wide unknown: must be neither truncated nor left unnormalized */
         struct inbound_obs o;
 
         failures += run_inbound_d18(WIDE_UNKNOWN_CODE, &o);
         MOQ_TEST_CHECK(o.code == MOQ_REQUEST_ERROR_INTERNAL_ERROR);
         MOQ_TEST_CHECK(o.code != COLLIDING_LOW32);
     }
-    {   /* in-range unknown: NO truncation, missing normalization alone */
+    {   /* in-range unknown: no truncation risk, normalization alone */
         struct inbound_obs o;
 
         failures += run_inbound_d18(NARROW_UNKNOWN_CODE, &o);
@@ -1726,7 +1796,7 @@ int main(void)
     }
 
     /*
-     * -- RED: a wide value whose low bits are REDIRECT ----------------
+     * -- A wide value whose low bits are REDIRECT ---------------------
      * Redirect recognition must look at the FULL decoded value. On both
      * drafts this must stay an ORDINARY REQUEST_ERROR: exactly one
      * SUBSCRIBE_ERROR, zero MOQ_EVENT_REQUEST_REDIRECT. What the code
@@ -1749,7 +1819,7 @@ int main(void)
         MOQ_TEST_CHECK(o.code == MOQ_REQUEST_ERROR_INTERNAL_ERROR);
     }
 
-    /* -- RED: draft-16, the narrowest defensible expectation ---------- */
+    /* -- Draft-16, the narrowest defensible expectation --------------- */
     {
         struct inbound_obs o;
 
@@ -1838,6 +1908,8 @@ int main(void)
     failures += outbound_public_width_is_64_bit();
     failures += outbound_reject(MOQ_VERSION_DRAFT_16);
     failures += outbound_reject(MOQ_VERSION_DRAFT_18);
+    failures += outbound_reject_retry_bytes(MOQ_VERSION_DRAFT_16);
+    failures += outbound_reject_retry_bytes(MOQ_VERSION_DRAFT_18);
     /* a real code above UINT32_MAX, within draft-16's own ceiling */
     failures += outbound_reject_code(MOQ_VERSION_DRAFT_16,
                                      UINT64_C(0x1FFFFFFFF));

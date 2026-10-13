@@ -51,7 +51,7 @@ class Version(IntEnum):
 
     DRAFT_16 = _constants["VERSION_DRAFT_16"]
     DRAFT_18 = _constants["VERSION_DRAFT_18"]
-    DRAFT_21 = _constants["VERSION_DRAFT_21"]
+    DRAFT_22 = _constants["VERSION_DRAFT_22"]
 
 
 class EndpointState(IntEnum):
@@ -846,7 +846,7 @@ class SendTrackConfig:
     here so a malformed track never reaches the service. A live track must not
     declare a duration (5.2.35).
 
-    Deferred, and deliberately not settable from Python in this slice: the
+    Deliberately not settable from Python: the
     CMSF maximum SAP starting types, content-protection reference ids, the
     generated SAP and media timelines, and the CMSF alternate group. Every one
     of them is sent absent.

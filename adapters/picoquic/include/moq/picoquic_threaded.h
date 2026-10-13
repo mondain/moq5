@@ -286,7 +286,7 @@ typedef struct moq_pq_threaded_cfg {
      * inert in server mode. */
     const char        *ca_file;
 
-    /* Appended (struct_size append-only ABI) -- CLIENT only, draft 21: the AUTHORITY
+    /* Appended (struct_size append-only ABI) -- CLIENT only, draft 22: the AUTHORITY
      * and PATH a native-QUIC client sends in SETUP (9.1.1, 9.1.2). NUL-terminated,
      * copied during _create; NULL/empty = send none. Inert for servers and for
      * drafts that do not carry them. */

@@ -53,7 +53,7 @@ Factual status of draft-ietf-moq-transport-16 support in libmoq.
 ## Known Limitations
 
 - **REQUEST_UPDATE**: Auto-accepts priority, forward, and delivery timeout for subscriptions and PUBLISH-created subscriptions. Outbound update API for both subscription and publication sides. Pending update tombstones across PUBLISH_DONE and UNSUBSCRIBE. Filter, auth token, new group request, and subscription filter params are rejected as unsupported. Other targets (fetch, namespace, track-status) return REQUEST_ERROR(NOT_SUPPORTED).
-- **d18 profile**: Implemented in the tree (see the draft 21 section below for the newest profile and the interop runner results).
+- **d18 profile**: Implemented in the tree (see the draft 22 section below for the newest profile and the interop runner results).
 - **QUIC transport**: Sans-I/O core. In-tree adapters: picoquic (raw QUIC), mvfst (raw QUIC), picoquic WebTransport, and proxygen WebTransport. The WebTransport adapters are experimental.
 - **Facades**: Publisher and subscriber facades exist; relay facade not started.
 - **Joining fetch filter**: Only LARGEST_OBJECT filter is valid per spec; client and server both enforce this.
@@ -69,73 +69,60 @@ Factual status of draft-ietf-moq-transport-16 support in libmoq.
 | OOM sweep | 14 scenarios | Fail-at-N allocator exhaustive |
 
 
-## Draft 21 (draft-ietf-moq-transport-21)
+## Draft 22 (draft-ietf-moq-transport-22)
 
-Status of the draft-21 profile (`core/src/session/profile_d21.c`, codec in
-`core/src/wire/control_d21.c`), offered first by the endpoint ({21, 18, 16}). The wire
-facts and the ambiguities are in `docs/draft21-wire-reference.md`; the build plan and
-per-task results are in `docs/draft21-implementation-plan.md`.
+The endpoint offers `{22,18,16}`. Draft 22 replaces the pending draft-21 profile.
+The authority is [draft-ietf-moq-transport-22.txt](draft-ietf-moq-transport-22.txt),
+with the [wire reference](draft22-wire-reference.md) and
+[implementation notes](draft22-implementation-plan.md) describing the mapping.
 
-| Area | Status |
-|------|--------|
-| Control codec, setup options, request layer | Full (draft 21 message set, REQUEST_OK for PUBLISH_OK, PUBLISH_SKIPPED, STATE_NOTIFY, GOAWAY without Request ID) |
-| SETUP AUTHORITY / PATH | Sent by a native-QUIC client on the picoquic, msquic and mvfst endpoint paths (also under draft 18); not by the WebTransport paths, which must not |
-| Subscriptions | Concurrent subscriptions per Track, exact Location Filter (relative start, end Object), Range Filters declined with INVALID_FILTER |
-| PUBLISH | Accept sends non-default choices as a follow-up REQUEST_UPDATE; the publisher's initial parameters are readable (`moq_session_publish_initial_params`) |
-| Fill streams (replace Joining FETCH) | Both sides: request a fill on SUBSCRIBE / REQUEST_UPDATE, receive it as fetch events; publisher opens, serves (facade: from the retained group), resets on cancel; STOP_SENDING cancels only the fill. Subscriber facade: `moq_sub_subscribe_with_fill` (MOQ_EVENT_FILL_OPENED names the fill's fetch handle). The media receiver asks for a fill of the latest group on the catalog SUBSCRIBE where draft 18 sends a Joining FETCH, so a late joiner still gets the catalog |
-| Request streams | A FIN is not a cancellation; responder FIN without PUBLISH_DONE fails the request |
-| PUBLISH_STATE_NOTIFY | Received and validated; sendable on an established subscription (`moq_session_notify_subscription_state`) |
-| MAX_REQUEST_UPDATES | Advertised when configured (`moq_session_cfg_t::max_request_updates`); one update is processed and answered at a time, so no inbound counter enforces it and TOO_MANY_REQUEST_UPDATES is never sent |
-| Data plane | Shared with draft 18 plus FIRST_OBJECT (set by the original publisher), End of Timed-Out Range |
-| Delivery timeouts | The SUBGROUP timer starts at the subgroup's FIN, uses the first object's property override, and resets the stream on expiry (closed subgroups are kept until it fires). The per-object clock is not implemented: the session hands each object to the transport as it is written, so only an application that holds an object back (WOULD_BLOCK) could age one |
-| FILL_TIMEOUT | Carried and surfaced; not acted on. It bounds how long a relay waits for upstream sources (9.20.6), which an origin publisher never does |
-| LOC properties | LOC-04 ids (Timestamp 0x10, Frame Marking 0x09 as bytes, ...) selected by `moq_loc_profile_for_transport` |
+| Area | Implementation |
+|---|---|
+| Negotiation and control | Draft-22 ALPN/protocol, SETUP, request streams, REQUEST_OK, PUBLISH_STATE_NOTIFY, PUBLISH_SKIPPED and GOAWAY |
+| Location Filter | Explicit types 0 through 5, relative starts, absolute origin, inclusive end object, overflow and unknown-type rejection |
+| FETCH and fills | Standalone FETCH; SUBSCRIBE/REQUEST_UPDATE fills; exact history resolution; Next Object FETCH rejection and relative-start clamping |
+| Names | Binary fields, 0..32 namespace fields, nonempty individual fields, 4096-byte aggregate limits |
+| Authorization | Opaque token payloads; alias registration/use/delete, transactional cache changes, duplicate resolved token checks |
+| PUBLISH | Non-default accepted parameters sent as REQUEST_UPDATE; initial parameters queryable |
+| Data | Subgroup/object layouts, FIRST_OBJECT and FETCH End of Range markers |
+| Range Filters | Declined with INVALID_FILTER; MAX_FILTER_RANGES defaults to zero |
+| Delivery timeouts | Subgroup timer starts at FIN; per-object clock remains unimplemented |
+| FILL_TIMEOUT | Surfaced; relay waiting remains unimplemented |
+| Bindings | C++ and Swift version mappings and public codec headers updated |
 
-Swift: `.draft21` added to `MoQTransportVersion` and its C mappings (plan 8.4).
+### Validation on 2026-10-13
 
-Not implemented: the per-object delivery clock, per-adapter
-loopback tests for 21 beyond picoquic (the other adapters take their version list from the
-shared endpoint list).
+| Configuration | Result |
+|---|---|
+| Core/service, warnings as errors | 193/193 CTest |
+| ASan/UBSan with leak detection | 193/193 CTest; draft-22 allocator failure sweep passed |
+| Shared libraries and C++ binding | 211/211 CTest |
+| Pinned picoquic, native QUIC and WebTransport | 279/279 CTest |
+| Pinned MsQuic | 229/229 CTest |
+| Swift | 386/386 tests when run serially; the parallel run had 12 timing failures |
+| Fuzzing | Draft-22 control codec and session-control targets completed 30 seconds each with ASan/UBSan |
+| Dependency setup | Patch-list/idempotence and picotls compiler-policy self-tests passed |
 
-### Interop runner results (moq-contribution-interop-runner, native QUIC, driven by `tools/interop-adapter`)
+The contribution tester was freshly built from `ae0364dfe013610ef4e399efae82ffb37a291f42`;
+its previous binary identified the older `28b2974` source commit. Draft-22 audit:
+170/170 required executable coverage, 3/97 optional coverage, static gate passed.
+These are catalog/instrument checks, not a publisher conformance score.
 
-216 driven scenarios were run, each connected over ALPN `moqt-21`; requirements sharing scenarios
-were run together. Of the 638 catalog rows (270 testable): **57 PASS, 1 FAIL**, 212 not run, 103 not
-testable, 265 not applicable. `moq-interop-audit --draft 21` reports 173/173 required executable
-coverage. WebTransport was not exercised (the picoquic WebTransport backend speaks the legacy
-dialect the runner rejects).
+Live driven tests used the maintained `tools/interop-adapter/run.sh` and the
+fresh `media_send` binary: 21 selected contexts per transport, all establishing
+native-QUIC `moqt-22` or WebTransport `moqt-22` sessions. Both transports scored
+`D22-8-7-MUST-269` (empty namespace field) and `D22-8-7-MUST-270` (too many
+namespace fields) as PASS, with no scored FAIL. All run verdicts were INCOMPLETE.
 
-The one FAIL, `D21-5-2-MUST-130` (`d21-subgroup-completion-withheld-acknowledgments`): the
-runner asks for a 200 ms SUBGROUP_DELIVERY_TIMEOUT, holds each data stream at 64 bytes of flow
-control and expects a reset once the publisher has completed the subgroup. The placeholder
-`media_send` stalls under that flow control before it can finish a subgroup, so the spec's
-timer (which starts at the FIN, 5.2) never starts. The row passed in an earlier run only because
-the timer was then armed when the stream opened, which resets live subgroups early and is not
-what the draft says; that behaviour was removed. Closing the gap needs the placeholder publisher
-(or an adapter mode) to complete a subgroup while the receiver withholds credit.
+Several raw probes report accepted byte counts but `operation_accepted=false`,
+so their evaluators leave requirements NOT_RUN despite observing protocol
+closes. Other selected rows need publisher behaviors the placeholder application
+does not originate or token-cache/policy configuration it does not provide.
+Do not interpret these gaps as passed requirements. In particular, typed filter
+byte vectors and session tests establish the codec behavior; the live tester
+does not currently provide a complete filter conformance score for this app.
 
-Rows fixed on this branch because the first full run failed them: FIRST_OBJECT on a new subgroup
-(D21-2-2-MUST-020), SETUP AUTHORITY / PATH including an empty path and a present empty query
-(D21-6-3-2-MUST-150, D21-9-1-1-MUST-296, D21-9-1-2-MUST-303/304), a single response to
-SUBSCRIBE_NAMESPACE (D21-4-1-MUST-082), the 8,192-byte GOAWAY URI, and process exit status when
-the library closed a session over a peer's protocol violation (`media_send --peer-close-ok`).
-
-Triage of the 212 rows not run (no row is reported as passed that was not):
-
-| Bucket | Rows | Meaning |
-|--------|------|---------|
-| NOT_RUN: scenario not executable | about 109 | The runner has no executable profile for the scenario (100 scenario ids) or needs a different run configuration (six namespace-period probes are refused as an invalid run config) |
-| NOT_RUN: needs a publisher mode | about 103 | The scenario ran but its evaluator needs the publisher to originate something the placeholder `media_send` does not (property repeats, gap properties, padding streams, fetch data, a premature reset). The adapter has no per-scenario modes |
-| FIX | 1 | D21-5-2-MUST-130 above |
-| DISPUTE | 0 | None raised |
-
-Draft 18 under the same adapter: 69 PASS and 2 FAIL (a standalone FETCH for a track with no
-objects, D18-10-12-3-MUST-004, and the SUBSCRIBE_TRACKS single response, D18-6-1-MUST-003). The
-earlier 63 PASS / 7 FAIL became 69 / 2 because SETUP AUTHORITY / PATH and FIRST_OBJECT were also
-added to the draft-18 profile. A full Task 0 baseline was not captured, so "not worse" rests on
-that comparison.
-
-Also green: default tree 131/131, ASan/UBSan tree 131/131, the simulator OOM test under drafts 18
-and 21, all six fuzz targets clean for 30 s each, `scripts/check_profile_boundary.sh`; the `dev`
-tree's failing set equals `main`'s. The seeded sweeps under draft 21 fail the same runners
-they fail under draft 18 (they assume the draft-16 start order).
+The adapter ignores its media fixture and sends placeholder access units. These
+runs do not establish rendered-media delivery. The live WebTransport run exposed
+an omitted port in CONNECT `:authority`; the client now uses its connect host
+and port independently of its TLS server name.

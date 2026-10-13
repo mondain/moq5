@@ -143,10 +143,22 @@ static moq_transport_result_t ep_reset(void *ctx, uint64_t stream_id,
     if (genuine_at) {
         /* picowt uses reliable_size = 2 + varint(control_stream_id) for a local
          * stream; mirror it as the test witness. */
-        ep->last_reset_reliable_size =
-            2 + picoquic_frames_varint_encode_length(ep->control_stream_id);
-        int rc = picowt_reset_stream(ep->cnx, sc, wt_code);
-        return rc == 0 ? MOQ_TRANSPORT_OK : MOQ_TRANSPORT_ERROR;
+        unsigned client_mode = (unsigned)(picoquic_is_client(ep->cnx) != 0);
+        bool is_local = ((sc->stream_id ^ client_mode) & 1u) != 0;
+        if (!is_local && (sc->stream_id & 2u) != 0)
+            return MOQ_TRANSPORT_ERROR;
+        ep->last_reset_reliable_size = is_local
+            ? 2 + picoquic_frames_varint_encode_length(ep->control_stream_id) : 0;
+        int rc = picoquic_reset_stream_at(ep->cnx, sc->stream_id, wt_code,
+                                        ep->last_reset_reliable_size);
+        /* The provider requires the reliable prefix to have been packetized.
+         * Its queued WT preamble survives the application queue drop above.
+         * The bridge owns a bounded reset retry until that prefix is sent. */
+        if (rc == PICOQUIC_ERROR_OFFSET_TOO_BIG)
+            return MOQ_TRANSPORT_WOULD_BLOCK;
+        if (rc != 0) return MOQ_TRANSPORT_ERROR;
+        sc->ps.stream_state.is_fin_sent = 1;
+        return MOQ_TRANSPORT_OK;
     }
 
     /* Plain RESET_STREAM, preserving picowt_reset_stream's bookkeeping: the
@@ -276,7 +288,8 @@ int pico_wt_endpoint_init(moq_transport_endpoint_ops_t *ops,
     *ops = (moq_transport_endpoint_ops_t){
         .struct_size     = sizeof(moq_transport_endpoint_ops_t),
         .capabilities    = MOQ_TRANSPORT_CAP_DATAGRAM |
-                           MOQ_TRANSPORT_CAP_WRITE_PAYLOAD,
+                           MOQ_TRANSPORT_CAP_WRITE_PAYLOAD |
+                           MOQ_TRANSPORT_CAP_HOLD_INPUT,
         .open_uni        = ep_open_uni,
         .set_stream_priority = ep_priority,
         .open_bidi       = ep_open_bidi,

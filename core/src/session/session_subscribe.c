@@ -5,7 +5,7 @@
 
 /* -- Subscription pool --------------------------------------------- */
 
-/* Draft 21 3.4: an empty fill opens no stream. Retire only the expectation
+/* Draft 22 3.4: an empty fill opens no stream. Retire only the expectation
  * belonging to this response, using its Largest snapshot, not the registry. */
 static void sub_retire_empty_fill(moq_sub_entry_t *e, uint64_t request_id,
     bool has_largest, uint64_t largest_group, uint64_t largest_object)
@@ -847,6 +847,16 @@ static moq_result_t handle_fetch_response_bytes(moq_session_t *s, int fslot,
         return rc;                    /* committed entry left intact for retry */
 
     if (consumed == 0) {
+        if (fe->req_recv_fin && fe->req_recv_len == 0 &&
+            s->profile->request_fin_is_not_cancel) {
+            bool abort_data = fe->data_stream_started && !fe->data_stream_fin;
+            if (action_queue_avail(s) < (size_t)(1 + abort_data))
+                return MOQ_ERR_WOULD_BLOCK;
+            rc = session_core_on_fetch_error(s, fslot, MOQ_REQUEST_ERROR_INTERNAL_ERROR,
+                false, 0, NULL, 0, false, NULL);
+            if (rc < 0) return rc;
+            return request_stream_teardown(s, stream_ref, false, 0);
+        }
         if (fe->req_recv_fin)
             return close_with_error(s, 0x3, "truncated fetch response");
         return MOQ_OK;                /* incomplete; wait for more */
@@ -920,6 +930,14 @@ static moq_result_t handle_track_status_stream_bytes(moq_session_t *s, int tslot
         return rc;
 
     if (consumed == 0) {
+        if (te->req_recv_fin && te->req_recv_len == 0 &&
+            s->profile->request_fin_is_not_cancel) {
+            rc = session_core_on_track_status_error(s, tslot,
+                MOQ_REQUEST_ERROR_INTERNAL_ERROR, false, 0, NULL, 0, NULL);
+            if (rc < 0) return rc;
+            ts_free_entry(s, tslot);
+            return MOQ_OK;
+        }
         if (te->req_recv_fin)
             return close_with_error(s, 0x3, "truncated track-status response");
         return MOQ_OK;                /* incomplete; wait for more */
@@ -1179,8 +1197,9 @@ static moq_result_t handle_publish_stream_bytes(moq_session_t *s, int slot,
  * there as transitional ownership and drive that family's own FIN handling --
  * the same handler a later wire FIN would reach. Nothing here decides the
  * outcome: a family whose teardown blocks on capacity keeps the marker and is
- * resumed by an empty re-feed, which routes back to the same handler. Families
- * outside this slice keep their existing behavior. */
+ * resumed by an empty re-feed, which routes back to the same handler. Only the
+ * families dispatched below take part; any other kind returns MOQ_OK
+ * untouched. */
 static moq_result_t request_stream_handoff_fin(moq_session_t *s,
                                                 moq_stream_ref_t stream_ref,
                                                 moq_request_endpoint_t dest)
@@ -1233,7 +1252,7 @@ static bool request_stream_handoff_fin_install(moq_session_t *s,
     }
 }
 
-/* -- No-slot admission carriers (#245b) ----------------------------- *
+/* -- No-slot admission carriers ------------------------------------ *
  * A bounded, session-owned record of a no-slot request-bidi terminal that is
  * owed but not yet emittable. Storage is arena-backed in the session slab at
  * create time (never lazily allocated), so installing one during ingress cannot
@@ -1448,7 +1467,7 @@ moq_result_t handle_request_stream_bytes(moq_session_t *s,
     int slot = (ep.kind == MOQ_REQ_SUBSCRIPTION) ? ep.slot : -1;
 
     if (slot < 0) {
-        /* A no-slot terminal already owed on this bidi (#245b): re-drive it
+        /* A no-slot terminal already owed on this bidi: re-drive it
          * from the durable carrier, folding in whatever FIN was recorded, and
          * without ever re-staging or redelivering peer bytes. Checked BEFORE
          * the empty-input early return so the documented empty re-feed reaches
@@ -1603,7 +1622,9 @@ moq_result_t handle_request_stream_bytes(moq_session_t *s,
          * local accept) has no defined inbound lifecycle message. An empty
          * re-feed is a harmless no-op; real bytes fail closed. */
         if (!as_request && !as_response) {
-            if (e->req_recv_len > 0 || e->req_recv_fin)
+            bool requester_fin = s->profile->request_fin_is_not_cancel &&
+                e->state == MOQ_SUB_PENDING_PUBLISHER && e->role == MOQ_SUB_ROLE_PUBLISHER;
+            if (e->req_recv_len > 0 || (e->req_recv_fin && !requester_fin))
                 return close_with_error(s, 0x3,
                     "unexpected bytes on request stream");
             return MOQ_OK;
@@ -1669,7 +1690,7 @@ moq_result_t handle_request_stream_bytes(moq_session_t *s,
         }
 
         if (consumed == 0) {
-            /* Draft 21 6.4.2.2: a FIN is not a request cancellation. The
+            /* Draft 22 6.4.2.2: a FIN is not a request cancellation. The
              * requester of an established subscription that FINs with nothing
              * buffered has only closed its direction (the FIN is latched in
              * req_recv_fin, which the terminal path uses to free the entry). The
@@ -1678,7 +1699,7 @@ moq_result_t handle_request_stream_bytes(moq_session_t *s,
             if (e->req_recv_fin && s->profile->request_fin_is_not_cancel &&
                 !receiving && e->req_recv_len == 0) {
                 if (as_request) return MOQ_OK;
-                return request_stream_teardown(s, stream_ref);
+                return request_stream_teardown(s, stream_ref, false, 0);
             }
             if (e->req_recv_fin) {
                 if (receiving) sub_free_entry(s, (size_t)slot);
@@ -1782,7 +1803,8 @@ moq_result_t request_streams_refeed_deferred(moq_session_t *s)
  * MOQ_OK for a ref that is not a stream-correlated request (the caller handles
  * other stream kinds). */
 moq_result_t request_stream_teardown(moq_session_t *s,
-                                     moq_stream_ref_t stream_ref)
+                                     moq_stream_ref_t stream_ref,
+                                     bool reset, uint64_t error_code)
 {
     moq_request_endpoint_t ep =
         request_registry_find_by_streamref(s, stream_ref);
@@ -1833,9 +1855,16 @@ moq_result_t request_stream_teardown(moq_session_t *s,
          * fetch_request_bidi_cancel(), which already stops the incoming
          * response stream for the fetcher role. */
         bool fetcher = (fe->role == MOQ_FETCH_ROLE_FETCHER);
+        /* A fetcher-role request that already surfaced its terminal (FETCH_ERROR
+         * or REQUEST_REDIRECT, entry draining the response stream's FIN) owes
+         * the application nothing more: the peer's teardown just retires it,
+         * with the same stream cleanup (STOP of a still-open data uni, cancel
+         * tombstone) and no event slot, so a full event queue cannot strand it. */
+        bool already_terminal = fetcher &&
+                                fe->state == MOQ_FETCH_DRAINING_RESPONSE;
         /* Reserve everything before mutating: the data abort MUST be queued, so
          * a full action queue defers the whole teardown for a later retry. */
-        if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+        if (!already_terminal && event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
         if (need_data_abort && action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
         if (need_data_abort) {
             moq_action_t a;
@@ -1855,12 +1884,31 @@ moq_result_t request_stream_teardown(moq_session_t *s,
             }
             (void)push_action(s, &a);
         }
+        /* The event names the role: the publisher learns its peer CANCELLED
+         * the request; the fetcher learns its request was torn down by the
+         * peer and surfaces the stream terminal with the peer's code and
+         * which signal carried it (the request stream, never the data uni). */
         moq_event_t e;
         memset(&e, 0, sizeof(e));
-        e.kind = MOQ_EVENT_FETCH_CANCELLED;
-        e.detail_size = (uint32_t)sizeof(moq_fetch_cancelled_event_t);
-        e.borrow_epoch = s->borrow_epoch;
-        e.u.fetch_cancelled.fetch = fe->handle;
+        if (already_terminal) {
+            fetch_cancel_tomb_add(s, fe->request_id);
+            fetch_free_entry(s, ep.slot);
+            return MOQ_OK;
+        }
+        if (fetcher) {
+            e.kind = MOQ_EVENT_FETCH_RESET;
+            e.detail_size = (uint32_t)sizeof(moq_fetch_reset_event_t);
+            e.borrow_epoch = s->borrow_epoch;
+            e.u.fetch_reset.fetch = fe->handle;
+            e.u.fetch_reset.error_code = error_code;
+            e.u.fetch_reset.data_stream = false;
+            e.u.fetch_reset.stop_sending = !reset;
+        } else {
+            e.kind = MOQ_EVENT_FETCH_CANCELLED;
+            e.detail_size = (uint32_t)sizeof(moq_fetch_cancelled_event_t);
+            e.borrow_epoch = s->borrow_epoch;
+            e.u.fetch_cancelled.fetch = fe->handle;
+        }
         (void)push_event(s, &e);
         /* A fetcher's data uni may not have presented its FETCH_HEADER yet.
          * Tombstone the request id so late data is absorbed and stopped instead
@@ -2839,7 +2887,7 @@ moq_result_t session_core_on_request_update(moq_session_t *s,
         e->req_start_object = d->start_object;
         e->req_end_group = d->end_group;
         e->req_loc = d->loc_filter;
-        if (d->loc_filter.present && d->loc_filter.field_count > 0)
+        if (d->loc_filter.present && d->loc_filter.location_type > 0)
             moq_resolve_loc_filter_window(&d->loc_filter,
                                   usnap_has, usnap_g, usnap_o,
                                   s->profile->location_varint_max, &e->window);
@@ -2929,7 +2977,7 @@ moq_result_t moq_session_subscribe(moq_session_t *s,
     memset(&fill_req, 0, sizeof(fill_req));
     if (SUB_CFG_HAS(fill) && cfg->fill.present) {
         if (!s->profile->supports_fill) return MOQ_ERR_UNSUPPORTED;
-        if (cfg->fill.field_count > 4) return MOQ_ERR_INVAL;
+        if (cfg->fill.location_type > 5) return MOQ_ERR_INVAL;
         fill_req = cfg->fill;
     }
 
@@ -3294,7 +3342,7 @@ moq_result_t moq_session_accept_subscribe(
      * against the SAME snapshot. The facade installs this window via
      * moq_session_sub_resolved_window. */
     if (snap_has && shist) track_hist_merge(shist, snap_g, snap_o);
-    if (s->subs[slot].req_loc.present && s->subs[slot].req_loc.field_count > 0)
+    if (s->subs[slot].req_loc.present && s->subs[slot].req_loc.location_type > 0)
         moq_resolve_loc_filter_window(&s->subs[slot].req_loc,
                                       snap_has, snap_g, snap_o, loc_max,
                                       &s->subs[slot].window);
@@ -3883,7 +3931,7 @@ moq_result_t moq_session_update_subscription(
     memset(&fill_req, 0, sizeof(fill_req));
     if (UPD_CFG_HAS(fill) && cfg->fill.present) {
         if (!s->profile->supports_fill) return MOQ_ERR_UNSUPPORTED;
-        if (cfg->fill.field_count > 4) return MOQ_ERR_INVAL;
+        if (cfg->fill.location_type > 5) return MOQ_ERR_INVAL;
         fill_req = cfg->fill;
     }
 #undef UPD_CFG_HAS

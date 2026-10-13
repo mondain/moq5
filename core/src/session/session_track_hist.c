@@ -327,9 +327,9 @@ void moq_resolve_filter_window(moq_subscribe_filter_t filter,
     }
 }
 
-/* Draft-21 Location Filter -> window (9.20.10), exact for every field count the
+/* Draft-22 Location Filter -> window (9.20.10), exact for every field count the
  * wire allows. One field is a relative start ({Largest.Group + 1 - N, 0}; 0 =
- * Next Group), two zero fields are the Next Object, anything else starts at the
+ * Next Group), type 5 selects Next Object, anything else starts at the
  * absolute Location; a third field ends the window at StartGroup + delta (whole
  * group) and a fourth makes the end Object inclusive. With no largest known the
  * relative forms open from the origin, as the four-type resolver does. Callers
@@ -343,13 +343,13 @@ void moq_resolve_loc_filter_window(const moq_decoded_loc_filter_t *lf,
     memset(out, 0, sizeof(*out));
     out->has_window = true;
 
-    if (lf->field_count == 1) {
+    if (lf->location_type == 1) {
         out->filter = MOQ_SUBSCRIBE_FILTER_NEXT_GROUP;
         if (!has_snap) return;
         if (lf->start_group == 0) {
-            out->unsatisfiable = moq_loc_successor(
-                snap_group, ceiling, ceiling,
-                &out->start_group, &out->start_object);
+            /* Relative starts clamp rather than becoming unsatisfiable (9.20.9). */
+            out->start_group = snap_group == ceiling ? ceiling : snap_group + 1u;
+            out->start_object = 0;
         } else {
             uint64_t back = lf->start_group - 1u;
             out->start_group = back > snap_group ? 0 : snap_group - back;
@@ -357,7 +357,7 @@ void moq_resolve_loc_filter_window(const moq_decoded_loc_filter_t *lf,
         }
         return;
     }
-    if (lf->field_count == 2 && lf->start_group == 0 && lf->start_object == 0) {
+    if (lf->location_type == 5) {
         out->filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
         if (!has_snap) return;
         out->unsatisfiable = moq_loc_successor(
@@ -365,17 +365,17 @@ void moq_resolve_loc_filter_window(const moq_decoded_loc_filter_t *lf,
             &out->start_group, &out->start_object);
         return;
     }
-    out->filter = lf->field_count >= 3 ? MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE
+    out->filter = lf->location_type >= 3 ? MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE
                                        : MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
     out->start_group = lf->start_group;
     out->start_object = lf->start_object;
-    if (lf->field_count >= 3) {
+    if (lf->location_type >= 3) {
         out->has_end = true;
         out->end_group = lf->end_group_delta > UINT64_MAX - lf->start_group
                              ? UINT64_MAX
                              : lf->start_group + lf->end_group_delta;
     }
-    if (lf->field_count == 4) {
+    if (lf->location_type == 4) {
         out->has_end_object = true;
         out->end_object = lf->end_object;
     }
@@ -387,15 +387,19 @@ bool moq_fill_selection_has_content(const moq_fill_selection_t *selection,
     if (!has_largest) return false;
     moq_resolved_window_t window;
     if (selection->fill.has_location) {
-        if (selection->fill.field_count == 0) return true; /* whole track */
+        if (selection->fill.location_type == 0) return true; /* whole track */
         moq_decoded_loc_filter_t lf = {
             .present = true,
-            .field_count = selection->fill.field_count,
+            .location_type = selection->fill.location_type,
             .start_group = selection->fill.start_group,
             .start_object = selection->fill.start_object,
             .end_group_delta = selection->fill.end_group_delta,
             .end_object = selection->fill.end_object,
         };
+        moq_resolve_loc_filter_window(&lf, true, largest_group, largest_object,
+                                      UINT64_MAX, &window);
+    } else if (selection->filter == MOQ_SUBSCRIBE_FILTER_NEXT_GROUP) {
+        moq_decoded_loc_filter_t lf = { .present = true, .location_type = 1 };
         moq_resolve_loc_filter_window(&lf, true, largest_group, largest_object,
                                       UINT64_MAX, &window);
     } else {
@@ -421,13 +425,16 @@ bool moq_resolve_fill_range(const moq_decoded_loc_filter_t *lf,
     if (!has_largest) return false;
     uint64_t start_g = 0, start_o = 0;
     uint64_t end_g = lg, end_o = lo;       /* default end: Largest Object */
-    uint8_t n = (lf && lf->present) ? lf->field_count : 0;
+    uint8_t n = (lf && lf->present) ? lf->location_type : 0;
+    if (n == 5) return false;             /* Next Object is beyond Largest */
     if (n == 1) {
-        if (lf->start_group == 0) return false;          /* Next Group: after Largest */
-        uint64_t back = lf->start_group - 1u;
-        start_g = back > lg ? 0 : lg - back;
+        if (lf->start_group == 0) {
+            start_g = lg == UINT64_MAX ? UINT64_MAX : lg + 1u;
+        } else {
+            uint64_t back = lf->start_group - 1u;
+            start_g = back > lg ? 0 : lg - back;
+        }
     } else if (n >= 2) {
-        if (lf->start_group == 0 && lf->start_object == 0) return false;   /* Next Object */
         start_g = lf->start_group;
         start_o = lf->start_object;
     }

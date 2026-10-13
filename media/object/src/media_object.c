@@ -33,7 +33,7 @@ static bool track_transport_version(const moq_media_track_info_t *track,
     switch (track->transport_version) {
     case MOQ_VERSION_DRAFT_16:
     case MOQ_VERSION_DRAFT_18:
-    case MOQ_VERSION_DRAFT_21:
+    case MOQ_VERSION_DRAFT_22:
         *out = track->transport_version;
         return true;
     default:

@@ -1,0 +1,22 @@
+Match the save-ticket callback signature in pinned picotls f06553b.
+
+The new picotls callback includes ticket properties. Picoquic b4075dd uses
+its existing ticket store and does not consume those properties. Accept the
+argument explicitly so calls have matching types and consumer warning gates
+remain meaningful. Applies after 0002 to the pinned picoquic source.
+
+diff --git a/picoquic/tls_api.c b/picoquic/tls_api.c
+index a624c29..177a3d6 100644
+--- a/picoquic/tls_api.c
++++ b/picoquic/tls_api.c
+@@ -1443,8 +1443,9 @@ int picoquic_server_encrypt_ticket_call_back(ptls_encrypt_ticket_t* encrypt_tick
+  */
+ 
+ int picoquic_client_save_ticket_call_back(ptls_save_ticket_t* save_ticket_ctx,
+-    ptls_t* tls, ptls_iovec_t input)
++    ptls_t* tls, ptls_iovec_t input, const ptls_save_ticket_properties_t* properties)
+ {
++    (void)properties;
+     int ret = 0;
+     picoquic_quic_t* quic = *((picoquic_quic_t**)(((char*)save_ticket_ctx) + sizeof(ptls_save_ticket_t)));
+     const char* sni = ptls_get_server_name(tls);

@@ -31,7 +31,7 @@ func cTransportVersion(_ v: MediaTransportVersion) -> moq_version_t {
     switch v {
     case .draft16: return MOQ_VERSION_DRAFT_16
     case .draft18: return MOQ_VERSION_DRAFT_18
-    case .draft21: return MOQ_VERSION_DRAFT_21
+    case .draft22: return MOQ_VERSION_DRAFT_22
     }
 }
 

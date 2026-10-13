@@ -16,7 +16,7 @@
 #define MOQ_DEFAULT_MAX_EVENTS       16
 #define MOQ_DEFAULT_SEND_BUF         4096
 #define MOQ_DEFAULT_RECV_BUF         4096
-#define MOQ_D21_RECV_BUF             8448   /* 8192-byte GOAWAY URI + framing */
+#define MOQ_D22_RECV_BUF             8448   /* 8192-byte GOAWAY URI + framing */
 #define MOQ_DEFAULT_MAX_SUBS         64
 #define MOQ_DEFAULT_OUTPUT_SCRATCH   65536
 #define MOQ_DEFAULT_MAX_SUBGROUPS    64
@@ -105,7 +105,7 @@ typedef struct moq_setup_params {
     uint64_t max_auth_token_cache_size;
     bool     has_path;
     bool     has_authority;
-    /* Draft 21 (9.1.6, 9.1.7). Absent means the draft's default, which is also 0:
+    /* Draft 22 (9.1.6, 9.1.7). Absent means the draft's default, which is also 0:
      * MAX_FILTER_RANGES 0 (the peer is not allowed Range Filters) and
      * MAX_REQUEST_UPDATES 0 (unlimited outstanding updates). */
     bool     has_max_filter_ranges;
@@ -119,11 +119,11 @@ typedef struct moq_setup_params {
  * (defined below, after the entry structs). */
 typedef struct moq_track_hist moq_track_hist_t;
 
-/* Draft-21 Location Filter exactly as on the wire (see the comment where it is
+/* Draft-22 Location Filter exactly as on the wire (see the comment where it is
  * produced, below the decoded-message section); defined here so entries can keep it. */
 typedef struct moq_decoded_loc_filter {
     bool     present;             /* a LOCATION_FILTER parameter was on the wire */
-    uint8_t  field_count;         /* 0..4; 0 = a zero-length (remove / whole) filter */
+    uint8_t  location_type;         /* 0..4; 0 = a zero-length (remove / whole) filter */
     uint64_t start_group;
     uint64_t start_object;
     uint64_t end_group_delta;     /* raw delta from start_group */
@@ -131,7 +131,7 @@ typedef struct moq_decoded_loc_filter {
     bool     approximated;
 } moq_decoded_loc_filter_t;
 
-/* FILL_PARAMETERS as decoded (draft 21 9.20.16); defined here so a subscription
+/* FILL_PARAMETERS as decoded (draft 22 9.20.16); defined here so a subscription
  * entry can hold the pending fill. */
 typedef struct moq_decoded_fill {
     bool     present;             /* FILL_PARAMETERS carried: a fill is requested */
@@ -165,7 +165,7 @@ typedef struct moq_resolved_window {
     uint64_t               start_group;
     uint64_t               start_object;
     uint64_t               end_group;      /* valid iff has_end */
-    bool                   has_end_object; /* draft 21: End Object bounds End Group */
+    bool                   has_end_object; /* draft 22: End Object bounds End Group */
     uint64_t               end_object;     /* valid iff has_end_object; inclusive */
 } moq_resolved_window_t;
 
@@ -255,8 +255,8 @@ typedef struct moq_sub_entry {
     uint64_t req_start_group;
     uint64_t req_start_object;
     uint64_t req_end_group;
-    moq_decoded_loc_filter_t req_loc;   /* draft 21: the exact filter, re-resolved on update */
-    /* Draft 21 fill (3.4): FILL_PARAMETERS on the SUBSCRIBE or latest REQUEST_UPDATE
+    moq_decoded_loc_filter_t req_loc;   /* draft 22: the exact filter, re-resolved on update */
+    /* Draft 22 fill (3.4): FILL_PARAMETERS on the SUBSCRIBE or latest REQUEST_UPDATE
      * is held here until the application opens the fill stream. `fill_pending` is
      * set only when Forward State is 1 at that point; the Largest Object the
      * response advertised bounds the fill range. */
@@ -477,7 +477,7 @@ typedef struct moq_fetch_entry {
     uint32_t           generation;
     moq_fetch_t        handle;
     uint64_t           request_id;
-    /* A fill fetch stream (draft 21 3.4): owned by a subscription, carries that
+    /* A fill fetch stream (draft 22 3.4): owned by a subscription, carries that
      * request's id in its FETCH_HEADER, has no request bidi and no registry key. */
     bool               is_fill;
     moq_subscription_t fill_sub;
@@ -620,7 +620,7 @@ typedef struct moq_pub_entry {
      * joining_* is the latched result; has_joining_loc gates every read.
      * Absence of a required Largest leaves no Joining Location at all -- there
      * is no fallback to stale or current state. */
-    bool               publish_forward;      /* the FORWARD value our PUBLISH advertised (draft 21: it stays
+    bool               publish_forward;      /* the FORWARD value our PUBLISH advertised (draft 22: it stays
                                                  * in force until the subscriber's REQUEST_UPDATE) */
     bool               publish_has_largest;
     uint64_t           publish_largest_group;
@@ -891,7 +891,7 @@ bool moq_loc_successor(uint64_t group, uint64_t object, uint64_t ceiling,
  * no snapshot resolve to an open window from the origin (never unsatisfiable);
  * at-ceiling relative filters set `unsatisfiable`.
  */
-/* Resolve a draft-21 fill range against Largest Object (3.4 / 3.3.1). Returns
+/* Resolve a draft-22 fill range against Largest Object (3.4 / 3.3.1). Returns
  * false when there is nothing to fill (no content, an empty range, or a start after
  * Largest Object); otherwise the INCLUSIVE range. `lf` may be NULL or zero-field
  * (the whole track up to Largest Object). */
@@ -899,7 +899,7 @@ bool moq_loc_successor(uint64_t group, uint64_t object, uint64_t ceiling,
  * ended, so its fills are cancelled (3.4.1). Best effort when the action queue is
  * full -- the entry is freed either way. */
 /* A FETCH_HEADER whose Request ID is the SUBSCRIBE / update that asked for a fill
- * (draft 21 3.4): create the subscriber-side fill fetch entry for it and return its
+ * (draft 22 3.4): create the subscriber-side fill fetch entry for it and return its
  * slot, or -1 when no subscription expects that id. The expectation is consumed and
  * MOQ_EVENT_FILL_OPENED is queued; -2 (nothing bound) when event or fetch capacity is full. */
 int session_core_bind_fill_stream(moq_session_t *s, uint64_t request_id);
@@ -1096,7 +1096,7 @@ typedef struct moq_auth_txn {
 
 #define MOQ_DECODED_MAX_TOKENS 16
 
-/* -- No-slot admission carrier (#245b) ------------------------------- *
+/* -- No-slot admission carrier ------------------------------------- *
  * The minimal durable record of a no-slot request-bidi terminal owed but not
  * yet emittable for local resource pressure. The terminal is fixed and
  * content-independent, so only the stream identity and the observed FIN fact
@@ -1143,7 +1143,7 @@ typedef struct moq_ns_sub_entry {
      * not buffer the bytes, so the obligation -- not the raw bytes -- is what
      * must survive: this durable marker re-drives ns_sub_local_teardown on the
      * documented empty re-feed, with no peer-byte redelivery. Cleared in the
-     * selective free (#245c). */
+     * selective free. */
     bool                local_teardown_pending;
     bool                closing_remote_error;
     bool                forward;
@@ -1322,7 +1322,7 @@ typedef struct moq_publish_state_notify_args {
     bool     has_forward;
     bool     forward;
     bool     has_filter;
-    uint8_t  filter_field_count;
+    uint8_t  filter_location_type;
     uint64_t filter_start_group, filter_start_object;
     uint64_t filter_end_group_delta, filter_end_object;
 } moq_publish_state_notify_args_t;
@@ -1401,6 +1401,18 @@ typedef enum moq_rx_parse_state {
      * retried on the next drive, by any route, until it lands, then the entry
      * is freed. */
     MOQ_RX_PENDING_RESET    = 9,
+    /* The session STOPped this stream (STOP_DATA queued) but the peer has not
+     * yet FIN'd or RESET it. STOP_SENDING cannot recall bytes already sent,
+     * so the entry keeps the stream's identity -- its buffers, bindings and
+     * any pending object are released at the STOP -- and every later chunk
+     * is consumed without parsing or emitting until the peer's FIN or RESET
+     * frees the entry (neither counts as a completed stream; the FIN is still
+     * noted as the transport stream's end, so later bytes on the ref are
+     * data after FIN). The entry holds
+     * its receive slot meanwhile; a stream that finds no free slot is STOPped
+     * without one and its identity kept in rx_stopped_refs instead
+     * (rx_get_or_create_stream). */
+    MOQ_RX_STOPPED          = 10,
 } moq_rx_parse_state_t;
 
 typedef struct moq_rx_stream {
@@ -1533,7 +1545,7 @@ static inline bool ns_sub_fin_observed(const moq_ns_sub_entry_t *e, bool fin) {
     return fin || e->pending_fin || e->handoff_fin_pending;
 }
 
-/* No-slot admission carriers (#245b). */
+/* No-slot admission carriers. */
 int  noslot_carrier_find(const moq_session_t *s, moq_stream_ref_t ref);
 bool noslot_carrier_install(moq_session_t *s, moq_stream_ref_t ref, bool fin);
 void noslot_carrier_remove(moq_session_t *s, moq_stream_ref_t ref);
@@ -1733,6 +1745,18 @@ struct moq_session {
     size_t           rx_fin_head;
     size_t           rx_fin_count;
 
+    /* Streams STOPped while every receive entry was held: a STOP_DATA was
+     * queued and the stream's identity is kept here (arena-backed, bounded
+     * like rx_finished, never evicted) so every later chunk is consumed
+     * without parsing until the peer's FIN or RESET releases the record.
+     * The session owns these streams (moq_session_has_transport_stream).
+     * With the records exhausted a new stream is refused with WOULD_BLOCK
+     * and nothing retained -- no STOP, no ownership -- which the bridge
+     * treats as an unowned refusal and discards that stream itself. */
+    uint64_t        *rx_stopped_refs;
+    size_t           rx_stopped_cap;
+    size_t           rx_stopped_count;
+
     uint64_t        *unsub_tombstones;
     size_t           unsub_tomb_cap;
     size_t           unsub_tomb_count;
@@ -1747,6 +1771,20 @@ struct moq_session {
     size_t           fetch_cancel_tomb_cap;
     size_t           fetch_cancel_tomb_count;
 
+    /* Bounded grace cache of request IDs of publisher-role fetches this side
+     * ABORTED (moq_session_abort_fetch): the slot is freed at abort, and on
+     * profiles whose cancellation is a control message (draft-16 FETCH_CANCEL)
+     * the peer's cancel may cross the reset in flight. A cancel naming a
+     * recorded id is consumed instead of being treated as an unknown request.
+     * Separate from fetch_cancel_tombs on purpose: that ring holds ids this
+     * side originated as a FETCHER, this one holds peer-originated ids this
+     * side answered as a PUBLISHER, so neither ring's lookups can alias the
+     * other's. Drop-oldest when full (capacity = fetch pool size): an evicted
+     * id's late cancel fails closed on the unknown-request path. */
+    uint64_t        *fetch_abort_tombs;
+    size_t           fetch_abort_tomb_cap;
+    size_t           fetch_abort_tomb_count;
+
     /* Request-bidi stream_refs locally cancelled (unsubscribe / fetch cancel)
      * on stream-correlated profiles, draining any late in-flight response until
      * the bidi FINs or the peer resets it. Draft-16 leaves this empty. */
@@ -1755,7 +1793,7 @@ struct moq_session {
     size_t           drain_ref_cap;
     size_t           drain_ref_count;
 
-    /* No-slot admission carriers (#245b). A draft-18 request bidi that arrives
+    /* No-slot admission carriers. A draft-18 request bidi that arrives
      * with the subscription pool full owes a fixed, content-independent
      * terminal (pre-setup STOP+RESET, post-setup REQUEST_ERROR+FIN). When drain/
      * action/send capacity cannot admit that terminal yet, the OPERATION -- not
@@ -2174,8 +2212,18 @@ void session_resume_deferred_for_alias(moq_session_t *s, uint64_t alias);
  * event-queue backpressure (called after poll frees capacity). */
 void session_retry_resumed_deferred(moq_session_t *s);
 
-/* Stop + free all streams still deferred on an unestablished alias. */
+/* STOP every stream still deferred on an unestablished alias. A STOP the
+ * action queue refuses stays owed on its entry (NEED_STOP);
+ * session_retry_owed_stops issues it once capacity returns. */
 void session_discard_deferred_streams(moq_session_t *s);
+
+/* Issue the STOP_DATA owed by every NEED_STOP receive entry that action
+ * capacity now admits (called after a poll drains actions): a refused STOP
+ * must progress without further peer input on its stream. */
+void session_retry_owed_stops(moq_session_t *s);
+
+/* Index of `ref_v` among the streams stopped without a receive entry, or -1. */
+int rx_stopped_ref_find(const moq_session_t *s, uint64_t ref_v);
 void sg_recompute_deadline(moq_session_t *s);
 int sg_find_free(moq_session_t *s);
 moq_subgroup_handle_t sg_make_handle(moq_session_t *s, size_t slot);
@@ -2321,8 +2369,8 @@ typedef struct moq_request_update_ok_encode_args {
 
 /* PUBLISH_OK response: the subscriber's delivery parameters plus
  * the raw SUBSCRIPTION_FILTER and FORWARD it chose. One args struct instead of
- * a growing positional vtable signature. Outbound EXPIRES stays unsupported
- * (D2) -- no field. */
+ * a growing positional vtable signature. Outbound EXPIRES is not supported,
+ * so there is no field for it. */
 typedef struct moq_publish_ok_encode_args {
     uint64_t               request_id;
     uint8_t                subscriber_priority;  /* 128 = omitted */
@@ -2381,9 +2429,9 @@ typedef struct moq_request_update_encode_args {
 
 #define MOQ_DECODED_MAX_NAMESPACE_PARTS 32
 
-/* -- Raw draft-21 filter surfaces (profile -> session core) --------------- *
+/* -- Raw draft-22 filter surfaces (profile -> session core) --------------- *
  * The core models a subscription filter as one of four types plus locations
- * (MOQ_SUBSCRIBE_FILTER_*). Draft 21 expresses filters as a Location Filter of 0 to
+ * (MOQ_SUBSCRIBE_FILTER_*). Draft 22 expresses filters as a Location Filter of 0 to
  * 4 fields (9.20.10), FILL_PARAMETERS (9.20.16) and Range Filters (9.20.11-15). The
  * profile maps what the four types can express exactly and passes the wire fields
  * through here in full, so the core can finish the semantics (plan Tasks 6 and 7)
@@ -2424,9 +2472,9 @@ typedef struct moq_decoded_subscribe {
     uint64_t         start_group;
     uint64_t         start_object;
     uint64_t         end_group;
-    moq_decoded_loc_filter_t     loc_filter;      /* draft 21: the exact wire filter */
-    moq_decoded_fill_t           fill;            /* draft 21: FILL_PARAMETERS */
-    moq_decoded_range_filters_t  range_filters;   /* draft 21: parsed, never applied */
+    moq_decoded_loc_filter_t     loc_filter;      /* draft 22: the exact wire filter */
+    moq_decoded_fill_t           fill;            /* draft 22: FILL_PARAMETERS */
+    moq_decoded_range_filters_t  range_filters;   /* draft 22: parsed, never applied */
     moq_resolved_token_t tokens[MOQ_DECODED_MAX_TOKENS];
     bool             token_staged[MOQ_DECODED_MAX_TOKENS];
     size_t           token_count;
@@ -2481,9 +2529,9 @@ typedef struct moq_decoded_request_update {
     uint64_t start_group;
     uint64_t start_object;
     uint64_t end_group;
-    moq_decoded_loc_filter_t     loc_filter;      /* draft 21: the exact wire filter */
-    moq_decoded_fill_t           fill;            /* draft 21: FILL_PARAMETERS */
-    moq_decoded_range_filters_t  range_filters;   /* draft 21: parsed, never applied */
+    moq_decoded_loc_filter_t     loc_filter;      /* draft 22: the exact wire filter */
+    moq_decoded_fill_t           fill;            /* draft 22: FILL_PARAMETERS */
+    moq_decoded_range_filters_t  range_filters;   /* draft 22: parsed, never applied */
     /* Resolved AUTHORIZATION_TOKEN parameters (both profiles; the auth
      * transaction commit/abort is a safe no-op on an empty transaction).
      * auth_reject_code is non-zero when a token failed at the message level
@@ -2598,7 +2646,8 @@ typedef struct moq_decoded_ns_sub_response {
 
     /* For ERROR: */
     uint64_t error_code;
-    uint64_t retry_interval;         /* REQUEST_ERROR Retry Interval (0 = none) */
+    uint64_t retry_interval;         /* REQUEST_ERROR wire Retry Interval:
+                                      * milliseconds + 1; 0 = no retry */
     const uint8_t *reason;           /* borrowed from recv_buf */
     size_t reason_len;
     bool has_trailing_bytes;         /* trailing after ERROR = close */
@@ -2635,7 +2684,7 @@ typedef struct moq_decoded_fetch {
     uint64_t         joining_request_id;
     uint64_t         joining_start;
     int              joining_sub_slot;
-    /* Draft 21: the exact wire filter that carried the range (the core's
+    /* Draft 22: the exact wire filter that carried the range (the core's
      * [start, end) fields above are filled from it where the model expresses it),
      * and the parsed-but-never-applied Range Filters. */
     moq_decoded_loc_filter_t     loc_filter;
@@ -2838,7 +2887,7 @@ typedef struct moq_decoded_publish {
     uint64_t         largest_object;
     bool             has_expires;
     uint64_t         expires_ms;
-    /* Draft 21: the publisher's own initial Subscription Parameters on the PUBLISH. */
+    /* Draft 22: the publisher's own initial Subscription Parameters on the PUBLISH. */
     bool                     has_initial_params;
     uint8_t                  subscriber_priority;
     moq_group_order_t        group_order;
@@ -3363,6 +3412,15 @@ typedef enum moq_drain_reason {
 } moq_drain_reason_t;
 
 bool drain_ref_add(moq_session_t *s, moq_stream_ref_t ref);
+void fetch_abort_tomb_add(moq_session_t *s, uint64_t request_id);
+/* Fetcher-side terminal for a peer RESET of the identified response data stream
+ * of fetch `slot`: emits FETCH_RESET and retires the request (reserve-before-
+ * mutate; MOQ_ERR_WOULD_BLOCK leaves the entry and the obligation intact). A
+ * slot that already surfaced its terminal, or is not an active fetcher-role
+ * request, is left alone and reports MOQ_OK. */
+moq_result_t fetch_on_data_stream_reset(moq_session_t *s, int slot,
+                                        uint64_t error_code);
+bool fetch_abort_tomb_consume(moq_session_t *s, uint64_t request_id);
 bool drain_ref_add_strict(moq_session_t *s, moq_stream_ref_t ref);
 /* Reason of a present ref (MOQ_DRAIN_NORMAL if absent). */
 moq_drain_reason_t drain_ref_reason(const moq_session_t *s, moq_stream_ref_t ref);
@@ -3480,15 +3538,21 @@ moq_result_t handle_bidi_stream_bytes(moq_session_t *s,
 moq_result_t request_streams_refeed_deferred(moq_session_t *s);
 
 moq_result_t handle_bidi_stream_reset(moq_session_t *s,
-                                       moq_stream_ref_t stream_ref);
+                                       moq_stream_ref_t stream_ref,
+                                       uint64_t error_code);
 moq_result_t handle_bidi_stream_stop(moq_session_t *s,
-                                      moq_stream_ref_t stream_ref);
+                                      moq_stream_ref_t stream_ref,
+                                      uint64_t error_code);
 
 /* Terminate a stream-correlated request (SUBSCRIPTION or FETCH) whose request
  * bidi was torn down by the peer: free the entry and remove its registry keys,
  * surfacing a best-effort local event. Returns true if `stream_ref` matched a
  * stream-correlated request (so the caller need not look elsewhere). */
+/* Peer teardown of a request bidi: `reset` distinguishes RESET_STREAM from
+ * STOP_SENDING and `error_code` is the peer's stream code, both surfaced on the
+ * fetcher-side FETCH_RESET terminal; the other request families ignore them. */
 moq_result_t request_stream_teardown(moq_session_t *s,
-                                     moq_stream_ref_t stream_ref);
+                                     moq_stream_ref_t stream_ref,
+                                     bool reset, uint64_t error_code);
 
 #endif /* MOQ_SESSION_INTERNAL_H */

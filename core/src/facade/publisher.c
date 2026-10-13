@@ -124,7 +124,7 @@ typedef struct {
     moq_rcbuf_t  *payload;          /* WRITE_OBJECT payload / WRITE_DATA chunk */
     moq_rcbuf_t  *properties;
     /* The op's object is the first published in its Group (the original publisher's
-     * FIRST_OBJECT, draft 21), judged from the track history at commit. */
+     * FIRST_OBJECT, draft 22), judged from the track history at commit. */
     bool          first_in_group;
 } pub_pending_op_t;
 
@@ -261,7 +261,7 @@ typedef struct {
     pub_retained_obj_t *objs;        /* incref'd snapshot; released on finish */
     size_t              obj_count;
     size_t              next_idx;    /* write cursor (resumes on WOULD_BLOCK) */
-    /* A fill fetch stream (draft 21 3.4): already open (so `accepted`), ends at
+    /* A fill fetch stream (draft 22 3.4): already open (so `accepted`), ends at
      * its FIN, and a write failure resets it rather than FINing a partial fill. */
     bool                is_fill;
     size_t              end_idx;     /* fills: one past the last object in range */
@@ -574,7 +574,7 @@ static moq_result_t track_run_completions(moq_publisher_t *pub,
                                           uint64_t now_us)
 {
     uint64_t through;
-    /* No SUBSCRIPTION_ENDED status (draft 21): a finite filter end does not end
+    /* No SUBSCRIPTION_ENDED status (draft 22): a finite filter end does not end
      * the subscription; the slot stays and simply receives nothing more. */
     if (!moq_session_has_subscription_ended_status(pub->session)) return MOQ_OK;
     if (!track_complete_through(t, &through)) return MOQ_OK;
@@ -651,8 +651,7 @@ static bool op_buf_same(const moq_rcbuf_t *a, const moq_rcbuf_t *b)
 
 /*
  * Admission is split into a non-mutating peek and a mutating commit so that
- * per-object validation (and, in a later slice, completion-promise checks)
- * runs BEFORE any state is touched, and the exactly-once history merge runs
+ * per-object validation runs BEFORE any state is touched, and the exactly-once history merge runs
  * only on a genuinely new op. track_op_peek returns:
  *   MOQ_OK               a byte-identical op is already pending (retry/resume)
  *   1                    no op pending -- the caller should commit a new one
@@ -1264,7 +1263,7 @@ static void pub_close_local(moq_publisher_t *pub, uint64_t code)
         pub->callbacks.on_closed(pub->callbacks.ctx, code);
 }
 
-/* Open and serve the fill of every subscription that has one pending (draft 21
+/* Open and serve the fill of every subscription that has one pending (draft 22
  * 3.4). The retained group is the only data this facade holds, so a fill is served
  * from the part of it inside the fill range; a fill that range does not touch
  * cannot be answered and is reset (the stream opens, then fails, 3.4.1). One fill
@@ -1538,7 +1537,7 @@ moq_result_t moq_pub_create(moq_session_t *session,
         }
     }
 
-    /* One slot is enough for drafts 16/18 (one subscription per Track); draft 21
+    /* One slot is enough for drafts 16/18 (one subscription per Track); draft 22
      * allows concurrent subscriptions to a Track, each served from its own slot.
      * The session capability gates how many are used. */
     p->sub_slot_cap = PUB_MAX_CONCURRENT_SUBS;
@@ -3423,7 +3422,7 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
 
     if (event->kind == MOQ_EVENT_NS_SUB_REQUEST) {
         /* A peer asks which namespaces under a prefix this publisher has. Exactly one
-         * response is owed (draft 21 4.1): accept when a track here lies under the
+         * response is owed (draft 22 4.1): accept when a track here lies under the
          * prefix (then announce each such namespace's suffix), else reject. */
         const moq_ns_sub_request_event_t *nr = &event->u.ns_sub_request;
         *result = MOQ_PUB_EVENT_CONSUMED;

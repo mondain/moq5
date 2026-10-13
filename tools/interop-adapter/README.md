@@ -2,7 +2,7 @@
 
 `run.sh` lets `moq-contribution-interop-runner` (sibling checkout) start
 `examples/service/media_send` as a contribution publisher and score what it puts
-on the wire against draft 18 or draft 21. The checked-in drafts, not this
+on the wire against draft 18 or draft 22. The checked-in drafts, not this
 publisher and not the runner, decide what is compliant.
 
 ## Use
@@ -35,7 +35,7 @@ ctest as `interop_adapter_contract` when `jq` is installed.
 | `endpoint` | URL (`moqt://` native QUIC, `https://` WebTransport) |
 | `namespace_hex` (fields, joined with `/`) | namespace |
 | `track_name_hex` | track name |
-| `draft` (18 or 21) | `--draft N` (an exact offer, never a fallback) |
+| `draft` (18 or 22) | `--draft N` (an exact offer, never a fallback) |
 | `tls_ca` | `--ca FILE` |
 | `scenario_timeout_ms` | `timeout --signal=INT` (ceiling, in seconds) |
 
@@ -50,7 +50,7 @@ Reaching the scenario timeout is the normal end of a context and exits 0.
   Score such rows as publisher gaps, then decide whether to add a mode.
 - **No per-scenario modes yet.** The moqxr adapter passes scenario-specific
   options so its publisher originates or withholds messages. This adapter does
-  not; the roughly 100 draft-21 probes in which the runner acts as the subscriber
+  not; the roughly 100 draft-22 probes in which the runner acts as the subscriber
   score whatever `media_send` does by default.
 - **WebTransport does not connect to the runner from the `dev` build.** The runner
   admits only the current WebTransport profile (`webtransport-h3`, HTTP/3
@@ -58,5 +58,5 @@ Reaching the scenario timeout is the normal end of a context and exits 0.
   dialect, so the handshake ends in a transport failure (terminal reason 5) before
   any MoQT bytes. Only the `wtquic-msquic` backend offers the current profile, and
   no existing build tree enables it. Native QUIC is unaffected.
-- **Draft 21 connects** (native QUIC): the runner sees SETUP, MOQT_IMPLEMENTATION and the
+- **Draft 22 connects** (native QUIC): the runner sees SETUP, MOQT_IMPLEMENTATION and the
   publisher's request streams. Per-scenario scores are the Task 10 acceptance work.

@@ -9,11 +9,11 @@
  * object. The catalog can then reach the receiver only as a past object:
  *
  *   draft 18: SUBSCRIBE, then a Joining FETCH(offset 0) served on a fetch stream.
- *   draft 21: there is no Joining FETCH (the profile refuses it), so the receiver
+ *   draft 22: there is no Joining FETCH (the profile refuses it), so the receiver
  *             asks for a fill on the SUBSCRIBE (3.4), served on a fill stream.
  *
- * Before the draft-21 fill path, the receiver's Joining FETCH was refused under
- * draft 21 and it waited for a catalog update that never came.
+ * Before the draft-22 fill path, the receiver's Joining FETCH was refused under
+ * draft 22 and it waited for a catalog update that never came.
  */
 #include <moq/media_receiver.h>
 #include <moq/sim.h>
@@ -174,7 +174,7 @@ static void run(moq_version_t version, const char *label)
     MOQ_TEST_CHECK(!moq_media_receiver_is_fatal(r));
     MOQ_TEST_CHECK(track_added);
     MOQ_TEST_CHECK(catalog_ready);
-    if (version == MOQ_VERSION_DRAFT_21) {
+    if (version == MOQ_VERSION_DRAFT_22) {
         MOQ_TEST_CHECK(st.fills == 1);     /* the fill on the SUBSCRIBE... */
         MOQ_TEST_CHECK(st.fetches == 0);   /* ...and no Joining FETCH */
     } else {
@@ -189,7 +189,7 @@ static void run(moq_version_t version, const char *label)
 int main(void)
 {
     run(MOQ_VERSION_DRAFT_18, "draft 18");
-    run(MOQ_VERSION_DRAFT_21, "draft 21");
+    run(MOQ_VERSION_DRAFT_22, "draft 22");
     if (failures == 0)
         MOQ_TEST_PASS("media_receiver_fill_catalog");
     return failures ? 1 : 0;

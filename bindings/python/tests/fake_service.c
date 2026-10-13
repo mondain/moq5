@@ -3254,13 +3254,13 @@ PyObject *test_write_simulate(PyObject *self, PyObject *args)
     return PyLong_FromLong((long)rc);
 }
 
-/* Drive the PROPOSED write ordering against the recorder, so the ordering
- * observer can be proved before the bridge exists. This is a fixture driver
- * over the fake, not a Python write surface: it takes no moq5 object, returns
- * no outcome value, and the product rows stay RED.
+/* Drive a write ordering against the recorder, so the ordering observer is
+ * proved independently of the bridge. This is a fixture driver over the fake,
+ * not a Python write surface: it takes no moq5 object and returns no outcome
+ * value.
  *
  * `release_before_result` selects the ordering under test. True is the
- * proposed order -- release both spans, THEN allocate the result. False is the
+ * required order -- release both spans, THEN allocate the result. False is the
  * mutant, and the fault-site inventory tells them apart at the fault itself. */
 PyObject *test_write_simulate_ordered(PyObject *self, PyObject *args)
 {

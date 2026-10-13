@@ -6,14 +6,13 @@
 /* =====================================================================
  * The declared topology.
  *
- * Transport rows: both built drafts are AVAILABLE, with the reviewed ALPN
- * literals (Step 3's canonical table is the authority the drift gate compares
- * against), the integer codec each draft specifies, and the endpoint-offer
- * facts. AUTO ranks are 1-based and D21 is offered FIRST.
+ * Transport rows: all built drafts are AVAILABLE, with their ALPN literals
+ * (the canonical table in adapters/common/moq_alpn.h is the authority the
+ * drift gate compares against), the integer codec each draft specifies, and the endpoint-offer
+ * facts. AUTO ranks are 1-based and D22 is offered FIRST.
  *
  * Media rows: LOC-01 is implemented; LOC-02 is RESERVED with a reason. The
- * reviewed property IDs are recorded because they are the collision at the
- * heart of the arc -- LOC-01 Capture Timestamp is ID 2
+ * property IDs are recorded because they collide across the two profiles -- LOC-01 Capture Timestamp is ID 2
  * (draft-ietf-moq-loc-01 §2.3.1.1) while LOC-02 Timestamp is ID 0x06
  * (draft-ietf-moq-loc-02 §2.3.1.1), which is LOC-01's AUDIO LEVEL id.
  * ===================================================================== */
@@ -24,12 +23,12 @@ static const np_transport_row_t kTransports[] = {
       NP_QUIC_VARINT_MAX, true, 3, NULL },
     { 18, NP_T_AVAILABLE, "moqt-18", 7, NP_ENC_VI64,
       NP_VI64_MAX,        true, 2, NULL },
-    /* Draft 21 is wire ready and offered first. Its media cells are still
+    /* Draft 22 is wire ready and offered first. Its media cells are still
      * UNSUPPORTED (LOC property ids are not implemented for it), which is why the
      * row keeps a reason. */
-    { 21, NP_T_AVAILABLE, "moqt-21", 7, NP_ENC_VI64,
+    { 22, NP_T_AVAILABLE, "moqt-22", 7, NP_ENC_VI64,
       NP_VI64_MAX,        true, 1,
-      "draft-21 LOC property ids are not implemented" },
+      "draft-22 LOC property ids are not implemented" },
 };
 
 static const np_media_row_t kMedias[] = {
@@ -42,17 +41,17 @@ static const np_media_row_t kMedias[] = {
 };
 
 /*
- * Closure cells. LOC-01 is SUPPORTED on both drafts but carries a temporary
- * closure waiver with both callbacks NULL: Step 5 declares the topology and
- * leaves the service closures to Step 6, which will replace these waivers
- * with the shared send/receive functions.
+ * Closure cells. LOC-01 is SUPPORTED on both drafts but carries a closure
+ * waiver with both callbacks NULL: the tables declare the topology only, and
+ * a cell's waiver is replaced by the shared send/receive functions once the
+ * service closures exist.
  */
 static const np_cell_row_t kCells[] = {
     { 16, "loc01", NP_C_SUPPORTED, NULL,
-      "step-5 substrate: service closure callbacks land in step 6",
+      "topology only: no service closure callbacks are declared",
       NULL, NULL },
     { 18, "loc01", NP_C_SUPPORTED, NULL,
-      "step-5 substrate: service closure callbacks land in step 6",
+      "topology only: no service closure callbacks are declared",
       NULL, NULL },
     { 16, "loc02", NP_C_UNSUPPORTED,
       "LOC-02 is RESERVED: no product encoder or decoder exists for its "
@@ -62,12 +61,12 @@ static const np_cell_row_t kCells[] = {
       "LOC-02 is RESERVED: no product encoder or decoder exists for its "
       "renumbered property ids on any draft",
       NULL, NULL, NULL },
-    { 21, "loc01", NP_C_UNSUPPORTED,
-      "draft 21 carries LOC-04 (Timestamp 0x10, Video Frame Marking 0x09), which "
+    { 22, "loc01", NP_C_UNSUPPORTED,
+      "draft 22 carries LOC-04 (Timestamp 0x10, Video Frame Marking 0x09), which "
       "the product implements but this topology has no media row for yet; LOC-01 "
-      "is not carried on draft 21",
+      "is not carried on draft 22",
       NULL, NULL, NULL },
-    { 21, "loc02", NP_C_UNSUPPORTED,
+    { 22, "loc02", NP_C_UNSUPPORTED,
       "LOC-02 is RESERVED: no product encoder or decoder exists for its "
       "renumbered property ids on any draft",
       NULL, NULL, NULL },

@@ -1,16 +1,16 @@
 /*
- * Draft-21 session bring-up through the d21 profile (draft-ietf-moq-transport-21):
+ * Draft-22 session bring-up through the d22 profile (draft-ietf-moq-transport-22):
  * SETUP options on the wire in both directions, the peer limits the session
  * records, the setup and GOAWAY violation matrix, and the profile capabilities
  * that differ from draft 18.
  *
- * Inputs are built with the draft-21 codec (control_d21), whose own byte vectors
- * are pinned in test_control_d21; this file checks what the SESSION does with them.
- * The d21 profile is not wire ready (it is refused by the endpoint), but sessions
+ * Inputs are built with the draft-22 codec (control_d22), whose own byte vectors
+ * are pinned in test_control_d22; this file checks what the SESSION does with them.
+ * The d22 profile is not wire ready (it is refused by the endpoint), but sessions
  * can be created for it, which is what the simulator and these tests use.
  */
 #include <moq/moq.h>
-#include <moq/control_d21.h>
+#include <moq/control_d22.h>
 #include <moq/sim.h>
 #include "test_support.h"
 #include "../../core/src/session/session_internal.h"
@@ -25,7 +25,7 @@ static moq_session_t *make_started(moq_perspective_t persp, uint64_t cache_size,
 {
     moq_session_cfg_t cfg;
     moq_session_cfg_init_sized(&cfg, sizeof(cfg), moq_alloc_default(), persp);
-    cfg.version = MOQ_VERSION_DRAFT_21;
+    cfg.version = MOQ_VERSION_DRAFT_22;
     cfg.goaway_timeout_us = goaway_timeout_us;
     if (cache_size > 0) {
         cfg.send_auth_token_cache_size = true;
@@ -55,7 +55,7 @@ static moq_result_t feed_setup(moq_session_t *s, const uint8_t *payload, size_t 
     uint8_t msg[200];
     moq_buf_writer_t w;
     moq_buf_writer_init(&w, msg, sizeof(msg));
-    moq_buf_write_vi64(&w, MOQ_D21_STREAM_SETUP);
+    moq_buf_write_vi64(&w, MOQ_D22_STREAM_SETUP);
     moq_buf_write_uint16(&w, (uint16_t)plen);
     if (plen > 0) moq_buf_write_raw(&w, payload, plen);
     return moq_session_on_control_bytes(s, msg, moq_buf_writer_offset(&w), 0);
@@ -96,7 +96,7 @@ static size_t frame(uint8_t *out, size_t cap, uint64_t type, const uint8_t *body
 }
 
 /* Capture the SETUP message the session opened its control stream with. */
-static bool capture_setup_options(moq_session_t *s, moq_d21_setup_opts_t *out)
+static bool capture_setup_options(moq_session_t *s, moq_d22_setup_opts_t *out)
 {
     bool found = false;
     moq_action_t a;
@@ -105,9 +105,9 @@ static bool capture_setup_options(moq_session_t *s, moq_d21_setup_opts_t *out)
             moq_buf_reader_t r;
             moq_buf_reader_init(&r, a.u.open_uni_control.data, a.u.open_uni_control.len);
             moq_control_envelope_t env;
-            if (moq_d21_decode_envelope(&r, &env) == MOQ_OK &&
-                env.msg_type == MOQ_D21_STREAM_SETUP &&
-                moq_d21_decode_setup_opts(env.payload, env.payload_len, out) == MOQ_OK)
+            if (moq_d22_decode_envelope(&r, &env) == MOQ_OK &&
+                env.msg_type == MOQ_D22_STREAM_SETUP &&
+                moq_d22_decode_setup_opts(env.payload, env.payload_len, out) == MOQ_OK)
                 found = true;
         }
         moq_action_cleanup(&a);
@@ -128,7 +128,7 @@ static void t_setup_emitted(void)
     for (size_t i = 0; i < 2; i++) {
         moq_session_t *s = make_started(persp[i], 0, 0);
         MOQ_TEST_CHECK(s != NULL);
-        moq_d21_setup_opts_t o;
+        moq_d22_setup_opts_t o;
         MOQ_TEST_CHECK(capture_setup_options(s, &o));
         MOQ_TEST_CHECK(o.has_implementation);
         MOQ_TEST_CHECK(o.implementation.len == sizeof(impl) - 1 &&
@@ -144,7 +144,7 @@ static void t_setup_emitted(void)
      * at the boundary (100 = 0x64), alongside the implementation string. */
     {
         moq_session_t *s = make_started(MOQ_PERSPECTIVE_CLIENT, 100, 0);
-        moq_d21_setup_opts_t o;
+        moq_d22_setup_opts_t o;
         MOQ_TEST_CHECK(capture_setup_options(s, &o));
         MOQ_TEST_CHECK(o.has_max_auth_token_cache_size);
         MOQ_TEST_CHECK_EQ_U64(o.max_auth_token_cache_size, 100);
@@ -158,12 +158,12 @@ static void t_setup_max_request_updates(void)
 {
     moq_session_cfg_t cfg;
     moq_session_cfg_init_sized(&cfg, sizeof(cfg), moq_alloc_default(), MOQ_PERSPECTIVE_SERVER);
-    cfg.version = MOQ_VERSION_DRAFT_21;
+    cfg.version = MOQ_VERSION_DRAFT_22;
     cfg.max_request_updates = 3;
     moq_session_t *s = NULL;
     MOQ_TEST_CHECK(moq_session_create(&cfg, 0, &s) >= 0 && s);
     MOQ_TEST_CHECK(moq_session_start(s, 0) >= 0);
-    moq_d21_setup_opts_t o;
+    moq_d22_setup_opts_t o;
     MOQ_TEST_CHECK(capture_setup_options(s, &o));
     MOQ_TEST_CHECK(o.has_max_request_updates && o.max_request_updates == 3);
     moq_session_destroy(s);
@@ -175,7 +175,7 @@ static void t_setup_authority_path(void)
 {
     moq_session_cfg_t cfg;
     moq_session_cfg_init_sized(&cfg, sizeof(cfg), moq_alloc_default(), MOQ_PERSPECTIVE_CLIENT);
-    cfg.version = MOQ_VERSION_DRAFT_21;
+    cfg.version = MOQ_VERSION_DRAFT_22;
     cfg.setup_authority = (moq_bytes_t){ (const uint8_t *)"h:4443", 6 };
     cfg.setup_path = (moq_bytes_t){ (const uint8_t *)"/moq?x=1", 8 };
     moq_session_t *s = NULL;
@@ -205,7 +205,7 @@ static void t_setup_authority_path(void)
         moq_session_t *s2 = NULL;
         MOQ_TEST_CHECK(moq_session_create(&c2, 0, &s2) >= 0 && s2);
         MOQ_TEST_CHECK(moq_session_start(s2, 0) >= 0);
-        moq_d21_setup_opts_t o2;
+        moq_d22_setup_opts_t o2;
         MOQ_TEST_CHECK(capture_setup_options(s2, &o2));
         MOQ_TEST_CHECK(o2.has_path && o2.has_authority);
         moq_session_destroy(s2);
@@ -216,7 +216,7 @@ static void t_setup_authority_path(void)
     s = NULL;
     MOQ_TEST_CHECK(moq_session_create(&cfg, 0, &s) >= 0 && s);
     MOQ_TEST_CHECK(moq_session_start(s, 0) >= 0);
-    moq_d21_setup_opts_t o;
+    moq_d22_setup_opts_t o;
     MOQ_TEST_CHECK(capture_setup_options(s, &o));
     MOQ_TEST_CHECK(!o.has_path && !o.has_authority);
     moq_session_destroy(s);
@@ -357,7 +357,7 @@ static moq_result_t feed_goaway(moq_session_t *s, const char *uri, uint64_t time
     moq_buf_writer_t w;
     moq_buf_writer_init(&w, buf, sizeof(buf));
     size_t n = uri ? strlen(uri) : 0;
-    moq_d21_encode_goaway(&w, (const uint8_t *)uri, n, timeout_ms);
+    moq_d22_encode_goaway(&w, (const uint8_t *)uri, n, timeout_ms);
     return moq_session_on_control_bytes(s, buf, moq_buf_writer_offset(&w), 1);
 }
 
@@ -370,7 +370,7 @@ static void t_goaway_max_uri(void)
     moq_session_t *s = make_established(MOQ_PERSPECTIVE_CLIENT, 0);
     moq_buf_writer_t w;
     moq_buf_writer_init(&w, big, sizeof(big));
-    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_goaway(&w, uri, sizeof(uri), 0), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d22_encode_goaway(&w, uri, sizeof(uri), 0), (int)MOQ_OK);
     MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_control_bytes(s, big, moq_buf_writer_offset(&w), 1), (int)MOQ_OK);
     MOQ_TEST_CHECK(s->state != MOQ_SESS_CLOSED && s->goaway_received);
     moq_session_destroy(s);
@@ -389,11 +389,11 @@ static void t_goaway(void)
                 moq_buf_reader_t r;
                 moq_buf_reader_init(&r, act.u.send_control.data, act.u.send_control.len);
                 moq_control_envelope_t env;
-                if (moq_d21_decode_envelope(&r, &env) == MOQ_OK && env.msg_type == MOQ_D21_GOAWAY) {
-                    moq_d21_goaway_t ga;
+                if (moq_d22_decode_envelope(&r, &env) == MOQ_OK && env.msg_type == MOQ_D22_GOAWAY) {
+                    moq_d22_goaway_t ga;
                     /* The strict decoder accepts it only because nothing follows the
                      * Timeout: a draft-18 style Request ID would be rejected. */
-                    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_goaway(env.payload, env.payload_len, &ga), (int)MOQ_OK);
+                    MOQ_TEST_CHECK_EQ_INT((int)moq_d22_decode_goaway(env.payload, env.payload_len, &ga), (int)MOQ_OK);
                     MOQ_TEST_CHECK_EQ_U64(ga.timeout_ms, 5);        /* 5000 us -> 5 ms */
                     MOQ_TEST_CHECK_EQ_SIZE(ga.uri.len, 0);          /* a client sends none */
                     seen = true;
@@ -443,7 +443,7 @@ static void t_goaway(void)
         moq_session_t *s = make_established(MOQ_PERSPECTIVE_CLIENT, 0);
         static const uint8_t d18[] = { 0x00, 0x05, 0x01 };           /* uri "", timeout 5, id 1 */
         uint8_t m[16];
-        size_t n = frame(m, sizeof(m), MOQ_D21_GOAWAY, d18, sizeof(d18));
+        size_t n = frame(m, sizeof(m), MOQ_D22_GOAWAY, d18, sizeof(d18));
         moq_session_on_control_bytes(s, m, n, 1);
         MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_CLOSED);
         MOQ_TEST_CHECK_EQ_U64(poll_close_code(s), 0x3);
@@ -473,8 +473,8 @@ static void t_control_messages(void)
      * messages belong on request streams, and 0x1E (draft 18's PUBLISH_OK) is
      * reserved: each is an unknown control message and closes the session. */
     static const uint64_t types[] = {
-        MOQ_D21_SUBSCRIBE, MOQ_D21_REQUEST_OK, MOQ_D21_REQUEST_ERROR, MOQ_D21_PUBLISH,
-        MOQ_D21_FETCH, MOQ_D21_PUBLISH_STATE_NOTIFY, MOQ_D21_PUBLISH_SKIPPED, 0x1E, 0x7F };
+        MOQ_D22_SUBSCRIBE, MOQ_D22_REQUEST_OK, MOQ_D22_REQUEST_ERROR, MOQ_D22_PUBLISH,
+        MOQ_D22_FETCH, MOQ_D22_PUBLISH_STATE_NOTIFY, MOQ_D22_PUBLISH_SKIPPED, 0x1E, 0x7F };
     for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
         moq_session_t *s = make_established(MOQ_PERSPECTIVE_CLIENT, 0);
         uint8_t m[8];
@@ -494,27 +494,27 @@ static void t_capabilities(void)
 {
     const moq_profile_ops_t *d16 = moq_profile_lookup(MOQ_VERSION_DRAFT_16);
     const moq_profile_ops_t *d18 = moq_profile_lookup(MOQ_VERSION_DRAFT_18);
-    const moq_profile_ops_t *d21 = moq_profile_lookup(MOQ_VERSION_DRAFT_21);
-    MOQ_TEST_CHECK(d16 && d18 && d21);
-    if (!(d16 && d18 && d21)) return;
+    const moq_profile_ops_t *d22 = moq_profile_lookup(MOQ_VERSION_DRAFT_22);
+    MOQ_TEST_CHECK(d16 && d18 && d22);
+    if (!(d16 && d18 && d22)) return;
 
     /* The answer to a PUBLISH no longer carries the subscriber's choices, and the
-     * Joining FETCH is gone (draft 21 moved the first to REQUEST_UPDATE and replaced
+     * Joining FETCH is gone (draft 22 moved the first to REQUEST_UPDATE and replaced
      * the second with fill streams): the core asks these instead of a version. */
     MOQ_TEST_CHECK(d16->publish_ok_carries_params && d18->publish_ok_carries_params);
-    MOQ_TEST_CHECK(!d21->publish_ok_carries_params);
+    MOQ_TEST_CHECK(!d22->publish_ok_carries_params);
     MOQ_TEST_CHECK(d16->supports_joining_fetch && d18->supports_joining_fetch);
-    MOQ_TEST_CHECK(!d21->supports_joining_fetch);
+    MOQ_TEST_CHECK(!d22->supports_joining_fetch);
 
     /* Unchanged from draft 18: the uni control pair, request streams, full-range
      * vi64 locations and error codes, root namespaces, ascending-only fetch. */
-    MOQ_TEST_CHECK(d21->uses_uni_control_channel && d21->uses_request_streams);
-    MOQ_TEST_CHECK_EQ_INT((int)d21->min_track_namespace_fields, 0);
-    MOQ_TEST_CHECK_EQ_U64(d21->location_varint_max, UINT64_MAX);
-    MOQ_TEST_CHECK_EQ_U64(d21->request_error_wire_max, UINT64_MAX);
-    MOQ_TEST_CHECK_EQ_U64(d21->object_payload_len_max, UINT64_MAX);
-    MOQ_TEST_CHECK(!d21->fetch_descending_supported);
-    MOQ_TEST_CHECK(d21->version == MOQ_VERSION_DRAFT_21);
+    MOQ_TEST_CHECK(d22->uses_uni_control_channel && d22->uses_request_streams);
+    MOQ_TEST_CHECK_EQ_INT((int)d22->min_track_namespace_fields, 0);
+    MOQ_TEST_CHECK_EQ_U64(d22->location_varint_max, UINT64_MAX);
+    MOQ_TEST_CHECK_EQ_U64(d22->request_error_wire_max, UINT64_MAX);
+    MOQ_TEST_CHECK_EQ_U64(d22->object_payload_len_max, UINT64_MAX);
+    MOQ_TEST_CHECK(!d22->fetch_descending_supported);
+    MOQ_TEST_CHECK(d22->version == MOQ_VERSION_DRAFT_22);
 }
 
 int main(void)
@@ -529,8 +529,8 @@ int main(void)
     t_control_messages();
     t_capabilities();
     if (failures) {
-        fprintf(stderr, "test_d21_setup: %d failures\n", failures);
+        fprintf(stderr, "test_d22_setup: %d failures\n", failures);
         return 1;
     }
-    MOQ_TEST_PASS("test_d21_setup");
+    MOQ_TEST_PASS("test_d22_setup");
 }

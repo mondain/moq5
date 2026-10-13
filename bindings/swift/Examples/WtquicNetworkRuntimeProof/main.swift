@@ -1,3 +1,8 @@
+// Historical success proof: NOT a qualification gate under the current policy.
+// .wtquicNetwork now throws .unsupported synchronously before network startup.
+// Current rejection gates are wtquic_network_managed and
+// endpoint_wtquic_network_smoke; old successful receipts must not be reused.
+// This retained example is not an available playback path.
 // Standalone .wtquicNetwork runtime proof (NOT an xctest -- Network.framework
 // does not establish inside an xctest host, so the proof must run as a normal
 // process). The driver scripts/check_wtquic_network_runtime.sh spawns fresh one-shot
@@ -7,7 +12,7 @@
 // Network.framework -> real MsQuic peer -- through the same public API
 // SimplePlayer uses (LiveMediaSession over MoQEndpoint + MediaReceiver):
 //
-//   exchange <port> <16|18|21>
+//   exchange <port> <16|18|22>
 //       Establish (assert the negotiated draft), watch the namespace,
 //       receive the object, verify every payload byte, stop cleanly.
 //
@@ -250,14 +255,14 @@ func u16(_ s: String) -> UInt16 { UInt16(s) ?? { fail("bad port \(s)") }() }
 if #available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *) {
     switch args.count >= 2 ? args[1] : "" {
     case "exchange" where args.count == 4:
-        // exactly 16, 18 or 21; anything else is a usage error, never a
+        // exactly 16, 18 or 22; anything else is a usage error, never a
         // silent draft-16 default
         let version: MoQVersion
         switch args[3] {
         case "16": version = .draft16
         case "18": version = .draft18
-        case "21": version = .draft21
-        default: fail("bad version '\(args[3])' (want 16, 18 or 21)")
+        case "22": version = .draft22
+        default: fail("bad version '\(args[3])' (want 16, 18 or 22)")
         }
         await exchange(port: u16(args[2]), version: version,
                        label: "exchange-d\(args[3])")
@@ -266,7 +271,7 @@ if #available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *) {
     case "untrusted" where args.count == 3:
         await runUntrusted(port: u16(args[2]))
     default:
-        fail("usage: exchange <port> <16|18|21> | reconnect <portA> <portB> | untrusted <port>")
+        fail("usage: exchange <port> <16|18|22> | reconnect <portA> <portB> | untrusted <port>")
     }
     exit(0)
 } else { fail("requires macOS 13 / iOS 16") }

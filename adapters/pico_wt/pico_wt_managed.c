@@ -93,6 +93,7 @@ struct moq_pico_wt_managed {
     moq_perspective_t  perspective;
     char              *host;
     char              *sni;
+    char              *authority;
     char              *path;
     char              *wt_protocols;   /* offer (client) / supported (server);
                                         * NULL = legacy no-negotiation */
@@ -1042,11 +1043,12 @@ static void free_strings(moq_pico_wt_managed_t *m)
 {
     if (m->host) m->alloc.free(m->host, strlen(m->host) + 1, m->alloc.ctx);
     if (m->sni)  m->alloc.free(m->sni, strlen(m->sni) + 1, m->alloc.ctx);
+    if (m->authority) m->alloc.free(m->authority, strlen(m->authority) + 1, m->alloc.ctx);
     if (m->path) m->alloc.free(m->path, strlen(m->path) + 1, m->alloc.ctx);
     if (m->wt_protocols)
         m->alloc.free(m->wt_protocols, strlen(m->wt_protocols) + 1,
                       m->alloc.ctx);
-    m->host = m->sni = m->path = NULL;
+    m->host = m->sni = m->path = m->authority = NULL;
     m->wt_protocols = NULL;
 }
 
@@ -1095,6 +1097,16 @@ moq_result_t moq_pico_wt_managed_create(
     bool dup_ok = (m->path != NULL);
     if (persp == MOQ_PERSPECTIVE_CLIENT) {
         m->host = dup_str(&m->alloc, host);
+        /* HTTP routing uses the connect host and port; SNI is a separate
+         * certificate name and may be overridden. Bracket IPv6 literals. */
+        bool bracket = strchr(host, ':') != NULL && host[0] != '[';
+        int authority_len = snprintf(NULL, 0, bracket ? "[%s]:%d" : "%s:%d", host, port);
+        if (authority_len >= 0) {
+            m->authority = (char *)m->alloc.alloc((size_t)authority_len + 1, m->alloc.ctx);
+            if (m->authority)
+                snprintf(m->authority, (size_t)authority_len + 1,
+                         bracket ? "[%s]:%d" : "%s:%d", host, port);
+        }
         /* Choose the SNI / verified server name. An explicit cfg->sni always
          * wins. Otherwise: for a DNS host, default to the host (the default
          * verifier then checks the cert against the real name we connected to).
@@ -1124,7 +1136,7 @@ moq_result_t moq_pico_wt_managed_create(
             return MOQ_ERR_INVAL;
         }
         m->sni = dup_str(&m->alloc, sni_src);
-        dup_ok = dup_ok && m->host && m->sni;
+        dup_ok = dup_ok && m->host && m->sni && m->authority;
     }
     if (CFG_HAS(cfg, wt_protocols) && cfg->wt_protocols &&
         cfg->wt_protocols[0] != '\0') {
@@ -1243,7 +1255,7 @@ moq_result_t moq_pico_wt_managed_create(
         if (prc != 0) goto fail_configure;
 
         picowt_set_transport_parameters(m->cnx);
-        if (picowt_connect(m->cnx, m->h3_ctx, m->ctrl_ctx, m->sni,
+        if (picowt_connect(m->cnx, m->h3_ctx, m->ctrl_ctx, m->authority,
                            m->path, managed_client_wt_cb, m,
                            m->wt_protocols) != 0)
             goto fail_configure;

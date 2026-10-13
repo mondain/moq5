@@ -19,7 +19,7 @@
  *   track      track name (default "video")
  *   --insecure-skip-verify  disable TLS certificate verification; for
  *              LOCAL/self-signed testing ONLY (verification is on by default)
- *   --draft N  offer exactly this MoQT draft (16, 18 or 21); default is to
+ *   --draft N  offer exactly this MoQT draft (16, 18 or 22); default is to
  *              offer every draft this build supports and negotiate one
  *   --peer-close-ok  a session the library closed over a PEER protocol violation is
  *              not a failure of this process (conformance probes provoke exactly that)
@@ -78,14 +78,14 @@ static void payload_release(void *ctx, const uint8_t *data, size_t len)
     (void)len;
 }
 
-/* Strict draft parse: exactly "16", "18" or "21" -> that draft, anything else
+/* Strict draft parse: exactly "16", "18" or "22" -> that draft, anything else
  * -> 0. atoi would silently accept "18junk" as 18 and "abc" as auto, which
  * would falsify per-draft interop results. */
 static moq_version_t parse_draft(const char *s)
 {
     if (strcmp(s, "16") == 0) return MOQ_VERSION_DRAFT_16;
     if (strcmp(s, "18") == 0) return MOQ_VERSION_DRAFT_18;
-    if (strcmp(s, "21") == 0) return (moq_version_t)21;
+    if (strcmp(s, "22") == 0) return (moq_version_t)22;
     return (moq_version_t)0;
 }
 
@@ -129,7 +129,7 @@ int main(int argc, char **argv)
             "          [--draft N] [--ca FILE] [--peer-close-ok]\n"
             "  --insecure-skip-verify  disable TLS certificate verification\n"
             "                          (LOCAL/self-signed testing ONLY)\n"
-            "  --draft N               offer exactly draft 16, 18 or 21\n"
+            "  --draft N               offer exactly draft 16, 18 or 22\n"
             "                          (default: offer every supported draft)\n"
             "  --ca FILE               PEM certificate to trust\n",
             argv[0]);
@@ -152,7 +152,7 @@ int main(int argc, char **argv)
             pinned = parse_draft(argv[++i]);
             if (pinned == 0) {
                 fprintf(stderr,
-                        "error: --draft must be exactly 16, 18 or 21 "
+                        "error: --draft must be exactly 16, 18 or 22 "
                         "(got \"%s\")\n", argv[i]);
                 return 2;
             }

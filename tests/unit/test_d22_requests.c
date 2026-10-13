@@ -1,24 +1,24 @@
 /*
- * Draft-21 request layer through the d21 profile: how the session core's filter
+ * Draft-22 request layer through the d22 profile: how the session core's filter
  * and fetch-range model maps onto Location Filters, FILL_PARAMETERS and Range
  * Filters, and how SUBSCRIBE, REQUEST_UPDATE, FETCH, PUBLISH and PUBLISH_OK,
  * PUBLISH_STATE_NOTIFY and REQUEST_ERROR behave end to end on a request bidi.
  *
- * Wire inputs are built with the draft-21 codec (byte vectors pinned in
- * test_control_d21); this file checks what the PROFILE and SESSION do with them.
- * Where the core's four-type filter model cannot express a draft-21 request the
+ * Wire inputs are built with the draft-22 codec (byte vectors pinned in
+ * test_control_d22); this file checks what the PROFILE and SESSION do with them.
+ * Where the core's four-type filter model cannot express a draft-22 request the
  * mapping is APPROXIMATED and flagged, and the exact wire fields are surfaced
  * beside it; those cases are asserted explicitly so the gap cannot widen silently
- * (plan Task 6.1 and Task 7 finish them).
+ * Exact request fields also drive the resolved session window.
  */
 #include <moq/moq.h>
-#include <moq/control_d21.h>
+#include <moq/control_d22.h>
 #include <moq/sim.h>
 #include <moq/subscriber.h>
 #include "test_support.h"
 #include "../../core/src/session/session_internal.h"
 #include "../../core/src/session/profile.h"
-#include "../../core/src/session/profile_d21_internal.h"
+#include "../../core/src/session/profile_d22_internal.h"
 
 static int failures = 0;
 
@@ -32,72 +32,72 @@ static moq_bytes_t lit(const char *s)
  * Part 1. The mapping helpers, directly
  * ===================================================================== */
 
-static moq_d21_location_filter_t lf(uint8_t n, uint64_t sg, uint64_t so, uint64_t dg, uint64_t eo)
+static moq_d22_location_filter_t lf(uint8_t n, uint64_t sg, uint64_t so, uint64_t dg, uint64_t eo)
 {
-    moq_d21_location_filter_t f;
+    moq_d22_location_filter_t f;
     memset(&f, 0, sizeof(f));
-    f.field_count = n; f.start_group = sg; f.start_object = so;
+    f.location_type = n; f.start_group = sg; f.start_object = so;
     f.end_group_delta = dg; f.end_object = eo;
     return f;
 }
 
 static void t_filter_to_wire(void)
 {
-    moq_d21_location_filter_t f;
+    moq_d22_location_filter_t f;
     bool emit;
 
-    /* The four semantic types and how each is written (9.20.10). */
-    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_profile_filter_to_wire(MOQ_SUBSCRIBE_FILTER_NEXT_GROUP, 9, 9, 9, &f, &emit), (int)MOQ_OK);
-    MOQ_TEST_CHECK(emit && f.field_count == 1 && f.start_group == 0);   /* locations ignored */
+    /* The four semantic types and how each is written (9.20.9). */
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d22_profile_filter_to_wire(MOQ_SUBSCRIBE_FILTER_NEXT_GROUP, 9, 9, 9, &f, &emit), (int)MOQ_OK);
+    MOQ_TEST_CHECK(emit && f.location_type == 1 && f.start_group == 0);   /* locations ignored */
 
-    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_profile_filter_to_wire(MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT, 9, 9, 9, &f, &emit), (int)MOQ_OK);
-    MOQ_TEST_CHECK(emit && f.field_count == 2 && f.start_group == 0 && f.start_object == 0);   /* Next Object */
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d22_profile_filter_to_wire(MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT, 9, 9, 9, &f, &emit), (int)MOQ_OK);
+    MOQ_TEST_CHECK(emit && f.location_type == 5 && f.start_group == 0 && f.start_object == 0);   /* Next Object */
 
-    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_profile_filter_to_wire(MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START, 5, 3, 0, &f, &emit), (int)MOQ_OK);
-    MOQ_TEST_CHECK(emit && f.field_count == 2 && f.start_group == 5 && f.start_object == 3);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d22_profile_filter_to_wire(MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START, 5, 3, 0, &f, &emit), (int)MOQ_OK);
+    MOQ_TEST_CHECK(emit && f.location_type == 2 && f.start_group == 5 && f.start_object == 3);
 
-    /* An absolute start at {0,0} cannot be two zero fields (that reads as the Next
-     * Object) and is "equivalent to unfiltered" (9.20.10): it is not sent. */
-    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_profile_filter_to_wire(MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START, 0, 0, 0, &f, &emit), (int)MOQ_OK);
-    MOQ_TEST_CHECK(!emit);
+    /* Absolute origin is type 2 and remains distinct from Next Object (type 5). */
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d22_profile_filter_to_wire(MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START, 0, 0, 0, &f, &emit), (int)MOQ_OK);
+    MOQ_TEST_CHECK(emit && f.location_type == 2);
     /* ... but a start in group 0 at a later object, or in a later group, is. */
-    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_profile_filter_to_wire(MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START, 0, 1, 0, &f, &emit), (int)MOQ_OK);
-    MOQ_TEST_CHECK(emit && f.field_count == 2 && f.start_object == 1);
-    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_profile_filter_to_wire(MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START, 1, 0, 0, &f, &emit), (int)MOQ_OK);
-    MOQ_TEST_CHECK(emit && f.field_count == 2 && f.start_group == 1);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d22_profile_filter_to_wire(MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START, 0, 1, 0, &f, &emit), (int)MOQ_OK);
+    MOQ_TEST_CHECK(emit && f.location_type == 2 && f.start_object == 1);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d22_profile_filter_to_wire(MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START, 1, 0, 0, &f, &emit), (int)MOQ_OK);
+    MOQ_TEST_CHECK(emit && f.location_type == 2 && f.start_group == 1);
 
     /* A range is three fields: the end group as a delta from the start, and no end
      * object, which keeps the whole end group. {0,0} start stays absolute here. */
-    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_profile_filter_to_wire(MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE, 5, 3, 9, &f, &emit), (int)MOQ_OK);
-    MOQ_TEST_CHECK(emit && f.field_count == 3 && f.start_group == 5 && f.start_object == 3 && f.end_group_delta == 4);
-    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_profile_filter_to_wire(MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE, 0, 0, 0, &f, &emit), (int)MOQ_OK);
-    MOQ_TEST_CHECK(emit && f.field_count == 3 && f.end_group_delta == 0);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d22_profile_filter_to_wire(MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE, 5, 3, 9, &f, &emit), (int)MOQ_OK);
+    MOQ_TEST_CHECK(emit && f.location_type == 3 && f.start_group == 5 && f.start_object == 3 && f.end_group_delta == 4);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d22_profile_filter_to_wire(MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE, 0, 0, 0, &f, &emit), (int)MOQ_OK);
+    MOQ_TEST_CHECK(emit && f.location_type == 3 && f.end_group_delta == 0);
     /* A range that ends before it starts, and an unknown type, are refused. */
-    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_profile_filter_to_wire(MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE, 5, 0, 4, &f, &emit), (int)MOQ_ERR_INVAL);
-    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_profile_filter_to_wire(99, 0, 0, 0, &f, &emit), (int)MOQ_ERR_INVAL);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d22_profile_filter_to_wire(MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE, 5, 0, 4, &f, &emit), (int)MOQ_ERR_INVAL);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d22_profile_filter_to_wire(99, 0, 0, 0, &f, &emit), (int)MOQ_ERR_INVAL);
     /* The full 64-bit range is carried. */
-    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_profile_filter_to_wire(MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE, 1, 0, UINT64_MAX, &f, &emit), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d22_profile_filter_to_wire(MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE, 1, 0, UINT64_MAX, &f, &emit), (int)MOQ_OK);
     MOQ_TEST_CHECK_EQ_U64(f.end_group_delta, UINT64_MAX - 1);
 }
 
 typedef struct {
     const char *what;
-    moq_d21_location_filter_t in;
+    moq_d22_location_filter_t in;
     uint32_t type; uint64_t sg, so, eg; bool approx;
 } from_case_t;
 
 static void t_filter_from_wire(void)
 {
     const from_case_t cases[] = {
-        /* zero length: the filter is removed, i.e. an absolute start at {0,0}. */
+        /* type 0: the filter is removed, i.e. an absolute start at {0,0}. */
         { "zero length",            lf(0, 0, 0, 0, 0), MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START, 0, 0, 0, false },
         /* one field is a start RELATIVE to the Next Group; only 0 is exact. */
         { "next group",             lf(1, 0, 0, 0, 0), MOQ_SUBSCRIBE_FILTER_NEXT_GROUP, 0, 0, 0, false },
         { "current group (1)",      lf(1, 1, 0, 0, 0), MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT, 0, 0, 0, true },
         { "two groups back (2)",    lf(1, 2, 0, 0, 0), MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT, 0, 0, 0, true },
         { "relative at max",        lf(1, UINT64_MAX, 0, 0, 0), MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT, 0, 0, 0, true },
-        /* two fields: {0,0} is the Next Object, anything else an absolute start. */
-        { "next object",            lf(2, 0, 0, 0, 0), MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT, 0, 0, 0, false },
+        /* type 5 selects Next Object; type 2 is always an absolute start. */
+        { "next object",            lf(5, 0, 0, 0, 0), MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT, 0, 0, 0, false },
+        { "absolute zero",          lf(2, 0, 0, 0, 0), MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START, 0, 0, 0, false },
         { "absolute start",         lf(2, 5, 3, 0, 0), MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START, 5, 3, 0, false },
         { "start group 0 object 1", lf(2, 0, 1, 0, 0), MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START, 0, 1, 0, false },
         /* three fields: an absolute range keeping the whole end group. */
@@ -108,7 +108,7 @@ static void t_filter_from_wire(void)
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         uint32_t type; uint64_t sg, so, eg; bool approx;
-        moq_d21_profile_filter_from_wire(&cases[i].in, &type, &sg, &so, &eg, &approx);
+        moq_d22_profile_filter_from_wire(&cases[i].in, &type, &sg, &so, &eg, &approx);
         if (type != cases[i].type || sg != cases[i].sg || so != cases[i].so ||
             eg != cases[i].eg || approx != cases[i].approx) {
             fprintf(stderr, "FAIL: from_wire %s: type %u sg %llu so %llu eg %llu approx %d\n",
@@ -128,10 +128,10 @@ static void t_filter_from_wire(void)
         { MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE, 0, 0, 3 },
     };
     for (size_t i = 0; i < sizeof(rt) / sizeof(rt[0]); i++) {
-        moq_d21_location_filter_t f; bool emit;
-        MOQ_TEST_CHECK_EQ_INT((int)moq_d21_profile_filter_to_wire(rt[i].t, rt[i].sg, rt[i].so, rt[i].eg, &f, &emit), (int)MOQ_OK);
+        moq_d22_location_filter_t f; bool emit;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d22_profile_filter_to_wire(rt[i].t, rt[i].sg, rt[i].so, rt[i].eg, &f, &emit), (int)MOQ_OK);
         uint32_t type; uint64_t sg, so, eg; bool approx;
-        moq_d21_profile_filter_from_wire(&f, &type, &sg, &so, &eg, &approx);
+        moq_d22_profile_filter_from_wire(&f, &type, &sg, &so, &eg, &approx);
         MOQ_TEST_CHECK_EQ_INT((int)type, (int)rt[i].t);
         MOQ_TEST_CHECK_EQ_U64(sg, rt[i].sg);
         MOQ_TEST_CHECK_EQ_U64(so, rt[i].so);
@@ -142,44 +142,44 @@ static void t_filter_from_wire(void)
 
 static void t_surface_subscription_filters(void)
 {
-    moq_d21_msg_params_t p;
+    moq_d22_msg_params_t p;
     bool has; uint32_t type; uint64_t sg, so, eg;
     moq_decoded_loc_filter_t loc; moq_decoded_fill_t fill; moq_decoded_range_filters_t rf;
 
     /* No parameters: unfiltered, nothing surfaced. */
     memset(&p, 0, sizeof(p));
-    moq_d21_profile_surface_subscription_filters(&p, false, &has, &type, &sg, &so, &eg, &loc, &fill, &rf);
+    moq_d22_profile_surface_subscription_filters(&p, false, &has, &type, &sg, &so, &eg, &loc, &fill, &rf);
     MOQ_TEST_CHECK(!has && type == MOQ_SUBSCRIBE_FILTER_NONE);
     MOQ_TEST_CHECK(!loc.present && !fill.present && rf.ranges == 0 && !rf.invalid);
 
-    /* A zero-length Location Filter on a SUBSCRIBE is just no filter, but is still
+    /* A type-0 Location Filter on a SUBSCRIBE is just no filter, but is still
      * surfaced as present; on a REQUEST_UPDATE it REMOVES the filter, which is an
-     * absolute start at {0,0} (9.20.10). */
+     * absolute start at {0,0} (9.20.9). */
     p.has_location_filter = true;
-    moq_d21_profile_surface_subscription_filters(&p, false, &has, &type, &sg, &so, &eg, &loc, &fill, &rf);
+    moq_d22_profile_surface_subscription_filters(&p, false, &has, &type, &sg, &so, &eg, &loc, &fill, &rf);
     MOQ_TEST_CHECK(!has && type == MOQ_SUBSCRIBE_FILTER_NONE);
-    MOQ_TEST_CHECK(loc.present && loc.field_count == 0 && !loc.approximated);
-    moq_d21_profile_surface_subscription_filters(&p, true, &has, &type, &sg, &so, &eg, &loc, &fill, &rf);
+    MOQ_TEST_CHECK(loc.present && loc.location_type == 0 && !loc.approximated);
+    moq_d22_profile_surface_subscription_filters(&p, true, &has, &type, &sg, &so, &eg, &loc, &fill, &rf);
     MOQ_TEST_CHECK(has && type == MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START && sg == 0 && so == 0);
-    MOQ_TEST_CHECK(loc.present && loc.field_count == 0);
+    MOQ_TEST_CHECK(loc.present && loc.location_type == 0);
 
     /* The raw wire fields always ride along, including where the four types only
      * approximate: a relative start (one field, 2) and a four-field range. */
     p.location_filter = lf(1, 2, 0, 0, 0);
-    moq_d21_profile_surface_subscription_filters(&p, false, &has, &type, &sg, &so, &eg, &loc, &fill, &rf);
+    moq_d22_profile_surface_subscription_filters(&p, false, &has, &type, &sg, &so, &eg, &loc, &fill, &rf);
     MOQ_TEST_CHECK(has && type == MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT);
-    MOQ_TEST_CHECK(loc.present && loc.approximated && loc.field_count == 1 && loc.start_group == 2);
+    MOQ_TEST_CHECK(loc.present && loc.approximated && loc.location_type == 1 && loc.start_group == 2);
     p.location_filter = lf(4, 5, 3, 4, 7);
-    moq_d21_profile_surface_subscription_filters(&p, false, &has, &type, &sg, &so, &eg, &loc, &fill, &rf);
+    moq_d22_profile_surface_subscription_filters(&p, false, &has, &type, &sg, &so, &eg, &loc, &fill, &rf);
     MOQ_TEST_CHECK(has && type == MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE && eg == 9);
-    MOQ_TEST_CHECK(loc.approximated && loc.field_count == 4 && loc.end_group_delta == 4 && loc.end_object == 7);
+    MOQ_TEST_CHECK(loc.approximated && loc.location_type == 4 && loc.end_group_delta == 4 && loc.end_object == 7);
 
-    /* FILL_PARAMETERS (9.20.16): presence is the request; its own filter, timeout,
+    /* FILL_PARAMETERS (9.20.15): presence is the request; its own filter, timeout,
      * priority and group order are surfaced, and a fill with no filter of its own
      * takes the subscription's (not surfaced as present). */
     memset(&p, 0, sizeof(p));
     p.has_fill = true;
-    moq_d21_profile_surface_subscription_filters(&p, false, &has, &type, &sg, &so, &eg, &loc, &fill, &rf);
+    moq_d22_profile_surface_subscription_filters(&p, false, &has, &type, &sg, &so, &eg, &loc, &fill, &rf);
     MOQ_TEST_CHECK(fill.present && !fill.location.present && !fill.has_timeout &&
                    !fill.has_priority && !fill.has_group_order);
     p.fill.has_location_filter = true;
@@ -187,17 +187,17 @@ static void t_surface_subscription_filters(void)
     p.fill.has_fill_timeout = true; p.fill.fill_timeout_ms = 250;
     p.fill.has_subscriber_priority = true; p.fill.subscriber_priority = 9;
     p.fill.has_group_order = true; p.fill.group_order = 2;
-    moq_d21_profile_surface_subscription_filters(&p, false, &has, &type, &sg, &so, &eg, &loc, &fill, &rf);
-    MOQ_TEST_CHECK(fill.present && fill.location.present && fill.location.field_count == 1 &&
+    moq_d22_profile_surface_subscription_filters(&p, false, &has, &type, &sg, &so, &eg, &loc, &fill, &rf);
+    MOQ_TEST_CHECK(fill.present && fill.location.present && fill.location.location_type == 1 &&
                    fill.location.start_group == 1 && fill.location.approximated);
     MOQ_TEST_CHECK(fill.has_timeout && fill.timeout_ms == 250);
     MOQ_TEST_CHECK(fill.has_priority && fill.priority == 9);
     MOQ_TEST_CHECK(fill.has_group_order && fill.group_order == 2);
     MOQ_TEST_CHECK(!has && !loc.present);                       /* the subscription's own filter is separate */
-    /* The whole-track fill: a zero-length filter inside FILL_PARAMETERS. */
+    /* The whole-track fill: a type-0 filter inside FILL_PARAMETERS. */
     p.fill.location_filter = lf(0, 0, 0, 0, 0);
-    moq_d21_profile_surface_subscription_filters(&p, false, &has, &type, &sg, &so, &eg, &loc, &fill, &rf);
-    MOQ_TEST_CHECK(fill.location.present && fill.location.field_count == 0 && !fill.location.approximated);
+    moq_d22_profile_surface_subscription_filters(&p, false, &has, &type, &sg, &so, &eg, &loc, &fill, &rf);
+    MOQ_TEST_CHECK(fill.location.present && fill.location.location_type == 0 && !fill.location.approximated);
 
     /* Range Filters are counted across the message and its fill, and either one
      * being invalid makes the whole request invalid (the session answers
@@ -205,35 +205,35 @@ static void t_surface_subscription_filters(void)
     memset(&p, 0, sizeof(p));
     p.range_filter_params = 1; p.range_filter_ranges = 2;
     p.has_fill = true; p.fill.range_filter_params = 1; p.fill.range_filter_ranges = 3;
-    moq_d21_profile_surface_subscription_filters(&p, false, &has, &type, &sg, &so, &eg, &loc, &fill, &rf);
+    moq_d22_profile_surface_subscription_filters(&p, false, &has, &type, &sg, &so, &eg, &loc, &fill, &rf);
     MOQ_TEST_CHECK_EQ_U64(rf.ranges, 5);
     MOQ_TEST_CHECK(!rf.invalid);
     p.fill.range_filter_invalid = true;
-    moq_d21_profile_surface_subscription_filters(&p, false, &has, &type, &sg, &so, &eg, &loc, &fill, &rf);
+    moq_d22_profile_surface_subscription_filters(&p, false, &has, &type, &sg, &so, &eg, &loc, &fill, &rf);
     MOQ_TEST_CHECK(rf.invalid);
     p.fill.range_filter_invalid = false; p.range_filter_invalid = true;
-    moq_d21_profile_surface_subscription_filters(&p, false, &has, &type, &sg, &so, &eg, &loc, &fill, &rf);
+    moq_d22_profile_surface_subscription_filters(&p, false, &has, &type, &sg, &so, &eg, &loc, &fill, &rf);
     MOQ_TEST_CHECK(rf.invalid);
 }
 
 static void t_fetch_range(void)
 {
-    moq_d21_location_filter_t f;
+    moq_d22_location_filter_t f;
 
     /* Outbound: the core's [start, end) with end_object 0 = the whole end group
      * becomes an inclusive Location Filter: three fields without an end object,
      * four with one (exclusive -> inclusive). */
-    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_profile_fetch_range_to_wire(3, 0, 5, 0, &f), (int)MOQ_OK);
-    MOQ_TEST_CHECK(f.field_count == 3 && f.start_group == 3 && f.start_object == 0 && f.end_group_delta == 2);
-    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_profile_fetch_range_to_wire(3, 1, 5, 8, &f), (int)MOQ_OK);
-    MOQ_TEST_CHECK(f.field_count == 4 && f.start_object == 1 && f.end_group_delta == 2 && f.end_object == 7);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d22_profile_fetch_range_to_wire(3, 0, 5, 0, &f), (int)MOQ_OK);
+    MOQ_TEST_CHECK(f.location_type == 3 && f.start_group == 3 && f.start_object == 0 && f.end_group_delta == 2);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d22_profile_fetch_range_to_wire(3, 1, 5, 8, &f), (int)MOQ_OK);
+    MOQ_TEST_CHECK(f.location_type == 4 && f.start_object == 1 && f.end_group_delta == 2 && f.end_object == 7);
     /* Always absolute, even from {0,0}: two fields would read as the Next Object. */
-    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_profile_fetch_range_to_wire(0, 0, 0, 0, &f), (int)MOQ_OK);
-    MOQ_TEST_CHECK(f.field_count == 3 && f.start_group == 0 && f.start_object == 0 && f.end_group_delta == 0);
-    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_profile_fetch_range_to_wire(5, 0, 4, 0, &f), (int)MOQ_ERR_INVAL);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d22_profile_fetch_range_to_wire(0, 0, 0, 0, &f), (int)MOQ_OK);
+    MOQ_TEST_CHECK(f.location_type == 3 && f.start_group == 0 && f.start_object == 0 && f.end_group_delta == 0);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d22_profile_fetch_range_to_wire(5, 0, 4, 0, &f), (int)MOQ_ERR_INVAL);
 
     /* Inbound. */
-    typedef struct { const char *what; bool has; moq_d21_location_filter_t in;
+    typedef struct { const char *what; bool has; moq_d22_location_filter_t in;
                      uint64_t sg, so, eg, eo; bool approx; } fc_t;
     const fc_t cases[] = {
         /* No filter and an empty filter: {0,0} up to Largest Object (3.3.1), written
@@ -243,7 +243,7 @@ static void t_fetch_range(void)
         /* The Next Group / Next Object lie beyond Largest Object: an out-of-range
          * start makes the core answer INVALID_RANGE, as 9.11 requires. */
         { "next group",     true,  lf(1,0,0,0,0), UINT64_MAX, 0, UINT64_MAX, 0, false },
-        { "next object",    true,  lf(2,0,0,0,0), UINT64_MAX, 0, UINT64_MAX, 0, false },
+        { "next object",    true,  lf(5, 0, 0, 0, 0), UINT64_MAX, 0, UINT64_MAX, 0, false },
         /* A relative start needs Largest Object: approximated as the whole track. */
         { "relative (1)",   true,  lf(1,1,0,0,0), 0, 0, UINT64_MAX, 0, true },
         { "absolute start", true,  lf(2,4,2,0,0), 4, 2, UINT64_MAX, 0, false },
@@ -253,12 +253,12 @@ static void t_fetch_range(void)
         { "end object max", true,  lf(4,3,1,2,UINT64_MAX), 3, 1, 5, 0, false },
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-        moq_d21_msg_params_t p;
+        moq_d22_msg_params_t p;
         memset(&p, 0, sizeof(p));
         p.has_location_filter = cases[i].has;
         p.location_filter = cases[i].in;
         uint64_t sg, so, eg, eo; bool approx;
-        moq_d21_profile_fetch_range_from_wire(&p, &sg, &so, &eg, &eo, &approx);
+        moq_d22_profile_fetch_range_from_wire(&p, &sg, &so, &eg, &eo, &approx);
         if (sg != cases[i].sg || so != cases[i].so || eg != cases[i].eg ||
             eo != cases[i].eo || approx != cases[i].approx) {
             fprintf(stderr, "FAIL: fetch from_wire %s: %llu:%llu - %llu:%llu approx %d\n",
@@ -268,12 +268,12 @@ static void t_fetch_range(void)
         }
     }
     /* A range the core can express survives a round trip. */
-    moq_d21_msg_params_t q;
+    moq_d22_msg_params_t q;
     memset(&q, 0, sizeof(q));
-    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_profile_fetch_range_to_wire(6, 2, 9, 5, &q.location_filter), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d22_profile_fetch_range_to_wire(6, 2, 9, 5, &q.location_filter), (int)MOQ_OK);
     q.has_location_filter = true;
     uint64_t sg, so, eg, eo; bool approx;
-    moq_d21_profile_fetch_range_from_wire(&q, &sg, &so, &eg, &eo, &approx);
+    moq_d22_profile_fetch_range_from_wire(&q, &sg, &so, &eg, &eo, &approx);
     MOQ_TEST_CHECK(sg == 6 && so == 2 && eg == 9 && eo == 5 && !approx);
 }
 
@@ -285,7 +285,7 @@ static moq_session_t *make_session_max_fetches(moq_perspective_t persp, uint32_t
 {
     moq_session_cfg_t cfg;
     moq_session_cfg_init_sized(&cfg, sizeof(cfg), moq_alloc_default(), persp);
-    cfg.version = MOQ_VERSION_DRAFT_21;
+    cfg.version = MOQ_VERSION_DRAFT_22;
     cfg.max_fetches = max_fetches;
     moq_session_t *s = NULL;
     if (moq_session_create(&cfg, 0, &s) < 0) return NULL;
@@ -295,7 +295,7 @@ static moq_session_t *make_session_max_fetches(moq_perspective_t persp, uint32_t
     uint8_t setup[8];
     moq_buf_writer_t w;
     moq_buf_writer_init(&w, setup, sizeof(setup));
-    moq_d21_encode_setup_opts(&w, NULL);
+    moq_d22_encode_setup_opts(&w, NULL);
     moq_session_on_control_bytes(s, setup, moq_buf_writer_offset(&w), 0);
     moq_event_t e;
     while (moq_session_poll_events(s, &e, 1) > 0) moq_event_cleanup(&e);
@@ -357,7 +357,7 @@ static bool decode_msg(const uint8_t *b, size_t n, uint64_t want_type, moq_contr
 {
     moq_buf_reader_t r;
     moq_buf_reader_init(&r, b, n);
-    return moq_d21_decode_envelope(&r, env) == MOQ_OK && env->msg_type == want_type;
+    return moq_d22_decode_envelope(&r, env) == MOQ_OK && env->msg_type == want_type;
 }
 
 static moq_namespace_t ns_live(moq_bytes_t *parts)
@@ -374,9 +374,9 @@ static void t_outbound_subscribe(void)
     const oc_t cases[] = {
         { "none",              MOQ_SUBSCRIBE_FILTER_NONE, 0, 0, 0, false, 0 },
         { "next group",        MOQ_SUBSCRIBE_FILTER_NEXT_GROUP, 0, 0, 0, true, 1 },
-        { "largest object",    MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT, 0, 0, 0, true, 2 },
+        { "largest object",    MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT, 0, 0, 0, true, 5 },
         { "absolute start",    MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START, 5, 3, 0, true, 2 },
-        { "absolute {0,0}",    MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START, 0, 0, 0, false, 0 },
+        { "absolute {0,0}",    MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START, 0, 0, 0, true, 2 },
         { "absolute range",    MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE, 5, 3, 9, true, 3 },
     };
     moq_session_t *s = make_session(MOQ_PERSPECTIVE_CLIENT);
@@ -387,7 +387,7 @@ static void t_outbound_subscribe(void)
         moq_subscribe_cfg_init(&cfg);
         cfg.track_namespace = ns_live(parts);
         /* One track per case: the current core refuses a second concurrent
-         * subscription to the same track, which draft 21 allows (3.1; Task 6.1). */
+         * subscription to the same track, which draft 22 allows (3.1; Task 6.1). */
         char track[8];
         snprintf(track, sizeof(track), "v%zu", i);
         cfg.track_name = lit(track);
@@ -398,15 +398,15 @@ static void t_outbound_subscribe(void)
         uint8_t m[128];
         size_t n = take_bidi_message(s, m, sizeof(m), NULL);
         moq_control_envelope_t env;
-        MOQ_TEST_CHECK(n > 0 && decode_msg(m, n, MOQ_D21_SUBSCRIBE, &env));
+        MOQ_TEST_CHECK(n > 0 && decode_msg(m, n, MOQ_D22_SUBSCRIBE, &env));
         moq_bytes_t dparts[8];
-        moq_d21_subscribe_t sub;
-        MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_subscribe(env.payload, env.payload_len, dparts, 8, &sub), (int)MOQ_OK);
+        moq_d22_subscribe_t sub;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d22_decode_subscribe(env.payload, env.payload_len, dparts, 8, &sub), (int)MOQ_OK);
         bool has = sub.params.has_location_filter;
         if (has != cases[i].wire_filter ||
-            (has && sub.params.location_filter.field_count != cases[i].fields)) {
+            (has && sub.params.location_filter.location_type != cases[i].fields)) {
             fprintf(stderr, "FAIL: outbound SUBSCRIBE %s: filter on wire %d (%u fields)\n",
-                    cases[i].what, (int)has, has ? sub.params.location_filter.field_count : 0);
+                    cases[i].what, (int)has, has ? sub.params.location_filter.location_type : 0);
             failures++;
         }
         if (has && cases[i].filter == MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE) {
@@ -450,10 +450,10 @@ static bool establish_subscription(moq_session_t *s, moq_subscription_t *h, moq_
     uint8_t ok[64];
     moq_buf_writer_t w;
     moq_buf_writer_init(&w, ok, sizeof(ok));
-    moq_d21_msg_params_t p;
+    moq_d22_msg_params_t p;
     memset(&p, 0, sizeof(p));
     if (with_largest) { p.has_largest = true; p.largest_group = 4; p.largest_object = 2; }
-    if (moq_d21_encode_subscribe_ok(&w, 1, &p, (moq_bytes_t){ NULL, 0 }) != MOQ_OK) return false;
+    if (moq_d22_encode_subscribe_ok(&w, 1, &p, (moq_bytes_t){ NULL, 0 }) != MOQ_OK) return false;
     /* The bytes on the response half are the SUBSCRIBE_OK message. */
     if (moq_session_on_bidi_stream_bytes(s, *ref, ok, moq_buf_writer_offset(&w), false, 2) < 0) return false;
     moq_event_t ev;
@@ -476,7 +476,7 @@ static void t_outbound_update(void)
         { "next group",   MOQ_SUBSCRIBE_FILTER_NEXT_GROUP, 0, 0, 0, 1 },
         { "absolute",     MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START, 6, 1, 0, 2 },
         { "range",        MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE, 6, 1, 8, 3 },
-        { "removal",      MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START, 0, 0, 0, 0 },
+        { "absolute origin", MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START, 0, 0, 0, 2 },
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         moq_subscription_update_cfg_t u;
@@ -489,10 +489,10 @@ static void t_outbound_update(void)
         uint8_t m[128];
         size_t n = take_bidi_message(s, m, sizeof(m), NULL);
         moq_control_envelope_t env;
-        MOQ_TEST_CHECK(n > 0 && decode_msg(m, n, MOQ_D21_REQUEST_UPDATE, &env));
-        moq_d21_request_update_t d;
-        MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_request_update(env.payload, env.payload_len, &d), (int)MOQ_OK);
-        if (!d.params.has_location_filter || d.params.location_filter.field_count != cases[i].fields) {
+        MOQ_TEST_CHECK(n > 0 && decode_msg(m, n, MOQ_D22_REQUEST_UPDATE, &env));
+        moq_d22_request_update_t d;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d22_decode_request_update(env.payload, env.payload_len, &d), (int)MOQ_OK);
+        if (!d.params.has_location_filter || d.params.location_filter.location_type != cases[i].fields) {
             fprintf(stderr, "FAIL: outbound REQUEST_UPDATE %s\n", cases[i].what);
             failures++;
         }
@@ -500,7 +500,7 @@ static void t_outbound_update(void)
         uint8_t ok[16];
         moq_buf_writer_t w;
         moq_buf_writer_init(&w, ok, sizeof(ok));
-        moq_d21_encode_request_ok(&w, MOQ_D21_REQUEST_OK_REQUEST_UPDATE, NULL, (moq_bytes_t){ NULL, 0 });
+        moq_d22_encode_request_ok(&w, MOQ_D22_REQUEST_OK_REQUEST_UPDATE, NULL, (moq_bytes_t){ NULL, 0 });
         MOQ_TEST_CHECK(moq_session_on_bidi_stream_bytes(s, ref, ok, moq_buf_writer_offset(&w), false, 4) >= 0);
         moq_event_t ev;
         if (next_event(s, MOQ_EVENT_SUBSCRIPTION_UPDATE_OK, &ev)) moq_event_cleanup(&ev);
@@ -522,12 +522,12 @@ static void t_outbound_fetch(void)
     uint8_t m[160];
     size_t n = take_bidi_message(s, m, sizeof(m), NULL);
     moq_control_envelope_t env;
-    MOQ_TEST_CHECK(n > 0 && decode_msg(m, n, MOQ_D21_FETCH, &env));
+    MOQ_TEST_CHECK(n > 0 && decode_msg(m, n, MOQ_D22_FETCH, &env));
     moq_bytes_t dparts[8];
-    moq_d21_fetch_t d;
-    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_fetch(env.payload, env.payload_len, dparts, 8, &d), (int)MOQ_OK);
+    moq_d22_fetch_t d;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d22_decode_fetch(env.payload, env.payload_len, dparts, 8, &d), (int)MOQ_OK);
     /* [3:1, 5:8) exclusive becomes the inclusive filter 3:1 to group +2 object 7. */
-    MOQ_TEST_CHECK(d.params.has_location_filter && d.params.location_filter.field_count == 4);
+    MOQ_TEST_CHECK(d.params.has_location_filter && d.params.location_filter.location_type == 4);
     MOQ_TEST_CHECK_EQ_U64(d.params.location_filter.start_group, 3);
     MOQ_TEST_CHECK_EQ_U64(d.params.location_filter.start_object, 1);
     MOQ_TEST_CHECK_EQ_U64(d.params.location_filter.end_group_delta, 2);
@@ -537,13 +537,13 @@ static void t_outbound_fetch(void)
     f.end_object = 0;
     MOQ_TEST_CHECK_EQ_INT((int)moq_session_fetch(s, &f, 1, &fh), (int)MOQ_OK);
     n = take_bidi_message(s, m, sizeof(m), NULL);
-    MOQ_TEST_CHECK(n > 0 && decode_msg(m, n, MOQ_D21_FETCH, &env));
-    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_fetch(env.payload, env.payload_len, dparts, 8, &d), (int)MOQ_OK);
-    MOQ_TEST_CHECK(d.params.location_filter.field_count == 3);
+    MOQ_TEST_CHECK(n > 0 && decode_msg(m, n, MOQ_D22_FETCH, &env));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d22_decode_fetch(env.payload, env.payload_len, dparts, 8, &d), (int)MOQ_OK);
+    MOQ_TEST_CHECK(d.params.location_filter.location_type == 3);
     moq_session_destroy(s);
 }
 
-/* Draft 21 has no Joining FETCH: the profile refuses it. Nothing is sent and no
+/* Draft 22 has no Joining FETCH: the profile refuses it. Nothing is sent and no
  * request id is consumed, so the next FETCH carries the id the failed one would
  * have used. (The core is expected to gate on supports_joining_fetch before it
  * gets here; plan Task 7.) */
@@ -574,10 +574,10 @@ static void t_joining_fetch_refused(void)
     MOQ_TEST_CHECK_EQ_INT((int)moq_session_fetch(s, &f, 6, &fh), (int)MOQ_OK);
     size_t n = take_bidi_message(s, m, sizeof(m), NULL);
     moq_control_envelope_t env;
-    MOQ_TEST_CHECK(n > 0 && decode_msg(m, n, MOQ_D21_FETCH, &env));
+    MOQ_TEST_CHECK(n > 0 && decode_msg(m, n, MOQ_D22_FETCH, &env));
     moq_bytes_t dparts[8];
-    moq_d21_fetch_t d;
-    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_fetch(env.payload, env.payload_len, dparts, 8, &d), (int)MOQ_OK);
+    moq_d22_fetch_t d;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d22_decode_fetch(env.payload, env.payload_len, dparts, 8, &d), (int)MOQ_OK);
     MOQ_TEST_CHECK_EQ_U64(d.request_id, 2);
     moq_session_destroy(s);
 }
@@ -590,14 +590,14 @@ static moq_result_t feed_request(moq_session_t *s, uint64_t stream_id, const uin
 
 static void t_inbound_subscribe(void)
 {
-    typedef struct { const char *what; bool has; moq_d21_location_filter_t f;
+    typedef struct { const char *what; bool has; moq_d22_location_filter_t f;
                      uint32_t filter; uint64_t sg, so, eg; } ic_t;
     const ic_t cases[] = {
         { "no filter",         false, lf(0,0,0,0,0), MOQ_SUBSCRIBE_FILTER_NONE, 0, 0, 0 },
         { "zero length",       true,  lf(0,0,0,0,0), MOQ_SUBSCRIBE_FILTER_NONE, 0, 0, 0 },
         { "next group",        true,  lf(1,0,0,0,0), MOQ_SUBSCRIBE_FILTER_NEXT_GROUP, 0, 0, 0 },
         { "relative (approx)", true,  lf(1,2,0,0,0), MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT, 0, 0, 0 },
-        { "next object",       true,  lf(2,0,0,0,0), MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT, 0, 0, 0 },
+        { "next object",       true,  lf(5, 0, 0, 0, 0), MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT, 0, 0, 0 },
         { "absolute start",    true,  lf(2,5,3,0,0), MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START, 5, 3, 0 },
         { "range",             true,  lf(3,5,3,4,0), MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE, 5, 3, 9 },
         { "range+end object",  true,  lf(4,5,3,4,7), MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE, 5, 3, 9 },
@@ -606,7 +606,7 @@ static void t_inbound_subscribe(void)
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         moq_bytes_t parts[1];
         moq_namespace_t ns = ns_live(parts);
-        moq_d21_msg_params_t p;
+        moq_d22_msg_params_t p;
         memset(&p, 0, sizeof(p));
         p.has_location_filter = cases[i].has;
         p.location_filter = cases[i].f;
@@ -615,7 +615,7 @@ static void t_inbound_subscribe(void)
         moq_buf_writer_init(&w, msg, sizeof(msg));
         char track[8];                  /* one track per case (see t_outbound_subscribe) */
         snprintf(track, sizeof(track), "v%zu", i);
-        MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_subscribe(&w, i * 2, &ns, lit(track), &p), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d22_encode_subscribe(&w, i * 2, &ns, lit(track), &p), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT((int)feed_request(s, 4 * (i + 1), msg, moq_buf_writer_offset(&w)), (int)MOQ_OK);
         moq_event_t ev;
         bool got = next_event(s, MOQ_EVENT_SUBSCRIBE_REQUEST, &ev);
@@ -629,7 +629,7 @@ static void t_inbound_subscribe(void)
                         (unsigned long long)r->start_object, (unsigned long long)r->end_group);
                 failures++;
             }
-            /* The defaults when nothing is sent (9.20.8, 9.20.19). */
+            /* The defaults when nothing is sent (9.20.8, 9.20.18). */
             MOQ_TEST_CHECK(r->forward);
             MOQ_TEST_CHECK_EQ_INT((int)r->subscriber_priority, 128);
             moq_event_cleanup(&ev);
@@ -640,7 +640,7 @@ static void t_inbound_subscribe(void)
 
 static void t_inbound_fetch(void)
 {
-    typedef struct { const char *what; bool has; moq_d21_location_filter_t f;
+    typedef struct { const char *what; bool has; moq_d22_location_filter_t f;
                      uint64_t sg, so, eg, eo; } fc_t;
     const fc_t cases[] = {
         { "no filter",     false, lf(0,0,0,0,0), 0, 0, UINT64_MAX, 0 },
@@ -651,7 +651,7 @@ static void t_inbound_fetch(void)
     moq_session_t *s = make_session(MOQ_PERSPECTIVE_SERVER);
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         moq_bytes_t parts[1];
-        moq_d21_fetch_t f;
+        moq_d22_fetch_t f;
         memset(&f, 0, sizeof(f));
         f.request_id = i * 2;
         f.track_namespace = ns_live(parts);
@@ -661,7 +661,7 @@ static void t_inbound_fetch(void)
         uint8_t msg[96];
         moq_buf_writer_t w;
         moq_buf_writer_init(&w, msg, sizeof(msg));
-        MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_fetch(&w, &f), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d22_encode_fetch(&w, &f), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT((int)feed_request(s, 4 * (i + 1), msg, moq_buf_writer_offset(&w)), (int)MOQ_OK);
         moq_event_t ev;
         bool got = next_event(s, MOQ_EVENT_FETCH_REQUEST, &ev);
@@ -702,10 +702,10 @@ static void t_publish_ok_semantics(void)
         moq_stream_ref_t ref;
         size_t n = take_bidi_message(s, m, sizeof(m), &ref);
         moq_control_envelope_t env;
-        MOQ_TEST_CHECK(n > 0 && decode_msg(m, n, MOQ_D21_PUBLISH, &env));
+        MOQ_TEST_CHECK(n > 0 && decode_msg(m, n, MOQ_D22_PUBLISH, &env));
         moq_bytes_t dparts[8];
-        moq_d21_publish_t pub;
-        MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_publish(env.payload, env.payload_len, dparts, 8, &pub), (int)MOQ_OK);
+        moq_d22_publish_t pub;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d22_decode_publish(env.payload, env.payload_len, dparts, 8, &pub), (int)MOQ_OK);
         MOQ_TEST_CHECK(pub.params.has_forward == (forward == 0));         /* sent only when 0 */
         if (forward == 0) MOQ_TEST_CHECK_EQ_INT((int)pub.params.forward, 0);
 
@@ -779,7 +779,7 @@ static void t_accept_publish_is_bare(void)
 {
     moq_session_t *s = make_session(MOQ_PERSPECTIVE_SERVER);
     moq_bytes_t parts[1];
-    moq_d21_publish_t pub;
+    moq_d22_publish_t pub;
     memset(&pub, 0, sizeof(pub));
     pub.request_id = 0;
     pub.track_namespace = ns_live(parts);
@@ -788,7 +788,7 @@ static void t_accept_publish_is_bare(void)
     uint8_t msg[96];
     moq_buf_writer_t w;
     moq_buf_writer_init(&w, msg, sizeof(msg));
-    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_publish(&w, &pub), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d22_encode_publish(&w, &pub), (int)MOQ_OK);
     MOQ_TEST_CHECK_EQ_INT((int)feed_request(s, 4, msg, moq_buf_writer_offset(&w)), (int)MOQ_OK);
     moq_event_t ev;
     bool got = next_event(s, MOQ_EVENT_PUBLISH_REQUEST, &ev);
@@ -840,7 +840,7 @@ static void t_state_notify(void)
     {
         moq_session_t *s = make_session(MOQ_PERSPECTIVE_SERVER);
         moq_bytes_t parts[1];
-        moq_d21_publish_t pub;
+        moq_d22_publish_t pub;
         memset(&pub, 0, sizeof(pub));
         pub.request_id = 0;
         pub.track_namespace = ns_live(parts);
@@ -849,7 +849,7 @@ static void t_state_notify(void)
         uint8_t msg[96];
         moq_buf_writer_t w;
         moq_buf_writer_init(&w, msg, sizeof(msg));
-        MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_publish(&w, &pub), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d22_encode_publish(&w, &pub), (int)MOQ_OK);
         feed_request(s, 4, msg, moq_buf_writer_offset(&w));
         moq_event_t ev;
         MOQ_TEST_CHECK(next_event(s, MOQ_EVENT_PUBLISH_REQUEST, &ev));
@@ -889,12 +889,12 @@ static void t_state_notify(void)
         moq_session_t *s = make_session(MOQ_PERSPECTIVE_SERVER);
         moq_bytes_t parts[1];
         moq_namespace_t ns = ns_live(parts);
-        moq_d21_msg_params_t p;
+        moq_d22_msg_params_t p;
         memset(&p, 0, sizeof(p));
         uint8_t msg[64];
         moq_buf_writer_t w;
         moq_buf_writer_init(&w, msg, sizeof(msg));
-        moq_d21_encode_subscribe(&w, 0, &ns, lit("v"), &p);
+        moq_d22_encode_subscribe(&w, 0, &ns, lit("v"), &p);
         feed_request(s, 4, msg, moq_buf_writer_offset(&w));
         moq_event_t ev;
         MOQ_TEST_CHECK(next_event(s, MOQ_EVENT_SUBSCRIBE_REQUEST, &ev));
@@ -916,24 +916,24 @@ static void t_state_notify(void)
 static void t_error_semantics(void)
 {
     const moq_profile_ops_t *d18 = moq_profile_lookup(MOQ_VERSION_DRAFT_18);
-    const moq_profile_ops_t *d21 = moq_profile_lookup(MOQ_VERSION_DRAFT_21);
-    MOQ_TEST_CHECK(d18 && d21);
-    if (!(d18 && d21)) return;
-    /* New in draft 21. */
-    MOQ_TEST_CHECK_EQ_U64(d21->semantic_request_error(0x36), MOQ_REQUEST_ERROR_INVALID_FILTER);
-    MOQ_TEST_CHECK_EQ_U64(d21->semantic_request_error(0x35), MOQ_REQUEST_ERROR_CONFLICTING_FILTERS);
+    const moq_profile_ops_t *d22 = moq_profile_lookup(MOQ_VERSION_DRAFT_22);
+    MOQ_TEST_CHECK(d18 && d22);
+    if (!(d18 && d22)) return;
+    /* New in draft 22. */
+    MOQ_TEST_CHECK_EQ_U64(d22->semantic_request_error(0x36), MOQ_REQUEST_ERROR_INVALID_FILTER);
+    MOQ_TEST_CHECK_EQ_U64(d22->semantic_request_error(0x35), MOQ_REQUEST_ERROR_CONFLICTING_FILTERS);
     /* Removed since draft 18: they now read as INTERNAL_ERROR, while draft 18 still
      * knows them. */
-    MOQ_TEST_CHECK_EQ_U64(d21->semantic_request_error(0x19), MOQ_REQUEST_ERROR_INTERNAL_ERROR);
-    MOQ_TEST_CHECK_EQ_U64(d21->semantic_request_error(0x32), MOQ_REQUEST_ERROR_INTERNAL_ERROR);
+    MOQ_TEST_CHECK_EQ_U64(d22->semantic_request_error(0x19), MOQ_REQUEST_ERROR_INTERNAL_ERROR);
+    MOQ_TEST_CHECK_EQ_U64(d22->semantic_request_error(0x32), MOQ_REQUEST_ERROR_INTERNAL_ERROR);
     MOQ_TEST_CHECK_EQ_U64(d18->semantic_request_error(0x19), MOQ_REQUEST_ERROR_DUPLICATE_SUBSCRIPTION);
     MOQ_TEST_CHECK_EQ_U64(d18->semantic_request_error(0x32), MOQ_REQUEST_ERROR_INVALID_JOINING_REQUEST_ID);
     MOQ_TEST_CHECK_EQ_U64(d18->semantic_request_error(0x36), MOQ_REQUEST_ERROR_INTERNAL_ERROR);
     /* Unchanged, and unknown (GREASE included) values never close (13). */
-    MOQ_TEST_CHECK_EQ_U64(d21->semantic_request_error(0x34), MOQ_REQUEST_ERROR_REDIRECT);
-    MOQ_TEST_CHECK_EQ_U64(d21->semantic_request_error(0x10), MOQ_REQUEST_ERROR_DOES_NOT_EXIST);
-    MOQ_TEST_CHECK_EQ_U64(d21->semantic_request_error(0x9D), MOQ_REQUEST_ERROR_INTERNAL_ERROR);
-    MOQ_TEST_CHECK_EQ_U64(d21->semantic_request_error(UINT64_MAX), MOQ_REQUEST_ERROR_INTERNAL_ERROR);
+    MOQ_TEST_CHECK_EQ_U64(d22->semantic_request_error(0x34), MOQ_REQUEST_ERROR_REDIRECT);
+    MOQ_TEST_CHECK_EQ_U64(d22->semantic_request_error(0x10), MOQ_REQUEST_ERROR_DOES_NOT_EXIST);
+    MOQ_TEST_CHECK_EQ_U64(d22->semantic_request_error(0x9D), MOQ_REQUEST_ERROR_INTERNAL_ERROR);
+    MOQ_TEST_CHECK_EQ_U64(d22->semantic_request_error(UINT64_MAX), MOQ_REQUEST_ERROR_INTERNAL_ERROR);
 }
 
 /* -- exact window resolution from the wire Location Filter (Task 6.1) --- */
@@ -941,9 +941,17 @@ static moq_decoded_loc_filter_t dlf(uint8_t n, uint64_t sg, uint64_t so, uint64_
 {
     moq_decoded_loc_filter_t f;
     memset(&f, 0, sizeof(f));
-    f.present = true; f.field_count = n; f.start_group = sg; f.start_object = so;
+    f.present = true; f.location_type = n; f.start_group = sg; f.start_object = so;
     f.end_group_delta = dg; f.end_object = eo;
     return f;
+}
+
+static void t_inherited_next_group_fill_at_ceiling(void)
+{
+    moq_fill_selection_t selection = {0};
+    selection.filter = MOQ_SUBSCRIBE_FILTER_NEXT_GROUP;
+    MOQ_TEST_CHECK(moq_fill_selection_has_content(&selection, true, UINT64_MAX, 0));
+    MOQ_TEST_CHECK(!moq_fill_selection_has_content(&selection, true, 7, 0));
 }
 
 static void t_resolve_loc_filter_window(void)
@@ -971,13 +979,13 @@ static void t_resolve_loc_filter_window(void)
     f = dlf(1, 3, 0, 0, 0);
     moq_resolve_loc_filter_window(&f, false, 0, 0, ceil, &w);
     MOQ_TEST_CHECK(w.start_group == 0 && w.start_object == 0 && !w.unsatisfiable);
-    /* Next Group past the ceiling cannot be represented. */
+    /* Relative Next Group clamps to the ceiling. */
     f = dlf(1, 0, 0, 0, 0);
     moq_resolve_loc_filter_window(&f, true, UINT64_MAX, 0, ceil, &w);
-    MOQ_TEST_CHECK(w.unsatisfiable);
+    MOQ_TEST_CHECK(!w.unsatisfiable && w.start_group == UINT64_MAX && w.start_object == 0);
 
     /* Two zero fields: the Next Object, {7,3}. */
-    f = dlf(2, 0, 0, 0, 0);
+    f = dlf(5, 0, 0, 0, 0);
     moq_resolve_loc_filter_window(&f, true, 7, 2, ceil, &w);
     MOQ_TEST_CHECK(w.start_group == 7 && w.start_object == 3 && !w.has_end);
     /* Absolute start, including group 0 object 1 and group 1 object 0. */
@@ -1004,7 +1012,7 @@ static void t_resolve_loc_filter_window(void)
  * start and an end Object are enforced rather than approximated. */
 static void t_inbound_window(void)
 {
-    typedef struct { const char *what; moq_d21_location_filter_t f;
+    typedef struct { const char *what; moq_d22_location_filter_t f;
                      uint64_t sg, so; bool has_end; uint64_t eg; bool has_eo; uint64_t eo; } wc_t;
     const wc_t cases[] = {
         { "relative 3",   lf(1,3,0,0,0),   5, 0, false, 0, false, 0 },
@@ -1019,14 +1027,14 @@ static void t_inbound_window(void)
         char track[8];
         snprintf(track, sizeof(track), "w%zu", i);
         MOQ_TEST_CHECK_EQ_INT((int)moq_session_note_object_published(s, &ns, lit(track), 7, 2), (int)MOQ_OK);
-        moq_d21_msg_params_t p;
+        moq_d22_msg_params_t p;
         memset(&p, 0, sizeof(p));
         p.has_location_filter = true;
         p.location_filter = cases[i].f;
         uint8_t msg[96];
         moq_buf_writer_t w;
         moq_buf_writer_init(&w, msg, sizeof(msg));
-        MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_subscribe(&w, i * 2, &ns, lit(track), &p), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d22_encode_subscribe(&w, i * 2, &ns, lit(track), &p), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT((int)feed_request(s, 4 * (i + 1), msg, moq_buf_writer_offset(&w)), (int)MOQ_OK);
         moq_event_t ev;
         MOQ_TEST_CHECK(next_event(s, MOQ_EVENT_SUBSCRIBE_REQUEST, &ev));
@@ -1082,9 +1090,9 @@ static bool took_invalid_filter(moq_session_t *s)
     uint8_t m[128];
     size_t n = take_bidi_message(s, m, sizeof(m), NULL);
     moq_control_envelope_t env;
-    moq_d21_request_error_t re;
-    return n > 0 && decode_msg(m, n, MOQ_D21_REQUEST_ERROR, &env) &&
-           moq_d21_decode_request_error(env.payload, env.payload_len, &re) == MOQ_OK &&
+    moq_d22_request_error_t re;
+    return n > 0 && decode_msg(m, n, MOQ_D22_REQUEST_ERROR, &env) &&
+           moq_d22_decode_request_error(env.payload, env.payload_len, &re) == MOQ_OK &&
            re.error_code == 0x36;
 }
 
@@ -1092,7 +1100,7 @@ static void t_range_filters_declined(void)
 {
     moq_bytes_t parts[1];
     moq_namespace_t ns = ns_live(parts);
-    moq_d21_msg_params_t p;
+    moq_d22_msg_params_t p;
     uint8_t msg[96];
     moq_buf_writer_t w;
     moq_event_t ev;
@@ -1101,7 +1109,7 @@ static void t_range_filters_declined(void)
     moq_session_t *s = make_session(MOQ_PERSPECTIVE_SERVER);
     memset(&p, 0, sizeof(p));
     moq_buf_writer_init(&w, msg, sizeof(msg));
-    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_subscribe(&w, 0, &ns, lit("v"), &p), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d22_encode_subscribe(&w, 0, &ns, lit("v"), &p), (int)MOQ_OK);
     size_t n = add_range_filter(msg, moq_buf_writer_offset(&w));
     MOQ_TEST_CHECK_EQ_INT((int)feed_request(s, 4, msg, n), (int)MOQ_OK);
     MOQ_TEST_CHECK(!next_event(s, MOQ_EVENT_SUBSCRIBE_REQUEST, &ev));
@@ -1111,11 +1119,11 @@ static void t_range_filters_declined(void)
 
     /* FETCH. */
     s = make_session(MOQ_PERSPECTIVE_SERVER);
-    moq_d21_fetch_t f;
+    moq_d22_fetch_t f;
     memset(&f, 0, sizeof(f));
     f.request_id = 0; f.track_namespace = ns; f.track_name = lit("v");
     moq_buf_writer_init(&w, msg, sizeof(msg));
-    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_fetch(&w, &f), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d22_encode_fetch(&w, &f), (int)MOQ_OK);
     n = add_range_filter(msg, moq_buf_writer_offset(&w));
     MOQ_TEST_CHECK_EQ_INT((int)feed_request(s, 4, msg, n), (int)MOQ_OK);
     MOQ_TEST_CHECK(!next_event(s, MOQ_EVENT_FETCH_REQUEST, &ev));
@@ -1126,7 +1134,7 @@ static void t_range_filters_declined(void)
     s = make_session(MOQ_PERSPECTIVE_SERVER);
     memset(&p, 0, sizeof(p));
     moq_buf_writer_init(&w, msg, sizeof(msg));
-    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_subscribe(&w, 0, &ns, lit("v"), &p), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d22_encode_subscribe(&w, 0, &ns, lit("v"), &p), (int)MOQ_OK);
     MOQ_TEST_CHECK_EQ_INT((int)feed_request(s, 4, msg, moq_buf_writer_offset(&w)), (int)MOQ_OK);
     MOQ_TEST_CHECK(next_event(s, MOQ_EVENT_SUBSCRIBE_REQUEST, &ev));
     moq_subscription_t sub = ev.u.subscribe_request.sub;
@@ -1138,7 +1146,7 @@ static void t_range_filters_declined(void)
     { moq_action_t a; while (moq_session_poll_actions(s, &a, 1) > 0) moq_action_cleanup(&a); }
     memset(&p, 0, sizeof(p));
     moq_buf_writer_init(&w, msg, sizeof(msg));
-    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_request_update(&w, 2, &p), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d22_encode_request_update(&w, 2, &p), (int)MOQ_OK);
     n = add_range_filter(msg, moq_buf_writer_offset(&w));
     MOQ_TEST_CHECK_EQ_INT((int)feed_request(s, 4, msg, n), (int)MOQ_OK);
     MOQ_TEST_CHECK(!next_event(s, MOQ_EVENT_SUBSCRIBE_UPDATED, &ev));
@@ -1168,18 +1176,18 @@ static void t_update_credit(void)
     uint8_t ok[16];
     moq_buf_writer_t w;
     moq_buf_writer_init(&w, ok, sizeof(ok));
-    moq_d21_encode_request_ok(&w, MOQ_D21_REQUEST_OK_REQUEST_UPDATE, NULL, (moq_bytes_t){ NULL, 0 });
+    moq_d22_encode_request_ok(&w, MOQ_D22_REQUEST_OK_REQUEST_UPDATE, NULL, (moq_bytes_t){ NULL, 0 });
     MOQ_TEST_CHECK(moq_session_on_bidi_stream_bytes(s, ref, ok, moq_buf_writer_offset(&w), false, 5) >= 0);
     MOQ_TEST_CHECK_EQ_INT((int)moq_session_update_subscription(s, h, &u, 6), (int)MOQ_OK);
     moq_session_destroy(s);
 
     /* REQUEST_UPDATE as the first message on a fresh request bidi. */
     s = make_session(MOQ_PERSPECTIVE_SERVER);
-    moq_d21_msg_params_t p;
+    moq_d22_msg_params_t p;
     memset(&p, 0, sizeof(p));
     uint8_t msg[32];
     moq_buf_writer_init(&w, msg, sizeof(msg));
-    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_request_update(&w, 0, &p), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d22_encode_request_update(&w, 0, &p), (int)MOQ_OK);
     (void)feed_request(s, 4, msg, moq_buf_writer_offset(&w));
     MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_CLOSED);
     MOQ_TEST_CHECK_EQ_U64(poll_close_code(s), 0x3);
@@ -1210,7 +1218,7 @@ static size_t take_two_bidi_messages(moq_session_t *s, uint8_t *a, size_t acap, 
 static moq_publication_t accept_setup_publish(moq_session_t *s, uint64_t request_id, const char *track)
 {
     moq_bytes_t parts[1];
-    moq_d21_publish_t pub;
+    moq_d22_publish_t pub;
     memset(&pub, 0, sizeof(pub));
     pub.request_id = request_id;
     pub.track_namespace = ns_live(parts);
@@ -1219,7 +1227,7 @@ static moq_publication_t accept_setup_publish(moq_session_t *s, uint64_t request
     uint8_t msg[96];
     moq_buf_writer_t w;
     moq_buf_writer_init(&w, msg, sizeof(msg));
-    moq_d21_encode_publish(&w, &pub);
+    moq_d22_encode_publish(&w, &pub);
     feed_request(s, 4 * (request_id / 2 + 1), msg, moq_buf_writer_offset(&w));
     moq_event_t ev;
     moq_publication_t ph = {0};
@@ -1236,7 +1244,7 @@ static void t_accept_publish_followup_update(void)
     uint8_t a[96], b[96];
     size_t an, bn;
     moq_control_envelope_t env;
-    moq_d21_request_update_t u;
+    moq_d22_request_update_t u;
 
     /* Priority, a filter and a forward change (the PUBLISH defaulted to forward 1). */
     moq_publication_t ph = accept_setup_publish(s, 0, "p0");
@@ -1250,11 +1258,11 @@ static void t_accept_publish_followup_update(void)
     MOQ_TEST_CHECK_EQ_INT((int)take_two_bidi_messages(s, a, sizeof(a), &an, b, sizeof(b), &bn), 2);
     static const uint8_t bare[] = { 0x07, 0x00, 0x01, 0x00 };
     MOQ_TEST_CHECK(an == sizeof(bare) && memcmp(a, bare, an) == 0);
-    MOQ_TEST_CHECK(decode_msg(b, bn, MOQ_D21_REQUEST_UPDATE, &env));
-    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_request_update(env.payload, env.payload_len, &u), (int)MOQ_OK);
+    MOQ_TEST_CHECK(decode_msg(b, bn, MOQ_D22_REQUEST_UPDATE, &env));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d22_decode_request_update(env.payload, env.payload_len, &u), (int)MOQ_OK);
     MOQ_TEST_CHECK(u.params.has_subscriber_priority && u.params.subscriber_priority == 9);
     MOQ_TEST_CHECK(u.params.has_forward && u.params.forward == 0);
-    MOQ_TEST_CHECK(u.params.has_location_filter && u.params.location_filter.field_count == 2 &&
+    MOQ_TEST_CHECK(u.params.has_location_filter && u.params.location_filter.location_type == 2 &&
                    u.params.location_filter.start_group == 6 && u.params.location_filter.start_object == 1);
     MOQ_TEST_CHECK(!u.params.has_group_order);
     /* A second accept-time follow-up would need its own credit; the first is pending. */
@@ -1299,12 +1307,12 @@ static void t_range_filter_types(void)
     moq_namespace_t ns = ns_live(parts);
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         moq_session_t *s = make_session(MOQ_PERSPECTIVE_SERVER);
-        moq_d21_msg_params_t p;
+        moq_d22_msg_params_t p;
         memset(&p, 0, sizeof(p));
         uint8_t msg[96];
         moq_buf_writer_t w;
         moq_buf_writer_init(&w, msg, sizeof(msg));
-        moq_d21_encode_subscribe(&w, 0, &ns, lit("v"), &p);
+        moq_d22_encode_subscribe(&w, 0, &ns, lit("v"), &p);
         size_t n = add_range_filter_bytes(msg, moq_buf_writer_offset(&w), cases[i].b, cases[i].n);
         MOQ_TEST_CHECK_EQ_INT((int)feed_request(s, 4, msg, n), (int)MOQ_OK);
         moq_event_t ev;
@@ -1319,7 +1327,7 @@ static void t_range_filter_types(void)
     }
 }
 
-/* -- Request stream closure (Task 6.4, draft 21 6.4.2.2 / 6.4.2.3) --------- *
+/* -- Request stream closure (Task 6.4, draft 22 6.4.2.2 / 6.4.2.3) --------- *
  * A FIN only says "no more messages in this direction"; it is not a cancellation.
  * A requester MAY FIN right after its SUBSCRIBE when it will not send a
  * REQUEST_UPDATE, and the subscription must live on. Cancelling is RESET_STREAM
@@ -1329,12 +1337,12 @@ static moq_subscription_t accept_new_subscription(moq_session_t *s, uint64_t req
 {
     moq_bytes_t parts[1];
     moq_namespace_t ns = ns_live(parts);
-    moq_d21_msg_params_t p;
+    moq_d22_msg_params_t p;
     memset(&p, 0, sizeof(p));
     uint8_t msg[96];
     moq_buf_writer_t w;
     moq_buf_writer_init(&w, msg, sizeof(msg));
-    moq_d21_encode_subscribe(&w, request_id, &ns, lit(track), &p);
+    moq_d22_encode_subscribe(&w, request_id, &ns, lit(track), &p);
     moq_session_on_bidi_stream_bytes(s, moq_stream_ref_from_u64(4 * (request_id / 2 + 1)), msg,
                                      moq_buf_writer_offset(&w), fin_with_request, 1);
     moq_subscription_t sub = {0};
@@ -1349,6 +1357,66 @@ static moq_subscription_t accept_new_subscription(moq_session_t *s, uint64_t req
     }
     { moq_action_t a; while (moq_session_poll_actions(s, &a, 1) > 0) moq_action_cleanup(&a); }
     return sub;
+}
+
+static void t_split_request_fin_before_accept(void)
+{
+    moq_session_t *s = make_session(MOQ_PERSPECTIVE_SERVER);
+    moq_bytes_t parts[1]; moq_namespace_t ns = ns_live(parts);
+    uint8_t msg[96]; moq_buf_writer_t w;
+    moq_buf_writer_init(&w, msg, sizeof(msg));
+    MOQ_TEST_CHECK(moq_d22_encode_subscribe(&w, 0, &ns, lit("split-fin"), &(moq_d22_msg_params_t){0}) == MOQ_OK);
+    MOQ_TEST_CHECK(feed_request(s, 4, msg, moq_buf_writer_offset(&w)) == MOQ_OK);
+    moq_event_t ev;
+    bool requested = next_event(s, MOQ_EVENT_SUBSCRIBE_REQUEST, &ev);
+    MOQ_TEST_CHECK(requested);
+    if (requested) {
+        moq_subscription_t sub = ev.u.subscribe_request.sub;
+        moq_event_cleanup(&ev);
+        MOQ_TEST_CHECK(moq_session_on_bidi_stream_bytes(s, moq_stream_ref_from_u64(4),
+            NULL, 0, true, 2) == MOQ_OK);
+        MOQ_TEST_CHECK(s->state == MOQ_SESS_ESTABLISHED);
+        moq_accept_subscribe_cfg_t acc = {0}; acc.struct_size = sizeof(acc);
+        MOQ_TEST_CHECK(moq_session_accept_subscribe(s, sub, &acc, 3) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_sub_resolved_window(s, sub) != NULL);
+    }
+    moq_session_destroy(s);
+}
+
+static void t_empty_response_fin_fails_request(void)
+{
+    moq_session_t *s = make_session(MOQ_PERSPECTIVE_CLIENT);
+    moq_bytes_t parts[1]; moq_namespace_t ns = ns_live(parts);
+    moq_fetch_cfg_t fc; moq_fetch_cfg_init_sized(&fc, sizeof(fc));
+    fc.track_namespace = ns; fc.track_name = lit("missing-response"); fc.end_group = 9;
+    moq_fetch_t fetch;
+    MOQ_TEST_CHECK(moq_session_fetch(s, &fc, 1, &fetch) == MOQ_OK);
+    uint8_t message[96]; moq_stream_ref_t ref;
+    MOQ_TEST_CHECK(take_bidi_message(s, message, sizeof(message), &ref) > 0);
+    MOQ_TEST_CHECK(moq_session_on_bidi_stream_bytes(s, ref, NULL, 0, true, 2) == MOQ_OK);
+    MOQ_TEST_CHECK(s->state == MOQ_SESS_ESTABLISHED);
+    moq_event_t ev;
+    bool failed = next_event(s, MOQ_EVENT_FETCH_ERROR, &ev);
+    MOQ_TEST_CHECK(failed);
+    if (failed) {
+        MOQ_TEST_CHECK(moq_fetch_eq(ev.u.fetch_error.fetch, fetch));
+        moq_event_cleanup(&ev);
+    }
+    MOQ_TEST_CHECK(moq_session_fetch_cancel(s, fetch, 3) == MOQ_ERR_STALE_HANDLE);
+    moq_session_destroy(s);
+
+    s = make_session(MOQ_PERSPECTIVE_CLIENT);
+    moq_track_status_cfg_t tc; moq_track_status_cfg_init(&tc);
+    tc.track_namespace = ns; tc.track_name = lit("missing-status-response");
+    moq_track_status_handle_t status;
+    MOQ_TEST_CHECK(moq_session_track_status(s, &tc, 1, &status) == MOQ_OK);
+    MOQ_TEST_CHECK(take_bidi_message(s, message, sizeof(message), &ref) > 0);
+    MOQ_TEST_CHECK(moq_session_on_bidi_stream_bytes(s, ref, NULL, 0, true, 2) == MOQ_OK);
+    MOQ_TEST_CHECK(s->state == MOQ_SESS_ESTABLISHED);
+    failed = next_event(s, MOQ_EVENT_TRACK_STATUS_ERROR, &ev);
+    MOQ_TEST_CHECK(failed);
+    if (failed) moq_event_cleanup(&ev);
+    moq_session_destroy(s);
 }
 
 static void t_request_stream_closure(void)
@@ -1411,7 +1479,7 @@ static size_t goaway_bytes(uint8_t *m, size_t cap, const char *uri, uint64_t tim
 {
     moq_buf_writer_t w;
     moq_buf_writer_init(&w, m, cap);
-    moq_d21_encode_goaway(&w, (const uint8_t *)uri, uri ? strlen(uri) : 0, timeout_ms);
+    moq_d22_encode_goaway(&w, (const uint8_t *)uri, uri ? strlen(uri) : 0, timeout_ms);
     return moq_buf_writer_offset(&w);
 }
 
@@ -1468,13 +1536,13 @@ static void t_timed_out_range(void)
 {
     moq_session_t *s = make_session(MOQ_PERSPECTIVE_SERVER);
     moq_bytes_t parts[1];
-    moq_d21_fetch_t f;
+    moq_d22_fetch_t f;
     memset(&f, 0, sizeof(f));
     f.request_id = 0; f.track_namespace = ns_live(parts); f.track_name = lit("v");
     uint8_t msg[96];
     moq_buf_writer_t w;
     moq_buf_writer_init(&w, msg, sizeof(msg));
-    moq_d21_encode_fetch(&w, &f);
+    moq_d22_encode_fetch(&w, &f);
     feed_request(s, 4, msg, moq_buf_writer_offset(&w));
     moq_event_t ev;
     MOQ_TEST_CHECK(next_event(s, MOQ_EVENT_FETCH_REQUEST, &ev));
@@ -1501,12 +1569,12 @@ static void t_timed_out_range(void)
     moq_session_destroy(s);
 }
 
-/* -- Fill fetch streams (Task 7, draft 21 3.4) -------------------------------- */
+/* -- Fill fetch streams (Task 7, draft 22 3.4) -------------------------------- */
 static void t_resolve_fill_range(void)
 {
     uint64_t sg, so, eg, eo;
     moq_decoded_loc_filter_t f;
-    /* Largest Object {7,2}. No filter / zero-length: the whole track up to Largest. */
+    /* Largest Object {7,2}. No filter / type 0: the whole track up to Largest. */
     MOQ_TEST_CHECK(moq_resolve_fill_range(NULL, true, 7, 2, &sg, &so, &eg, &eo));
     MOQ_TEST_CHECK(sg == 0 && so == 0 && eg == 7 && eo == 2);
     f = dlf(0, 0, 0, 0, 0);
@@ -1527,7 +1595,7 @@ static void t_resolve_fill_range(void)
     /* Next Group and Next Object start after Largest Object: no fill stream. */
     f = dlf(1, 0, 0, 0, 0);
     MOQ_TEST_CHECK(!moq_resolve_fill_range(&f, true, 7, 2, &sg, &so, &eg, &eo));
-    f = dlf(2, 0, 0, 0, 0);
+    f = dlf(5, 0, 0, 0, 0);
     MOQ_TEST_CHECK(!moq_resolve_fill_range(&f, true, 7, 2, &sg, &so, &eg, &eo));
     /* An absolute start after Largest Object is empty too. */
     f = dlf(2, 8, 0, 0, 0);
@@ -1559,13 +1627,13 @@ static void t_resolve_fill_range(void)
 
 /* An inbound SUBSCRIBE with FILL_PARAMETERS; `fwd` is the Forward Parameter. */
 static moq_subscription_t fill_subscribe(moq_session_t *s, uint64_t request_id, const char *track,
-                                         moq_d21_location_filter_t fill_filter, bool has_fill_filter,
+                                         moq_d22_location_filter_t fill_filter, bool has_fill_filter,
                                          bool has_fwd, uint8_t fwd)
 {
     moq_bytes_t parts[1];
     moq_namespace_t ns = ns_live(parts);
     moq_session_note_object_published(s, &ns, lit(track), 7, 2);
-    moq_d21_msg_params_t p;
+    moq_d22_msg_params_t p;
     memset(&p, 0, sizeof(p));
     p.has_forward = has_fwd; p.forward = fwd;
     p.has_fill = true;
@@ -1574,7 +1642,7 @@ static moq_subscription_t fill_subscribe(moq_session_t *s, uint64_t request_id, 
     uint8_t msg[128];
     moq_buf_writer_t w;
     moq_buf_writer_init(&w, msg, sizeof(msg));
-    moq_d21_encode_subscribe(&w, request_id, &ns, lit(track), &p);
+    moq_d22_encode_subscribe(&w, request_id, &ns, lit(track), &p);
     feed_request(s, 4 * (request_id / 2 + 1), msg, moq_buf_writer_offset(&w));
     moq_subscription_t sub = {0};
     moq_event_t ev;
@@ -1607,7 +1675,7 @@ static void t_fill_stream(void)
     uint8_t want[8];
     moq_buf_writer_t w;
     moq_buf_writer_init(&w, want, sizeof(want));
-    moq_d21_encode_fetch_header(&w, 0);
+    moq_d22_encode_fetch_header(&w, 0);
     bool opened = false;
     moq_action_t act;
     while (moq_session_poll_actions(s, &act, 1) > 0) {
@@ -1630,7 +1698,7 @@ static void t_fill_stream(void)
 
     /* Nothing to fill: Next Object. Consumes the request, opens no stream. */
     s = make_session(MOQ_PERSPECTIVE_SERVER);
-    a = fill_subscribe(s, 0, "f2", lf(2, 0, 0, 0, 0), true, false, 0);
+    a = fill_subscribe(s, 0, "f2", lf(5, 0, 0, 0, 0), true, false, 0);
     MOQ_TEST_CHECK(moq_session_sub_fill_pending(s, a));
     MOQ_TEST_CHECK_EQ_INT((int)moq_session_open_fill(s, a, 3, &info, &fh), (int)MOQ_OK);
     MOQ_TEST_CHECK(info.empty);
@@ -1696,7 +1764,7 @@ static void t_fill_lifecycle(void)
     MOQ_TEST_CHECK_EQ_INT((int)moq_session_reset_fill(s, fh, 0x2, 5), (int)MOQ_ERR_STALE_HANDLE);
 
     /* A second fill while the first is open (an update with its own Request ID). */
-    moq_d21_msg_params_t p;
+    moq_d22_msg_params_t p;
     memset(&p, 0, sizeof(p));
     p.has_fill = true;
     p.fill.has_location_filter = true;
@@ -1704,7 +1772,7 @@ static void t_fill_lifecycle(void)
     uint8_t msg[64];
     moq_buf_writer_t w;
     moq_buf_writer_init(&w, msg, sizeof(msg));
-    moq_d21_encode_request_update(&w, 2, &p);
+    moq_d22_encode_request_update(&w, 2, &p);
     feed_request(s, 4, msg, moq_buf_writer_offset(&w));
     MOQ_TEST_CHECK(moq_session_sub_fill_pending(s, a));
     MOQ_TEST_CHECK_EQ_INT((int)moq_session_open_fill(s, a, 6, &info, &fh), (int)MOQ_OK);
@@ -1713,7 +1781,7 @@ static void t_fill_lifecycle(void)
     memset(&p, 0, sizeof(p));
     p.has_subscriber_priority = true; p.subscriber_priority = 5;
     moq_buf_writer_init(&w, msg, sizeof(msg));
-    moq_d21_encode_request_update(&w, 4, &p);
+    moq_d22_encode_request_update(&w, 4, &p);
     feed_request(s, 4, msg, moq_buf_writer_offset(&w));
     MOQ_TEST_CHECK(!moq_session_sub_fill_pending(s, a));
     moq_session_destroy(s);
@@ -1726,7 +1794,7 @@ static void t_fetch_relative_start(void)
     moq_bytes_t parts[1];
     moq_namespace_t ns = ns_live(parts);
     moq_session_note_object_published(s, &ns, lit("have"), 7, 2);
-    moq_d21_fetch_t f;
+    moq_d22_fetch_t f;
     memset(&f, 0, sizeof(f));
     f.track_namespace = ns; f.track_name = lit("have");
     f.params.has_location_filter = true;
@@ -1734,7 +1802,7 @@ static void t_fetch_relative_start(void)
     uint8_t msg[96];
     moq_buf_writer_t w;
     moq_buf_writer_init(&w, msg, sizeof(msg));
-    moq_d21_encode_fetch(&w, &f);
+    moq_d22_encode_fetch(&w, &f);
     feed_request(s, 4, msg, moq_buf_writer_offset(&w));
     moq_event_t ev;
     MOQ_TEST_CHECK(next_event(s, MOQ_EVENT_FETCH_REQUEST, &ev));
@@ -1746,17 +1814,119 @@ static void t_fetch_relative_start(void)
     f.track_name = lit("none");
     moq_buf_writer_init(&w, msg, sizeof(msg));
     f.request_id = 2;
-    moq_d21_encode_fetch(&w, &f);
+    moq_d22_encode_fetch(&w, &f);
     feed_request(s, 8, msg, moq_buf_writer_offset(&w));
     MOQ_TEST_CHECK(!next_event(s, MOQ_EVENT_FETCH_REQUEST, &ev));
     uint8_t m[64];
     size_t n = take_bidi_message(s, m, sizeof(m), NULL);
     moq_control_envelope_t env;
-    moq_d21_request_error_t re;
-    MOQ_TEST_CHECK(n > 0 && decode_msg(m, n, MOQ_D21_REQUEST_ERROR, &env) &&
-                   moq_d21_decode_request_error(env.payload, env.payload_len, &re) == MOQ_OK &&
+    moq_d22_request_error_t re;
+    MOQ_TEST_CHECK(n > 0 && decode_msg(m, n, MOQ_D22_REQUEST_ERROR, &env) &&
+                   moq_d22_decode_request_error(env.payload, env.payload_len, &re) == MOQ_OK &&
                    re.error_code != 0);
     moq_session_destroy(s);
+}
+
+/* Next Object lies beyond fetchable history. Relative Next Group clamps at
+ * the vi64 maximum; absolute {0,0} stays valid. */
+static void t_fetch_next_location_rejected(void)
+{
+    const uint8_t types[] = { 5, 1, 2 };
+    for (size_t i = 0; i < sizeof(types); i++) {
+        moq_session_t *s = make_session(MOQ_PERSPECTIVE_SERVER);
+        moq_bytes_t parts[1];
+        moq_namespace_t ns = ns_live(parts);
+        moq_session_note_object_published(s, &ns, lit("max"), UINT64_MAX, 1);
+        moq_d22_fetch_t f = {0};
+        f.track_namespace = ns; f.track_name = lit("max");
+        f.params.has_location_filter = true;
+        f.params.location_filter = lf(types[i], 0, 0, 0, 0);
+        uint8_t msg[96]; moq_buf_writer_t w;
+        moq_buf_writer_init(&w, msg, sizeof(msg));
+        MOQ_TEST_CHECK(moq_d22_encode_fetch(&w, &f) == MOQ_OK);
+        feed_request(s, 4, msg, moq_buf_writer_offset(&w));
+        moq_event_t ev;
+        bool requested = next_event(s, MOQ_EVENT_FETCH_REQUEST, &ev);
+        MOQ_TEST_CHECK(requested == (types[i] != 5));
+        if (requested) moq_event_cleanup(&ev);
+        if (types[i] == 5) {
+            uint8_t response[64];
+            size_t n = take_bidi_message(s, response, sizeof(response), NULL);
+            moq_control_envelope_t env; moq_d22_request_error_t err;
+            MOQ_TEST_CHECK(n > 0 && decode_msg(response, n, MOQ_D22_REQUEST_ERROR, &env) &&
+                moq_d22_decode_request_error(env.payload, env.payload_len, &err) == MOQ_OK &&
+                err.error_code == MOQ_REQUEST_ERROR_INVALID_RANGE);
+        }
+        MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_ESTABLISHED);
+        moq_session_destroy(s);
+    }
+}
+
+/* Token payloads are opaque bytes; the token type defines their syntax (8.9). */
+static void t_opaque_auth_token_values(void)
+{
+    static const uint8_t binary[] = { 'a', 0, 'b', 0xff };
+    for (size_t len = 0; len <= sizeof(binary); len += sizeof(binary)) {
+        moq_session_t *s = make_session(MOQ_PERSPECTIVE_SERVER);
+        moq_bytes_t parts[1]; moq_d22_subscribe_t sub = {0};
+        sub.track_namespace = ns_live(parts); sub.track_name = lit("binary-auth");
+        sub.params.auth_token_count = 1;
+        sub.params.auth_tokens[0].alias_type = MOQ_AUTH_TOKEN_USE_VALUE;
+        sub.params.auth_tokens[0].token_type = 77;
+        sub.params.auth_tokens[0].token_value.data = binary;
+        sub.params.auth_tokens[0].token_value.len = len;
+        uint8_t msg[128]; moq_buf_writer_t w;
+        moq_buf_writer_init(&w, msg, sizeof(msg));
+        MOQ_TEST_CHECK(moq_d22_encode_subscribe(&w, sub.request_id, &sub.track_namespace, sub.track_name, &sub.params) == MOQ_OK);
+        feed_request(s, 4, msg, moq_buf_writer_offset(&w));
+        moq_event_t ev;
+        bool requested = next_event(s, MOQ_EVENT_SUBSCRIBE_REQUEST, &ev);
+        MOQ_TEST_CHECK(requested);
+        if (requested) {
+            MOQ_TEST_CHECK(ev.u.subscribe_request.token_count == 1);
+            if (ev.u.subscribe_request.token_count == 1) {
+                const moq_resolved_token_t *t = ev.u.subscribe_request.tokens;
+                MOQ_TEST_CHECK(t->token_type == 77 && t->token_value.len == len);
+                if (len) MOQ_TEST_CHECK(memcmp(t->token_value.data, binary, len) == 0);
+            }
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_ESTABLISHED);
+        /* The configured receiver cache must preserve the same opaque bytes
+         * across REGISTER and USE_ALIAS, including an empty token value. */
+        s->peer_token_cache.max_bytes = 512;
+        sub.request_id = 2;
+        sub.track_name = lit("register-auth");
+        sub.params.auth_tokens[0].alias_type = MOQ_AUTH_TOKEN_REGISTER;
+        sub.params.auth_tokens[0].alias = 9;
+        moq_buf_writer_init(&w, msg, sizeof(msg));
+        MOQ_TEST_CHECK(moq_d22_encode_subscribe(&w, sub.request_id,
+            &sub.track_namespace, sub.track_name, &sub.params) == MOQ_OK);
+        MOQ_TEST_CHECK(feed_request(s, 8, msg, moq_buf_writer_offset(&w)) == MOQ_OK);
+        requested = next_event(s, MOQ_EVENT_SUBSCRIBE_REQUEST, &ev);
+        MOQ_TEST_CHECK(requested);
+        if (requested) moq_event_cleanup(&ev);
+        sub.request_id = 4;
+        sub.track_name = lit("cached-auth");
+        sub.params.auth_tokens[0].alias_type = MOQ_AUTH_TOKEN_USE_ALIAS;
+        moq_buf_writer_init(&w, msg, sizeof(msg));
+        MOQ_TEST_CHECK(moq_d22_encode_subscribe(&w, sub.request_id,
+            &sub.track_namespace, sub.track_name, &sub.params) == MOQ_OK);
+        MOQ_TEST_CHECK(feed_request(s, 12, msg, moq_buf_writer_offset(&w)) == MOQ_OK);
+        requested = next_event(s, MOQ_EVENT_SUBSCRIBE_REQUEST, &ev);
+        MOQ_TEST_CHECK(requested);
+        if (requested) {
+            MOQ_TEST_CHECK(ev.u.subscribe_request.token_count == 1);
+            if (ev.u.subscribe_request.token_count == 1) {
+                const moq_resolved_token_t *t = ev.u.subscribe_request.tokens;
+                MOQ_TEST_CHECK(t->token_type == 77 && t->token_value.len == len);
+                if (len) MOQ_TEST_CHECK(memcmp(t->token_value.data, binary, len) == 0);
+            }
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_ESTABLISHED);
+        moq_session_destroy(s);
+    }
 }
 
 /* The publisher's own initial Subscription Parameters on a PUBLISH are readable. */
@@ -1764,7 +1934,7 @@ static void t_publish_initial_params(void)
 {
     moq_session_t *s = make_session(MOQ_PERSPECTIVE_SERVER);
     moq_bytes_t parts[1];
-    moq_d21_publish_t pub;
+    moq_d22_publish_t pub;
     memset(&pub, 0, sizeof(pub));
     pub.track_namespace = ns_live(parts); pub.track_name = lit("ip"); pub.track_alias = 9;
     pub.params.has_subscriber_priority = true; pub.params.subscriber_priority = 7;
@@ -1775,7 +1945,7 @@ static void t_publish_initial_params(void)
     uint8_t msg[128];
     moq_buf_writer_t w;
     moq_buf_writer_init(&w, msg, sizeof(msg));
-    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_publish(&w, &pub), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d22_encode_publish(&w, &pub), (int)MOQ_OK);
     feed_request(s, 4, msg, moq_buf_writer_offset(&w));
     moq_event_t ev;
     MOQ_TEST_CHECK(next_event(s, MOQ_EVENT_PUBLISH_REQUEST, &ev));
@@ -1786,13 +1956,13 @@ static void t_publish_initial_params(void)
     MOQ_TEST_CHECK(ip.present && ip.subscriber_priority == 7 &&
                    ip.group_order == MOQ_GROUP_ORDER_DESCENDING &&
                    ip.has_delivery_timeout && ip.delivery_timeout_ms == 1500 &&
-                   ip.has_filter && ip.filter_field_count == 2 &&
+                   ip.has_filter && ip.filter_location_type == 2 &&
                    ip.filter_start_group == 4 && ip.filter_start_object == 1);
     /* Defaults when omitted. */
     memset(&pub.params, 0, sizeof(pub.params));
     pub.request_id = 2; pub.track_name = lit("ip2"); pub.track_alias = 10;
     moq_buf_writer_init(&w, msg, sizeof(msg));
-    moq_d21_encode_publish(&w, &pub);
+    moq_d22_encode_publish(&w, &pub);
     feed_request(s, 8, msg, moq_buf_writer_offset(&w));
     MOQ_TEST_CHECK(next_event(s, MOQ_EVENT_PUBLISH_REQUEST, &ev));
     ph = ev.u.publish_request.pub;
@@ -1816,9 +1986,9 @@ static void t_send_state_notify(void)
     uint8_t m[64];
     size_t n = take_bidi_message(s, m, sizeof(m), NULL);
     moq_control_envelope_t env;
-    moq_d21_publish_state_notify_t nt;
-    MOQ_TEST_CHECK(n > 0 && decode_msg(m, n, MOQ_D21_PUBLISH_STATE_NOTIFY, &env));
-    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_publish_state_notify(env.payload, env.payload_len, &nt), (int)MOQ_OK);
+    moq_d22_publish_state_notify_t nt;
+    MOQ_TEST_CHECK(n > 0 && decode_msg(m, n, MOQ_D22_PUBLISH_STATE_NOTIFY, &env));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d22_decode_publish_state_notify(env.payload, env.payload_len, &nt), (int)MOQ_OK);
     MOQ_TEST_CHECK(nt.params.has_largest && nt.params.largest_group == 5 && nt.params.largest_object == 1 &&
                    nt.params.has_forward && nt.params.forward == 0);
     /* Nothing to say, and a subscription that is not ours to notify, are refused. */
@@ -1842,7 +2012,7 @@ static void t_fill_end_to_end(void)
     sc.alloc = moq_alloc_default();
     sc.seed = 7;
     sc.initial_now_us = 1000;
-    sc.version = MOQ_VERSION_DRAFT_21;
+    sc.version = MOQ_VERSION_DRAFT_22;
     sc.client_send_request_capacity = true; sc.client_initial_request_capacity = 16;
     sc.server_send_request_capacity = true; sc.server_initial_request_capacity = 16;
     moq_simpair_t *sp = NULL;
@@ -1861,7 +2031,7 @@ static void t_fill_end_to_end(void)
     cfg.track_namespace = ns; cfg.track_name = lit("fe");
     cfg.filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;          /* Next Object live edge */
     cfg.fill.present = true; cfg.fill.has_location = true;
-    cfg.fill.field_count = 1; cfg.fill.start_group = 1;        /* the current group, from its start */
+    cfg.fill.location_type = 1; cfg.fill.start_group = 1;        /* the current group, from its start */
     moq_subscription_t csub;
     MOQ_TEST_CHECK_EQ_INT((int)moq_session_subscribe(cl, &cfg, moq_simpair_now_us(sp), &csub), (int)MOQ_OK);
     moq_simpair_run_until_quiescent(sp, 8, NULL);
@@ -1917,7 +2087,7 @@ static void t_fill_end_to_end(void)
     moq_session_destroy(s18);
 }
 
-/* -- Delivery timeout timing (6.8, draft 21 5.2) ------------------------------ *
+/* -- Delivery timeout timing (6.8, draft 22 5.2) ------------------------------ *
  * The SUBGROUP timeout starts when the subgroup's last object is published (its FIN), the first
  * object's own property overrides the Track value, and an expired closing stream is reset. */
 static int delivery_timer_case(bool override, bool sub_param, uint64_t open_now, uint64_t probe_after_us)
@@ -1925,7 +2095,7 @@ static int delivery_timer_case(bool override, bool sub_param, uint64_t open_now,
     moq_session_t *s = make_session(MOQ_PERSPECTIVE_SERVER);
     moq_bytes_t parts[1];
     moq_namespace_t ns = ns_live(parts);
-    moq_d21_msg_params_t p;
+    moq_d22_msg_params_t p;
     memset(&p, 0, sizeof(p));
     if (sub_param) {                                /* the SUBSCRIBER asks for 50 ms */
         p.has_subgroup_delivery_timeout = true;
@@ -1934,7 +2104,7 @@ static int delivery_timer_case(bool override, bool sub_param, uint64_t open_now,
     uint8_t msg[96];
     moq_buf_writer_t w;
     moq_buf_writer_init(&w, msg, sizeof(msg));
-    moq_d21_encode_subscribe(&w, 0, &ns, lit("dt"), &p);
+    moq_d22_encode_subscribe(&w, 0, &ns, lit("dt"), &p);
     feed_request(s, 4, msg, moq_buf_writer_offset(&w));
     moq_event_t ev;
     int resets = 0;
@@ -2047,7 +2217,7 @@ static moq_fill_request_t current_group_fill(void)
 {
     moq_fill_request_t f;
     memset(&f, 0, sizeof(f));
-    f.has_location = true; f.field_count = 1; f.start_group = 1;
+    f.has_location = true; f.location_type = 1; f.start_group = 1;
     return f;
 }
 
@@ -2101,7 +2271,7 @@ static bool fill_serve(moq_simpair_t *sp, moq_subscription_t ssub)
 
 static void t_facade_fill(void)
 {
-    moq_simpair_t *sp = fill_pair(MOQ_VERSION_DRAFT_21);
+    moq_simpair_t *sp = fill_pair(MOQ_VERSION_DRAFT_22);
     MOQ_TEST_CHECK(sp != NULL);
     if (!sp) return;
     moq_subscriber_t *sub = fill_sub(sp);
@@ -2143,7 +2313,7 @@ static void t_facade_fill(void)
 /* Accepted with no content: no fill stream comes, so the fill completes empty. */
 static void t_facade_fill_no_content(void)
 {
-    moq_simpair_t *sp = fill_pair(MOQ_VERSION_DRAFT_21);
+    moq_simpair_t *sp = fill_pair(MOQ_VERSION_DRAFT_22);
     MOQ_TEST_CHECK(sp != NULL);
     if (!sp) return;
     moq_subscriber_t *sub = fill_sub(sp);
@@ -2174,7 +2344,7 @@ static void t_facade_fill_no_content(void)
 /* A rejected subscription ends its fill with the rejection's error code. */
 static void t_facade_fill_rejected(void)
 {
-    moq_simpair_t *sp = fill_pair(MOQ_VERSION_DRAFT_21);
+    moq_simpair_t *sp = fill_pair(MOQ_VERSION_DRAFT_22);
     MOQ_TEST_CHECK(sp != NULL);
     if (!sp) return;
     moq_subscriber_t *sub = fill_sub(sp);
@@ -2206,7 +2376,7 @@ static void t_facade_fill_rejected(void)
 /* Cancelling a fill before it arrives drops it locally; the subscription stays. */
 static void t_facade_fill_cancel(void)
 {
-    moq_simpair_t *sp = fill_pair(MOQ_VERSION_DRAFT_21);
+    moq_simpair_t *sp = fill_pair(MOQ_VERSION_DRAFT_22);
     MOQ_TEST_CHECK(sp != NULL);
     if (!sp) return;
     moq_subscriber_t *sub = fill_sub(sp);
@@ -2235,7 +2405,7 @@ static void t_facade_fill_cancel(void)
  * SUBSCRIBE's request stream, so a fetch cancel there would end the subscription. */
 static void t_fill_fetch_cancel_refused(void)
 {
-    moq_simpair_t *sp = fill_pair(MOQ_VERSION_DRAFT_21);
+    moq_simpair_t *sp = fill_pair(MOQ_VERSION_DRAFT_22);
     MOQ_TEST_CHECK(sp != NULL);
     if (!sp) return;
     moq_session_t *cl = moq_simpair_client(sp), *sv = moq_simpair_server(sp);
@@ -2304,7 +2474,7 @@ static void t_fill_fetch_cancel_refused(void)
 /* Unsubscribing before the fill arrives frees its fetch slot for the next fill. */
 static void t_facade_fill_unsubscribe(void)
 {
-    moq_simpair_t *sp = fill_pair(MOQ_VERSION_DRAFT_21);
+    moq_simpair_t *sp = fill_pair(MOQ_VERSION_DRAFT_22);
     MOQ_TEST_CHECK(sp != NULL);
     if (!sp) return;
     moq_sub_cfg_t cfg;
@@ -2359,11 +2529,11 @@ static void t_facade_fill_unsupported(void)
     moq_simpair_destroy(sp);
 }
 
-/* Empty fills open no stream (draft 21 3.4), and must not exhaust the
+/* Empty fills open no stream (draft 22 3.4), and must not exhaust the
  * subscriber's bookkeeping for later fills on the same subscription. */
 static void t_fill_after_empty_updates(void)
 {
-    moq_simpair_t *sp = fill_pair(MOQ_VERSION_DRAFT_21);
+    moq_simpair_t *sp = fill_pair(MOQ_VERSION_DRAFT_22);
     MOQ_TEST_CHECK(sp != NULL);
     if (!sp) return;
     moq_session_t *cl = moq_simpair_client(sp), *sv = moq_simpair_server(sp);
@@ -2435,16 +2605,16 @@ static void t_fill_expectation_backpressure(void)
         MOQ_TEST_CHECK(moq_session_update_subscription(s, h, &uc, 10) == MOQ_OK);
         uint8_t msg[128];
         size_t n = take_bidi_message(s, msg, sizeof(msg), NULL);
-        moq_control_envelope_t env; moq_d21_request_update_t update;
-        MOQ_TEST_CHECK(decode_msg(msg, n, MOQ_D21_REQUEST_UPDATE, &env));
-        MOQ_TEST_CHECK(moq_d21_decode_request_update(env.payload, env.payload_len, &update) == MOQ_OK);
+        moq_control_envelope_t env; moq_d22_request_update_t update;
+        MOQ_TEST_CHECK(decode_msg(msg, n, MOQ_D22_REQUEST_UPDATE, &env));
+        MOQ_TEST_CHECK(moq_d22_decode_request_update(env.payload, env.payload_len, &update) == MOQ_OK);
         if (i == 0) first_id = update.request_id;
         uint8_t ok[64]; moq_buf_writer_t w;
         moq_buf_writer_init(&w, ok, sizeof(ok));
-        moq_d21_msg_params_t p;
+        moq_d22_msg_params_t p;
         memset(&p, 0, sizeof(p));
         p.has_largest = true; p.largest_group = 4; p.largest_object = 2;
-        MOQ_TEST_CHECK(moq_d21_encode_request_ok(&w, MOQ_D21_REQUEST_OK_REQUEST_UPDATE,
+        MOQ_TEST_CHECK(moq_d22_encode_request_ok(&w, MOQ_D22_REQUEST_OK_REQUEST_UPDATE,
             &p, (moq_bytes_t){0}) == MOQ_OK);
         MOQ_TEST_CHECK(moq_session_on_bidi_stream_bytes(s, ref, ok,
             moq_buf_writer_offset(&w), false, 11) == MOQ_OK);
@@ -2461,7 +2631,7 @@ static void t_fill_expectation_backpressure(void)
     MOQ_TEST_CHECK_EQ_SIZE(take_bidi_message(s, msg, sizeof(msg), NULL), 0);
     moq_buf_writer_t w;
     moq_buf_writer_init(&w, msg, sizeof(msg));
-    MOQ_TEST_CHECK(moq_d21_encode_fetch_header(&w, first_id) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_d22_encode_fetch_header(&w, first_id) == MOQ_OK);
     MOQ_TEST_CHECK(moq_session_on_data_bytes(s, moq_stream_ref_from_u64(100),
         msg, moq_buf_writer_offset(&w), true, 13) == MOQ_OK);
     moq_event_t ev;
@@ -2492,13 +2662,13 @@ static void t_facade_fill_empty_range(void)
     } cases[] = {
         { "after Largest", true, 2, 9, 0, 0, 0, MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT },
         { "Next Group", true, 1, 0, 0, 0, 0, MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT },
-        { "Next Object", true, 2, 0, 0, 0, 0, MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT },
+        { "Next Object", true, 5, 0, 0, 0, 0, MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT },
         { "end before start", true, 4, 3, 1, 0, 0, MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT },
         { "inherited Next Object", false, 0, 0, 0, 0, 0, MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT },
         { "inherited Next Group", false, 0, 0, 0, 0, 0, MOQ_SUBSCRIBE_FILTER_NEXT_GROUP },
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-        moq_simpair_t *sp = fill_pair(MOQ_VERSION_DRAFT_21);
+        moq_simpair_t *sp = fill_pair(MOQ_VERSION_DRAFT_22);
         MOQ_TEST_CHECK(sp != NULL);
         if (!sp) continue;
         moq_sub_cfg_t cfg;
@@ -2511,7 +2681,7 @@ static void t_facade_fill_empty_range(void)
         tc.filter = cases[i].inherited;
         moq_fill_request_t fill;
         memset(&fill, 0, sizeof(fill));
-        fill.has_location = cases[i].own_location; fill.field_count = cases[i].fields;
+        fill.has_location = cases[i].own_location; fill.location_type = cases[i].fields;
         fill.start_group = cases[i].group; fill.start_object = cases[i].object;
         fill.end_group_delta = cases[i].delta; fill.end_object = cases[i].end_object;
         moq_sub_track_t *track = NULL; moq_sub_fetch_req_t *req = NULL;
@@ -2546,7 +2716,7 @@ static void t_facade_fill_empty_range(void)
     }
 }
 
-/* FILL_PARAMETERS alone is a valid REQUEST_UPDATE (draft 21 9.5.1).
+/* FILL_PARAMETERS alone is a valid REQUEST_UPDATE (draft 22 9.5.1).
  * It requests history without changing the subscription's live parameters. */
 static void t_fill_only_update(void)
 {
@@ -2561,11 +2731,11 @@ static void t_fill_only_update(void)
     if (rc == MOQ_OK) {
         uint8_t msg[128];
         size_t n = take_bidi_message(s, msg, sizeof(msg), NULL);
-        moq_control_envelope_t env; moq_d21_request_update_t update;
-        MOQ_TEST_CHECK(decode_msg(msg, n, MOQ_D21_REQUEST_UPDATE, &env));
-        MOQ_TEST_CHECK(moq_d21_decode_request_update(env.payload, env.payload_len, &update) == MOQ_OK);
+        moq_control_envelope_t env; moq_d22_request_update_t update;
+        MOQ_TEST_CHECK(decode_msg(msg, n, MOQ_D22_REQUEST_UPDATE, &env));
+        MOQ_TEST_CHECK(moq_d22_decode_request_update(env.payload, env.payload_len, &update) == MOQ_OK);
         MOQ_TEST_CHECK(update.params.has_fill && update.params.fill.has_location_filter &&
-            update.params.fill.location_filter.field_count == 1 &&
+            update.params.fill.location_filter.location_type == 1 &&
             update.params.fill.location_filter.start_group == 1);
         MOQ_TEST_CHECK(!update.params.has_forward && !update.params.has_subscriber_priority &&
             !update.params.has_location_filter && !update.params.has_group_order);
@@ -2591,7 +2761,7 @@ static void t_fill_only_update(void)
     moq_session_destroy(s);
 }
 
-/* PUBLISH_DONE's Stream Count includes fills (draft 21 9.9). A fill FIN or
+/* PUBLISH_DONE's Stream Count includes fills (draft 22 9.9). A fill FIN or
  * identifiable RESET satisfies the gate, independent of control/data order. */
 static void t_fill_stream_count(void)
 {
@@ -2606,15 +2776,15 @@ static void t_fill_stream_count(void)
         MOQ_TEST_CHECK(moq_session_update_subscription(s, h, &uc, 10) == MOQ_OK);
         uint8_t msg[128];
         size_t n = take_bidi_message(s, msg, sizeof(msg), NULL);
-        moq_control_envelope_t env; moq_d21_request_update_t update;
-        MOQ_TEST_CHECK(decode_msg(msg, n, MOQ_D21_REQUEST_UPDATE, &env));
-        MOQ_TEST_CHECK(moq_d21_decode_request_update(env.payload, env.payload_len, &update) == MOQ_OK);
-        moq_d21_msg_params_t p;
+        moq_control_envelope_t env; moq_d22_request_update_t update;
+        MOQ_TEST_CHECK(decode_msg(msg, n, MOQ_D22_REQUEST_UPDATE, &env));
+        MOQ_TEST_CHECK(moq_d22_decode_request_update(env.payload, env.payload_len, &update) == MOQ_OK);
+        moq_d22_msg_params_t p;
         memset(&p, 0, sizeof(p));
         p.has_largest = true; p.largest_group = 4; p.largest_object = 2;
         moq_buf_writer_t w;
         moq_buf_writer_init(&w, msg, sizeof(msg));
-        MOQ_TEST_CHECK(moq_d21_encode_request_ok(&w, MOQ_D21_REQUEST_OK_REQUEST_UPDATE,
+        MOQ_TEST_CHECK(moq_d22_encode_request_ok(&w, MOQ_D22_REQUEST_OK_REQUEST_UPDATE,
             &p, (moq_bytes_t){0}) == MOQ_OK);
         MOQ_TEST_CHECK(moq_session_on_bidi_stream_bytes(s, ref, msg,
             moq_buf_writer_offset(&w), false, 11) == MOQ_OK);
@@ -2624,7 +2794,7 @@ static void t_fill_stream_count(void)
         int opened = 0, completed = 0, done = 0, subgroup_events = 0;
         if (scenario != HEADER_AFTER_DONE) {
             moq_buf_writer_init(&w, msg, sizeof(msg));
-            MOQ_TEST_CHECK(moq_d21_encode_fetch_header(&w, update.request_id) == MOQ_OK);
+            MOQ_TEST_CHECK(moq_d22_encode_fetch_header(&w, update.request_id) == MOQ_OK);
             MOQ_TEST_CHECK(moq_session_on_data_bytes(s, data_ref, msg,
                 moq_buf_writer_offset(&w), scenario == FIN_BEFORE_DONE, 12) == MOQ_OK);
             while (moq_session_poll_events(s, &ev, 1)) {
@@ -2634,7 +2804,7 @@ static void t_fill_stream_count(void)
             }
         }
         moq_buf_writer_init(&w, msg, sizeof(msg));
-        MOQ_TEST_CHECK(moq_d21_encode_publish_done(&w, 0, 1, (moq_bytes_t){0}) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_d22_encode_publish_done(&w, 0, 1, (moq_bytes_t){0}) == MOQ_OK);
         MOQ_TEST_CHECK(moq_session_on_bidi_stream_bytes(s, ref, msg,
             moq_buf_writer_offset(&w), true, 13) == MOQ_OK);
         while (moq_session_poll_events(s, &ev, 1)) {
@@ -2648,7 +2818,7 @@ static void t_fill_stream_count(void)
             MOQ_TEST_CHECK(moq_session_on_data_reset(s, data_ref, 1, 15) == MOQ_OK);
         } else if (scenario == HEADER_AFTER_DONE) {
             moq_buf_writer_init(&w, msg, sizeof(msg));
-            MOQ_TEST_CHECK(moq_d21_encode_fetch_header(&w, update.request_id) == MOQ_OK);
+            MOQ_TEST_CHECK(moq_d22_encode_fetch_header(&w, update.request_id) == MOQ_OK);
             MOQ_TEST_CHECK(moq_session_on_data_bytes(s, data_ref, msg,
                 moq_buf_writer_offset(&w), true, 14) == MOQ_OK);
         } else if (scenario == FIN_AFTER_DONE) {
@@ -2686,16 +2856,16 @@ static void t_fill_receive_capacity(void)
         MOQ_TEST_CHECK(moq_session_update_subscription(s, h, &uc, 10) == MOQ_OK);
         uint8_t msg[128];
         size_t n = take_bidi_message(s, msg, sizeof(msg), NULL);
-        moq_control_envelope_t env; moq_d21_request_update_t update;
-        MOQ_TEST_CHECK(decode_msg(msg, n, MOQ_D21_REQUEST_UPDATE, &env));
-        MOQ_TEST_CHECK(moq_d21_decode_request_update(env.payload, env.payload_len, &update) == MOQ_OK);
+        moq_control_envelope_t env; moq_d22_request_update_t update;
+        MOQ_TEST_CHECK(decode_msg(msg, n, MOQ_D22_REQUEST_UPDATE, &env));
+        MOQ_TEST_CHECK(moq_d22_decode_request_update(env.payload, env.payload_len, &update) == MOQ_OK);
         ids[i] = update.request_id;
-        moq_d21_msg_params_t p;
+        moq_d22_msg_params_t p;
         memset(&p, 0, sizeof(p));
         p.has_largest = true; p.largest_group = 4; p.largest_object = 2;
         moq_buf_writer_t w;
         moq_buf_writer_init(&w, msg, sizeof(msg));
-        MOQ_TEST_CHECK(moq_d21_encode_request_ok(&w, MOQ_D21_REQUEST_OK_REQUEST_UPDATE,
+        MOQ_TEST_CHECK(moq_d22_encode_request_ok(&w, MOQ_D22_REQUEST_OK_REQUEST_UPDATE,
             &p, (moq_bytes_t){0}) == MOQ_OK);
         MOQ_TEST_CHECK(moq_session_on_bidi_stream_bytes(s, ref, msg,
             moq_buf_writer_offset(&w), false, 11) == MOQ_OK);
@@ -2705,7 +2875,7 @@ static void t_fill_receive_capacity(void)
     for (int i = 0; i < 2; i++) {
         uint8_t hdr[32]; moq_buf_writer_t w;
         moq_buf_writer_init(&w, hdr, sizeof(hdr));
-        MOQ_TEST_CHECK(moq_d21_encode_fetch_header(&w, ids[i]) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_d22_encode_fetch_header(&w, ids[i]) == MOQ_OK);
         moq_result_t rc = moq_session_on_data_bytes(s, moq_stream_ref_from_u64(100 + i),
             hdr, moq_buf_writer_offset(&w), false, 12);
         MOQ_TEST_CHECK(rc == (i == 0 ? MOQ_OK : MOQ_ERR_WOULD_BLOCK));
@@ -2744,10 +2914,13 @@ int main(void)
     t_accept_publish_is_bare();
     t_state_notify();
     t_error_semantics();
+    t_inherited_next_group_fill_at_ceiling();
     t_resolve_loc_filter_window();
     t_inbound_window();
     t_range_filters_declined();
     t_range_filter_types();
+    t_empty_response_fin_fails_request();
+    t_split_request_fin_before_accept();
     t_request_stream_closure();
     t_request_goaway();
     t_timed_out_range();
@@ -2755,6 +2928,8 @@ int main(void)
     t_fill_stream();
     t_fill_lifecycle();
     t_fetch_relative_start();
+    t_fetch_next_location_rejected();
+    t_opaque_auth_token_values();
     t_publish_initial_params();
     t_send_state_notify();
     t_fill_end_to_end();
@@ -2775,8 +2950,8 @@ int main(void)
     t_update_credit();
     t_accept_publish_followup_update();
     if (failures) {
-        fprintf(stderr, "test_d21_requests: %d failures\n", failures);
+        fprintf(stderr, "test_d22_requests: %d failures\n", failures);
         return 1;
     }
-    MOQ_TEST_PASS("test_d21_requests");
+    MOQ_TEST_PASS("test_d22_requests");
 }

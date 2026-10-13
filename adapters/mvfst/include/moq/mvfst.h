@@ -217,7 +217,7 @@ typedef struct moq_mvfst_managed_cfg {
     void                 *app_deadline_ctx;
 
     /* Appended (struct_size append-only ABI) -- CLIENT only: the AUTHORITY and PATH a
-     * native-QUIC client sends in SETUP (draft 18 10.3.1, draft 21 9.1). NUL-terminated,
+     * native-QUIC client sends in SETUP (draft 18 10.3.1, draft 22 9.1). NUL-terminated,
      * copied at create; NULL = send none, "" sends the option empty. Drafts 16 ignores them. */
     const char           *setup_authority;
     const char           *setup_path;

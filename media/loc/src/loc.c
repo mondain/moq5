@@ -21,7 +21,7 @@
 #define LOC01_VIDEO_CONFIG        0x0du
 
 /* -- Property ids per profile ----------------------------------------
- * LOC-01 (drafts 16/18) and LOC-04 (the ids MoQT draft 21 registers in 16.8 and
+ * LOC-01 (drafts 16/18) and LOC-04 (the ids MoQT draft 22 registers in 16.8 and
  * draft-ietf-moq-loc-04 section 2.3). Frame marking is a varint under LOC-01 but a
  * length-prefixed byte string under LOC-04 (its id is odd). */
 typedef struct loc_ids {
@@ -43,7 +43,7 @@ static const loc_ids_t *loc_ids_for(moq_version_t v, moq_loc_profile_t p)
     if (p == MOQ_LOC_PROFILE_01)
         return (v == MOQ_VERSION_DRAFT_16 || v == MOQ_VERSION_DRAFT_18) ? &k_ids_01 : NULL;
     if (p == MOQ_LOC_PROFILE_04)
-        return v == MOQ_VERSION_DRAFT_21 ? &k_ids_04 : NULL;
+        return v == MOQ_VERSION_DRAFT_22 ? &k_ids_04 : NULL;
     return NULL;
 }
 
@@ -52,7 +52,7 @@ moq_loc_profile_t moq_loc_profile_for_transport(moq_version_t v)
     switch (v) {
     case MOQ_VERSION_DRAFT_16:
     case MOQ_VERSION_DRAFT_18: return MOQ_LOC_PROFILE_01;
-    case MOQ_VERSION_DRAFT_21: return MOQ_LOC_PROFILE_04;
+    case MOQ_VERSION_DRAFT_22: return MOQ_LOC_PROFILE_04;
     default: return (moq_loc_profile_t)0;
     }
 }
@@ -95,7 +95,7 @@ static const loc_int_codec_t *loc_codec_for(moq_version_t v)
     switch (v) {
     case MOQ_VERSION_DRAFT_16: return &k_codec_d16;  /* section 1.4 (i)    */
     case MOQ_VERSION_DRAFT_18: return &k_codec_d18;  /* section 1.4.1 vi64 */
-    case MOQ_VERSION_DRAFT_21: return &k_codec_d18;  /* vi64, unchanged (draft 21 8.1) */
+    case MOQ_VERSION_DRAFT_22: return &k_codec_d18;  /* vi64, unchanged (draft 22 8.1) */
     default: return NULL;   /* unknown/unregistered: fail closed */
     }
 }

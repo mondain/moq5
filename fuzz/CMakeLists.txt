@@ -61,10 +61,10 @@ target_link_libraries(fuzz_control_d16 PRIVATE moq::core)
 target_compile_options(fuzz_control_d16 PRIVATE ${FUZZ_FLAGS})
 target_link_options(fuzz_control_d16 PRIVATE ${FUZZ_FLAGS})
 
-add_executable(fuzz_control_d21 fuzz_control_d21.c)
-target_link_libraries(fuzz_control_d21 PRIVATE moq::core)
-target_compile_options(fuzz_control_d21 PRIVATE ${FUZZ_FLAGS})
-target_link_options(fuzz_control_d21 PRIVATE ${FUZZ_FLAGS})
+add_executable(fuzz_control_d22 fuzz_control_d22.c)
+target_link_libraries(fuzz_control_d22 PRIVATE moq::core)
+target_compile_options(fuzz_control_d22 PRIVATE ${FUZZ_FLAGS})
+target_link_options(fuzz_control_d22 PRIVATE ${FUZZ_FLAGS})
 
 add_executable(fuzz_session_control fuzz_session_control.c)
 target_link_libraries(fuzz_session_control PRIVATE moq::core)
@@ -101,8 +101,8 @@ add_test(NAME fuzz_kvp_decode_smoke
          COMMAND fuzz_kvp_decode -runs=1 -max_len=0)
 add_test(NAME fuzz_control_d16_smoke
          COMMAND fuzz_control_d16 -runs=1 -max_len=0)
-add_test(NAME fuzz_control_d21_smoke
-         COMMAND fuzz_control_d21 -runs=1 -max_len=0)
+add_test(NAME fuzz_control_d22_smoke
+         COMMAND fuzz_control_d22 -runs=1 -max_len=0)
 add_test(NAME fuzz_session_control_smoke
          COMMAND fuzz_session_control -runs=1 -max_len=0)
 add_test(NAME fuzz_session_data_smoke

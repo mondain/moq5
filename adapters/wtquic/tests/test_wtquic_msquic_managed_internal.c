@@ -8,7 +8,7 @@
  *   - owned copies actually deep-copy (survive scribble/free of the inputs);
  *   - wt_protocol_count overflow / cap / NULL-array rejection; server lane cap.
  *
- * Client transport (authoritative per the review boundary):
+ * Client transport:
  *   - WT-Protocol negotiation: exact-token validation, offered-token
  *     enforcement, legacy draft-16 fallback, no silent downgrade, and the
  *     materialized default offer;
@@ -2452,7 +2452,7 @@ static moq_wtquic_msquic_managed_t *make_client(const moq_alloc_t *alloc,
     return m;
 }
 
-/* --- WT_ALPN_ERROR on the client negotiation-failure route (RED) --------- */
+/* --- WT_ALPN_ERROR on the client negotiation-failure route ---------------- */
 /* draft-ietf-webtrans-http3-15 3.3 + its IANA registry entry: a client that
  * REQUIRES application-protocol negotiation MUST close the WebTransport session
  * with WT_ALPN_ERROR (0x0817b3dd) when a successful response omits WT-Protocol,
@@ -2570,7 +2570,7 @@ static void alpn_run_arm(const alpn_arm_t *arm)
             void *conn = g_alpn_conn;
             moq_wtquic_msquic_managed_test_deliver_established(m, conn, arm->tok);
 
-            /* -- the WIRE obligation: this is the RED -- */
+            /* -- the WIRE obligation: the load-bearing assertion -- */
             ACHECK(g_alpn_close_calls == 1);
             ACHECK(g_alpn_close_ws == FAKE_WS);
             ACHECK(g_alpn_close_code == WT_ALPN_ERROR_CODE);
@@ -3080,6 +3080,9 @@ static void test_create_unwind(void)
 
 /* --- connect result mapping: each wtquic code -> the right moq code ------- */
 static wtq_result_t g_forced_connect_rc;
+static unsigned mapping_stopped_calls;
+static void mapping_stopped(void *ctx)
+{ (void)ctx; mapping_stopped_calls++; }
 static wtq_result_t forced_connect(wtq_msquic_env_t *env,
                                    const wtq_msquic_client_cfg_t *cfg,
                                    wtq_session_t **out)
@@ -3098,6 +3101,7 @@ static void test_connect_result_mapping(void)
         { WTQ_ERR_INVALID_ARG, MOQ_ERR_INVAL },
         { WTQ_ERR_TOO_LARGE, MOQ_ERR_INVAL },
         { WTQ_ERR_NOMEM, MOQ_ERR_NOMEM },
+        { WTQ_ERR_UNSUPPORTED, MOQ_ERR_UNSUPPORTED },
         { WTQ_ERR_BACKEND, MOQ_ERR_INTERNAL },
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -3114,9 +3118,12 @@ static void test_connect_result_mapping(void)
         cfg.host = "127.0.0.1";
         cfg.port = 443;
         cfg.on_lane_pump = pump;
+        cfg.on_stopped = mapping_stopped;
+        mapping_stopped_calls = 0;
         moq_wtquic_msquic_managed_t *m = NULL;
         CHECK(moq_wtquic_msquic_managed_create(&cfg, &m) == cases[i].out);
         CHECK(m == NULL);
+        CHECK(mapping_stopped_calls == 0);
         CHECK(acnt_live(&a) == 0);
         acnt_destroy(&a);
     }

@@ -22,7 +22,7 @@ typedef struct {
 static const alpn_expect_t EXPECT[] = {
     { MOQ_VERSION_DRAFT_16, "moqt-16", 7 },
     { MOQ_VERSION_DRAFT_18, "moqt-18", 7 },
-    { MOQ_VERSION_DRAFT_21, "moqt-21", 7 },
+    { MOQ_VERSION_DRAFT_22, "moqt-22", 7 },
 };
 
 #define EXPECT_N (sizeof(EXPECT) / sizeof(EXPECT[0]))
@@ -204,19 +204,19 @@ int main(void)
         MOQ_TEST_CHECK(v == MOQ_VERSION_DRAFT_18);
     }
 
-    /* moqt-21 maps to DRAFT_21, and neighbouring drafts that this build does
+    /* moqt-22 maps to DRAFT_22, and neighbouring drafts that this build does
      * not register stay unknown (a wrong guess here would negotiate a version
      * with no profile). */
     {
         moq_version_t v = (moq_version_t)0;
-        MOQ_TEST_CHECK(moq_alpn_to_version("moqt-21", 7, &v) == true);
-        MOQ_TEST_CHECK(v == MOQ_VERSION_DRAFT_21);
+        MOQ_TEST_CHECK(moq_alpn_to_version("moqt-22", 7, &v) == true);
+        MOQ_TEST_CHECK(v == MOQ_VERSION_DRAFT_22);
 
         v = (moq_version_t)0xDEAD;
         MOQ_TEST_CHECK(moq_alpn_to_version("moqt-19", 7, &v) == false);
         MOQ_TEST_CHECK(moq_alpn_to_version("moqt-20", 7, &v) == false);
-        MOQ_TEST_CHECK(moq_alpn_to_version("moqt-22", 7, &v) == false);
-        MOQ_TEST_CHECK(moq_alpn_to_version("moqt-210", 8, &v) == false);
+        MOQ_TEST_CHECK(moq_alpn_to_version("moqt-21", 7, &v) == false);
+        MOQ_TEST_CHECK(moq_alpn_to_version("moqt-220", 8, &v) == false);
         MOQ_TEST_CHECK(moq_alpn_to_version("moqt-2", 6, &v) == false);
         MOQ_TEST_CHECK(v == (moq_version_t)0xDEAD);
     }
@@ -260,9 +260,9 @@ int main(void)
         MOQ_TEST_CHECK(s18 != NULL);
         MOQ_TEST_CHECK(s18 && strcmp(s18, "moqt-18") == 0);
 
-        const char *s21 = moq_alpn_for_version(MOQ_VERSION_DRAFT_21);
-        MOQ_TEST_CHECK(s21 != NULL);
-        MOQ_TEST_CHECK(s21 && strcmp(s21, "moqt-21") == 0);
+        const char *s22 = moq_alpn_for_version(MOQ_VERSION_DRAFT_22);
+        MOQ_TEST_CHECK(s22 != NULL);
+        MOQ_TEST_CHECK(s22 && strcmp(s22, "moqt-22") == 0);
 
         /* Unregistered versions return NULL. */
         MOQ_TEST_CHECK(moq_alpn_for_version((moq_version_t)17) == NULL);

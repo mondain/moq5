@@ -152,11 +152,11 @@ moq_result_t moq_simpair_create(const moq_simpair_cfg_t *cfg,
                       sizeof(cfg->version)))
         version = cfg->version;
     /* Sweep hook: scenarios that do not pin a version run under MOQ_SIM_VERSION
-     * (16, 18 or 21) when it is set, so the seeded sweeps can cover every draft
+     * (16, 18 or 22) when it is set, so the seeded sweeps can cover every draft
      * without each runner growing an option. An explicit cfg->version wins. */
     if (version == 0) {
         const char *env = getenv("MOQ_SIM_VERSION");
-        if (env && (!strcmp(env, "16") || !strcmp(env, "18") || !strcmp(env, "21")))
+        if (env && (!strcmp(env, "16") || !strcmp(env, "18") || !strcmp(env, "22")))
             version = (moq_version_t)atoi(env);
     }
     uint32_t server_max_subscriptions = 0;   /* 0 -> session default */
@@ -291,7 +291,7 @@ uint64_t moq_simpair_seed(const moq_simpair_t *sp)
  * profiles that require a symmetric start are added here. */
 static bool version_requires_symmetric_start(moq_version_t version)
 {
-    return version == MOQ_VERSION_DRAFT_18 || version == MOQ_VERSION_DRAFT_21;
+    return version == MOQ_VERSION_DRAFT_18 || version == MOQ_VERSION_DRAFT_22;
 }
 
 moq_result_t moq_simpair_start(moq_simpair_t *sp)

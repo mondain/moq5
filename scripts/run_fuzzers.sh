@@ -81,7 +81,7 @@ TARGETS=(
     fuzz_quic_varint
     fuzz_kvp_decode
     fuzz_control_d16
-    fuzz_control_d21
+    fuzz_control_d22
     fuzz_session_control
     fuzz_session_data
 )
@@ -91,7 +91,7 @@ seed_for() {
     case "$1" in
         fuzz_session_control) echo "session_control";;
         fuzz_session_data)    echo "session_data";;
-        fuzz_control_d21)     echo "control_d21";;
+        fuzz_control_d22)     echo "control_d22";;
         *)                    echo "";;
     esac
 }

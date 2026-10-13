@@ -197,7 +197,7 @@ int main(void)
 {
     t_lifetime(MOQ_VERSION_DRAFT_16, "d16");
     t_lifetime(MOQ_VERSION_DRAFT_18, "d18");
-    t_lifetime(MOQ_VERSION_DRAFT_21, "d21");
+    t_lifetime(MOQ_VERSION_DRAFT_22, "d22");
     t_standalone();
 
     if (failures == 0)

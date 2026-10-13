@@ -44,7 +44,9 @@
 #   OPENSSL_ROOT_DIR  passed to picotls' cmake if set (macOS/brew)
 #
 # The pinned picoquic includes the capsule-parser cursor reset upstream.
-# --self-test checks the compiler policy with offline fixtures.
+# The remaining dependency patches are applied after checkout. Already-patched
+# inputs are accepted; conflicting inputs fail before any dependency build.
+# --self-test checks patching and the compiler policy with offline fixtures.
 #
 # Requires: git, cmake, a C compiler, and OpenSSL dev headers
 # (Ubuntu: apt-get install -y libssl-dev cmake).
@@ -58,6 +60,11 @@ PICOQUIC_REF="${PICOQUIC_REF:-b4075dd184f4ae3276e4347308ffc7b0cfac737f}"
 PICOTLS_REPO="${PICOTLS_REPO:-https://github.com/h2o/picotls.git}"
 # picotls publishes no tags; pin master as of 2026-10-05 (commit 2026-09-30).
 PICOTLS_REF="${PICOTLS_REF:-f06553b877ada93c860dd1db9002eabf7365292d}"
+
+PICOQUIC_PATCHES=(
+    0002-reset-stream-after-fin.patch
+    0003-picotls-save-ticket-signature.patch
+)
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
 repo_root=$(cd "$script_dir/.." && pwd)
@@ -135,7 +142,93 @@ C
     printf 'picotls compiler policy self-test: assertions, caller flags, three archives, warning refusal PASS\n'
 )
 
+apply_picoquic_patch() {
+    local dir=$1 name=$2
+    local patch="$repo_root/patches/picoquic/$name"
+    [ -f "$patch" ] || die "missing picoquic patch: $patch"
+    # A non-repository child of libmoq can silently skip every patch path.
+    [ "$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" = "$(cd "$dir" && pwd -P)" ] \
+        || die "picoquic patch input is not its own git root: $dir"
+    if git -C "$dir" apply --check "$patch" >/dev/null 2>&1; then
+        git -C "$dir" apply "$patch" || die "picoquic patch $name failed to apply"
+        log "applied picoquic patch $name"
+    elif git -C "$dir" apply --reverse --check "$patch" >/dev/null 2>&1; then
+        log "picoquic patch $name already applied"
+    else
+        die "picoquic patch $name conflicts with $dir"
+    fi
+}
+
+apply_picoquic_patches() {
+    local dir=$1 name i
+    local files=("$repo_root/patches/picoquic/"*.patch)
+    for name in "${PICOQUIC_PATCHES[@]}"; do
+        [ -f "$repo_root/patches/picoquic/$name" ] \
+            || die "missing picoquic patch: $repo_root/patches/picoquic/$name"
+    done
+    [ "${#files[@]}" -eq "${#PICOQUIC_PATCHES[@]}" ] \
+        || die "declared picoquic patch list does not match tracked patches"
+    for ((i=0; i<${#files[@]}; ++i)); do
+        [ "${files[$i]##*/}" = "${PICOQUIC_PATCHES[$i]}" ] \
+            || die "declared picoquic patch list does not match tracked order"
+    done
+    for name in "${PICOQUIC_PATCHES[@]}"; do
+        apply_picoquic_patch "$dir" "$name"
+    done
+}
+
+patch_list_selftest() (
+    set -eu
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    repo_root=$tmp/root
+    PICOQUIC_PATCHES=(0001-one.patch 0002-two.patch)
+    mkdir -p "$repo_root/patches/picoquic" "$tmp/tree"
+    git -C "$tmp/tree" init -q
+    for pair in 0001-one 0002-two; do
+        name=${pair#*-}
+        printf 'old\n' > "$tmp/tree/$name.txt"
+        printf '%s\n' "diff --git a/$name.txt b/$name.txt" \
+            "--- a/$name.txt" "+++ b/$name.txt" '@@ -1 +1 @@' '-old' '+new' \
+            > "$repo_root/patches/picoquic/$pair.patch"
+    done
+    apply_picoquic_patches "$tmp/tree"
+    test "$(cat "$tmp/tree/one.txt")" = new
+    test "$(cat "$tmp/tree/two.txt")" = new
+    apply_picoquic_patches "$tmp/tree"
+    test "$(cat "$tmp/tree/one.txt")" = new
+    test "$(cat "$tmp/tree/two.txt")" = new
+    printf 'old\n' > "$tmp/tree/one.txt"
+    printf 'old\n' > "$tmp/tree/two.txt"
+    mv "$repo_root/patches/picoquic/0002-two.patch" "$tmp/two.patch"
+    if (apply_picoquic_patches "$tmp/tree") > "$tmp/log" 2>&1; then
+        die "self-test: missing second patch was accepted"
+    fi
+    grep -qF 'missing picoquic patch:' "$tmp/log"
+    test "$(cat "$tmp/tree/one.txt")" = old
+    mv "$tmp/two.patch" "$repo_root/patches/picoquic/0002-two.patch"
+    if (PICOQUIC_PATCHES=(0002-two.patch 0001-one.patch); \
+        apply_picoquic_patches "$tmp/tree") > "$tmp/log" 2>&1; then
+        die "self-test: reversed patch list was accepted"
+    fi
+    grep -qF 'does not match tracked order' "$tmp/log"
+    if (PICOQUIC_PATCHES=(0001-one.patch); \
+        apply_picoquic_patches "$tmp/tree") > "$tmp/log" 2>&1; then
+        die "self-test: omitted patch was accepted"
+    fi
+    grep -qF 'does not match tracked patches' "$tmp/log"
+    test "$(cat "$tmp/tree/one.txt")" = old
+    printf 'conflicting source\n' > "$tmp/tree/two.txt"
+    if (apply_picoquic_patches "$tmp/tree") > "$tmp/log" 2>&1; then
+        die "self-test: conflicting second patch was accepted"
+    fi
+    grep -qF 'picoquic patch 0002-two.patch conflicts' "$tmp/log"
+    test "$(cat "$tmp/tree/two.txt")" = 'conflicting source'
+    printf 'patch list self-test: all members, repeat, missing, order, omission, conflict PASS\n'
+)
+
 if [ "${1:-}" = "--self-test" ]; then
+    patch_list_selftest
     compiler_policy_selftest
     exit $?
 fi
@@ -177,6 +270,7 @@ mkdir -p "$MOQ_DEPS_DIR"
 log "deps dir: $MOQ_DEPS_DIR"
 
 fetch_at "$PICOQUIC_REPO" "$PICOQUIC_REF" "$picoquic_dir"
+apply_picoquic_patches "$picoquic_dir"
 fetch_at "$PICOTLS_REPO"  "$PICOTLS_REF"  "$picotls_dir"
 
 # picotls carries minicrypto backends as submodules pinned by the parent

@@ -161,7 +161,7 @@ MOQ_API moq_result_t moq_sub_subscribe(
     moq_sub_track_t **out);
 
 /*
- * Subscribe and ask for a fill (draft 21 3.4): the publisher also delivers the
+ * Subscribe and ask for a fill (draft 22 3.4): the publisher also delivers the
  * past Objects in fill->location (see moq_fill_request_t; fill->present is
  * implied) on a fill stream. *out_fill receives a fetch request that carries them:
  * poll it with moq_sub_poll_fetch like a Joining FETCH, except a fill has no
@@ -464,6 +464,10 @@ typedef enum moq_sub_fetch_item_kind {
     MOQ_SUB_FETCH_OBJECT   = 3,
     MOQ_SUB_FETCH_GAP      = 4,
     MOQ_SUB_FETCH_COMPLETE = 5,
+    /* Terminal: the peer abruptly terminated a stream of this fetch (see
+     * MOQ_EVENT_FETCH_RESET). u.reset carries the peer's STREAM error code --
+     * not a request error -- and which stream carried it. */
+    MOQ_SUB_FETCH_RESET    = 6,
 } moq_sub_fetch_item_kind_t;
 
 typedef struct moq_sub_fetch_item {
@@ -492,6 +496,11 @@ typedef struct moq_sub_fetch_item {
             uint64_t               group_id;
             uint64_t               object_id;
         } gap;
+        struct {
+            uint64_t error_code;    /* peer STREAM application error code */
+            bool     data_stream;   /* true: response data stream; false: request stream */
+            bool     stop_sending;  /* request stream only: STOP_SENDING, not RESET_STREAM */
+        } reset;
     } u;
 } moq_sub_fetch_item_t;
 
@@ -500,7 +509,7 @@ typedef struct moq_sub_fetch_item {
  * Returns MOQ_DONE when no items are queued.
  * Caller must call moq_sub_fetch_item_cleanup after processing.
  *
- * For terminal items (ERROR, COMPLETE), request is an opaque
+ * For terminal items (ERROR, COMPLETE, RESET), request is an opaque
  * correlation token. The slot is released when the terminal item
  * is polled and may be reused by a later moq_sub_fetch call.
  * Do not dereference or retain as live state.

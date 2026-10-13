@@ -1832,16 +1832,20 @@ static moq_result_t d18_encode_subscribe_ok(
     return moq_d18_encode_subscribe_ok(w, args->track_alias, &p, props);
 }
 
-/* REQUEST_ERROR encode. No request id (stream-correlated); retry_interval is 0
- * when retry is not offered. The optional Redirect structure (§10.6.1) is encoded
- * when args->has_redirect (an all-empty Redirect is valid). */
+/* REQUEST_ERROR encode. No request id (stream-correlated). The wire Retry
+ * Interval is "the minimum time (in milliseconds) before the request SHOULD be
+ * sent again, plus one. If the value is 0, the request SHOULD NOT be retried"
+ * (§10.6), so an offered retry of N ms is N + 1 on the wire and no retry is 0.
+ * The optional Redirect structure (§10.6.1) is encoded when args->has_redirect
+ * (an all-empty Redirect is valid). */
 static moq_result_t d18_encode_request_error(
     moq_session_t *s, struct moq_buf_writer *w,
     const struct moq_request_error_encode_args *args)
 {
     (void)s;
     moq_bytes_t reason = { args->reason, args->reason_len };
-    uint64_t retry = args->can_retry ? args->retry_after_ms : 0;
+    if (args->can_retry && args->retry_after_ms == UINT64_MAX) return MOQ_ERR_INVAL;
+    uint64_t retry = args->can_retry ? args->retry_after_ms + 1u : 0;
     if (args->has_redirect) {
         moq_d18_redirect_t rd = {
             .connect_uri     = { args->connect_uri, args->connect_uri_len },
@@ -2282,7 +2286,9 @@ static moq_result_t d18_process_response_stream(
         if (rc < 0)
             return close_with_error(s, 0x3, "malformed REQUEST_ERROR");
         size_t off = moq_buf_reader_offset(&r);
+        /* §10.6: wire Retry Interval = minimum milliseconds + 1; 0 = no retry. */
         bool can_retry = er.retry_interval != 0;
+        uint64_t retry_ms = can_retry ? er.retry_interval - 1u : 0;
 
         /* REDIRECT (§10.6) carries a Redirect tail and is valid only for SUBSCRIBE,
          * FETCH, TRACK_STATUS and PUBLISH_NAMESPACE here (SUBSCRIBE_NAMESPACE is on
@@ -2318,7 +2324,7 @@ static moq_result_t d18_process_response_stream(
                 return close_with_error(s, 0x3, "extra bytes after REQUEST_ERROR");
             /* Defer the free: the core drains the request stream's FIN. */
             rc = session_core_on_fetch_error(s, slot, er.error_code, can_retry,
-                er.retry_interval, er.reason.data, er.reason.len, false, redirect);
+                retry_ms, er.reason.data, er.reason.len, false, redirect);
         } else if (kind == (uint32_t)MOQ_REQ_ANNOUNCEMENT) {
             /* Terminal rejection of a pending PUBLISH_NAMESPACE. A REQUEST_ERROR
              * after the announcement is established is not a valid response. */
@@ -2332,7 +2338,7 @@ static moq_result_t d18_process_response_stream(
             d.target_slot = slot;
             d.error_code = er.error_code;
             d.can_retry = can_retry;
-            d.retry_after_ms = er.retry_interval;
+            d.retry_after_ms = retry_ms;
             d.reason = er.reason.data;
             d.reason_len = er.reason.len;
             rc = session_core_on_announcement_error(s, &d, redirect);
@@ -2341,7 +2347,7 @@ static moq_result_t d18_process_response_stream(
             if (off < len)
                 return close_with_error(s, 0x3, "extra bytes after REQUEST_ERROR");
             rc = session_core_on_track_status_error(s, slot, er.error_code,
-                can_retry, er.retry_interval, er.reason.data, er.reason.len,
+                can_retry, retry_ms, er.reason.data, er.reason.len,
                 redirect);
         } else if (kind == (uint32_t)MOQ_REQ_SUBSCRIBE_TRACKS) {
             /* Terminal first-response rejection of a pending SUBSCRIBE_TRACKS.
@@ -2352,7 +2358,7 @@ static moq_result_t d18_process_response_stream(
             if (off < len)
                 return close_with_error(s, 0x3, "extra bytes after REQUEST_ERROR");
             rc = session_core_on_subscribe_tracks_error(s, slot, er.error_code,
-                can_retry, er.retry_interval, er.reason.data, er.reason.len);
+                can_retry, retry_ms, er.reason.data, er.reason.len);
         } else if (kind == (uint32_t)MOQ_REQ_PUBLISH) {
             /* Terminal rejection of a pending outbound PUBLISH. REDIRECT is not
              * permitted here (excluded above). */
@@ -2364,7 +2370,7 @@ static moq_result_t d18_process_response_stream(
             /* Defer the free: the core drains the request stream's FIN and closes
              * our send half reciprocally. */
             rc = session_core_on_publish_error(s, slot, er.error_code, can_retry,
-                er.retry_interval, er.reason.data, er.reason.len, false);
+                retry_ms, er.reason.data, er.reason.len, false);
         } else if (s->subs[slot].state == MOQ_SUB_ESTABLISHED) {
             /* A REQUEST_ERROR on an established subscription is an update
              * failure: clear the pending update. The publisher must follow with
@@ -2384,7 +2390,7 @@ static moq_result_t d18_process_response_stream(
             d.target_slot = slot;
             d.error_code = er.error_code;
             d.can_retry = can_retry;
-            d.retry_after_ms = er.retry_interval;
+            d.retry_after_ms = retry_ms;
             d.reason = er.reason.data;
             d.reason_len = er.reason.len;
             rc = session_core_on_subscribe_error(s, &d, false, redirect);

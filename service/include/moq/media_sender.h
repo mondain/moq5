@@ -346,7 +346,7 @@ typedef struct moq_media_track_cfg {
      * 'depends' on this track: packaging "mediatimeline", mimeType
      * "application/json", NO eventType. Its objects carry explicit §7.1.1 records
      * [mediaTime, [group,object], wallclock] describing this track's published
-     * groups. In this slice the service records ONE record per media group, at
+     * groups. The service records ONE record per media group, at
      * the group-start object (Location (group, 0)): mediaTime is that object's
      * presentation time in ms, and wallclock is the emit time in ms for a live
      * track or 0 for a non-live/VOD track. Per-object records are a future

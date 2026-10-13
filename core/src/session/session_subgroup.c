@@ -153,7 +153,7 @@ bool sg_reap_terminal_resumable(moq_session_t *s, uint32_t *budget)
             s->sweep_slot = (nxt >= 0) ? (size_t)nxt : s->sg_cap;
             continue;                      /* costs nothing; never suspends */
         }
-        /* Draft 21: a closed subgroup whose delivery timer is armed stays until the timer
+        /* Draft 22: a closed subgroup whose delivery timer is armed stays until the timer
          * resets it (5.2); reaping it now would forget the timer. */
         if (s->subgroups[i].state == MOQ_SG_CLOSING &&
             s->profile->subgroup_timer_at_fin &&
@@ -327,8 +327,8 @@ moq_result_t moq_session_open_subgroup(
      * and subscriber-side (peer parameters/acked updates) values -- never
      * the min_nonzero legacy projection, which could wrongly shorten it
      * when the object timeout is smaller (d18 §8). Start instant (armed at
-     * open) is deliberately unchanged; the start-instant correction is a
-     * recorded backlog item (design §9.8 A2). */
+     * open) is deliberately unchanged: this site does not correct the start
+     * instant (design §9.8 A2). */
     {
         const moq_sub_entry_t *dte = &s->subs[sub_slot];
         uint64_t sg_ms = dt_negotiate_ms(
@@ -500,7 +500,7 @@ void moq_object_cfg_init(moq_object_cfg_t *cfg)
     cfg->struct_size = sizeof(*cfg);
 }
 
-/* Draft 21 5.2: the first object of a subgroup may carry its own SUBGROUP_DELIVERY_TIMEOUT,
+/* Draft 22 5.2: the first object of a subgroup may carry its own SUBGROUP_DELIVERY_TIMEOUT,
  * overriding the Track value for this subgroup; on any later object it is ignored. */
 static void sg_note_first_object_timeouts(moq_session_t *s, moq_sg_entry_t *entry,
                                           const uint8_t *props, size_t props_len)

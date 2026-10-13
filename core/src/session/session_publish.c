@@ -755,7 +755,7 @@ moq_result_t session_core_on_publish(moq_session_t *s,
         .delivery_timeout_ms = d->has_delivery_timeout ? d->delivery_timeout_ms : 0 };
     if (d->has_initial_params && d->loc_filter.present) {
         entry->initial.has_filter = true;
-        entry->initial.filter_field_count = d->loc_filter.field_count;
+        entry->initial.filter_location_type = d->loc_filter.location_type;
         entry->initial.filter_start_group = d->loc_filter.start_group;
         entry->initial.filter_start_object = d->loc_filter.start_object;
         entry->initial.filter_end_group_delta = d->loc_filter.end_group_delta;
@@ -1332,7 +1332,7 @@ moq_result_t moq_session_accept_publish(
     if (has_new_group_request && !s->publishes[slot].dynamic_groups)
         return MOQ_ERR_INVAL;
 
-    /* A profile whose PUBLISH_OK cannot carry the subscriber's choices (draft 21:
+    /* A profile whose PUBLISH_OK cannot carry the subscriber's choices (draft 22:
      * the OK is a bare REQUEST_OK) sends any non-default priority, a forward that
      * differs from what the PUBLISH advertised, a filter or a new-group request as
      * a REQUEST_UPDATE right behind it, instead of dropping them. The Forward
@@ -1474,6 +1474,11 @@ moq_result_t moq_session_reject_publish(
     /* PUBLISH is not REDIRECT-eligible (§10.6 lists 5 families; PUBLISH not among
      * them); refuse a REDIRECT code rather than emit an unacceptable response. */
     if (cfg->error_code == MOQ_REQUEST_ERROR_REDIRECT) return MOQ_ERR_INVAL;
+    /* A retry is sent as milliseconds + 1 (d16 Section 9.8, d18 Section
+     * 10.6): refuse an interval whose wire form is unrepresentable rather
+     * than let it wrap to 0, which means "do not retry". */
+    if (cfg->can_retry && cfg->retry_after_ms >= MOQ_QUIC_VARINT_MAX)
+        return MOQ_ERR_INVAL;
     /* The code must be representable in THIS profile's wire encoding; refuse
      * before any mutation rather than truncate (draft-16 encodes a QUIC
      * varint, draft-18 a vi64 spanning the full 64-bit range). */
@@ -1900,7 +1905,7 @@ moq_result_t session_core_on_publish_request_update(
             e->dt_sub_has_subgroup, e->dt_sub_subgroup_ms);
     }
     if (d->has_filter) {
-        if (d->loc_filter.present && d->loc_filter.field_count > 0)
+        if (d->loc_filter.present && d->loc_filter.location_type > 0)
             moq_resolve_loc_filter_window(&d->loc_filter,
                                   usnap_has, usnap_g, usnap_o,
                                   s->profile->location_varint_max, &e->window);

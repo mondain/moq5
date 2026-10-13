@@ -1,14 +1,14 @@
-#ifndef MOQ_WIRE_CONTROL_D21_INTERNAL_H
-#define MOQ_WIRE_CONTROL_D21_INTERNAL_H
+#ifndef MOQ_WIRE_CONTROL_D22_INTERNAL_H
+#define MOQ_WIRE_CONTROL_D22_INTERNAL_H
 
 /*
- * Internal draft-21 control-codec helpers -- NOT part of the public wire codec
+ * Internal draft-22 control-codec helpers -- NOT part of the public wire codec
  * surface (no MOQ_API, so hidden from the shared-library dynamic symbol table).
- * Shared between the wire codec (control_d21.c) and the session profile
- * (profile_d21.c) without widening the public ABI.
+ * Shared between the wire codec (control_d22.c) and the session profile
+ * (profile_d22.c) without widening the public ABI.
  */
 
-#include "moq/control_d21.h"
+#include "moq/control_d22.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -19,7 +19,7 @@ extern "C" {
  * searching the mutable list and IMMUTABLE_PROPERTIES contents; duplicates
  * and nested immutable blocks are MOQ_ERR_PROTO; unknown properties pass
  * through. */
-moq_result_t moq_d21_scan_delivery_timeouts(const uint8_t *props, size_t len,
+moq_result_t moq_d22_scan_delivery_timeouts(const uint8_t *props, size_t len,
                                             bool *out_has_object,
                                             uint64_t *out_object_ms,
                                             bool *out_has_subgroup,
@@ -29,4 +29,4 @@ moq_result_t moq_d21_scan_delivery_timeouts(const uint8_t *props, size_t len,
 }
 #endif
 
-#endif /* MOQ_WIRE_CONTROL_D21_INTERNAL_H */
+#endif /* MOQ_WIRE_CONTROL_D22_INTERNAL_H */

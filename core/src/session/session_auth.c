@@ -426,7 +426,8 @@ moq_result_t process_auth_tokens(moq_session_t *s,
          * requires the alias to register even when the message is rejected,
          * and the reject path commits the txn. A future USE_ALIAS of that
          * alias resolves to the same value and fails here again. */
-        if (!moq_auth_token_value_semantically_valid(tok_value,
+        if (!s->profile->opaque_auth_token_values &&
+            !moq_auth_token_value_semantically_valid(tok_value,
                                                      tok_value_len)) {
             if (tok_op == MOQ_AUTH_OP_USE_ALIAS &&
                 tok_value && tok_value_len > 0)

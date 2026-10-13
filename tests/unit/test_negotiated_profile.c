@@ -1,14 +1,14 @@
 /*
- * Negotiated-profile substrate (Step 5): the green declaration.
+ * Negotiated-profile substrate: the declared tables and their checks.
  *
  * This target owns the product-independent half: the pure oracle, the four
  * declared tables, the fail-closed corpus, the derived pair relation, and the
- * drift gate against core profile availability and the Step-3 ALPN table.
+ * drift gate against core profile availability and the canonical ALPN table.
  * The endpoint-offer/AUTO half of the drift gate needs the service tier and
  * lives in service/tests/test_negotiated_profile_offer.c.
  *
- * There are NO service closures here: LOC-01 cells carry temporary closure
- * waivers, and Step 6 replaces those with the shared send/receive functions.
+ * There are NO service closures here: LOC-01 cells carry closure waivers in
+ * place of the shared send/receive functions.
  * Nothing in this file calls a LOC, KVP or integer-codec product API.
  */
 #include "np_oracle.h"
@@ -18,7 +18,7 @@
 
 /* the drift gate's two product authorities */
 #include "profile.h"       /* moq_profile_lookup: core availability */
-#include "moq_alpn.h"      /* the Step-3 canonical ALPN table */
+#include "moq_alpn.h"      /* the canonical ALPN table */
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -65,32 +65,32 @@ static void t_tables(void)
         MOQ_TEST_CHECK(d18->enc == NP_ENC_VI64);
         MOQ_TEST_CHECK_EQ_U64(d16->int_max, NP_QUIC_VARINT_MAX);
         MOQ_TEST_CHECK_EQ_U64(d18->int_max, NP_VI64_MAX);
-        /* AUTO offers the NEWEST draft first (21, 18, 16) */
+        /* AUTO offers the NEWEST draft first (22, 18, 16) */
         MOQ_TEST_CHECK_EQ_INT(d18->auto_rank, 2);
         MOQ_TEST_CHECK_EQ_INT(d16->auto_rank, 3);
     }
 
-    /* Draft 21: wire ready, AVAILABLE, offered first. Its media cells stay
+    /* Draft 22: wire ready, AVAILABLE, offered first. Its media cells stay
      * UNSUPPORTED until the LOC property ids are implemented for it, so the row
      * keeps a reason. */
-    MOQ_TEST_CHECK(moq_profile_lookup(MOQ_VERSION_DRAFT_21) != NULL);
-    MOQ_TEST_CHECK(moq_profile_wire_ready(MOQ_VERSION_DRAFT_21));
+    MOQ_TEST_CHECK(moq_profile_lookup(MOQ_VERSION_DRAFT_22) != NULL);
+    MOQ_TEST_CHECK(moq_profile_wire_ready(MOQ_VERSION_DRAFT_22));
     MOQ_TEST_CHECK(moq_profile_wire_ready(MOQ_VERSION_DRAFT_16));
     MOQ_TEST_CHECK(moq_profile_wire_ready(MOQ_VERSION_DRAFT_18));
-    const np_transport_row_t *d21 = np_transport_by_draft(21);
-    MOQ_TEST_CHECK(d21 != NULL);
-    if (d21) {
-        MOQ_TEST_CHECK(strcmp(d21->alpn, "moqt-21") == 0);
-        MOQ_TEST_CHECK(d21->enc == NP_ENC_VI64);
-        MOQ_TEST_CHECK_EQ_U64(d21->int_max, NP_VI64_MAX);
-        MOQ_TEST_CHECK(d21->state == NP_T_AVAILABLE);
-        MOQ_TEST_CHECK(d21->endpoint_offered);
-        MOQ_TEST_CHECK_EQ_INT(d21->auto_rank, 1);
-        MOQ_TEST_CHECK(d21->unusable_reason && d21->unusable_reason[0]);
+    const np_transport_row_t *d22 = np_transport_by_draft(22);
+    MOQ_TEST_CHECK(d22 != NULL);
+    if (d22) {
+        MOQ_TEST_CHECK(strcmp(d22->alpn, "moqt-22") == 0);
+        MOQ_TEST_CHECK(d22->enc == NP_ENC_VI64);
+        MOQ_TEST_CHECK_EQ_U64(d22->int_max, NP_VI64_MAX);
+        MOQ_TEST_CHECK(d22->state == NP_T_AVAILABLE);
+        MOQ_TEST_CHECK(d22->endpoint_offered);
+        MOQ_TEST_CHECK_EQ_INT(d22->auto_rank, 1);
+        MOQ_TEST_CHECK(d22->unusable_reason && d22->unusable_reason[0]);
     }
     {
-        const np_cell_row_t *c1 = np_cell(21, "loc01");
-        const np_cell_row_t *c2 = np_cell(21, "loc02");
+        const np_cell_row_t *c1 = np_cell(22, "loc01");
+        const np_cell_row_t *c2 = np_cell(22, "loc02");
         MOQ_TEST_CHECK(c1 && c2);
         if (c1 && c2) {
             MOQ_TEST_CHECK(c1->state == NP_C_UNSUPPORTED);
@@ -655,7 +655,7 @@ static void t_corpus_negatives(void)
  * 6. The future-draft DRIFT GATE (core half)
  *
  * Sweeps every moq_version_t value 0..255 and compares the declared rows
- * against core profile availability and the Step-3 canonical ALPN table in
+ * against core profile availability and the canonical ALPN table in
  * BOTH directions. The ALPN literals are the authority: a round trip through
  * the product alone would pass with two consistently wrong strings.
  * ===================================================================== */
@@ -665,7 +665,7 @@ static void t_drift_gate(void)
         moq_version_t ver = (moq_version_t)v;
         const np_transport_row_t *row = np_transport_by_draft(v);
         /* AVAILABLE means wire ready: a profile that exists only for the
-         * simulator (draft 21 while transitional) is declared ABSENT. */
+         * simulator (draft 22 while transitional) is declared ABSENT. */
         bool product_has_profile = moq_profile_wire_ready(ver);
 
         /* declared AVAILABLE <=> the core has a wire-ready profile for it */
@@ -681,7 +681,7 @@ static void t_drift_gate(void)
             failures++;
         }
 
-        /* declared ALPN <=> the Step-3 table, in both directions */
+        /* declared ALPN <=> the canonical table, in both directions */
         const char *product_alpn = moq_alpn_for_version(ver);
         if (row) {
             MOQ_TEST_CHECK(product_alpn != NULL);

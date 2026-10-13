@@ -37,7 +37,7 @@ Options:
   --build-dir DIR               Normal build root (default: build)
   --asan-dir DIR                ASan build root (default: build/asan)
   --fault-permille N            Fault rate for scenario_faults / scenario_transport_faults
-  --version N                   Run scenarios that do not pin a draft under draft N (16, 18, 21)
+  --version N                   Run scenarios that do not pin a draft under draft N (16, 18, 22)
   --alloc-fault-permille N      Allocation fault rate for scenario_combined_faults
   --transport-fault-permille N  Transport fault rate for scenario_combined_faults
   --fail-fast                   Stop on first failure
@@ -131,10 +131,10 @@ run_entry() {
         return 0
     fi
 
-    # scenario_fetch drives a Joining FETCH, which draft 21 replaced with fill
-    # streams (covered by test_d21_requests / test_publisher), so it cannot run there.
-    if [[ "${MOQ_SIM_VERSION:-}" == "21" && "$runner" == "scenario_fetch" ]]; then
-        echo "  SKIP $runner ($label): Joining FETCH does not exist in draft 21" >&2
+    # scenario_fetch drives a Joining FETCH, which draft 22 replaced with fill
+    # streams (covered by test_d22_requests / test_publisher), so it cannot run there.
+    if [[ "${MOQ_SIM_VERSION:-}" == "22" && "$runner" == "scenario_fetch" ]]; then
+        echo "  SKIP $runner ($label): Joining FETCH does not exist in draft 22" >&2
         return 2
     fi
 
