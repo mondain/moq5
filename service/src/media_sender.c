@@ -47,7 +47,16 @@
  * supply at least this; appended fields default absent for an older/smaller
  * cfg, and a newer/larger cfg's unknown trailing fields are ignored. */
 #define MEDIA_TRACK_CFG_MIN_SIZE \
-    offsetof(moq_media_track_cfg_t, has_track_duration)
+    MOQ_MEDIA_TRACK_CFG_V0_SIZE
+
+#define MEDIA_TRACK_CFG_SIZE_THROUGH_ALT_GROUP \
+    ((offsetof(moq_media_track_cfg_t, alt_group) + \
+      sizeof(((moq_media_track_cfg_t *)0)->alt_group) + \
+      _Alignof(moq_media_track_cfg_t) - 1u) & \
+     ~((size_t)_Alignof(moq_media_track_cfg_t) - 1u))
+_Static_assert(offsetof(moq_media_track_cfg_t, has_publisher_priority) >=
+               MEDIA_TRACK_CFG_SIZE_THROUGH_ALT_GROUP,
+               "publisher priority must follow the complete historical layout");
 
 /* Minimum accepted moq_media_sender_cfg_t size: the prefix through the last
  * pre-callbacks field. A create/attach caller must supply at least this; the
@@ -120,6 +129,8 @@ struct moq_media_track {
     uint64_t              track_duration_ms;
     bool                  has_alt_group;       /* CMSF §3.2 (switching set) */
     int                   alt_group;
+    bool                  has_publisher_priority;
+    uint8_t               publisher_priority;
 
     /* CMSF authoring metadata (copied at add_track). cp_ref_ids is its own
      * allocation; the id bytes live in `strings` with the other spans. */
@@ -1790,6 +1801,9 @@ static void sender_add_pub_track(moq_media_sender_t *s, moq_media_track_t *t,
     if (t->is_catalog) {
         tcfg.has_publisher_priority = true;
         tcfg.publisher_priority = 0;
+    } else if (t->has_publisher_priority) {
+        tcfg.has_publisher_priority = true;
+        tcfg.publisher_priority = t->publisher_priority;
     }
     /* The sender's production is strictly monotonic on every track: media
      * emission drains group_seq in order (eviction only drops OLDER groups
@@ -2994,12 +3008,19 @@ void moq_media_sender_cfg_init_lossless_sized(moq_media_sender_cfg_t *cfg,
         cfg->block_timeout_us = SENDER_DEFAULT_BLOCK_TIMEOUT_US;
 }
 
-void moq_media_track_cfg_init(moq_media_track_cfg_t *cfg)
+void moq_media_track_cfg_init_sized(moq_media_track_cfg_t *cfg, size_t cfg_size)
 {
-    if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(*cfg);
-    cfg->is_live = true;
+    if (!cfg || cfg_size < sizeof(cfg->struct_size)) return;
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
+    if (n >= offsetof(moq_media_track_cfg_t, is_live) + sizeof(cfg->is_live))
+        cfg->is_live = true;
+}
+
+void (moq_media_track_cfg_init)(moq_media_track_cfg_t *cfg)
+{
+    moq_media_track_cfg_init_sized(cfg, MEDIA_TRACK_CFG_SIZE_THROUGH_ALT_GROUP);
 }
 
 /* -- CMSF content-protection authoring (deep copy) -------------------- *
@@ -4042,6 +4063,11 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
     memcpy(&cfg_local, cfg,
            cfg->struct_size < sizeof(cfg_local) ? cfg->struct_size
                                                 : sizeof(cfg_local));
+    if (cfg->struct_size < offsetof(moq_media_track_cfg_t, publisher_priority) +
+                           sizeof(cfg->publisher_priority)) {
+        cfg_local.has_publisher_priority = false;
+        cfg_local.publisher_priority = 0;
+    }
     cfg_local.struct_size = sizeof(cfg_local);
     cfg = &cfg_local;
     if (cfg->name.len == 0 || !cfg->name.data) return MOQ_ERR_INVAL;
@@ -4167,6 +4193,8 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
     t->track_duration_ms = cfg->track_duration_ms;
     t->has_alt_group = cfg->has_alt_group;
     t->alt_group = cfg->alt_group;
+    t->has_publisher_priority = cfg->has_publisher_priority;
+    t->publisher_priority = cfg->publisher_priority;
     t->has_max_grp_sap = cfg->has_max_grp_sap;
     t->max_grp_sap = cfg->max_grp_sap;
     t->has_max_obj_sap = cfg->has_max_obj_sap;

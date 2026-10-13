@@ -159,7 +159,7 @@ jobs:
       - name: Deterministic service tests (incl. C/C++ consumers)
         run: >
           ctest --test-dir build/service-surface --output-on-failure
-          -R 'media_sender_catalog|media_sender_lifecycle|media_sender_pacing|service_consumer_cxx|endpoint_resolve'
+          -R 'media_sender_catalog|media_sender_lifecycle|media_sender_pacing|media_sender_priority|media_track_cfg_init|service_consumer_cxx|endpoint_resolve'
 
       - name: Shared service build + initializer symbol check
         run: |
@@ -172,7 +172,7 @@ jobs:
           cmake --build build/service-surface-shared -j3
           lib="$(find build/service-surface-shared/service -name 'libmoq-service.so*' -type f -print -quit)"
           test -n "$lib"
-          for sym in moq_media_sender_cfg_init_sized moq_media_sender_cfg_init_live_sized moq_media_sender_cfg_init_lossless_sized moq_media_sender_callbacks_init_sized; do
+          for sym in moq_media_sender_cfg_init_sized moq_media_sender_cfg_init_live_sized moq_media_sender_cfg_init_lossless_sized moq_media_sender_callbacks_init_sized moq_media_track_cfg_init moq_media_track_cfg_init_sized; do
             nm -D --defined-only "$lib" | grep -q " $sym\$" ||
               { echo "missing export: $sym"; exit 1; }
           done
