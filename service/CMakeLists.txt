@@ -426,7 +426,7 @@ if(MOQ_BUILD_TESTS)
             ${CMAKE_SOURCE_DIR}/tests/unit)
         add_test(NAME media_catalog_update COMMAND test_media_catalog_update)
 
-        # Publication-race RED (MOQ-MEDIA-CP-LOOKUP-RACE): deterministic
+        # Publication-race test (MOQ-MEDIA-CP-LOOKUP-RACE): deterministic
         # try-lock phase oracle for the effective-catalog publication vs the
         # public content-protection lookup, plus a TSan stress companion.
         add_executable(test_media_catalog_publication_race
@@ -766,7 +766,7 @@ if(MOQ_BUILD_TESTS)
             add_test(NAME media_sender_refresh
                 COMMAND test_media_sender_refresh)
 
-            # Negotiated-profile closure REDs (step 6). Two independent directions
+            # Negotiated-profile closure tests. Two independent directions
             # over the SAME substrate: a real sender's LOC-01 property bytes
             # checked against the pure oracle, and independently built bytes fed
             # to a real receiver. Both need the sender AND receiver seams plus a
@@ -776,7 +776,8 @@ if(MOQ_BUILD_TESTS)
             #
             # These tests assert the CORRECT per-draft contract, so the draft-18
             # halves FAIL until the encoder/decoder become version-aware. That is
-            # deliberate: they are the RED, not a pending feature.
+            # deliberate: the failure records the contract gap; it is not a
+            # pending feature.
             add_executable(test_np_closure_sender
                 tests/test_np_closure_sender.c)
             target_link_libraries(test_np_closure_sender PRIVATE

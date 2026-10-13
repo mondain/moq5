@@ -185,6 +185,12 @@ endif()
 # build-tree package is consumable end to end. Needs picoquic source
 # (the consumer's FindPicoquic re-resolves it) and
 # MOQ_BUILD_ADAPTER_PICO_WT=ON so BUILD_HTTP defines picohttp-core.
+# Nested consumer builds configure picoquic again: give them this tree's C++
+# compiler too (see tests/cmake/NestedToolchain.cmake).
+include("${PROJECT_SOURCE_DIR}/tests/cmake/NestedToolchain.cmake")
+moq_nested_cxx_args(_picowt_nested_cxx FLAGS)
+moq_nested_cxx_env(_picowt_nested_cxx_env)
+
 if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR)
     set(_picowt_consumer_src "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer")
     set(_picowt_consumer_bld "${CMAKE_CURRENT_BINARY_DIR}/consumer-test-build")
@@ -210,7 +216,7 @@ if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR)
                  -DMOQ_PICOQUIC_SOURCE_DIR='${MOQ_PICOQUIC_SOURCE_DIR}' \
                  -DMOQ_PICOTLS_PREFIX='${MOQ_PICOTLS_PREFIX}' \
                  -DCMAKE_C_COMPILER='${CMAKE_C_COMPILER}' \
-                 -DCMAKE_C_FLAGS='${CMAKE_C_FLAGS}' \
+                 -DCMAKE_C_FLAGS='${CMAKE_C_FLAGS}'${_picowt_nested_cxx} \
                  -DCMAKE_EXE_LINKER_FLAGS='${CMAKE_EXE_LINKER_FLAGS}' \
                  -DCMAKE_BUILD_TYPE='${CMAKE_BUILD_TYPE}' \
                  -DCMAKE_OSX_SYSROOT='${CMAKE_OSX_SYSROOT}' \
@@ -235,7 +241,7 @@ if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR)
         get_filename_component(_picowt_openssl_root "${_o}" DIRECTORY)
     endif()
     add_test(NAME pico_wt_install_consumer
-        COMMAND bash
+        COMMAND ${CMAKE_COMMAND} -E env ${_picowt_nested_cxx_env} bash
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_install_consumer.sh"
             "${CMAKE_COMMAND}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer"
@@ -255,7 +261,7 @@ if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR)
     find_program(PKG_CONFIG_EXECUTABLE pkg-config)
     if(PKG_CONFIG_EXECUTABLE)
         add_test(NAME pico_wt_pkgconfig_consumer
-            COMMAND bash
+            COMMAND ${CMAKE_COMMAND} -E env ${_picowt_nested_cxx_env} bash
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_pkgconfig_consumer.sh"
                 "${CMAKE_COMMAND}"
                 "libmoq-pico-wt"
@@ -625,7 +631,7 @@ endif()\n")
                      -DMOQ_PICOQUIC_SOURCE_DIR='${MOQ_PICOQUIC_SOURCE_DIR}' \
                      -DMOQ_PICOTLS_PREFIX='${MOQ_PICOTLS_PREFIX}' \
                      -DCMAKE_C_COMPILER='${CMAKE_C_COMPILER}' \
-                     -DCMAKE_C_FLAGS='${CMAKE_C_FLAGS}' \
+                     -DCMAKE_C_FLAGS='${CMAKE_C_FLAGS}'${_picowt_nested_cxx} \
                      -DCMAKE_EXE_LINKER_FLAGS='${CMAKE_EXE_LINKER_FLAGS}' \
                      -DCMAKE_BUILD_TYPE='${CMAKE_BUILD_TYPE}' && \
                  '${CMAKE_COMMAND}' --build '${_picowtm_consumer_bld}' && \
@@ -643,7 +649,7 @@ endif()\n")
             get_filename_component(_picowtm_openssl_root "${_om}" DIRECTORY)
         endif()
         add_test(NAME pico_wt_managed_install_consumer
-            COMMAND bash
+            COMMAND ${CMAKE_COMMAND} -E env ${_picowt_nested_cxx_env} bash
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_install_consumer_managed.sh"
                 "${CMAKE_COMMAND}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer-managed"
@@ -665,7 +671,7 @@ endif()\n")
         find_program(PKG_CONFIG_EXECUTABLE pkg-config)
         if(PKG_CONFIG_EXECUTABLE)
             add_test(NAME pico_wt_managed_pkgconfig_consumer
-                COMMAND bash
+                COMMAND ${CMAKE_COMMAND} -E env ${_picowt_nested_cxx_env} bash
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_pkgconfig_consumer.sh"
                     "${CMAKE_COMMAND}"
                     "libmoq-pico-wt-managed"
@@ -705,7 +711,7 @@ endif()\n")
                      -DMOQ_PICOQUIC_SOURCE_DIR='${MOQ_PICOQUIC_SOURCE_DIR}' \
                      -DMOQ_PICOTLS_PREFIX='${MOQ_PICOTLS_PREFIX}' \
                      -DCMAKE_C_COMPILER='${CMAKE_C_COMPILER}' \
-                     -DCMAKE_C_FLAGS='${CMAKE_C_FLAGS}' \
+                     -DCMAKE_C_FLAGS='${CMAKE_C_FLAGS}'${_picowt_nested_cxx} \
                      -DCMAKE_EXE_LINKER_FLAGS='${CMAKE_EXE_LINKER_FLAGS}' \
                      -DCMAKE_BUILD_TYPE='${CMAKE_BUILD_TYPE}' && \
                  '${CMAKE_COMMAND}' --build '${_picowtmv_consumer_bld}' && \
@@ -719,7 +725,7 @@ endif()\n")
         # its dependency in the static link line). Temp-prefix install.
         if(PKG_CONFIG_EXECUTABLE)
             add_test(NAME pico_wt_managed_verify_pkgconfig_consumer
-                COMMAND bash
+                COMMAND ${CMAKE_COMMAND} -E env ${_picowt_nested_cxx_env} bash
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_pkgconfig_consumer.sh"
                     "${CMAKE_COMMAND}"
                     "libmoq-pico-wt-managed libmoq"

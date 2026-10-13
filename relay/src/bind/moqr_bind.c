@@ -270,7 +270,7 @@ typedef struct b_nsu {
     size_t   bytes_len;
 } b_nsu_t;
 
-/* Delivery-park reasons (D3): why this connection's last delivery pass
+/* Delivery-park reasons: why this connection's last delivery pass
  * blocked, deciding its recovery gate. BIND_SG never parks — its recovery is
  * the explicit re-arm at every subgroup-slot release site. */
 #define B_PARK_NONE       0u
@@ -339,6 +339,10 @@ typedef struct b_conn {
 struct moqr_bind {
     moq_alloc_t  alloc;
     moqr_core_t *core;
+    /* The request namespace / name of the event being handled, copied out of
+     * session event memory (see bind_stash_ftn). */
+    moq_bytes_t  stash_parts[32];
+    uint8_t      stash_bytes[MOQ_FULL_TRACK_NAME_MAX];
     uint32_t     max_conns, n_dsubs, n_sgs, n_usubs, n_pubs, n_anns, n_fetches;
     uint32_t     n_refusals;             /* n_fetches + BIND_PUMP_EVENT_POLL */
     uint32_t     request_grant_window;   /* d16 MAX_REQUEST_ID grant step   */
@@ -2131,6 +2135,45 @@ ns_from_event(const moq_namespace_t *ns, moq_bytes_t *storage)
     return (moqr_ns_t){ .parts = storage, .count = count };
 }
 
+/* Copy a request's namespace (and optional name) out of session event memory
+ * into the binding's own stash, repointing the views. A core call retried with
+ * BIND_CALL_RETRY drains intents between attempts, and executing an intent on
+ * the same session can reset that session's event scratch; a retry must still
+ * read the request's own bytes. Views too large to stash are left as they are:
+ * the core refuses them as INVAL on the first attempt, before any retry. One
+ * stash serves the one event being handled. */
+static void
+bind_stash_ftn(moqr_bind_t *b, moqr_ns_t *ns, moq_bytes_t *name)
+{
+    size_t total = name != NULL ? name->len : 0;
+    if (ns->count > 32) {
+        return;
+    }
+    for (size_t i = 0; i < ns->count; i++) {
+        total += ns->parts[i].len;
+    }
+    if (total > sizeof(b->stash_bytes)) {
+        return;
+    }
+    size_t off = 0;
+    for (size_t i = 0; i < ns->count; i++) {
+        size_t len = ns->parts[i].len;
+        if (len != 0) {
+            memcpy(b->stash_bytes + off, ns->parts[i].data, len);
+        }
+        b->stash_parts[i].data = len != 0 ? b->stash_bytes + off : NULL;
+        b->stash_parts[i].len = len;
+        off += len;
+    }
+    ns->parts = b->stash_parts;
+    if (name != NULL) {
+        if (name->len != 0) {
+            memcpy(b->stash_bytes + off, name->data, name->len);
+            name->data = b->stash_bytes + off;
+        }
+    }
+}
+
 /* Session-level error code for an unauthorized connection (setup DENY). This
  * is the SESSION close code (0x2), distinct from the request-level
  * MOQ_REQUEST_ERROR_UNAUTHORIZED (0x1) used to reject individual requests. */
@@ -2297,6 +2340,46 @@ bind_reject_subscribe_cfg_init(moq_reject_subscribe_cfg_t *cfg,
     cfg->reason = bind_subscribe_error_reason(code);
 }
 
+/* Retry Interval offered with a capacity refusal: the condition is
+ * transient (a live track, subscription or fetch ends and frees its slot).
+ * Every client refused by the same full pool would otherwise retry in
+ * lockstep, so each request gets its own interval in [MIN, MIN + SPREAD]:
+ * "the sender can apply randomization to each retry interval so that retries
+ * are spread out over time" (d16 Section 9.8, d18 Section 10.6). Derived
+ * from the request handle, so it is deterministic per request. */
+#define B_CAPACITY_RETRY_MIN_MS    750u
+#define B_CAPACITY_RETRY_SPREAD_MS 500u
+
+static uint64_t
+bind_capacity_retry_ms(uint64_t request_cookie)
+{
+    uint64_t z = request_cookie + UINT64_C(0x9E3779B97F4A7C15);   /* SplitMix64 */
+    z = (z ^ (z >> 30)) * UINT64_C(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)) * UINT64_C(0x94D049BB133111EB);
+    z ^= z >> 31;
+    return B_CAPACITY_RETRY_MIN_MS + z % (B_CAPACITY_RETRY_SPREAD_MS + 1u);
+}
+
+/* The REQUEST_ERROR code for a request this relay cannot admit because a
+ * bounded pool holds only live entries (MOQR_ERR_CAPACITY). draft-18 has a
+ * code for exactly this, EXCESSIVE_LOAD (0x9, Section 10.6: "The responder is
+ * overloaded and cannot process the request at this time. The sender SHOULD
+ * use the Retry Interval to indicate when the request can be retried").
+ * draft-16's registry (Section 13.4.2) assigns no load code, and 0x9 is
+ * unassigned there, so INTERNAL_ERROR is its truthful answer. Either way the
+ * refusal carries a nonzero Retry Interval. */
+static moq_request_error_t
+bind_capacity_error(const b_conn_t *cn)
+{
+    return cn->wire_draft == B_DRAFT_18 ? MOQ_REQUEST_ERROR_EXCESSIVE_LOAD
+                                        : MOQ_REQUEST_ERROR_INTERNAL_ERROR;
+}
+
+static void
+bind_reject_ex(moqr_bind_t *b, b_conn_t *cn, moqr_auth_action_t action,
+               uint64_t session_cookie, uint64_t err, bool can_retry,
+               uint64_t retry_ms, uint64_t now_us);
+
 /* Reject the pending session request identified by (action, session_cookie)
  * with the wire error code. Shared by the inline refuse path and deferred
  * resolution, reconstructing the handle from the stored cookie. */
@@ -2304,12 +2387,38 @@ static void
 bind_reject(moqr_bind_t *b, b_conn_t *cn, moqr_auth_action_t action,
             uint64_t session_cookie, uint64_t err, uint64_t now_us)
 {
+    bind_reject_ex(b, cn, action, session_cookie, err, false, 0, now_us);
+}
+
+/* bind_reject for a core admission result: MOQR_ERR_CAPACITY is a capacity
+ * refusal (bind_capacity_error, retryable); anything else INTERNAL_ERROR. */
+static void
+bind_reject_admission(moqr_bind_t *b, b_conn_t *cn, moqr_auth_action_t action,
+                      uint64_t session_cookie, moqr_result_t rc,
+                      uint64_t now_us)
+{
+    if (rc == MOQR_ERR_CAPACITY) {
+        bind_reject_ex(b, cn, action, session_cookie, bind_capacity_error(cn),
+                       true, bind_capacity_retry_ms(session_cookie), now_us);
+    } else {
+        bind_reject(b, cn, action, session_cookie,
+                    MOQ_REQUEST_ERROR_INTERNAL_ERROR, now_us);
+    }
+}
+
+static void
+bind_reject_ex(moqr_bind_t *b, b_conn_t *cn, moqr_auth_action_t action,
+               uint64_t session_cookie, uint64_t err, bool can_retry,
+               uint64_t retry_ms, uint64_t now_us)
+{
     (void)b;
     switch (action) {
     case MOQR_AUTH_PUBLISH_NAMESPACE: {
         moq_reject_namespace_cfg_t r;
         moq_reject_namespace_cfg_init(&r);
         r.error_code = err;
+        r.can_retry = can_retry;
+        r.retry_after_ms = retry_ms;
         (void)moq_session_reject_namespace(
             cn->session, (moq_announcement_t){ ._opaque = session_cookie }, &r,
             now_us);
@@ -2318,6 +2427,8 @@ bind_reject(moqr_bind_t *b, b_conn_t *cn, moqr_auth_action_t action,
     case MOQR_AUTH_SUBSCRIBE: {
         moq_reject_subscribe_cfg_t r;
         bind_reject_subscribe_cfg_init(&r, err);
+        r.can_retry = can_retry;
+        r.retry_after_ms = retry_ms;
         (void)moq_session_reject_subscribe(
             cn->session, (moq_subscription_t){ ._opaque = session_cookie }, &r,
             now_us);
@@ -2327,6 +2438,8 @@ bind_reject(moqr_bind_t *b, b_conn_t *cn, moqr_auth_action_t action,
         moq_reject_ns_sub_cfg_t r;
         moq_reject_ns_sub_cfg_init(&r);
         r.error_code = err;
+        r.can_retry = can_retry;
+        r.retry_after_ms = retry_ms;
         (void)moq_session_reject_ns_sub(
             cn->session, (moq_ns_sub_handle_t){ ._opaque = session_cookie }, &r,
             now_us);
@@ -2336,6 +2449,8 @@ bind_reject(moqr_bind_t *b, b_conn_t *cn, moqr_auth_action_t action,
         moq_reject_track_status_cfg_t r;
         moq_reject_track_status_cfg_init(&r);
         r.error_code = err;
+        r.can_retry = can_retry;
+        r.retry_after_ms = retry_ms;
         (void)moq_session_reject_track_status(
             cn->session, (moq_track_status_handle_t){ ._opaque = session_cookie },
             &r, now_us);
@@ -2345,6 +2460,8 @@ bind_reject(moqr_bind_t *b, b_conn_t *cn, moqr_auth_action_t action,
         moq_reject_publish_cfg_t r;
         moq_reject_publish_cfg_init(&r);
         r.error_code = err;
+        r.can_retry = can_retry;
+        r.retry_after_ms = retry_ms;
         (void)moq_session_reject_publish(
             cn->session, (moq_publication_t){ ._opaque = session_cookie }, &r,
             now_us);
@@ -2437,7 +2554,9 @@ bind_resume(moqr_bind_t *b, b_conn_t *cn, const moqr_park_req_t *v,
                         MOQ_REQUEST_ERROR_INTERNAL_ERROR, now_us);
             return;
         }
-        rc = bind_announce(b, cn, v->ns, v->session_cookie, now_us);
+        /* The stored copy, not the parked material: retries drain intents. */
+        moqr_ns_t ans = cn->anns[ann_slot].ns;
+        rc = bind_announce(b, cn, ans, v->session_cookie, now_us);
         if (rc != MOQR_OK) {
             ann_clear_slot(b, cn, (uint32_t)ann_slot);
             if (gres.gen != 0) {
@@ -2445,7 +2564,7 @@ bind_resume(moqr_bind_t *b, b_conn_t *cn, const moqr_park_req_t *v,
             }
             break;
         }
-        if (bind_grant_commit_ann(b, cn, gres, v->ns, v->session_cookie,
+        if (bind_grant_commit_ann(b, cn, gres, ans, v->session_cookie,
                                   now_us)) {
             moq_accept_namespace_cfg_t a;
             moq_accept_namespace_cfg_init(&a);
@@ -2528,8 +2647,7 @@ bind_resume(moqr_bind_t *b, b_conn_t *cn, const moqr_park_req_t *v,
         return;
     }
     /* Resume failed: reject the pending request rather than leave it hanging. */
-    bind_reject(b, cn, v->action, v->session_cookie,
-                MOQ_REQUEST_ERROR_INTERNAL_ERROR, now_us);
+    bind_reject_admission(b, cn, v->action, v->session_cookie, rc, now_us);
 }
 
 /* Handle a non-ALLOW result at a request site: DEFER parks (fail closed if the
@@ -2813,23 +2931,24 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
                                                now_us);
             break;
         }
+        /* From here on the stored copy, never the event's views: the
+         * announce may be retried after an intent drain, and executing an
+         * intent on this session can reset its event memory. */
+        moqr_ns_t ans = cn->anns[ann_slot].ns;
         moqr_result_t arc;
-        arc = bind_announce(b, cn, ns, np->ann._opaque, now_us);
+        arc = bind_announce(b, cn, ans, np->ann._opaque, now_us);
         if (arc != MOQR_OK) {
             ann_clear_slot(b, cn, (uint32_t)ann_slot);
             if (gres.gen != 0) {
                 moqr_core_grant_abort(b->core, gres);
             }
-            moq_reject_namespace_cfg_t rcfg;
-            moq_reject_namespace_cfg_init(&rcfg);
-            rcfg.error_code = MOQ_REQUEST_ERROR_INTERNAL_ERROR;
-            (void)moq_session_reject_namespace(cn->session, np->ann, &rcfg,
-                                               now_us);
+            bind_reject_admission(b, cn, MOQR_AUTH_PUBLISH_NAMESPACE,
+                                  np->ann._opaque, arc, now_us);
             break;
         }
         /* Announce succeeded. Commit the reservation (if any), undoing the
          * announce on the invariant commit failure. */
-        if (bind_grant_commit_ann(b, cn, gres, ns, np->ann._opaque, now_us)) {
+        if (bind_grant_commit_ann(b, cn, gres, ans, np->ann._opaque, now_us)) {
             moq_accept_namespace_cfg_t acfg;
             moq_accept_namespace_cfg_init(&acfg);
             if (moq_session_accept_namespace(cn->session, np->ann, &acfg,
@@ -2903,8 +3022,10 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
         }
         moqr_subscribe_req_t req;
         moqr_subscribe_req_init(&req);
+        moq_bytes_t sname = sq->track_name;
+        bind_stash_ftn(b, &sns, &sname);
         req.ns = sns;
-        req.name = sq->track_name;
+        req.name = sname;
         if (sq->filter != MOQ_SUBSCRIBE_FILTER_NONE) {
             req.filter.type = (moqr_filter_type_t)sq->filter;
             req.filter.start_group = sq->start_group;
@@ -2926,11 +3047,8 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
             if (gres.gen != 0) {
                 moqr_core_grant_abort(b->core, gres);
             }
-            moq_reject_subscribe_cfg_t rj;
-            bind_reject_subscribe_cfg_init(&rj,
-                                           MOQ_REQUEST_ERROR_INTERNAL_ERROR);
-            (void)moq_session_reject_subscribe(cn->session, sq->sub, &rj,
-                                               now_us);
+            bind_reject_admission(b, cn, MOQR_AUTH_SUBSCRIBE, sq->sub._opaque,
+                                  src, now_us);
             break;
         }
         /* Subscribe succeeded; the ACCEPT_SUB flows through intents. Commit the
@@ -2994,7 +3112,7 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
          * scheduling only (control stays live), Forward=1 resumes. An update
          * omitting FORWARD (has_forward=0) leaves state unchanged. Priority /
          * delivery-timeout / new-group changes on this event are NOT applied
-         * here (separate audit item, out of scope for this slice). */
+         * here: this handler applies FORWARD only. */
         const moq_subscribe_updated_event_t *up = &ev->u.subscribe_updated;
         if (up->has_forward) {
             uint64_t raw = up->sub._opaque;
@@ -3303,6 +3421,7 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
             break;
         }
         moqr_result_t nrc;
+        bind_stash_ftn(b, &prefix, NULL);
         BIND_CALL_RETRY(nrc, moqr_core_ns_subscribe(
             b->core, cn->binding, prefix, nq->handle._opaque));
         if (nrc == MOQR_OK) {
@@ -3313,11 +3432,8 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
                 b->session_errors++;
             }
         } else {
-            moq_reject_ns_sub_cfg_t rcfg;
-            moq_reject_ns_sub_cfg_init(&rcfg);
-            rcfg.error_code = MOQ_REQUEST_ERROR_INTERNAL_ERROR;
-            (void)moq_session_reject_ns_sub(cn->session, nq->handle, &rcfg,
-                                            now_us);
+            bind_reject_admission(b, cn, MOQR_AUTH_SUBSCRIBE_NAMESPACE,
+                                  nq->handle._opaque, nrc, now_us);
         }
         break;
     }
@@ -3340,8 +3456,10 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
             break;
         }
         moqr_result_t trc;
+        moq_bytes_t tname = tq->track_name;
+        bind_stash_ftn(b, &ns, &tname);
         BIND_CALL_RETRY(trc, moqr_core_track_status(
-            b->core, cn->binding, ns, tq->track_name, tq->handle._opaque));
+            b->core, cn->binding, ns, tname, tq->handle._opaque));
         if (trc != MOQR_OK) {
             /* A ring-full status request would otherwise leave the peer
              * waiting forever; the invariant + drain makes trc==OK, but
@@ -3373,15 +3491,13 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
         }
         moqr_track_t track;
         moqr_result_t prc;
+        moq_bytes_t pname = pq->track_name;
+        bind_stash_ftn(b, &ns, &pname);
         BIND_CALL_RETRY(prc, moqr_core_publish_open(
-            b->core, cn->binding, ns, pq->track_name, pq->pub._opaque,
-            &track));
+            b->core, cn->binding, ns, pname, pq->pub._opaque, &track));
         if (prc != MOQR_OK) {
-            moq_reject_publish_cfg_t rj;
-            moq_reject_publish_cfg_init(&rj);
-            rj.error_code = MOQ_REQUEST_ERROR_INTERNAL_ERROR;
-            (void)moq_session_reject_publish(cn->session, pq->pub, &rj,
-                                             now_us);
+            bind_reject_admission(b, cn, MOQR_AUTH_PUBLISH, pq->pub._opaque,
+                                  prc, now_us);
         }
         break;
     }
@@ -3446,10 +3562,17 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
         freq.cookie = fq->fetch._opaque;
         moqr_fetch_t cfetch;
         moqr_fetch_plan_t plan;
-        if (moqr_core_fetch_open(b->core, cn->binding, &freq, now_us, &cfetch,
-                                 &plan) != MOQR_OK) {
+        moqr_result_t forc = moqr_core_fetch_open(b->core, cn->binding, &freq,
+                                                  now_us, &cfetch, &plan);
+        if (forc != MOQR_OK) {
             moq_reject_fetch_cfg_init(&rj);
-            rj.error_code = MOQ_REQUEST_ERROR_INTERNAL_ERROR;   /* pool full */
+            if (forc == MOQR_ERR_CAPACITY) {   /* fetch pool full of live fetches */
+                rj.error_code = bind_capacity_error(cn);
+                rj.can_retry = true;
+                rj.retry_after_ms = bind_capacity_retry_ms(fq->fetch._opaque);
+            } else {
+                rj.error_code = MOQ_REQUEST_ERROR_INTERNAL_ERROR;
+            }
             (void)moq_session_reject_fetch(cn->session, fq->fetch, &rj, now_us);
             break;
         }
@@ -3627,7 +3750,13 @@ bind_try_intent(moqr_bind_t *b, const moqr_intent_t *it, uint64_t now_us,
     case MOQR_INTENT_REJECT_SUB: {
         moq_subscription_t ssub = { it->cookie };
         moq_reject_subscribe_cfg_t cfg;
-        bind_reject_subscribe_cfg_init(&cfg, it->error_code);
+        if (it->error_code == MOQR_REQUEST_ERROR_CAPACITY) {
+            bind_reject_subscribe_cfg_init(&cfg, bind_capacity_error(cn));
+            cfg.can_retry = true;
+            cfg.retry_after_ms = bind_capacity_retry_ms(it->cookie);
+        } else {
+            bind_reject_subscribe_cfg_init(&cfg, it->error_code);
+        }
         if (moq_session_reject_subscribe(cn->session, ssub, &cfg, now_us) ==
             MOQ_ERR_WOULD_BLOCK) {
             *defer = *it;

@@ -2167,7 +2167,7 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
                                     _Alignof(max_align_t));
     size_t prof_align  = profile->state_align > 0 ? profile->state_align : 1;
     size_t off_profile = ALIGN_UP(off_evscratch + scratch_cap, prof_align);
-    /* No-owner admission carriers (#245b). Allocated in the session arena at
+    /* No-owner admission carriers. Allocated in the session arena at
      * create time so installing one during ingress can NEVER fail on
      * allocation: a refused no-owner request bidi always has a durable,
      * discoverable retry identity, so the bridge never fatalizes a retainable
@@ -2263,7 +2263,7 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
     s->recv_cap   = recv_cap;
     s->subs       = (moq_sub_entry_t *)(mem + off_subs);
     s->sub_cap    = sub_cap;
-    /* No-slot admission carriers (#245b): arena-backed (never allocation-fails
+    /* No-slot admission carriers: arena-backed (never allocation-fails
      * during ingress), bounded by the total request-owner lifecycle capacity. */
     s->noslot_carriers      = (moq_noslot_carrier_t *)(mem + off_noslot_carrier);
     s->noslot_carrier_cap   = noslot_carrier_cap;
@@ -2996,12 +2996,13 @@ bool moq_session_has_transport_stream(const moq_session_t *s, moq_stream_ref_t r
      * is keyed by stream ref: recognised through the request registry's
      * by-streamref lookup, which returns the packed endpoint the registry holds
      * for that ref. Without this, a retained request-stream WOULD_BLOCK is
-     * fatalized by the bridge (#245a). The lookup reports whatever ownership the
+     * fatalized by the bridge. The lookup reports whatever ownership the
      * registry carries for the ref; it does not independently revalidate a
-     * stale slot (the ordinal-0 cross-owner question is #252, out of scope). */
+     * stale slot (an ordinal-0 request id shared across owners is not
+     * disambiguated here). */
     if (request_registry_find_by_streamref(s, ref).kind != MOQ_REQ_NONE)
         return true;
-    /* A no-slot admission carrier (#245b): the request has no owner yet, but a
+    /* A no-slot admission carrier: the request has no owner yet, but a
      * fixed terminal is durably owed on this stream, so the bridge must retain
      * its retry rather than fatalize it. */
     if (noslot_carrier_find(s, ref) >= 0)
@@ -3028,7 +3029,8 @@ bool moq_session_can_admit_data_stream(const moq_session_t *s)
  * the PEER's terminal still owed here? This excludes a live request-registry
  * owner -- a local-origin request bidi the app itself FIN'd must retire even
  * while its owner lingers awaiting a response -- but keeps the peer-origin
- * receive paths and the two #245 peer-terminal-awaiting signals. */
+ * receive paths and the two peer-terminal-awaiting signals: a no-slot
+ * admission carrier and a drain-ring entry. */
 bool moq_session_stream_awaits_peer_terminal(const moq_session_t *s,
                                              moq_stream_ref_t ref)
 {

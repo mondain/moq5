@@ -123,8 +123,8 @@ jobs:
         run: scripts/check_swift_buffer_sendable.sh
 
       # Runs the full ungated suite, including the security regression coverage
-      # for findings 4, 6, 7 (`TrackEventBacklogTests`, `ChildTrapProbeTests`),
-      # which now pass against the product fixes.
+      # for the track-event backlog bound and the player decoder input checks
+      # (`TrackEventBacklogTests`, `ChildTrapProbeTests`).
       - name: Swift test
         run: swift test
 
@@ -224,11 +224,11 @@ jobs:
       # (the MoQ-linking test targets run in the ungated swift-binding job;
       # they cannot share a test bundle with MoQService -- that is the
       # duplicate-symbol canary working).
-      # Runs the gated suite, including the finding-5 video-dimension security
-      # regression coverage (`ServiceDimensionTests`, service stack), which now
-      # passes against the product guard. The finding-4/6/7 source-stack suites
-      # run in the ungated swift-binding job (they cannot share this service
-      # test bundle -- the moq_swift_stack_guard duplicate-symbol canary).
+      # Runs the gated suite, including the video-dimension security
+      # regression coverage (`ServiceDimensionTests`, service stack). The
+      # backlog and decoder source-stack suites run in the ungated
+      # swift-binding job (they cannot share this service test bundle -- the
+      # moq_swift_stack_guard duplicate-symbol canary).
       - name: Gated Swift test (MOQ_SERVICE=1)
         run: MOQ_SERVICE=1 swift test
         env:
@@ -444,10 +444,12 @@ jobs:
       # The 0x10 hard-failure teardown regression lives in pico_wt_loopback;
       # pico_wt_conformance covers the WebTransport scenario suite and
       # pico_wt_public_compile proves the standalone public header.
+      # pq_reset_after_fin pins the patched picoquic's reset-after-FIN
+      # behaviour; it needs picoquic-test, which this lane builds.
       - name: Test (pico_wt regression + conformance)
         run: >
           ctest --test-dir build/pico-wt-ci --output-on-failure
-          -R '^(pico_wt_public_compile|pico_wt_capsule_sequence|pico_wt_loopback|pico_wt_conformance|pico_wt_managed_keepalive|pico_wt_managed_keepalive_server|pico_wt_managed_stop_close|pico_wt_managed_pump_exit_close|pico_wt_managed_cfg_abi)$'
+          -R '^(pq_reset_after_fin|pico_wt_public_compile|pico_wt_capsule_sequence|pico_wt_loopback|pico_wt_conformance|pico_wt_managed_keepalive|pico_wt_managed_keepalive_server|pico_wt_managed_stop_close|pico_wt_managed_pump_exit_close|pico_wt_managed_cfg_abi)$'
 
       - name: Configure (mbedTLS-only)
         run: >
@@ -608,6 +610,8 @@ jobs:
         run: scripts/check_api_boundary.sh
       - name: Profile boundary
         run: scripts/check_profile_boundary.sh
+      - name: Process labels
+        run: scripts/check_process_labels.sh
 
   seed-sweep-quick:
     name: Seed Sweep (quick)

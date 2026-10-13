@@ -1150,8 +1150,9 @@ static moq_result_t handle_publish_stream_bytes(moq_session_t *s, int slot,
  * there as transitional ownership and drive that family's own FIN handling --
  * the same handler a later wire FIN would reach. Nothing here decides the
  * outcome: a family whose teardown blocks on capacity keeps the marker and is
- * resumed by an empty re-feed, which routes back to the same handler. Families
- * outside this slice keep their existing behavior. */
+ * resumed by an empty re-feed, which routes back to the same handler. Only the
+ * families dispatched below take part; any other kind returns MOQ_OK
+ * untouched. */
 static moq_result_t request_stream_handoff_fin(moq_session_t *s,
                                                 moq_stream_ref_t stream_ref,
                                                 moq_request_endpoint_t dest)
@@ -1204,7 +1205,7 @@ static bool request_stream_handoff_fin_install(moq_session_t *s,
     }
 }
 
-/* -- No-slot admission carriers (#245b) ----------------------------- *
+/* -- No-slot admission carriers ------------------------------------ *
  * A bounded, session-owned record of a no-slot request-bidi terminal that is
  * owed but not yet emittable. Storage is arena-backed in the session slab at
  * create time (never lazily allocated), so installing one during ingress cannot
@@ -1419,7 +1420,7 @@ moq_result_t handle_request_stream_bytes(moq_session_t *s,
     int slot = (ep.kind == MOQ_REQ_SUBSCRIPTION) ? ep.slot : -1;
 
     if (slot < 0) {
-        /* A no-slot terminal already owed on this bidi (#245b): re-drive it
+        /* A no-slot terminal already owed on this bidi: re-drive it
          * from the durable carrier, folding in whatever FIN was recorded, and
          * without ever re-staging or redelivering peer bytes. Checked BEFORE
          * the empty-input early return so the documented empty re-feed reaches

@@ -1,0 +1,164 @@
+Let a local stream be reset after its FIN is sent, until the FIN is ACKed.
+
+RFC 9000 Section 3.1 allows RESET_STREAM in the "Data Sent" state: the FIN
+has been sent but not every byte and the FIN are acknowledged. Upstream
+refuses that reset, because its "already closed" check reads fin_offset,
+which is set only from received frames, and because a sent FIN has already
+removed the stream from the output list, so an accepted reset would never
+be formatted. The draft-18 subgroup DELIVERY_TIMEOUT needs this reset.
+
+- picoquic_reset_stream_at refuses only when no reset is pending and the
+  sent bytes and FIN are all acknowledged (sent_offset), the terminal
+  "Data Recvd" state. It clears the application stream context only when
+  it accepts, and puts the stream back on the output list.
+- It refuses a Reliable Size above the stream's Final Size with
+  PICOQUIC_ERROR_OFFSET_TOO_BIG (the upstream code and value). Bytes
+  already queued but not yet sent count toward the Final Size, since they
+  are sent before the reset; picowt_reset_stream() can reset a stream
+  whose preamble is still queued.
+- The scheduler keeps a stream whose FIN is sent while a reset is pending,
+  so a reliable reset waiting for its prefix ACK is still sent later.
+- When an ACK completes every byte and the FIN while the reset is still
+  unsent, the stream has reached "Data Recvd": the reset is dropped and
+  the stream retires as a completed one. A reset already sent still waits
+  for its own ACK.
+- An ACK of an empty non-FIN STREAM frame records nothing, instead of
+  underflowing to a SACK range that covers the whole stream.
+- ACKs of RESET_STREAM_AT reach the existing retirement handler, which now
+  consumes the Reliable Size field so later frames in the same packet are
+  still parsed.
+- A received RESET_STREAM_AT whose Reliable Size exceeds its Final Size
+  closes the connection with FRAME_ENCODING_ERROR, as
+  draft-ietf-quic-reliable-stream-reset Section 4 requires.
+
+Applies to picoquic 55b473e207e436d06ea9a2895cc1fc555d42c81c, after 0001.
+Tests: adapters/picoquic/tests/test_pq_reset_after_fin.c (CTest
+pq_reset_after_fin), with constructed stream/SACK rows and packet rows over
+the simulated links.
+
+diff --git a/picoquic/frames.c b/picoquic/frames.c
+--- a/picoquic/frames.c
++++ b/picoquic/frames.c
+@@ -494,6 +494,12 @@ const uint8_t* picoquic_decode_reset_stream_at_frame(picoquic_cnx_t* cnx, const
+         picoquic_connection_error(cnx, PICOQUIC_TRANSPORT_FRAME_FORMAT_ERROR,
+             picoquic_frame_type_reset_stream);
+     }
++    else if (reliable_size > final_offset) {
++        /* draft-ietf-quic-reliable-stream-reset Section 4 */
++        picoquic_connection_error(cnx, PICOQUIC_TRANSPORT_FRAME_FORMAT_ERROR,
++            picoquic_frame_type_reset_stream_at);
++        bytes = NULL;
++    }
+     else {
+         bytes = picoquic_apply_reset_stream_frame(cnx, bytes, error_code_64, stream_id, final_offset, reliable_size);
+     }
+@@ -509,10 +515,14 @@ int picoquic_process_ack_of_reset_stream_at_frame(picoquic_cnx_t* cnx, const uin
+     picoquic_stream_head_t* stream;
+ 
+     if ((bytes = picoquic_frames_varint_decode(bytes + 1, bytes_max, &stream_id)) != NULL) {
++        /* Error Code, Final Size and Reliable Size */
+         bytes = picoquic_frames_varint_skip(bytes, bytes_max);
+         if (bytes != NULL) {
+             bytes = picoquic_frames_varint_skip(bytes, bytes_max);
+         }
++        if (bytes != NULL) {
++            bytes = picoquic_frames_varint_skip(bytes, bytes_max);
++        }
+     }
+     if (bytes == NULL) {
+         /* Internal error -- cannot parse the stored packet */
+@@ -3586,10 +3596,19 @@ int picoquic_process_ack_of_stream_frame(picoquic_cnx_t* cnx, uint8_t* bytes,
+ 
+         /* record the ack range for the stream */
+         stream = picoquic_find_stream(cnx, stream_id);
+-        if (stream != NULL) {
++        if (stream != NULL && (data_length != 0 || fin)) {
+             (void)picoquic_update_sack_list(&stream->sack_list,
+                 offset, offset + data_length - ((fin) ? 0 : 1), 0);
+ 
++            if (stream->reset_requested && !stream->reset_sent && stream->fin_sent &&
++                stream->reliable_size <= stream->sent_offset &&
++                picoquic_check_sack_list(&stream->sack_list, 0, stream->sent_offset)) {
++                /* Every byte and the FIN are acknowledged: "Data Recvd" is
++                 * terminal (RFC 9000 Section 3.1), so the unsent reset is
++                 * dropped and the stream retires as a completed one. */
++                stream->reset_requested = 0;
++            }
++
+             picoquic_delete_stream_if_closed(cnx, stream);
+         }
+     }
+@@ -3687,6 +3706,10 @@ void picoquic_process_ack_of_frames(picoquic_cnx_t* cnx, picoquic_packet_t* p,
+             ret = picoquic_process_ack_of_reset_stream_frame(cnx, &p->bytes[byte_index], p->length - byte_index, &frame_length);
+             byte_index += frame_length;
+             break;
++        case picoquic_frame_type_reset_stream_at:
++            ret = picoquic_process_ack_of_reset_stream_at_frame(cnx, &p->bytes[byte_index], p->length - byte_index, &frame_length);
++            byte_index += frame_length;
++            break;
+         case picoquic_frame_type_max_path_id:
+             ret = picoquic_process_ack_of_max_path_id_frame(cnx, &p->bytes[byte_index], p->length - byte_index, &frame_length);
+             byte_index += frame_length;
+diff --git a/picoquic/picoquic.h b/picoquic/picoquic.h
+--- a/picoquic/picoquic.h
++++ b/picoquic/picoquic.h
+@@ -113,6 +113,7 @@ extern "C" {
+ #define PICOQUIC_ERROR_REDIRECTED (PICOQUIC_ERROR_CLASS + 69) /* Not an error: the packet was captured by a proxy, no further processing needed */
+ #define PICOQUIC_ERROR_PADDING_PACKET (PICOQUIC_ERROR_CLASS + 70)
+ #define PICOQUIC_ERROR_PACKET_TOO_BIG (PICOQUIC_ERROR_CLASS + 71)
++#define PICOQUIC_ERROR_OFFSET_TOO_BIG (PICOQUIC_ERROR_CLASS + 72)
+ /*
+  * Protocol errors defined in the QUIC spec
+  */
+diff --git a/picoquic/streams.c b/picoquic/streams.c
+--- a/picoquic/streams.c
++++ b/picoquic/streams.c
+@@ -401,14 +401,32 @@ int picoquic_reset_stream_at(picoquic_cnx_t* cnx,
+         ret = PICOQUIC_ERROR_INVALID_STREAM_ID;
+     }
+     else {
+-        stream->app_stream_ctx = NULL;
+-        if (stream->fin_sent && picoquic_check_sack_list(&stream->sack_list, 0, stream->fin_offset) == 0) {
++        if (!stream->reset_requested && stream->fin_sent &&
++            picoquic_check_sack_list(&stream->sack_list, 0, stream->sent_offset)) {
+             ret = PICOQUIC_ERROR_STREAM_ALREADY_CLOSED;
+         }
+         else if (!stream->reset_requested) {
+-            stream->local_error = local_stream_error;
+-            stream->reset_requested = 1;
+-            stream->reliable_size = reliable_size;
++            /* The Reliable Size cannot exceed the Final Size. Bytes already
++             * queued but not yet sent still count: they go out before the
++             * reset, and picowt_reset_stream() covers a queued preamble. */
++            uint64_t committed = stream->sent_offset;
++            picoquic_stream_queue_node_t* queued = stream->send_queue;
++            while (queued != NULL) {
++                committed += queued->length - queued->offset;
++                queued = queued->next_stream_data;
++            }
++            if (reliable_size > committed) {
++                ret = PICOQUIC_ERROR_OFFSET_TOO_BIG;
++            }
++            else {
++                stream->app_stream_ctx = NULL;
++                stream->local_error = local_stream_error;
++                stream->reset_requested = 1;
++                stream->reliable_size = reliable_size;
++                /* FIN submission may already have removed this stream from the
++                 * output list. A reset pending its ACK must be schedulable. */
++                picoquic_insert_output_stream(cnx, stream);
++            }
+         }
+     }
+ 
+@@ -887,7 +905,9 @@ picoquic_stream_head_t* picoquic_find_ready_stream_path(picoquic_cnx_t* cnx, pic
+                 }
+             }
+         }
+-        else if (((stream->fin_requested && stream->fin_sent) || (stream->reset_requested && stream->reset_sent)) && (!stream->stop_sending_requested || stream->stop_sending_sent)) {
++        else if (((stream->fin_requested && stream->fin_sent && !stream->reset_requested) ||
++            (stream->reset_requested && stream->reset_sent)) &&
++            (!stream->stop_sending_requested || stream->stop_sending_sent)) {
+             /* If stream is exhausted, remove from output list */
+             picoquic_remove_output_stream(cnx, stream);
+ 

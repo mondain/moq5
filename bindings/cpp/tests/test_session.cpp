@@ -636,8 +636,8 @@ int main()
     // (which calls moq_event_cleanup / moq_action_cleanup). White-box: build the
     // polled object over a WRAPPED rcbuf whose release callback flips `freed`,
     // save the variant past the polled object's scope, and assert the buffer is
-    // NOT freed -- a deterministic lifetime check (independent of ASan). Pre-fix
-    // the variant copied an unowned raw pointer, so `freed` would already be true.
+    // NOT freed -- a deterministic lifetime check (independent of ASan). A variant
+    // that copied an unowned raw pointer would leave `freed` already true.
     {
         const moq_alloc_t *al = moq_alloc_default();
         static const uint8_t data[4] = {0xCA, 0xFE, 0xBA, 0xBE};

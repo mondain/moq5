@@ -146,8 +146,11 @@ typedef struct r_sub_baseline {
 _Static_assert(sizeof(r_sub_t) == sizeof(r_sub_baseline_t) +
                                       2 * sizeof(uint32_t),
                "track_next/track_prev must cost exactly 8 bytes per sub");
-_Static_assert(sizeof(r_track_t) == sizeof(r_track_baseline_t),
-               "subs_head must fit existing r_track_t padding (0-byte delta)");
+/* subs_head fits former padding (0 bytes); the reclaim bookkeeping
+ * (interest_seq + idle_since_us) costs exactly 16 bytes per track. */
+_Static_assert(sizeof(r_track_t) == sizeof(r_track_baseline_t) +
+                                        2 * sizeof(uint64_t),
+               "r_track_t grows only by the two reclaim words");
 
 /* -- The oracle ------------------------------------------------------------ */
 
@@ -173,7 +176,7 @@ oracle_scan_count(const moqr_core_t *c, uint32_t tslot)
 }
 
 /* Validate one track's index against the scan oracle. Returns NULL when
- * consistent, else a static string naming the SPECIFIC violation (the RED
+ * consistent, else a static string naming the SPECIFIC violation (the failure
  * signatures key off these). */
 static const char *
 index_check(const moqr_core_t *c, uint32_t tslot, bool *seen /* max_subs */)
@@ -729,6 +732,81 @@ test_index_capacity_delta(void)
     return failures;
 }
 
+/* -- Generation wrap ---------------------------------------------------------- */
+
+/* Every pool's slot generation steps within the 28-bit handle field and
+ * wraps: a slot at the top of the range still mints a valid, nonzero handle,
+ * and its next lives start over at the bottom, with every handle from before
+ * the wrap stale. Covers tracks (free/create and the retained-generation
+ * replace), bindings and subscriptions. */
+static int
+test_generation_wrap(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, 4, 1);
+    MOQ_TEST_CHECK(c != NULL);
+    moq_bytes_t nsp[1] = { { (const uint8_t *)"g", 1 } };
+    moqr_ns_t ns = { nsp, 1 };
+    moq_bytes_t name = { (const uint8_t *)"t", 1 };
+    moqr_intent_t its[8];
+
+    /* Bindings: the last odd generation, then the wrap to 0 and 1. */
+    c->bindings[0].gen = R_GEN_MASK - 1u;
+    moqr_binding_t pb;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 1, &pb) == MOQR_OK);
+    MOQ_TEST_CHECK(pb._opaque != 0 && moqr_binding_is_valid(pb));
+    MOQ_TEST_CHECK_EQ_U64(c->bindings[0].gen, R_GEN_MASK);
+    MOQ_TEST_CHECK(moqr_core_binding_close(c, pb, 1) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(c->bindings[0].gen, 0);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 1, &pb) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(c->bindings[0].gen, 1);
+    MOQ_TEST_CHECK(moqr_binding_is_valid(pb));
+
+    /* Tracks: create at the top, free (empty) wraps to 0, create is 1. */
+    c->tracks[0].gen = R_GEN_MASK - 1u;
+    moqr_track_t t1;
+    MOQ_TEST_CHECK(moqr_core_publish_open(c, pb, ns, name, 7, &t1) == MOQR_OK);
+    (void)moqr_core_poll_intents(c, its, 8);
+    MOQ_TEST_CHECK(t1._opaque != 0);
+    MOQ_TEST_CHECK_EQ_U64(c->tracks[0].gen, R_GEN_MASK);
+    MOQ_TEST_CHECK(ing(c, &a, t1, 0, 0) == MOQR_OK);
+    moqr_pd_desc_t done;
+    MOQ_TEST_CHECK(moqr_pd_desc_local(MOQR_PD_TRACK_ENDED, &done) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_source_done(c, t1, 1, done, 2) == MOQR_OK);
+    /* WARM with a record at the top generation; re-PUBLISH replaces the
+     * retained generation (two steps): R_GEN_MASK -> 0 -> 1. */
+    moqr_track_t t2;
+    MOQ_TEST_CHECK(moqr_core_publish_open(c, pb, ns, name, 8, &t2) == MOQR_OK);
+    (void)moqr_core_poll_intents(c, its, 8);
+    MOQ_TEST_CHECK_EQ_U64(c->tracks[0].gen, 1);
+    MOQ_TEST_CHECK(t2._opaque != 0 && t2._opaque != t1._opaque);
+    MOQ_TEST_CHECK(ing(c, &a, t1, 1, 0) == MOQR_ERR_STALE_HANDLE);
+    MOQ_TEST_CHECK(ing(c, &a, t2, 0, 0) == MOQR_OK);
+
+    /* Subscriptions. */
+    c->subs[0].gen = R_GEN_MASK - 1u;
+    moqr_subscribe_req_t rq;
+    moqr_subscribe_req_init(&rq);
+    rq.ns = ns;
+    rq.name = name;
+    rq.cookie = 3;
+    moqr_sub_t sub;
+    MOQ_TEST_CHECK(moqr_core_subscribe(c, pb, &rq, &sub) == MOQR_OK);
+    (void)moqr_core_poll_intents(c, its, 8);
+    MOQ_TEST_CHECK(moqr_sub_is_valid(sub));
+    MOQ_TEST_CHECK_EQ_U64(c->subs[0].gen, R_GEN_MASK);
+    MOQ_TEST_CHECK(moqr_core_unsubscribe(c, sub, 3) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(c->subs[0].gen, 0);
+    MOQ_TEST_CHECK(moqr_core_unsubscribe(c, sub, 4) == MOQR_ERR_STALE_HANDLE);
+
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("generation_wrap");
+    return failures;
+}
+
 int
 main(void)
 {
@@ -736,6 +814,7 @@ main(void)
     failures += test_index_lifecycle();
     failures += test_index_random_churn();
     failures += test_index_capacity_delta();
+    failures += test_generation_wrap();
     if (failures != 0) {
         fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

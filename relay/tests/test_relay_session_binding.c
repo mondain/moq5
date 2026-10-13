@@ -324,6 +324,10 @@ static uint32_t g_test_grant_bytes = 0;
  * the core's concurrent-fetch pool (which sizes the forwarding transactions). */
 static uint64_t g_test_fetch_forward_bytes = 0;
 static uint32_t g_test_max_fetches = 0;
+/* 0 = leave the core's default track-table size. */
+static uint32_t g_test_max_tracks = 0;
+/* 0 = leave the core's default namespace-trie size. */
+static uint32_t g_test_max_ns_nodes = 0;
 
 static moqr_result_t
 rig_create_ex(rig_t *r, ca_t *a, uint32_t bind_dsubs, uint32_t bind_usubs,
@@ -351,6 +355,12 @@ rig_create_ex(rig_t *r, ca_t *a, uint32_t bind_dsubs, uint32_t bind_usubs,
     }
     if (g_test_max_fetches != 0) {
         cfg.max_fetches = g_test_max_fetches;
+    }
+    if (g_test_max_tracks != 0) {
+        cfg.max_tracks = g_test_max_tracks;
+    }
+    if (g_test_max_ns_nodes != 0) {
+        cfg.max_ns_nodes = g_test_max_ns_nodes;
     }
     if (moqr_core_create(&cfg, &r->core) != MOQR_OK) {
         moqr_trace_destroy(r->trace);
@@ -467,6 +477,8 @@ typedef struct peer_state {
     bool               session_closed;
     uint64_t           close_code;
     uint64_t           sub_error_code;
+    bool               sub_error_can_retry;
+    uint64_t           sub_error_retry_ms;
     size_t             sub_error_reason_len;
     bool               sub_error_reason_truncated;
     uint8_t            sub_error_reason[64];
@@ -474,6 +486,8 @@ typedef struct peer_state {
     uint64_t           ts_error_code;
     int                ns_rejected;
     uint64_t           ns_rejected_code;
+    bool               ns_rejected_can_retry;
+    uint64_t           ns_rejected_retry_ms;
     char               ns_rejected_reason[64];
     int                ns_sub_error;
     uint64_t           ns_sub_error_code;
@@ -550,6 +564,8 @@ peer_drain(rig_t *r, conn_t *cn, peer_state_t *ps, bool auto_accept,
             case MOQ_EVENT_SUBSCRIBE_ERROR:
                 ps->subscribe_errors++;
                 ps->sub_error_code = ev->u.subscribe_error.error_code;
+                ps->sub_error_can_retry = ev->u.subscribe_error.can_retry;
+                ps->sub_error_retry_ms = ev->u.subscribe_error.retry_after_ms;
                 ps->sub_error_reason_len = ev->u.subscribe_error.reason.len;
                 if (ps->sub_error_reason_len > sizeof(ps->sub_error_reason)) {
                     ps->sub_error_reason_len = sizeof(ps->sub_error_reason);
@@ -574,6 +590,9 @@ peer_drain(rig_t *r, conn_t *cn, peer_state_t *ps, bool auto_accept,
             case MOQ_EVENT_NAMESPACE_REJECTED:
                 ps->ns_rejected++;
                 ps->ns_rejected_code = ev->u.namespace_rejected.error_code;
+                ps->ns_rejected_can_retry = ev->u.namespace_rejected.can_retry;
+                ps->ns_rejected_retry_ms =
+                    ev->u.namespace_rejected.retry_after_ms;
                 break;
             case MOQ_EVENT_NAMESPACE_ACCEPTED:
                 ps->namespace_accepted = true;
@@ -3130,7 +3149,7 @@ test_reval_conn_close_retires(void)
     return f;
 }
 
-/* Finding #1: an async ALLOW that carries a lease (a DEFER resolved with
+/* An async ALLOW that carries a lease (a DEFER resolved with
  * ALLOW + revalidate_after_us) must create a revalidation grant, exactly like a
  * synchronous ALLOW — otherwise an async-approved subscription is permanently
  * authorized. Proof over real sessions: DEFER a subscribe, resolve it ALLOW +
@@ -3216,7 +3235,7 @@ test_reval_resume_creates_grant(void)
     return f;
 }
 
-/* Finding #2: a publisher-side cancel that hits session backpressure
+/* A publisher-side cancel that hits session backpressure
  * (cancel_namespace WOULD_BLOCK) must not be lost. The core grant is peeked, not
  * drained, so the cancel is retried each pump until it lands. Constrain the
  * action queue and keep it full with unrelated responses across the revoke
@@ -3808,7 +3827,7 @@ test_upstream_goaway_terminates_downstream(void)
  * relay) WITHOUT pumping the binding — so several peer messages can be staged
  * into a single subsequent bind pump. */
 static void
-red_deliver(rig_t *r, conn_t *cn)
+deliver_without_pump(rig_t *r, conn_t *cn)
 {
     r->now += 1000;
     (void)moq_simpair_advance_to(cn->sp, r->now);
@@ -3822,7 +3841,7 @@ red_deliver(rig_t *r, conn_t *cn)
  * subscribe to a WARM track is the fan-out that emits ACCEPT_SUB THEN
  * UPSTREAM_SUBSCRIBE (relay.c:1935/1952) — the scalar-then-borrowed pairing. */
 static void
-red_warm_track(rig_t *r, conn_t *pub, conn_t *sub, moq_bytes_t ns2)
+warm_track(rig_t *r, conn_t *pub, conn_t *sub, moq_bytes_t ns2)
 {
     moq_bytes_t nsp[2] = { B("live"), ns2 };
     moq_publish_namespace_cfg_t pcfg;
@@ -3906,15 +3925,15 @@ borrowed_intent_never_parked(void)
     /* Warm the tracks with a ROOMY subscriber (WARM is a track-side state, so a
      * different, depth-1 subscriber can later rejoin it — this decouples the
      * easy setup from the depth-1 pressure the rejoin needs). */
-    red_warm_track(&rig, pub, warm, B("a"));
-    red_warm_track(&rig, pub, warm, B("b"));
+    warm_track(&rig, pub, warm, B("a"));
+    warm_track(&rig, pub, warm, B("b"));
 
     moqr_bind_stats_t bs;
     moqr_bind_get_stats(rig.bind, &bs);
     R_CHECK(&rig, bs.pending_nonscalar_blocked == 0);   /* clean after setup   */
 
     /* Stage BOTH warm-rejoin subscribes (from the depth-1 sub) into the relay
-     * before it pumps. red_deliver drains the depth-1 peer queue between them. */
+     * before it pumps. deliver_without_pump drains the depth-1 peer queue between them. */
     moq_subscribe_cfg_t rc;
     memset(&rc, 0, sizeof(rc));
     moq_subscribe_cfg_init(&rc);
@@ -3925,13 +3944,13 @@ borrowed_intent_never_parked(void)
     rc.track_namespace = (moq_namespace_t){ .parts = nsa, .count = 2 };
     moq_subscription_t rha;
     R_CHECK(&rig, moq_session_subscribe(sub->peer, &rc, rig.now, &rha) == MOQ_OK);
-    red_deliver(&rig, sub);
+    deliver_without_pump(&rig, sub);
 
     moq_bytes_t nsb[2] = { B("live"), B("b") };
     rc.track_namespace = (moq_namespace_t){ .parts = nsb, .count = 2 };
     moq_subscription_t rhb;
     R_CHECK(&rig, moq_session_subscribe(sub->peer, &rc, rig.now, &rhb) == MOQ_OK);
-    red_deliver(&rig, sub);
+    deliver_without_pump(&rig, sub);
 
     /* One pump processes both rejoins on a full depth-1 downstream queue. */
     (void)moqr_bind_pump(rig.bind, rig.now);
@@ -3940,8 +3959,8 @@ borrowed_intent_never_parked(void)
     R_CHECK(&rig, bs.pending_nonscalar_blocked == 0);   /* THE invariant       */
     R_CHECK(&rig, bs.pending_high_water > 0);           /* a scalar DID block  */
 
-    /* Drain to quiescence (retries any parked scalar; under the pre-fix bug a
-     * parked UPSTREAM_SUBSCRIBE would dangle here — ASan-visible). */
+    /* Drain to quiescence (retries any parked scalar; a parked borrowed
+     * UPSTREAM_SUBSCRIBE would dangle here — ASan-visible). */
     rig_pump(&rig, 40);
     moqr_bind_get_stats(rig.bind, &bs);
     R_CHECK(&rig, bs.pending_nonscalar_blocked == 0);
@@ -4244,7 +4263,7 @@ intent_retry_reentry_preserves_outer_batch(void)
  * relay cannot currently reclaim: the object carries end_of_group=false, so the
  * downstream subgroup slot stays open forever. */
 static void
-red_pub_subgroup_plain_fin(rig_t *r, conn_t *pub, moq_subscription_t up_sub,
+pub_subgroup_plain_fin(rig_t *r, conn_t *pub, moq_subscription_t up_sub,
                            uint64_t group, uint64_t subgroup, uint64_t object_id)
 {
     moq_subgroup_cfg_t sgc;
@@ -4267,15 +4286,15 @@ red_pub_subgroup_plain_fin(rig_t *r, conn_t *pub, moq_subscription_t up_sub,
 }
 
 /* Subgroup-slot reclamation: a downstream subgroup slot pool of 2, fed THREE distinct
- * (group, subgroup) streams each ending in a plain FIN (no EOG). Before the fix
- * the relay froze a slot per (group, subgroup) until EOG/SUB_DONE, so the third
- * candidate hit `freei < 0` → WOULD_BLOCK forever (only two objects delivered,
- * no terminal). Now the upstream `MOQ_EVENT_SUBGROUP_FINISHED` seals the log
+ * (group, subgroup) streams each ending in a plain FIN (no EOG). A relay that
+ * held a slot per (group, subgroup) until EOG/SUB_DONE would leave the third
+ * candidate at `freei < 0` → WOULD_BLOCK forever (only two objects delivered,
+ * no terminal). The upstream `MOQ_EVENT_SUBGROUP_FINISHED` seals the log
  * subgroup and the acknowledged SEAL notice — the only durable FIN path
  * (records carry `subgroup_end` as advisory metadata) — closes the
  * downstream stream and reclaims the slot, so all three objects flow.
- * RED-verified: asserting `objects == 3` fails at two without the seal
- * pipeline. */
+ * `objects == 3` depends on the seal pipeline: without it delivery stops at
+ * two. */
 static int
 subgroup_slot_reclamation(void)
 {
@@ -4323,9 +4342,9 @@ subgroup_slot_reclamation(void)
     rig_pump(&rig, 4);
 
     /* Three distinct (group, subgroup) streams, each a plain FIN (no EOG). */
-    red_pub_subgroup_plain_fin(&rig, pub, pub_ps.up_sub, 0, 0, 0);
-    red_pub_subgroup_plain_fin(&rig, pub, pub_ps.up_sub, 1, 0, 0);
-    red_pub_subgroup_plain_fin(&rig, pub, pub_ps.up_sub, 2, 0, 0);
+    pub_subgroup_plain_fin(&rig, pub, pub_ps.up_sub, 0, 0, 0);
+    pub_subgroup_plain_fin(&rig, pub, pub_ps.up_sub, 1, 0, 0);
+    pub_subgroup_plain_fin(&rig, pub, pub_ps.up_sub, 2, 0, 0);
     rig_pump(&rig, 40);   /* generous: prove the stall is permanent, not slow */
     peer_drain(&rig, sub, &s_ps, false, false, 0, 0);
 
@@ -4350,7 +4369,7 @@ subgroup_slot_reclamation(void)
  * on the LAST record (a multi-object subgroup must deliver every object before
  * the downstream stream closes), and the EOG path still reclaims. */
 static void
-red_pub_subgroup_n(rig_t *r, conn_t *pub, moq_subscription_t up_sub,
+pub_subgroup_n(rig_t *r, conn_t *pub, moq_subscription_t up_sub,
                    uint64_t group, uint64_t subgroup, uint64_t n, bool eog)
 {
     moq_subgroup_cfg_t sgc;
@@ -4428,9 +4447,9 @@ subgroup_reclamation_shapes(void)
     R_CHECK(&rig, pub_ps.up_seen);
     rig_pump(&rig, 4);
 
-    red_pub_subgroup_n(&rig, pub, pub_ps.up_sub, 0, 0, 3, false); /* 3 obj, FIN */
-    red_pub_subgroup_n(&rig, pub, pub_ps.up_sub, 1, 0, 0, true);  /* EOG only   */
-    red_pub_subgroup_n(&rig, pub, pub_ps.up_sub, 2, 0, 1, false); /* 1 obj, FIN */
+    pub_subgroup_n(&rig, pub, pub_ps.up_sub, 0, 0, 3, false); /* 3 obj, FIN */
+    pub_subgroup_n(&rig, pub, pub_ps.up_sub, 1, 0, 0, true);  /* EOG only   */
+    pub_subgroup_n(&rig, pub, pub_ps.up_sub, 2, 0, 1, false); /* 1 obj, FIN */
     rig_pump(&rig, 40);
     peer_drain(&rig, sub, &s_ps, false, false, 0, 0);
 
@@ -4452,7 +4471,7 @@ subgroup_reclamation_shapes(void)
 /* Write one object on an already-open subgroup handle (the stream stays open —
  * no FIN, so no SUBGROUP_FINISHED / seal). */
 static void
-red_write_obj(rig_t *r, conn_t *pub, moq_subgroup_handle_t h, uint64_t object_id)
+pub_write_obj(rig_t *r, conn_t *pub, moq_subgroup_handle_t h, uint64_t object_id)
 {
     uint8_t body[4] = { (uint8_t)object_id, 0x11, 0x22, 0x33 };
     moq_rcbuf_t *pl = NULL;
@@ -4525,20 +4544,20 @@ subgroup_eviction_spares_live_lower_group(void)
     sc.subgroup_id = 0;
     R_CHECK(&rig, moq_session_open_subgroup(pub->peer, pub_ps.up_sub, &sc,
                                             rig.now, &h0) == MOQ_OK);
-    red_write_obj(&rig, pub, h0, 0);
+    pub_write_obj(&rig, pub, h0, 0);
     sc.group_id = 1;
     R_CHECK(&rig, moq_session_open_subgroup(pub->peer, pub_ps.up_sub, &sc,
                                             rig.now, &h1) == MOQ_OK);
-    red_write_obj(&rig, pub, h1, 0);
+    pub_write_obj(&rig, pub, h1, 0);
     rig_pump(&rig, 8);   /* deliver g0o0, g1o0: downstream subgroups 0,1 open */
 
     sc.group_id = 2;
     R_CHECK(&rig, moq_session_open_subgroup(pub->peer, pub_ps.up_sub, &sc,
                                             rig.now, &h2) == MOQ_OK);
-    red_write_obj(&rig, pub, h2, 0);   /* group 2 ingest evicts group 0 */
+    pub_write_obj(&rig, pub, h2, 0);   /* group 2 ingest evicts group 0 */
     rig_pump(&rig, 8);   /* the watermark notice is acknowledged, then group 2 */
 
-    red_write_obj(&rig, pub, h1, 1);   /* more data on the RETAINED group 1 */
+    pub_write_obj(&rig, pub, h1, 1);   /* more data on the RETAINED group 1 */
     rig_pump(&rig, 8);
     peer_drain(&rig, sub, &s_ps, false, false, 0, 0);
 
@@ -6726,8 +6745,8 @@ close_churn_pending_scalar(void)
     rig_pump(&rig, 4);
 
     /* Warm two tracks with a roomy subscriber (WARM is a track-side state). */
-    red_warm_track(&rig, pub, warm, B("a"));
-    red_warm_track(&rig, pub, warm, B("b"));
+    warm_track(&rig, pub, warm, B("a"));
+    warm_track(&rig, pub, warm, B("b"));
 
     /* Stage BOTH warm-rejoin subscribes from the depth-1 sub, then ONE pump so a
      * scalar (the 2nd rejoin's ACCEPT_SUB — this is exactly the queued
@@ -6742,13 +6761,13 @@ close_churn_pending_scalar(void)
     moq_subscription_t rha;
     R_CHECK(&rig, moq_session_subscribe(sub->peer, &rc, rig.now, &rha) ==
                       MOQ_OK);
-    red_deliver(&rig, sub);
+    deliver_without_pump(&rig, sub);
     moq_bytes_t nsb[2] = { B("live"), B("b") };
     rc.track_namespace = (moq_namespace_t){ .parts = nsb, .count = 2 };
     moq_subscription_t rhb;
     R_CHECK(&rig, moq_session_subscribe(sub->peer, &rc, rig.now, &rhb) ==
                       MOQ_OK);
-    red_deliver(&rig, sub);
+    deliver_without_pump(&rig, sub);
     (void)moqr_bind_pump(rig.bind, rig.now);
 
     moqr_bind_stats_t bs;
@@ -7183,8 +7202,8 @@ range_completion_linger(void)
 
     /* Origin publishes group 0 (in range, EOG) then group 1 (past the range —
      * its arrival is the live edge that completes the subscription). */
-    red_pub_subgroup_n(&rig, pub, pub_ps.up_sub, 0, 0, 1, true);
-    red_pub_subgroup_n(&rig, pub, pub_ps.up_sub, 1, 0, 1, false);
+    pub_subgroup_n(&rig, pub, pub_ps.up_sub, 0, 0, 1, true);
+    pub_subgroup_n(&rig, pub, pub_ps.up_sub, 1, 0, 1, false);
     rig_pump(&rig, 8);   /* deliver group 0, ingest group 1 -> range completes */
     peer_drain(&rig, sub, &s_ps, false, false, 0, 0);
     R_CHECK(&rig, s_ps.done_seen);       /* the range completed (SUBSCRIBE_DONE) */
@@ -7198,10 +7217,10 @@ range_completion_linger(void)
     peer_drain(&rig, pub, &pub_ps, false, false, 0, 0);
     R_CHECK(&rig, pub_ps.unsubscribed == 0);
 
-    /* Fewer cycles than the linger window: still lingering under the fix. */
+    /* Fewer cycles than the linger window: still lingering. */
     rig_pump(&rig, 3);
     peer_drain(&rig, pub, &pub_ps, false, false, 0, 0);
-    R_CHECK(&rig, pub_ps.unsubscribed == 0);   /* RED with the literal-0 retire */
+    R_CHECK(&rig, pub_ps.unsubscribed == 0);   /* fails if linger expiry is computed from 0 */
 
     /* Past the linger deadline the track warms and releases the upstream. */
     rig_pump(&rig, 15);
@@ -8050,9 +8069,9 @@ chunk_liveedge_evict(void)
 /* A subscription terminated while a downstream subgroup is mid-object: the relay
  * must RESET the begun subgroup (the streaming-safe terminal) so the peer sees a
  * clean reset before the SUBSCRIBE_DONE — never a begun object left with no
- * terminal. Before the SUB_DONE reset hardening this is RED: the SUB_DONE handler
- * only closes subgroups, and close returns WRONG_STATE on a streaming subgroup,
- * so the open object is dropped with no downstream reset. */
+ * terminal. A SUB_DONE handler that only closed subgroups would fail this:
+ * close returns WRONG_STATE on a streaming subgroup, so the open object would
+ * be dropped with no downstream reset. */
 static int
 sub_done_resets_begun_subgroup(void)
 {
@@ -8292,9 +8311,9 @@ fetch_error_terminates(void)
  * the SAME object both ways — flipping only g_test_server_streaming_objects, with
  * identical streamed publish code — and proves an identical FETCH result (End
  * Location, object identity/order, payload length + bytes, completion, no false
- * error/close). The gauntlet repro was: chunked run yields FETCH_OK + zero
- * objects + FETCH_COMPLETE. RED: restore the `chunk_count > 0` skip in
- * fetch_scan_next and the chunked run drops to n == 0, so parity fails. */
+ * error/close). The failure this pins is a chunked run yielding FETCH_OK + zero
+ * objects + FETCH_COMPLETE: parity depends on fetch_scan_next serving records
+ * whose payload lives in the chunk list (chunk_count > 0), not skipping them. */
 
 typedef struct {
     bool     fetch_ok, fok_eot, session_closed;
@@ -8651,12 +8670,12 @@ rtr_route(void *ctx, const moqr_intent_t *it, uint64_t now_us)
     return true; /* consumed */
 }
 
-/* R8 intent-router seam: an output intent whose binding_cookie is a reserved
+/* Intent-router seam: an output intent whose binding_cookie is a reserved
  * shard-manager cookie (>= MOQR_SHARD_COOKIE_BASE) is handed to the router
  * instead of a session; a normal cookie is not; and a router that declines a
  * deferrable ACCEPT_SUB has it parked and retried, like a WOULD_BLOCKed write.
- * RED: drop the router hook in bind_try_intent -> reserved intents are silently
- * moot and the router never fires. */
+ * The router firing depends on the router hook in bind_try_intent; without it
+ * reserved intents are silently moot. */
 /* -- Attach-time draft validation ------------------------------------------ *
  * The binding encodes every terminal for the draft the reading peer speaks, so
  * a connection whose draft is unknown has no safe emission. Attach must refuse
@@ -8974,7 +8993,7 @@ ready_idle_zero_probes(void)
     rdy_wire_track(&rig, pub, idle, "live", "cam", "u", false,
                    &pub_ps2, &ih);
 
-    red_pub_subgroup_plain_fin(&rig, pub, pub_ps.up_sub, 0, 0, 0);
+    pub_subgroup_plain_fin(&rig, pub, pub_ps.up_sub, 0, 0, 0);
     rig_pump(&rig, 12);
     peer_drain(&rig, sub, &s_ps, false, false, 0, 0);
     R_CHECK(&rig, s_ps.objects == 1);
@@ -8985,7 +9004,7 @@ ready_idle_zero_probes(void)
     R_CHECK(&rig, moqr_bind_debug_delivery_probes() == p0);
 
     /* A fresh publish wakes exactly through the mark. */
-    red_pub_subgroup_plain_fin(&rig, pub, pub_ps.up_sub, 1, 0, 0);
+    pub_subgroup_plain_fin(&rig, pub, pub_ps.up_sub, 1, 0, 0);
     rig_pump(&rig, 12);
     peer_drain(&rig, sub, &s_ps, false, false, 0, 0);
     R_CHECK(&rig, s_ps.objects == 2);
@@ -9292,7 +9311,7 @@ ready_bind_sg_rearm(void)
     R_CHECK(&rig, s_ps.objects == 1);
 
     /* Subgroup B (group 1): blocked on the bind slot pool. */
-    red_pub_subgroup_plain_fin(&rig, pub, pub_ps.up_sub, 1, 0, 0);
+    pub_subgroup_plain_fin(&rig, pub, pub_ps.up_sub, 1, 0, 0);
     rig_pump(&rig, 6);
     peer_drain(&rig, sub, &s_ps, false, false, 0, 0);
     R_CHECK(&rig, s_ps.objects == 1);   /* still held out */
@@ -9726,7 +9745,7 @@ ready_confirm_failure_closes(void)
 
     /* Inject: the next confirmation misfires mid-delivery. */
     moqr_bind_debug_fail_confirm(1);
-    red_pub_subgroup_plain_fin(&rig, pub, pub_ps.up_sub, 0, 0, 0);
+    pub_subgroup_plain_fin(&rig, pub, pub_ps.up_sub, 0, 0, 0);
     rig_pump(&rig, 8);
     moqr_bind_debug_fail_confirm(0);
     R_CHECK(&rig, !moqr_bind_conn_is_open(rig.bind, sub->rsess));
@@ -9791,7 +9810,7 @@ ready_probe_error_policy(void)
 
     /* CAPACITY: transient — the object still arrives. */
     moqr_bind_debug_fail_probe(1, MOQR_ERR_CAPACITY);
-    red_pub_subgroup_plain_fin(&rig, pub, pub_ps.up_sub, 0, 0, 0);
+    pub_subgroup_plain_fin(&rig, pub, pub_ps.up_sub, 0, 0, 0);
     rig_pump(&rig, 10);
     moqr_bind_debug_fail_probe(0, MOQR_OK);
     peer_drain(&rig, sub, &s_ps, false, false, 0, 0);
@@ -9800,7 +9819,7 @@ ready_probe_error_policy(void)
 
     /* NOMEM: NOT transient — the connection fails closed. */
     moqr_bind_debug_fail_probe(1, MOQR_ERR_NOMEM);
-    red_pub_subgroup_plain_fin(&rig, pub, pub_ps.up_sub, 1, 0, 0);
+    pub_subgroup_plain_fin(&rig, pub, pub_ps.up_sub, 1, 0, 0);
     rig_pump(&rig, 10);
     moqr_bind_debug_fail_probe(0, MOQR_OK);
     R_CHECK(&rig, !moqr_bind_conn_is_open(rig.bind, sub->rsess));
@@ -9943,7 +9962,7 @@ ready_withdraw_idle_wake(void)
     rdy_wire_track(&rig, pub, sub, "live", "cam", "v", true, &pub_ps,
                    &sh);
     R_CHECK(&rig, pub_ps.up_seen);
-    red_pub_subgroup_plain_fin(&rig, pub, pub_ps.up_sub, 0, 0, 0);
+    pub_subgroup_plain_fin(&rig, pub, pub_ps.up_sub, 0, 0, 0);
     rig_pump(&rig, 10);
     peer_drain(&rig, sub, &s_ps, false, false, 0, 0);
     R_CHECK(&rig, s_ps.objects == 1);
@@ -10062,18 +10081,18 @@ ready_detach_replacement_clean(void)
     return f;
 }
 
-/* ============================ R8H-FORWARD ==================================
+/* ========================= DOWNSTREAM FORWARD ===============================
  * Downstream Forward-state (SUBSCRIBE_UPDATE §10.2.12): Forward=0 PAUSES
  * object delivery for one subscription without terminating it; Forward=1
- * resumes. Before the fix a paused sub's next write drew MOQ_ERR_WRONG_STATE,
- * which the bind mapped to STREAM_ERROR and the core retired the sub. These
+ * resumes. A paused sub's next write must not draw MOQ_ERR_WRONG_STATE, which
+ * the bind would map to STREAM_ERROR and the core would retire the sub. These
  * scenarios drive real SUBSCRIBE_UPDATE bytes over SimPair and assert the
  * subscription survives, emits nothing while paused, and resumes exact-once.
  * Backlog policy (stated, not spec-required): an object published DURING the
  * pause is retained and delivered on resume (the cursor never advances past
  * it); a FRESH post-resume object is the unambiguous exact-once anchor.
- * Neuter hooks (RED proof) are gated on env so each moving part can be
- * independently disabled to show a dedicated failure. */
+ * Env-gated disable hooks let each moving part be switched off on its own to
+ * show that it has a dedicated failure. */
 
 static const moq_bytes_t FWD_NS[2] = { { (const uint8_t *)"live", 4 },
                                        { (const uint8_t *)"cam1", 4 } };
@@ -10303,19 +10322,19 @@ forward_sibling_oracle(moq_version_t version)
     return rig.failures;
 }
 
-/* Cross-layer RED that makes the bind's begun-checkpoint call load-bearing, end
+/* Cross-layer check that makes the bind's begun-checkpoint call load-bearing, end
  * to end over SimPair through the real bind. A multi-chunk object is delivered
  * downstream under an action-constrained relay session (max_actions=2), so the
  * relay writes begin + some chunks and then WOULD_BLOCKs — and the bind drives
  * moqr_core_delivery_note_emitted, advancing the core's note_emitted_total.
  *
- * LOAD-BEARING assertion (the RED): note_emitted_total must advance. Deleting
- * the bind's production note_emitted call leaves it flat and fails this test —
- * verified. (NB: SimPair cannot make a *behavioral* RED here — the bind writes
+ * LOAD-BEARING assertion: note_emitted_total must advance. Without the bind's
+ * production note_emitted call it stays flat and this test fails. (NB: SimPair
+ * cannot make a *behavioral* failure here — the bind writes
  * chunks ahead into the session and reaches STALLED before a Forward=0 pause can
  * propagate, and STALLED marks begun independently, so the downstream RESET
  * survives deleting the call. The note_emitted_total counter is therefore the
- * load-bearing signal; the RESET below is integration coverage, not the RED.)
+ * load-bearing signal; the RESET below is integration coverage.)
  *
  * The object is left OPEN and then abandoned (reset_subgroup) while paused: the
  * paused subscriber still observes a downstream RESET of the begun-but-unfinished
@@ -13865,8 +13884,8 @@ jf_down_cancel_after_ok(moq_version_t version)
     return jf_teardown(&j, "fwd_down_cancel_after_ok");
 }
 
-/* Named core RED, run only through its own CTest entry (the binary's
- * `--core-red-cancel-after-stop` argument), never in the ordinary suite:
+/* Named core-contract check, run only through its own CTest entry (the
+ * binary's `--core-cancel-after-stop` argument), never in the ordinary suite:
  * the downstream pair's sessions hold a 3-deep action queue and the pair is
  * held unstepped while the relay accepts and starts writing the forwarded
  * response, so FETCH_OK and the first objects sit in the relay's queue; the
@@ -13878,7 +13897,7 @@ jf_down_cancel_after_ok(moq_version_t version)
  * zero) are asserted as well. The exact SimPair action/input trace of the
  * crossing is printed. */
 static int
-core_red_cancel_after_stop(moq_version_t version)
+core_cancel_after_stop(moq_version_t version)
 {
     static jf_trace_t tr;
     memset(&tr, 0, sizeof(tr));
@@ -13909,7 +13928,7 @@ core_red_cancel_after_stop(moq_version_t version)
     for (int i = 0; i < 8; i++) jf_cycle(&j);
     tr.armed = false;
     jf_stats(&j, &st);
-    printf("  core-red cancel-after-stop %s: peer_closed=%d code=0x%llx reason=\"%s\" peer saw "
+    printf("  core cancel-after-stop %s: peer_closed=%d code=0x%llx reason=\"%s\" peer saw "
            "ok=%d objects=%d reset=%d | relay cancelled_down=%llu down_gone=%llu down_lost=%llu "
            "delivered=%llu aborted=%llu live=%llu relay_session_state=%d\n",
            j.lbl, j.d[0].closed, (unsigned long long)j.d[0].close_code, j.d[0].close_reason,
@@ -13917,13 +13936,13 @@ core_red_cancel_after_stop(moq_version_t version)
            (unsigned long long)st.down_gone, (unsigned long long)st.down_lost,
            (unsigned long long)st.delivered, (unsigned long long)st.aborted,
            (unsigned long long)st.live, (int)moq_session_state(j.d[0].cn->rsess));
-    jf_trace_dump(&tr, "core-red cancel-after-stop");
+    jf_trace_dump(&tr, "core cancel-after-stop");
     /* Relay-side invariants. */
     R_CHECK(&j.rig, st.live == 0 && st.bytes_used == 0 && st.aborted == 0);
     R_CHECK(&j.rig, j.o.cancelled == 0 && j.d[0].foreign == 0);
     /* The core contract under test: the cancelling peer stays established. */
     R_CHECK(&j.rig, j.d[0].closed == 0 && moq_session_state(j.d[0].cn->peer) == MOQ_SESS_ESTABLISHED);
-    return jf_teardown(&j, "core_red_cancel_after_stop");
+    return jf_teardown(&j, "core_cancel_after_stop");
 }
 
 /* Queued upstream tail across pumps + immediate request-slot reuse: the
@@ -15375,12 +15394,376 @@ fetch_lifetime_probe(moq_version_t version, bool tiny_action_queue)
     return failures;
 }
 
+/* A track table full of LIVE tracks refuses a SUBSCRIBE that needs a new
+ * track with the draft's capacity code and a nonzero, jittered Retry
+ * Interval:
+ * draft-18 EXCESSIVE_LOAD (0x9, REQUEST_ERROR Section 10.6) and draft-16
+ * INTERNAL_ERROR (0x0; its Section 13.4.2 registry has no load code). The
+ * refusal is counted under refusals[tracks], and the live track is
+ * untouched. */
+static int
+track_capacity_code_case(moq_version_t version, uint64_t want_code,
+                         const char *label)
+{
+    int f = 0;
+    ca_t a;
+    ca_init(&a);
+    rig_t rig;
+    g_test_max_tracks = 1;
+    moqr_result_t crc = rig_create(&rig, &a);
+    g_test_max_tracks = 0;
+    if (crc != MOQR_OK) {
+        printf("FAIL: track_capacity_code(%s): rig\n", label);
+        return 1;
+    }
+    conn_t *pub = rig_connect(&rig, version);
+    conn_t *s1 = rig_connect(&rig, version);
+    conn_t *s2 = rig_connect(&rig, version);
+    peer_state_t pub_ps, s1_ps, s2_ps;
+    memset(&pub_ps, 0, sizeof(pub_ps));
+    memset(&s1_ps, 0, sizeof(s1_ps));
+    memset(&s2_ps, 0, sizeof(s2_ps));
+    rig_pump(&rig, 4);
+    moq_bytes_t nsp[2] = { B("cap"), B("x") };
+    moq_publish_namespace_cfg_t pcfg;
+    moq_publish_namespace_cfg_init(&pcfg);
+    pcfg.track_namespace = (moq_namespace_t){ .parts = nsp, .count = 2 };
+    moq_announcement_t ann;
+    (void)moq_session_publish_namespace(pub->peer, &pcfg, rig.now, &ann);
+    rig_pump(&rig, 4);
+
+    moq_subscribe_cfg_t scfg;
+    moq_subscribe_cfg_init(&scfg);
+    scfg.track_namespace = (moq_namespace_t){ .parts = nsp, .count = 2 };
+    scfg.track_name = B("live");
+    scfg.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
+    moq_subscription_t h1, h2;
+    R_CHECK(&rig, moq_session_subscribe(s1->peer, &scfg, rig.now, &h1) ==
+                           MOQ_OK);
+    rig_pump(&rig, 4);
+    peer_drain(&rig, pub, &pub_ps, true, false, 0, 0);
+    rig_pump(&rig, 4);
+    peer_drain(&rig, s1, &s1_ps, false, false, 0, 0);
+    R_CHECK(&rig, s1_ps.subscribe_ok && s1_ps.subscribe_errors == 0);
+
+    scfg.track_name = B("other");
+    R_CHECK(&rig, moq_session_subscribe(s2->peer, &scfg, rig.now, &h2) ==
+                           MOQ_OK);
+    rig_pump(&rig, 4);
+    peer_drain(&rig, s2, &s2_ps, false, false, 0, 0);
+    R_CHECK(&rig, s2_ps.subscribe_errors == 1);
+    R_CHECK(&rig, s2_ps.sub_error_code == want_code);
+    R_CHECK(&rig, s2_ps.sub_error_can_retry);
+    /* Jittered per request around one second (d18 Section 10.6). */
+    R_CHECK(&rig, s2_ps.sub_error_retry_ms >= 750 &&
+                      s2_ps.sub_error_retry_ms <= 1250);
+    /* A second refused request gets its own interval: refused clients are
+     * spread out, not synchronized. */
+    uint64_t first_retry = s2_ps.sub_error_retry_ms;
+    moq_subscription_t h3;
+    scfg.track_name = B("third");
+    R_CHECK(&rig, moq_session_subscribe(s2->peer, &scfg, rig.now, &h3) ==
+                      MOQ_OK);
+    rig_pump(&rig, 4);
+    memset(&s2_ps, 0, sizeof(s2_ps));
+    peer_drain(&rig, s2, &s2_ps, false, false, 0, 0);
+    R_CHECK(&rig, s2_ps.subscribe_errors == 1 && s2_ps.sub_error_can_retry);
+    R_CHECK(&rig, s2_ps.sub_error_retry_ms >= 750 &&
+                      s2_ps.sub_error_retry_ms <= 1250);
+    R_CHECK(&rig, s2_ps.sub_error_retry_ms != first_retry);
+    moqr_core_stats_t st;
+    moqr_core_get_stats(rig.core, &st);
+    R_CHECK(&rig, st.refusals[MOQR_REFUSE_TRACKS] == 2);
+    R_CHECK(&rig, st.tracks == 1 && st.subs_active == 1);
+
+    f += rig.failures;
+    rig_destroy(&rig);
+    if (a.live != 0) {
+        printf("FAIL: track_capacity_code(%s): leak %ld\n", label, a.live);
+        f++;
+    }
+    if (f == 0) {
+        printf("PASS: track_capacity_code(%s)\n", label);
+    }
+    return f;
+}
+
+static int
+test_track_capacity_code(void)
+{
+    int f = 0;
+    f += track_capacity_code_case(MOQ_VERSION_DRAFT_18,
+                                  MOQ_REQUEST_ERROR_EXCESSIVE_LOAD, "d18");
+    f += track_capacity_code_case(MOQ_VERSION_DRAFT_16,
+                                  MOQ_REQUEST_ERROR_INTERNAL_ERROR, "d16");
+    return f;
+}
+
+/* A PUBLISH_NAMESPACE that a trie full of LIVE announces cannot admit is
+ * refused with the draft's capacity code and a Retry Interval, whether it is
+ * handled inline or resumed after a deferred authorization: draft-18
+ * EXCESSIVE_LOAD, draft-16 INTERNAL_ERROR. */
+static int
+ns_capacity_code_case(moq_version_t version, bool deferred,
+                      uint64_t want_code, const char *label)
+{
+    int f = 0;
+    ca_t a;
+    ca_init(&a);
+    rig_t rig;
+    g_test_max_ns_nodes = 2;   /* root + one namespace */
+    g_defer_action = 0xFFFFFFFFu;
+    g_test_authorize = deferred ? defer_hook : NULL;
+    moqr_result_t crc = rig_create(&rig, &a);
+    g_test_max_ns_nodes = 0;
+    if (crc != MOQR_OK) {
+        g_test_authorize = NULL;
+        printf("FAIL: ns_capacity_code(%s): rig\n", label);
+        return 1;
+    }
+    conn_t *pub = rig_connect(&rig, version);
+    peer_state_t ps;
+    memset(&ps, 0, sizeof(ps));
+    rig_pump(&rig, 4);
+    moq_bytes_t a1[1] = { B("live") };
+    moq_publish_namespace_cfg_t pc;
+    moq_publish_namespace_cfg_init(&pc);
+    pc.track_namespace = (moq_namespace_t){ .parts = a1, .count = 1 };
+    moq_announcement_t h1, h2;
+    R_CHECK(&rig, moq_session_publish_namespace(pub->peer, &pc, rig.now,
+                                                &h1) == MOQ_OK);
+    rig_pump(&rig, 6);
+    peer_drain(&rig, pub, &ps, false, false, 0, 0);
+    R_CHECK(&rig, ps.namespace_accepted && ps.ns_rejected == 0);
+
+    if (deferred) {
+        g_defer_action = MOQR_AUTH_PUBLISH_NAMESPACE;
+        g_defer_last = 0;
+    }
+    moq_bytes_t a2[1] = { B("more") };
+    pc.track_namespace = (moq_namespace_t){ .parts = a2, .count = 1 };
+    R_CHECK(&rig, moq_session_publish_namespace(pub->peer, &pc, rig.now,
+                                                &h2) == MOQ_OK);
+    rig_pump(&rig, 6);
+    if (deferred) {
+        memset(&ps, 0, sizeof(ps));
+        peer_drain(&rig, pub, &ps, false, false, 0, 0);
+        R_CHECK(&rig, ps.ns_rejected == 0);   /* parked, not refused yet */
+        R_CHECK(&rig, g_defer_last != 0);
+        R_CHECK(&rig, moqr_bind_auth_resolve(
+                          rig.bind, g_defer_last,
+                          &(moqr_auth_verdict_t){ .decision = MOQR_AUTH_ALLOW },
+                          rig.now) == MOQR_OK);
+        rig_pump(&rig, 6);
+    }
+    memset(&ps, 0, sizeof(ps));
+    peer_drain(&rig, pub, &ps, false, false, 0, 0);
+    R_CHECK(&rig, ps.ns_rejected == 1);
+    R_CHECK(&rig, ps.ns_rejected_code == want_code);
+    R_CHECK(&rig, ps.ns_rejected_can_retry);
+    R_CHECK(&rig, ps.ns_rejected_retry_ms >= 750 &&
+                      ps.ns_rejected_retry_ms <= 1250);
+    moqr_core_stats_t st;
+    moqr_core_get_stats(rig.core, &st);
+    R_CHECK(&rig, st.refusals[MOQR_REFUSE_NS_NODES] == 1);
+
+    f += rig.failures;
+    rig_destroy(&rig);
+    g_test_authorize = NULL;
+    g_defer_action = 0xFFFFFFFFu;
+    if (a.live != 0) {
+        printf("FAIL: ns_capacity_code(%s): leak %ld\n", label, a.live);
+        f++;
+    }
+    if (f == 0) {
+        printf("PASS: ns_capacity_code(%s)\n", label);
+    }
+    return f;
+}
+
+static int
+test_ns_capacity_code(void)
+{
+    int f = 0;
+    f += ns_capacity_code_case(MOQ_VERSION_DRAFT_18, false,
+                               MOQ_REQUEST_ERROR_EXCESSIVE_LOAD, "d18 inline");
+    f += ns_capacity_code_case(MOQ_VERSION_DRAFT_16, false,
+                               MOQ_REQUEST_ERROR_INTERNAL_ERROR, "d16 inline");
+    f += ns_capacity_code_case(MOQ_VERSION_DRAFT_18, true,
+                               MOQ_REQUEST_ERROR_EXCESSIVE_LOAD,
+                               "d18 deferred");
+    f += ns_capacity_code_case(MOQ_VERSION_DRAFT_16, true,
+                               MOQ_REQUEST_ERROR_INTERNAL_ERROR,
+                               "d16 deferred");
+    return f;
+}
+
+/* An announce retried after an intent drain uses the binding's own copy of
+ * the namespace. The schedule: a publisher that also watches every namespace
+ * withdraws "a" and announces "b" in one pump, into a full trie. The NS_GONE
+ * for "a" (to that same session) still borrows a's node, so the announce of
+ * "b" first meets WOULD_BLOCK; the drain that follows sends the NS_GONE on
+ * that session, which may reset the session's event memory, and the retry is
+ * admitted. Another watcher must then learn exactly "b". */
+static int
+test_announce_retry_reads_own_copy(void)
+{
+    int f = 0;
+    ca_t a;
+    ca_init(&a);
+    rig_t rig;
+    g_test_max_ns_nodes = 3;   /* root + two namespaces */
+    moqr_result_t crc = rig_create(&rig, &a);
+    g_test_max_ns_nodes = 0;
+    if (crc != MOQR_OK) {
+        printf("FAIL: announce_retry_reads_own_copy: rig\n");
+        return 1;
+    }
+    conn_t *pub = rig_connect(&rig, MOQ_VERSION_DRAFT_18);
+    conn_t *other = rig_connect(&rig, MOQ_VERSION_DRAFT_18);
+    conn_t *watch = rig_connect(&rig, MOQ_VERSION_DRAFT_18);
+    rig_pump(&rig, 4);
+    moq_subscribe_namespace_cfg_t nsc;
+    moq_subscribe_namespace_cfg_init(&nsc);
+    nsc.track_namespace_prefix = (moq_namespace_t){ .parts = NULL, .count = 0 };
+    nsc.namespace_interest = MOQ_NAMESPACE_INTEREST_NAMESPACE_STATE;
+    moq_ns_sub_handle_t w1, w2;
+    R_CHECK(&rig, moq_session_subscribe_namespace(pub->peer, &nsc, rig.now,
+                                                  &w1) == MOQ_OK);
+    R_CHECK(&rig, moq_session_subscribe_namespace(watch->peer, &nsc, rig.now,
+                                                  &w2) == MOQ_OK);
+    rig_pump(&rig, 4);
+    moq_bytes_t na[1] = { B("a") }, nq[1] = { B("q") }, nb[1] = { B("b") };
+    moq_publish_namespace_cfg_t pc;
+    moq_publish_namespace_cfg_init(&pc);
+    moq_announcement_t ha, hq, hb;
+    pc.track_namespace = (moq_namespace_t){ .parts = na, .count = 1 };
+    R_CHECK(&rig, moq_session_publish_namespace(pub->peer, &pc, rig.now,
+                                                &ha) == MOQ_OK);
+    pc.track_namespace = (moq_namespace_t){ .parts = nq, .count = 1 };
+    R_CHECK(&rig, moq_session_publish_namespace(other->peer, &pc, rig.now,
+                                                &hq) == MOQ_OK);
+    rig_pump(&rig, 6);
+    peer_state_t ps, ws;
+    memset(&ps, 0, sizeof(ps));
+    memset(&ws, 0, sizeof(ws));
+    peer_drain(&rig, pub, &ps, false, false, 0, 0);
+    peer_drain(&rig, watch, &ws, false, false, 0, 0);
+    peer_drain(&rig, other, &ws, false, false, 0, 0);
+    moqr_core_stats_t st;
+    moqr_core_get_stats(rig.core, &st);
+    R_CHECK(&rig, st.ns_nodes == 3);   /* full */
+
+    /* Withdraw a and announce b, delivered together, one bind pump. */
+    R_CHECK(&rig, moq_session_publish_namespace_done(pub->peer, ha,
+                                                     rig.now) == MOQ_OK);
+    pc.track_namespace = (moq_namespace_t){ .parts = nb, .count = 1 };
+    R_CHECK(&rig, moq_session_publish_namespace(pub->peer, &pc, rig.now,
+                                                &hb) == MOQ_OK);
+    rig_step_pair(&rig, pub);
+    rig_bind_pump_once(&rig);
+    rig_pump(&rig, 6);
+    memset(&ps, 0, sizeof(ps));
+    memset(&ws, 0, sizeof(ws));
+    peer_drain(&rig, pub, &ps, false, false, 0, 0);
+    peer_drain(&rig, watch, &ws, false, false, 0, 0);
+    R_CHECK(&rig, ps.namespace_accepted && ps.ns_rejected == 0);
+    /* The watcher saw a go and b arrive, with b's exact bytes. */
+    R_CHECK(&rig, ws.ns_gone == 1);
+    R_CHECK(&rig, ws.ns_found == 1);
+    R_CHECK(&rig, ws.ns_seen_count == 1 && ws.ns_seen_total == 1 &&
+                      ws.ns_seen_bytes[0] == 'b');
+    moqr_core_get_stats(rig.core, &st);
+    R_CHECK(&rig, st.ns_nodes_reclaimed == 1);
+
+    f += rig.failures;
+    rig_destroy(&rig);
+    if (a.live != 0) {
+        printf("FAIL: announce_retry_reads_own_copy: leak %ld\n", a.live);
+        f++;
+    }
+    if (f == 0) {
+        printf("PASS: announce_retry_reads_own_copy\n");
+    }
+    return f;
+}
+
+/* Newest-wins across connections, inside one pump: a SUBSCRIBE queues an
+ * upstream SUBSCRIBE to the incumbent publisher, then a second publisher's
+ * PUBLISH_NAMESPACE for the same namespace force-withdraws the incumbent and
+ * frees the pending track before the pump executes its intents. The queued
+ * upstream request must not reach the incumbent (its track and name bytes are
+ * gone); the subscriber gets an answer, and nothing reads freed memory. */
+static int
+test_newest_wins_drops_pending_upstream(void)
+{
+    int f = 0;
+    ca_t a;
+    ca_init(&a);
+    rig_t rig;
+    if (rig_create(&rig, &a) != MOQR_OK) {
+        printf("FAIL: newest_wins_drops_pending_upstream: rig\n");
+        return 1;
+    }
+    conn_t *p1 = rig_connect(&rig, MOQ_VERSION_DRAFT_18);
+    conn_t *sub = rig_connect(&rig, MOQ_VERSION_DRAFT_18);
+    conn_t *p2 = rig_connect(&rig, MOQ_VERSION_DRAFT_18);
+    rig_pump(&rig, 4);
+    moq_bytes_t nsp[1] = { B("nw") };
+    moq_publish_namespace_cfg_t pc;
+    moq_publish_namespace_cfg_init(&pc);
+    pc.track_namespace = (moq_namespace_t){ .parts = nsp, .count = 1 };
+    moq_announcement_t h1, h2;
+    R_CHECK(&rig, moq_session_publish_namespace(p1->peer, &pc, rig.now,
+                                                &h1) == MOQ_OK);
+    rig_pump(&rig, 6);
+    peer_state_t p1s, p2s, ss;
+    memset(&p1s, 0, sizeof(p1s));
+    memset(&p2s, 0, sizeof(p2s));
+    memset(&ss, 0, sizeof(ss));
+    peer_drain(&rig, p1, &p1s, false, false, 0, 0);
+    R_CHECK(&rig, p1s.namespace_accepted);
+
+    moq_subscribe_cfg_t sc;
+    moq_subscribe_cfg_init(&sc);
+    sc.track_namespace = (moq_namespace_t){ .parts = nsp, .count = 1 };
+    sc.track_name = B("t");
+    sc.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
+    moq_subscription_t sh;
+    R_CHECK(&rig, moq_session_subscribe(sub->peer, &sc, rig.now, &sh) ==
+                      MOQ_OK);
+    R_CHECK(&rig, moq_session_publish_namespace(p2->peer, &pc, rig.now,
+                                                &h2) == MOQ_OK);
+    rig_step_pair(&rig, sub);
+    rig_step_pair(&rig, p2);
+    rig_bind_pump_once(&rig);   /* SUBSCRIBE, then the newest-wins announce */
+    rig_pump(&rig, 6);
+    memset(&p1s, 0, sizeof(p1s));
+    peer_drain(&rig, p1, &p1s, false, false, 0, 0);
+    peer_drain(&rig, p2, &p2s, false, false, 0, 0);
+    peer_drain(&rig, sub, &ss, false, false, 0, 0);
+    R_CHECK(&rig, p1s.up_subs == 0);         /* nothing reached the incumbent */
+    R_CHECK(&rig, p2s.namespace_accepted);   /* the newcomer won */
+    R_CHECK(&rig, ss.subscribe_errors == 1);
+
+    f += rig.failures;
+    rig_destroy(&rig);
+    if (a.live != 0) {
+        printf("FAIL: newest_wins_drops_pending_upstream: leak %ld\n", a.live);
+        f++;
+    }
+    if (f == 0) {
+        printf("PASS: newest_wins_drops_pending_upstream\n");
+    }
+    return f;
+}
+
 int
 main(int argc, char **argv)
 {
-    if (argc > 1 && strcmp(argv[1], "--core-red-cancel-after-stop") == 0) {
-        int f = core_red_cancel_after_stop(MOQ_VERSION_DRAFT_16);
-        f += core_red_cancel_after_stop(MOQ_VERSION_DRAFT_18);
+    if (argc > 1 && strcmp(argv[1], "--core-cancel-after-stop") == 0) {
+        int f = core_cancel_after_stop(MOQ_VERSION_DRAFT_16);
+        f += core_cancel_after_stop(MOQ_VERSION_DRAFT_18);
         return f == 0 ? 0 : 1;
     }
     int failures = 0;
@@ -15455,6 +15838,10 @@ main(int argc, char **argv)
     failures += parity_flow(MOQ_VERSION_DRAFT_18);
 
     failures += small_caps_flow();
+    failures += test_track_capacity_code();
+    failures += test_ns_capacity_code();
+    failures += test_announce_retry_reads_own_copy();
+    failures += test_newest_wins_drops_pending_upstream();
     failures += teardown_pending_intent_flow();
     failures += ring_full_track_status_flow();
     failures += ring_full_publish_flow();

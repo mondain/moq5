@@ -1776,7 +1776,7 @@ int main(void)
         CHECK(moq_cmaf_validate_object(NULL, (moq_bytes_t){ obj, len },
                                        &rep) == MOQ_OK);
         CHECK(rep.valid == true);
-        CHECK(rep.starts_with_sync == true);  /* the fix: fsf drives it */
+        CHECK(rep.starts_with_sync == true);  /* fsf drives it */
         CHECK(rep.sap_type == MOQ_SAP_UNKNOWN);
     }
 

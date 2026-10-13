@@ -280,7 +280,7 @@ typedef struct moqr_bind_stats {
 } moqr_bind_stats_t;
 
 MOQR_API void moqr_bind_get_stats(const moqr_bind_t *b, moqr_bind_stats_t *out);
-/* Same frozen-v1, tail-preserving contract as moqr_core_get_stats_sized. */
+/* Same tail-preserving sized contract as moqr_core_get_stats_sized. */
 MOQR_API moqr_result_t moqr_bind_get_stats_sized(
     const moqr_bind_t *bind, moqr_bind_stats_t *out, size_t out_size);
 

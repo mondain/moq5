@@ -257,8 +257,8 @@ void bridge_retire_or_tombstone(moq_transport_bridge_t *b, moq_stream_ref_t ref)
     if (e->local_send_closed && !e->peer_send_closed) {
         /* A bidi we opened whose send half a peer STOP_SENDING closed: the
          * peer's half still carries the response, so the mapping must survive
-         * until its own terminal. moq_session_has_transport_stream() does now
-         * recognise a live draft-18 request owner (#245a), but that is the wrong
+         * until its own terminal. moq_session_has_transport_stream() also
+         * recognises a live draft-18 request owner, but that is the wrong
          * question here: a live local-origin request owner does not by itself
          * mean its peer terminal is still owed. Retirement therefore keys on the
          * STOP fact (peer_stop_received) and the narrower

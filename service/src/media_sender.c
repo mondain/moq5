@@ -251,7 +251,7 @@ struct moq_media_track {
      * state above. A media track with emit_media_timeline owns a generated
      * sibling mediatimeline track (media_timeline) with is_media_timeline set,
      * which carries the fields below. Records are explicit §7.1.1 entries stored
-     * directly in codec form; this slice records one per media group-start. */
+     * directly in codec form; the sender records one per media group-start. */
     bool                  is_media_timeline; /* this IS a generated mediatimeline track */
     moq_media_track_t    *media_timeline;    /* media track -> its mediatimeline (else NULL) */
     moq_msf_media_timeline_record_t *mt_recs;
@@ -542,9 +542,8 @@ static moq_bytes_t default_role(moq_media_type_t t)
  * of the negotiated MoQ draft. LOC-02 (the draft-18 KVP profile) is a
  * coordinated future item -- encode, decode, and this selector must move
  * together; this is the single place the sender picks it up. The
- * standard-key validation in write() and the (next slice's) property
- * generation both key off this, so they can never disagree on the
- * profile. */
+ * standard-key validation in write() and any property generation both key
+ * off this, so they can never disagree on the profile. */
 /* Whether the latched draft names a codec the property encoder can use.
  * Zero -- the never-observed value -- is not one of them. */
 static bool sender_version_usable(moq_version_t v)
@@ -1365,7 +1364,7 @@ static void mt_history_append(moq_media_sender_t *s, moq_media_track_t *tl,
  * timeline track's OWN subscriber so it never head-of-line-blocks media (MSF
  * §7.3). Mirrors sender_emit_sap_for: the timeline shares media group ids and
  * each new media-group boundary emits an independent Object 0 carrying ALL
- * retained accessible records through that group. Since this slice records one
+ * retained accessible records through that group. Since the sender records one
  * entry per media group, the incremental branch is not normally exercised, but
  * it is kept for structural parity and safety. Serialization uses the explicit
  * §7.1.1 codec. s->mu held. */

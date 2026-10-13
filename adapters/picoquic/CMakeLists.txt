@@ -423,6 +423,23 @@ if(MOQ_BUILD_TESTS)
         endif()
         add_test(NAME pq_sim_flow_control COMMAND test_pq_sim_flow_control)
         set_tests_properties(pq_sim_flow_control PROPERTIES TIMEOUT 60)
+
+        # Local-stream reset after FIN against the pinned, patched picoquic
+        # (patches/picoquic/0002): constructed stream/SACK rows plus packet
+        # rows over the simulated links. Provider-only; no adapter code.
+        add_executable(test_pq_reset_after_fin tests/test_pq_reset_after_fin.c)
+        target_include_directories(test_pq_reset_after_fin PRIVATE
+            "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+        target_link_libraries(test_pq_reset_after_fin PRIVATE picoquic-test)
+        target_compile_definitions(test_pq_reset_after_fin PRIVATE
+            PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pq_reset_after_fin PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME pq_reset_after_fin COMMAND test_pq_reset_after_fin)
+        set_tests_properties(pq_reset_after_fin PROPERTIES TIMEOUT 120)
     endif()
 
     # Source-mode link-policy contract (see tests/source_mode_link_policy.cmake):
@@ -454,7 +471,7 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
     endif()
     add_test(NAME threaded_compile COMMAND test_threaded_compile)
 
-    # Focused RED row for the raw threaded SERVER terminal ownership defect:
+    # Focused row for the raw threaded SERVER terminal ownership hazard:
     # the same scenario as threaded_compile's
     # server_terminal_conn_observed_before_prune, on its own, so the ASan
     # abort is attributable without running the scenarios that precede it.
@@ -473,9 +490,9 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
             $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
     endif()
     # Two rows, registered separately so each terminal shape is attributable:
-    #   peer_terminal -- RED: picoquic_callback_close at
+    #   peer_terminal -- the hazard: picoquic_callback_close at
     #                    picoquic_state_disconnected, cnx already deleted
-    #   app_close     -- CONTROL (passes today): APPLICATION_CLOSE at
+    #   app_close     -- CONTROL: APPLICATION_CLOSE at
     #                    picoquic_state_closing_received, cnx still live
     add_test(NAME threaded_server_terminal_uaf
              COMMAND test_threaded_server_terminal_uaf peer_terminal)
@@ -497,9 +514,9 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
         TIMEOUT 120
         ENVIRONMENT "MOQ_PQ_THREADED_STATS=1")
 
-    # Terminal-ownership controls: these pass today and must keep passing, so
-    # the eventual fix cannot be obtained by unbinding a live caller-owned cnx
-    # too late, or by never unbinding at all.
+    # Terminal-ownership controls: these must always pass, so terminal
+    # ownership cannot be satisfied by unbinding a live caller-owned cnx too
+    # late, or by never unbinding at all.
     add_executable(test_threaded_terminal_controls
         tests/test_threaded_terminal_controls.c)
     target_link_libraries(test_threaded_terminal_controls
@@ -632,6 +649,8 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
 
     set(_threaded_consumer_src "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer-threaded")
     set(_threaded_consumer_bld "${CMAKE_CURRENT_BINARY_DIR}/consumer-threaded-test-build")
+    include("${PROJECT_SOURCE_DIR}/tests/cmake/NestedToolchain.cmake")
+    moq_nested_cxx_args(_threaded_consumer_cxx)
     add_test(NAME adapter_threaded_consumer
         COMMAND ${CMAKE_COMMAND} -E env bash -c
             "set -e; \
@@ -641,7 +660,7 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
                  -DCMAKE_PREFIX_PATH='${PROJECT_BINARY_DIR}' \
                  -DMOQ_PICOQUIC_SOURCE_DIR='${MOQ_PICOQUIC_SOURCE_DIR}' \
                  -DMOQ_PICOTLS_PREFIX='${MOQ_PICOTLS_PREFIX}' \
-                 -DCMAKE_C_COMPILER='${CMAKE_C_COMPILER}' && \
+                 -DCMAKE_C_COMPILER='${CMAKE_C_COMPILER}'${_threaded_consumer_cxx} && \
              '${CMAKE_COMMAND}' --build '${_threaded_consumer_bld}' && \
              '${_threaded_consumer_bld}/moq_adapter_threaded_consumer_test'")
 
@@ -656,8 +675,10 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
             get_filename_component(_tom "${OPENSSL_SSL_LIBRARY}" DIRECTORY)
             get_filename_component(_threaded_openssl_root "${_tom}" DIRECTORY)
         endif()
+        include("${PROJECT_SOURCE_DIR}/tests/cmake/NestedToolchain.cmake")
+        moq_nested_cxx_env(_threaded_install_cxx_env)
         add_test(NAME adapter_threaded_install_consumer
-            COMMAND bash
+            COMMAND ${CMAKE_COMMAND} -E env ${_threaded_install_cxx_env} bash
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_install_consumer_threaded.sh"
                 "${CMAKE_COMMAND}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer-threaded-install"
@@ -681,6 +702,8 @@ if(MOQ_BUILD_TESTS)
     set(_adapter_consumer_src "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer")
     set(_adapter_consumer_bld "${CMAKE_CURRENT_BINARY_DIR}/consumer-test-build")
     set(_adapter_consumer_deps "")
+    include("${PROJECT_SOURCE_DIR}/tests/cmake/NestedToolchain.cmake")
+    moq_nested_cxx_args(_adapter_consumer_cxx FLAGS)
     foreach(_dep IN ITEMS PTLS_INCLUDE_DIR MOQ_PTLS_LIB_DIR OPENSSL_INCLUDE_DIR
                           OPENSSL_SSL_LIBRARY OPENSSL_CRYPTO_LIBRARY)
         if(${_dep})
@@ -697,7 +720,7 @@ if(MOQ_BUILD_TESTS)
                  -DMOQ_PICOQUIC_SOURCE_DIR='${MOQ_PICOQUIC_SOURCE_DIR}' \
                  -DMOQ_PICOTLS_PREFIX='${MOQ_PICOTLS_PREFIX}' \
                  -DCMAKE_C_COMPILER='${CMAKE_C_COMPILER}' \
-                 -DCMAKE_C_FLAGS='${CMAKE_C_FLAGS}' \
+                 -DCMAKE_C_FLAGS='${CMAKE_C_FLAGS}'${_adapter_consumer_cxx} \
                  -DCMAKE_EXE_LINKER_FLAGS='${CMAKE_EXE_LINKER_FLAGS}' \
                  -DCMAKE_BUILD_TYPE='${CMAKE_BUILD_TYPE}' \
                  -DCMAKE_OSX_SYSROOT='${CMAKE_OSX_SYSROOT}' \

@@ -41,7 +41,7 @@ static int fix_unconsumed(fix_t *fix, const char *name);
 static void expect_controls(fix_t *fix, const char *label);
 
 /* Per-scenario verdict. MOQ_TEST_PASS only prints while the GLOBAL counter is
- * zero, which would silence every control that runs after a deliberate RED
+ * zero, which would silence every control that runs after a failing
  * row -- so each scenario reports its own outcome from its own delta.
  *
  * It ALSO closes the single final invariant, which covers EVERY peer
@@ -56,7 +56,7 @@ static void report(fix_t *fix, const char *name, int before)
     failures += fix_unconsumed(fix, name);
     int n = failures - before;
     if (n == 0) printf("PASS: %s\n", name);
-    else        printf("RED: %s (%d diagnostics)\n", name, n);
+    else        printf("FAIL: %s (%d diagnostics)\n", name, n);
 }
 
 /* Test seams (media_sender.c, MOQ_MEDIA_SENDER_TESTING). */
@@ -83,10 +83,10 @@ enum { TR_MAX = 128, TERM_MAX = 32, RESET_MAX = 8, SOK_MAX = 8, STAT_MAX = 8,
  *   ARM     - namespace/catalog/subscribe handshake. Objects are FORBIDDEN, so
  *             a stray or early object can never be adopted into a later
  *             scenario's measured baseline.
- *   RELEASE - the one arm that legitimately delivers media: S4's hold-release
- *             subscription, whose SUBSCRIBE_OK arrives while the previously
- *             held FIFO drains. Admits the subscribe control plus objects and
- *             their subgroup terminals, and nothing else.
+ *   RELEASE - the one arm that legitimately delivers media: scenario 4's
+ *             hold-release subscription, whose SUBSCRIBE_OK arrives while the
+ *             previously held FIFO drains. Admits the subscribe control plus
+ *             objects and their subgroup terminals, and nothing else.
  *   PACE    - a measured drain: objects and their subgroup terminals only. */
 typedef enum { PHASE_ARM = 0, PHASE_RELEASE, PHASE_PACE } phase_t;
 
@@ -1458,8 +1458,8 @@ static moq_media_track_t *add_track(moq_media_sender_t *s, const char *name,
 /* The pacing scenarios run on DRAFT-16, declared here rather than defaulted.
  * Draft-18 is deliberately EXCLUDED from this target: the service-generated
  * LOC-01 property block is refused by the draft-18 profile's object-property
- * validator, and that defect is already owned by the frozen negotiated-profile
- * Step-6 sender RED -- it is not re-pinned here. */
+ * validator, and that contract gap is pinned by the negotiated-profile sender
+ * test (np_closure_sender) -- it is not re-pinned here. */
 #define PACING_VERSION MOQ_VERSION_DRAFT_16
 
 /* `queue_objects` 0 keeps the library default; a nonzero value sets
@@ -1702,7 +1702,7 @@ static moq_result_t write_obj(fix_t *fix, int idx, uint8_t sentinel, bool sync,
 }
 
 /* ===================================================================== *
- *  S1 -- one-at-a-time demanded control.
+ *  Scenario 1 -- one-at-a-time demanded control.
  *  Each accepted object is followed by exactly ONE production drive. Proves
  *  the object leaves in that same drive, with exact FIFO identity and exact
  *  conservation at every boundary.
@@ -1793,7 +1793,7 @@ out:
 }
 
 /* ===================================================================== *
- *  S2 -- burst demanded control.
+ *  Scenario 2 -- burst demanded control.
  *  A GOP-shaped burst (one sync anchor + five deltas in one group) enqueued
  *  before any drive must drain as far as capacity allows in a SINGLE drive.
  * ===================================================================== */
@@ -1862,7 +1862,7 @@ out:
 }
 
 /* ===================================================================== *
- *  S3 -- alternating demanded tracks.
+ *  Scenario 3 -- alternating demanded tracks.
  *  Both tracks have demand. Proves the drain follows write order exactly and
  *  does NOT batch per track.
  * ===================================================================== */
@@ -1919,7 +1919,7 @@ out:
 }
 
 /* ===================================================================== *
- *  S4 -- undemanded-head discriminator.
+ *  Scenario 4 -- undemanded-head discriminator.
  *  An UNDEMANDED track sits at the FIFO head with a DEMANDED track behind it.
  *  This pins what the product actually does; it changes no semantics.
  * ===================================================================== */
@@ -1951,7 +1951,7 @@ static void test_isolation(bool drop_without_demand)
     MOQ_TEST_CHECK(write_obj(&fix, 1, 0x73, true, true, 4000) == MOQ_OK);
     expect_conserved(fix.s, 4, 0, 4, 0, 4 * PAYLOAD_LEN, "iso-queued");
     /* Non-vacuity: the fixture really did queue four objects across two
-     * tracks, so an empty fixture cannot masquerade as the intended RED. */
+     * tracks, so an empty fixture cannot masquerade as the intended outcome. */
     MOQ_TEST_CHECK_EQ_INT(fix.enq_n, 4);
 
     /* Declared audio identity/order -- ordinals 1 then 3, group 0 then 1. */
@@ -2053,7 +2053,7 @@ out:
 }
 
 /* ===================================================================== *
- *  S5 -- capacity/refusal recovery.
+ *  Scenario 5 -- capacity/refusal recovery.
  *  A REAL session refusal at the head: the peer session's action ring is small,
  *  so moq_pub_write_object_ex returns MOQ_ERR_WOULD_BLOCK mid-burst. Proves the
  *  retained head resumes on later DRIVES alone -- no new media, no unrelated
@@ -2342,7 +2342,7 @@ static void test_terminal_stats(void)
 
     /* The marker still occupies a slot against the ACTIVE QUEUE object bound:
      * that bound is now 3/3, so the next media write is refused. This is what
-     * stops the fix from simply dropping the marker out of the accounting. */
+     * keeps the marker from simply dropping out of the accounting. */
     MOQ_TEST_CHECK(write_obj(&fix, 1, 0xc2, true, true, 3000) == MOQ_ERR_WOULD_BLOCK);
     expect_conserved(fix.s, 2, 0, 2, 0, 2 * PAYLOAD_LEN,
                      "termstat-after-refusal");
@@ -2946,7 +2946,7 @@ static bool evict_geometry(fix_t *fix, uint64_t now)
      *    the video APP-LEVEL group 0 is still open (no later group has been
      *    written, so a further delta still belongs to it), while the WIRE
      *    subgroup it was emitted on is driven through RESET by the post-pass
-     *    sweep -- this GREEN's general no-entry discharge, which needs no
+     *    sweep -- the sender's general no-entry discharge, which needs no
      *    queued video entry to hang off. The obligation is therefore
      *    DISCHARGED here, not carried untouched into step 5. */
     const tr_exp_t audio[2] = { { 1, 0, 0, 0x52, 2 }, { 1, 1, 0, 0x53, 3 } };
@@ -3010,7 +3010,7 @@ static bool evict_geometry_noflush(fix_t *fix, uint64_t now)
     return true;
 }
 
-/* RED A -- cross-path cumulative group identity. */
+/* Eviction: cross-path cumulative group identity. */
 static void test_evict_crosspath_group(void)
 {
     int before = failures;
@@ -3057,7 +3057,7 @@ out:
     report(&fix, "pacing_evict_crosspath_group", before);
 }
 
-/* RED B -- the armed RESET must survive removal ordering. */
+/* Eviction: the armed RESET must survive removal ordering. */
 static void test_evict_reset_survives_removal(void)
 {
     int before = failures;

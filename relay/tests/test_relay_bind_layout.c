@@ -1,6 +1,6 @@
 /*
  * Bind delivery-scheduler capacity oracle. White-box (includes moqr_bind.c):
- * pins the R8H-1c structural delta with a baseline b_conn_t replica (the
+ * pins the delivery-park structural delta with a baseline b_conn_t replica (the
  * park fields must cost exactly one size_t — park_reason rides existing
  * bool padding), the widened bitset word arithmetic at the uint32_t
  * maximum, the descriptor slope across the 63/64/65 and 128/129 word
@@ -199,7 +199,7 @@ test_bind_capacity_slopes(void)
     MOQ_TEST_CHECK_EQ_U64(d65 - d64, per_conn + 16);      /* 2 word pairs */
     MOQ_TEST_CHECK_EQ_U64(d128 - d65, 63 * per_conn);     /* 2 word pairs */
     MOQ_TEST_CHECK_EQ_U64(d129 - d128, per_conn + 16);    /* 3 word pairs */
-    MOQ_TEST_CHECK(scratch > 2048u);   /* the embedded stack RED is real */
+    MOQ_TEST_CHECK(scratch > 2048u);   /* too large to live on the pump's stack */
 
     /* Create-time slope mirrors the descriptor exactly (all bind tables are
      * eager), and every size destroys leak-free. */

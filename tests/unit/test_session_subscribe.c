@@ -5,7 +5,7 @@
 #include <moq/sim.h>
 #endif
 
-/* Tracking allocator for the #245b arena test: counts every alloc/realloc/free
+/* Tracking allocator for the no-slot carrier arena test: counts every alloc/realloc/free
  * call and remembers the session slab pointer/size, so the test can prove that
  * exact allocation is freed exactly once (not merely that the net balance
  * returns to zero) and that installing/removing carriers allocates nothing. */
@@ -7033,7 +7033,7 @@ int main(void)
     }
 
     /* ============================================================== */
-    /* No-slot admission carriers (#245b): arena storage + accounting */
+    /* No-slot admission carriers: arena storage + accounting         */
     /* ============================================================== */
     /* Absolute, fixture-declared inventory throughout -- nothing is read back
      * from the product's own observed count. NOTE: this is a DIRECT-HELPER block

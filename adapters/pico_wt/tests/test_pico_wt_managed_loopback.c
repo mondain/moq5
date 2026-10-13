@@ -1231,13 +1231,13 @@ static run_status_t run_alpn_close_18(const char *cert, const char *key,
     CHECK(cli_fcode == 0);                         /* transport-class per the header contract */
     CHECK(!atomic_load(&capp.got_object));
 
-    /* -- the WIRE obligation: this is the RED ------------------------------
+    /* -- the WIRE obligation: the load-bearing assertion -------------------
      * MULTIPLICITY LIMIT, stated: is_closed()/close_code() prove the server
      * received A close carrying the latched code. The bridge stops counting
      * once terminal, so this oracle can neither prove "exactly one" nor detect
      * a later duplicate. Exact multiplicity is measured by the lab JS oracle
      * (accepted==1, closes==1, matching==1), which must be re-run against any
-     * eventual product GREEN. */
+     * product change to this path. */
     CHECK(srv_closed);                             /* a peer WT close was observed at all */
     CHECK(srv_code == WT_ALPN_ERROR_CODE);         /* and it carried WT_ALPN_ERROR */
     CHECK(!srv_fatal);                             /* not a MoQ protocol fatal */

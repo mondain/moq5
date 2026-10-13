@@ -1007,7 +1007,7 @@ typedef struct moq_auth_txn {
 
 #define MOQ_DECODED_MAX_TOKENS 16
 
-/* -- No-slot admission carrier (#245b) ------------------------------- *
+/* -- No-slot admission carrier ------------------------------------- *
  * The minimal durable record of a no-slot request-bidi terminal owed but not
  * yet emittable for local resource pressure. The terminal is fixed and
  * content-independent, so only the stream identity and the observed FIN fact
@@ -1054,7 +1054,7 @@ typedef struct moq_ns_sub_entry {
      * not buffer the bytes, so the obligation -- not the raw bytes -- is what
      * must survive: this durable marker re-drives ns_sub_local_teardown on the
      * documented empty re-feed, with no peer-byte redelivery. Cleared in the
-     * selective free (#245c). */
+     * selective free. */
     bool                local_teardown_pending;
     bool                closing_remote_error;
     bool                forward;
@@ -1444,7 +1444,7 @@ static inline bool ns_sub_fin_observed(const moq_ns_sub_entry_t *e, bool fin) {
     return fin || e->pending_fin || e->handoff_fin_pending;
 }
 
-/* No-slot admission carriers (#245b). */
+/* No-slot admission carriers. */
 int  noslot_carrier_find(const moq_session_t *s, moq_stream_ref_t ref);
 bool noslot_carrier_install(moq_session_t *s, moq_stream_ref_t ref, bool fin);
 void noslot_carrier_remove(moq_session_t *s, moq_stream_ref_t ref);
@@ -1685,7 +1685,7 @@ struct moq_session {
     size_t           drain_ref_cap;
     size_t           drain_ref_count;
 
-    /* No-slot admission carriers (#245b). A draft-18 request bidi that arrives
+    /* No-slot admission carriers. A draft-18 request bidi that arrives
      * with the subscription pool full owes a fixed, content-independent
      * terminal (pre-setup STOP+RESET, post-setup REQUEST_ERROR+FIN). When drain/
      * action/send capacity cannot admit that terminal yet, the OPERATION -- not
@@ -2260,8 +2260,8 @@ typedef struct moq_request_update_ok_encode_args {
 
 /* PUBLISH_OK response: the subscriber's delivery parameters plus
  * the raw SUBSCRIPTION_FILTER and FORWARD it chose. One args struct instead of
- * a growing positional vtable signature. Outbound EXPIRES stays unsupported
- * (D2) -- no field. */
+ * a growing positional vtable signature. Outbound EXPIRES is not supported,
+ * so there is no field for it. */
 typedef struct moq_publish_ok_encode_args {
     uint64_t               request_id;
     uint8_t                subscriber_priority;  /* 128 = omitted */
@@ -2512,7 +2512,8 @@ typedef struct moq_decoded_ns_sub_response {
 
     /* For ERROR: */
     uint64_t error_code;
-    uint64_t retry_interval;         /* REQUEST_ERROR Retry Interval (0 = none) */
+    uint64_t retry_interval;         /* REQUEST_ERROR wire Retry Interval:
+                                      * milliseconds + 1; 0 = no retry */
     const uint8_t *reason;           /* borrowed from recv_buf */
     size_t reason_len;
     bool has_trailing_bytes;         /* trailing after ERROR = close */
