@@ -608,19 +608,44 @@ int main(void)
         moq_endpoint_cfg_t c = mkcfg("https://relay.example/live/room1");
         MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
         MOQ_TEST_CHECK(bytes_eq(r.wt_path, "/live/room1"));
+        MOQ_TEST_CHECK_EQ_SIZE(r.wt_query.len, 0);
+
+        c = mkcfg("https://relay.example/live?jwt=abc");
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK(bytes_eq(r.wt_path, "/live"));
+        MOQ_TEST_CHECK(bytes_eq(r.wt_query, "?jwt=abc"));
+
+        c = mkcfg("https://relay.example?jwt=abc");
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK(bytes_eq(r.wt_path, "/moq"));
+        MOQ_TEST_CHECK(bytes_eq(r.wt_query, "?jwt=abc"));
+
+        c = mkcfg("https://relay.example?#local:part");
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK(bytes_eq(r.wt_path, "/moq"));
+        MOQ_TEST_CHECK(bytes_eq(r.wt_query, "?"));
 
         c = mkcfg("https://relay.example");
         MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
         MOQ_TEST_CHECK(bytes_eq(r.wt_path, "/moq"));
+        MOQ_TEST_CHECK_EQ_SIZE(r.wt_query.len, 0);
 
-        c = mkcfg("https://relay.example/live");
+        c = mkcfg("https://relay.example/live?url=query");
         c.wt_path = B("/custom");
         MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
         MOQ_TEST_CHECK(bytes_eq(r.wt_path, "/custom"));
+        MOQ_TEST_CHECK_EQ_SIZE(r.wt_query.len, 0);
 
-        c = mkcfg("moqt://relay.example/live");        /* RAW: wt_path empty */
+        c.wt_path.len = SIZE_MAX;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
+                             (int)MOQ_ERR_INVAL);
+
+        c = mkcfg("moqt://relay.example/live?x=y#local:part"); /* RAW: empty */
         MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_SIZE(r.wt_path.len, 0);
+        MOQ_TEST_CHECK_EQ_SIZE(r.wt_query.len, 0);
+        MOQ_TEST_CHECK(bytes_eq(r.url.path, "/live"));
+        MOQ_TEST_CHECK(bytes_eq(r.url.query, "x=y"));
     }
 
     /* == Version offers =============================================== */

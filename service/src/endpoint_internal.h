@@ -25,6 +25,8 @@ typedef struct moq_endpoint_resolved {
     moq_bytes_t sni;                     /* cfg->sni, or url host */
     moq_bytes_t wt_path;                 /* WEBTRANSPORT only (else empty):
                                             cfg->wt_path, or url path, or "/moq" */
+    moq_bytes_t wt_query;                /* URL query including "?", unless
+                                            wt_path was explicitly supplied */
     moq_version_policy_t policy;
     moq_version_t versions[MOQ_ENDPOINT_MAX_VERSIONS];
     size_t        version_count;
