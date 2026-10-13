@@ -116,7 +116,8 @@ size_t moq_test_build_cmaf_init_cenc(uint8_t *out, uint32_t track_id,
                     : ((omit & MOQ_TEST_CENC_SHORT_SCHM) ? 16 : 20); /* hdr+8 / hdr+12 */
     size_t tenc_body = (omit & MOQ_TEST_CENC_OMIT_TENC) ? 0
                      : ((omit & MOQ_TEST_CENC_SHORT_TENC) ? 10
-                       : ((omit & MOQ_TEST_CENC_TRAILING_TENC) ? 28 : 24));
+                       : ((omit & MOQ_TEST_CENC_ONE_SHORT_TENC) ? 23
+                         : ((omit & MOQ_TEST_CENC_TRAILING_TENC) ? 28 : 24)));
     size_t tenc_box = (omit & MOQ_TEST_CENC_OMIT_TENC) ? 0 : (8 + tenc_body);
     size_t schi_box = (omit & MOQ_TEST_CENC_OMIT_SCHI) ? 0 : (8 + tenc_box);
     size_t sinf_box = (omit & MOQ_TEST_CENC_OMIT_SINF)
@@ -210,7 +211,9 @@ size_t moq_test_build_cmaf_init_cenc(uint8_t *out, uint32_t track_id,
                     out[p++] = 0;                  /* reserved (pattern in v1) */
                     out[p++] = default_is_protected;
                     out[p++] = iv_size;
-                    memcpy(out + p, kid, 16); p += 16;  /* default_KID */
+                    size_t kid_len = (omit & MOQ_TEST_CENC_ONE_SHORT_TENC)
+                                   ? 15 : 16;
+                    memcpy(out + p, kid, kid_len); p += kid_len;
                     if (omit & MOQ_TEST_CENC_TRAILING_TENC) {
                         memset(out + p, 0, 4); p += 4;  /* trailing data */
                     }
