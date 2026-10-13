@@ -192,6 +192,10 @@ struct moq_media_track {
     uint64_t              emit_obj;          /* next object id in emit_group */
     bool                  pending_reset;     /* a drop abandoned emit_group;
                                                 the drain must reset it */
+    bool                  skip_open;         /* a no-demand drop cut skip_group
+                                                short, so the rest of it is
+                                                dropped even once demand returns */
+    uint64_t              skip_group;
 
     /* Per-pass drain scratch (network thread, mu held). Cleared at the top of
      * every sender_drain pass; never observable outside it.
@@ -1601,6 +1605,8 @@ static void sender_drain(moq_media_sender_t *s, uint64_t now_us)
         if (!has_sub) {
             if (s->drop_without_demand) {
                 preq_note_dropped(s, t, e);
+                t->skip_group = e->group_seq;
+                t->skip_open = true;
                 /* Arm the wire RESET once per affected track in this pass: an
                  * open wire subgroup just lost its tail and must not be
                  * truncated. */
@@ -1617,6 +1623,17 @@ static void sender_drain(moq_media_sender_t *s, uint64_t now_us)
             wr++; rd++;
             continue;
         }
+
+        /* Demand arrived inside a group whose head was dropped. Sending the
+         * rest would start the subscriber on a mid-group object numbered 0,
+         * so it waits for the next group start instead. */
+        if (t->skip_open && e->group_seq == t->skip_group) {
+            preq_note_dropped(s, t, e);
+            preq_entry_release(s, e);
+            rd++;
+            continue;
+        }
+        t->skip_open = false;
 
         /* A drop abandoned this track's open group: reset it on the wire
          * before emitting the next (newer) group. */
