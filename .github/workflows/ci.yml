@@ -558,6 +558,7 @@ jobs:
           cmake -B build/fuzz-ci
           -DMOQ_BUILD_FUZZ=ON
           -DMOQ_REQUIRE_FUZZ=ON
+          -DMOQ_BUILD_MSF=ON
           -DMOQ_BUILD_SIM=ON
           -DMOQ_BUILD_TESTS=ON
 
