@@ -13,6 +13,11 @@ if(POLICY CMP0167)
     cmake_policy(SET CMP0167 NEW)
 endif()
 
+# Toolchains select their own rules during project(); do not preempt that choice.
+if(NOT CMAKE_TOOLCHAIN_FILE AND "$ENV{CMAKE_TOOLCHAIN_FILE}" STREQUAL "")
+    include("${CMAKE_CURRENT_LIST_DIR}/cmake/MoqAppleAbiProbe.cmake")
+endif()
+
 project(libmoq
     VERSION 0.1.0
     LANGUAGES C

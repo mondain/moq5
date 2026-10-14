@@ -25,13 +25,18 @@
 #   9  exe linker flags
 #  10  build type
 #  11  openssl root   (may be empty)
-#  12  work dir       (created fresh; removed on success)
+#  12  work dir       (created fresh; removed on success unless retained below)
 #  13  install libdir (CMAKE_INSTALL_LIBDIR: lib, lib64, lib/<arch>, …)
+#  14  test-owned toolchain/rules preload (required)
+# Test-only: MOQ_TEST_KEEP_WORK=1 retains successful work and prints its path.
+# Unset or any other value preserves the default success cleanup.
 set -euo pipefail
 
 CMAKE="$1"; COMPONENT="$2"; CONSUMER_SRC="$3"; LIBMOQ_BUILD="$4"
 PICOQUIC_SRC="$5"; PICOTLS_PREFIX="$6"; CC="$7"; CFLAGS="$8"; LDFLAGS="$9"
 BUILD_TYPE="${10}"; OPENSSL_ROOT="${11}"; WORK="${12}"; LIBDIR="${13}"
+# Final argument: test-owned toolchain/rules preload, not installed metadata.
+ABI_PRELOAD="${14}"
 
 P="$WORK/prefix"
 PQB="$WORK/pq-build"
@@ -53,7 +58,7 @@ if [ -n "$OPENSSL_ROOT" ]; then
 fi
 
 echo "== 1. install picoquic (BUILD_HTTP=ON) -> $P =="
-"$CMAKE" -S "$PICOQUIC_SRC" -B "$PQB" \
+"$CMAKE" -C "$ABI_PRELOAD" -S "$PICOQUIC_SRC" -B "$PQB" \
     -DBUILD_HTTP=ON -DBUILD_DEMO=OFF -DBUILD_PQBENCH=OFF \
     -DBUILD_PICO_SIM=OFF -Dpicoquic_BUILD_TESTS=OFF -DBUILD_LOGLIB=ON \
     -DCMAKE_INSTALL_PREFIX="$P" \
@@ -101,4 +106,8 @@ echo "== 5. run consumer =="
 "$OUT"
 
 echo "== pkg-config consumer ($COMPONENT) OK =="
-rm -rf "$WORK"
+if [[ "${MOQ_TEST_KEEP_WORK:-0}" == 1 ]]; then
+    printf 'MOQ_TEST_RETAINED_WORK=%s\n' "$WORK"
+else
+    rm -rf "$WORK"
+fi

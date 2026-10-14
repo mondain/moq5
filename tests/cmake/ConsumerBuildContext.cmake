@@ -1,9 +1,75 @@
 include_guard(GLOBAL)
 
+function(_moq_context_quote value out)
+    set(eq "=")
+    string(FIND "${value}" "]${eq}]" found)
+    while(NOT found EQUAL -1)
+        string(APPEND eq "=")
+        string(FIND "${value}" "]${eq}]" found)
+    endwhile()
+    set(${out} "[${eq}[${value}]${eq}]" PARENT_SCOPE)
+endfunction()
+
+# -C needs cache entries to survive into configuration. Never install these paths.
+function(_moq_consumer_abi_context path out)
+    set(toolchain "${CMAKE_TOOLCHAIN_FILE}")
+    if(NOT toolchain STREQUAL "")
+        if(NOT IS_ABSOLUTE "${toolchain}" AND NOT EXISTS "${CMAKE_BINARY_DIR}/${toolchain}")
+            set(toolchain "${CMAKE_SOURCE_DIR}/${toolchain}")
+        endif()
+        get_filename_component(toolchain "${toolchain}" REALPATH BASE_DIR "${CMAKE_BINARY_DIR}")
+    endif()
+    _moq_context_quote("${toolchain}" toolchain_quoted)
+    set(validator "${path}.bundle.cmake")
+    configure_file("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/ConsumerAbiBundle.cmake.in"
+        "${validator}" @ONLY)
+    _moq_context_quote("${validator}" validator_quoted)
+    set(content "# Selected producer toolchain and rules hooks.\n")
+    string(APPEND content
+        "if(DEFINED CMAKE_PROJECT_INCLUDE_BEFORE AND NOT CMAKE_PROJECT_INCLUDE_BEFORE STREQUAL ${validator_quoted})\n    message(FATAL_ERROR \"Consumer ABI bundle cannot replace caller CMAKE_PROJECT_INCLUDE_BEFORE\")\nendif()\n"
+        "set(_moq_abi_loading_preload TRUE)\ninclude(${validator_quoted})\nunset(_moq_abi_loading_preload)\n"
+        "set(CMAKE_PROJECT_INCLUDE_BEFORE ${validator_quoted} CACHE STRING \"Test-owned ABI bundle validator\")\n")
+    foreach(var CMAKE_TOOLCHAIN_FILE CMAKE_USER_MAKE_RULES_OVERRIDE
+            CMAKE_USER_MAKE_RULES_OVERRIDE_C CMAKE_USER_MAKE_RULES_OVERRIDE_CXX)
+        if(DEFINED ${var})
+            set(value "${${var}}")
+            if(var STREQUAL "CMAKE_TOOLCHAIN_FILE")
+                set(value "${toolchain}")
+            elseif(NOT value STREQUAL "" AND NOT IS_ABSOLUTE "${value}")
+                # Compiler information modules include hooks with builtin-first lookup.
+                set(resolved "")
+                foreach(dir "${CMAKE_ROOT}/Modules" ${CMAKE_MODULE_PATH})
+                    if(EXISTS "${dir}/${value}.cmake")
+                        get_filename_component(resolved "${dir}/${value}.cmake" ABSOLUTE)
+                        break()
+                    endif()
+                endforeach()
+                if(resolved STREQUAL "")
+                    get_filename_component(resolved "${value}" ABSOLUTE
+                        BASE_DIR "${PROJECT_SOURCE_DIR}")
+                    if(NOT EXISTS "${resolved}")
+                        message(FATAL_ERROR "Cannot resolve producer rules hook '${value}' from '${PROJECT_SOURCE_DIR}'; select an absolute hook path")
+                    endif()
+                endif()
+                set(value "${resolved}")
+            endif()
+            _moq_context_quote("${value}" quoted)
+            string(APPEND content
+                "if(NOT DEFINED ${var})\n    set(${var} ${quoted} CACHE STRING \"Selected producer toolchain/rules hook\")\nendif()\n")
+        endif()
+    endforeach()
+    set(${out} "${content}" PARENT_SCOPE)
+endfunction()
+
+function(moq_write_consumer_abi_context path)
+    _moq_consumer_abi_context("${path}" content)
+    file(WRITE "${path}" "${content}")
+endfunction()
+
 # Cache preload rather than command-line hints: C-only children may legitimately
 # ignore C++ settings without producing unused-variable diagnostics.
 function(moq_write_consumer_context path)
-    set(vars CMAKE_TOOLCHAIN_FILE CMAKE_BUILD_TYPE CMAKE_TRY_COMPILE_CONFIGURATION
+    set(vars CMAKE_BUILD_TYPE CMAKE_TRY_COMPILE_CONFIGURATION
         CMAKE_SYSROOT CMAKE_SYSROOT_COMPILE CMAKE_SYSROOT_LINK
         CMAKE_OSX_SYSROOT CMAKE_OSX_ARCHITECTURES CMAKE_OSX_DEPLOYMENT_TARGET)
     if(CMAKE_CROSSCOMPILING)
@@ -21,16 +87,12 @@ function(moq_write_consumer_context path)
     foreach(config DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
         list(APPEND vars CMAKE_EXE_LINKER_FLAGS_${config})
     endforeach()
-    set(content "# Selected producer build context; dependencies remain explicit.\n")
+    _moq_consumer_abi_context("${path}" content)
+    string(APPEND content "# Selected producer build context; dependencies remain explicit.\n")
     foreach(var IN LISTS vars)
         if(DEFINED ${var})
-            set(eq "=")
-            string(FIND "${${var}}" "]${eq}]" found)
-            while(NOT found EQUAL -1)
-                string(APPEND eq "=")
-                string(FIND "${${var}}" "]${eq}]" found)
-            endwhile()
-            string(APPEND content "set(${var} [${eq}[${${var}}]${eq}] CACHE STRING \"Producer build context\" FORCE)\n")
+            _moq_context_quote("${${var}}" quoted)
+            string(APPEND content "set(${var} ${quoted} CACHE STRING \"Producer build context\" FORCE)\n")
         endif()
     endforeach()
     file(WRITE "${path}" "${content}")

@@ -2,6 +2,22 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
     add_compile_options(-Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
 endif()
 
+add_test(NAME cmake_apple_abi_rules
+    COMMAND ${CMAKE_COMMAND}
+        "-DTEST_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/apple-abi-rules"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/AppleAbiProbeRulesTest.cmake")
+add_test(NAME cmake_consumer_preload_argv
+    COMMAND ${CMAKE_COMMAND} "-DCTEST=${CMAKE_CTEST_COMMAND}"
+        "-DTEST_BUILD=${PROJECT_BINARY_DIR}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ConsumerPreloadArgvTest.cmake")
+add_test(NAME cmake_consumer_abi_bundle
+    COMMAND ${CMAKE_COMMAND}
+        "-DTEST_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/consumer-abi-bundle"
+        "-DTEST_GENERATOR=${CMAKE_GENERATOR}"
+        "-DTEST_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ConsumerAbiBundleTest.cmake")
+set_tests_properties(cmake_consumer_abi_bundle PROPERTIES TIMEOUT 60)
+
 # -- C tests --------------------------------------------------------
 add_executable(test_version unit/test_version.c)
 target_link_libraries(test_version PRIVATE moq::core)

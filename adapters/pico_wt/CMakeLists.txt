@@ -137,6 +137,10 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libmoq-pico-wt.pc
 
 # -- Tests -----------------------------------------------------------
 if(MOQ_BUILD_TESTS)
+    include("${PROJECT_SOURCE_DIR}/tests/cmake/ConsumerBuildContext.cmake")
+    set(_picowt_abi_context "${CMAKE_CURRENT_BINARY_DIR}/consumer-abi-context.cmake")
+    moq_write_consumer_abi_context("${_picowt_abi_context}")
+
     # Exercise the actual dependency parser used for WebTransport capsules.
     add_executable(test_pico_wt_capsule_sequence tests/test_pico_wt_capsule_sequence.c)
     target_link_libraries(test_pico_wt_capsule_sequence PRIVATE ${_PICOHTTP})
@@ -210,7 +214,7 @@ if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR)
         COMMAND ${CMAKE_COMMAND} -E env bash -c
             "set -e; \
              '${CMAKE_COMMAND}' -E rm -rf '${_picowt_consumer_bld}'; \
-             '${CMAKE_COMMAND}' -S '${_picowt_consumer_src}' \
+             '${CMAKE_COMMAND}' -C '${_picowt_abi_context}' -S '${_picowt_consumer_src}' \
                  -B '${_picowt_consumer_bld}' \
                  -DCMAKE_PREFIX_PATH='${PROJECT_BINARY_DIR}' \
                  -DMOQ_BUILD_ADAPTER_PICO_WT=ON \
@@ -254,7 +258,8 @@ if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR)
             "${CMAKE_EXE_LINKER_FLAGS}"
             "${CMAKE_BUILD_TYPE}"
             "${_picowt_openssl_root}"
-            "${CMAKE_CURRENT_BINARY_DIR}/install-consumer-work")
+            "${CMAKE_CURRENT_BINARY_DIR}/install-consumer-work"
+            "${_picowt_abi_context}")
     set_tests_properties(pico_wt_install_consumer PROPERTIES TIMEOUT 600)
 
     # pkg-config consumer (attach): a plain C program built with only
@@ -276,7 +281,8 @@ if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR)
                 "${CMAKE_BUILD_TYPE}"
                 "${_picowt_openssl_root}"
                 "${CMAKE_CURRENT_BINARY_DIR}/pkgconfig-consumer-work"
-                "${CMAKE_INSTALL_LIBDIR}")
+                "${CMAKE_INSTALL_LIBDIR}"
+                "${_picowt_abi_context}")
         set_tests_properties(pico_wt_pkgconfig_consumer PROPERTIES TIMEOUT 600)
     endif()
 endif()
@@ -646,7 +652,7 @@ endif()\n")
             COMMAND ${CMAKE_COMMAND} -E env bash -c
                 "set -e; \
                  '${CMAKE_COMMAND}' -E rm -rf '${_picowtm_consumer_bld}'; \
-                 '${CMAKE_COMMAND}' -S '${_picowtm_consumer_src}' \
+                 '${CMAKE_COMMAND}' -C '${_picowt_abi_context}' -S '${_picowtm_consumer_src}' \
                      -B '${_picowtm_consumer_bld}' \
                      -DCMAKE_PREFIX_PATH='${PROJECT_BINARY_DIR}' \
                      -DMOQ_BUILD_ADAPTER_PICO_WT=ON \
@@ -688,7 +694,8 @@ endif()\n")
                 "${CMAKE_BUILD_TYPE}"
                 "${_picowtm_openssl_root}"
                 "${CMAKE_CURRENT_BINARY_DIR}/install-consumer-managed-work"
-                "${_picowtm_install_staging}")
+                "${_picowtm_install_staging}"
+                "${_picowt_abi_context}")
         set_tests_properties(pico_wt_managed_install_consumer
             PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
 
@@ -712,7 +719,8 @@ endif()\n")
                     "${CMAKE_BUILD_TYPE}"
                     "${_picowtm_openssl_root}"
                     "${CMAKE_CURRENT_BINARY_DIR}/pkgconfig-managed-consumer-work"
-                    "${CMAKE_INSTALL_LIBDIR}")
+                    "${CMAKE_INSTALL_LIBDIR}"
+                    "${_picowt_abi_context}")
             set_tests_properties(pico_wt_managed_pkgconfig_consumer
                 PROPERTIES TIMEOUT 600)
         endif()
@@ -731,7 +739,7 @@ endif()\n")
             COMMAND ${CMAKE_COMMAND} -E env bash -c
                 "set -e; \
                  '${CMAKE_COMMAND}' -E rm -rf '${_picowtmv_consumer_bld}'; \
-                 '${CMAKE_COMMAND}' -S '${_picowtmv_consumer_src}' \
+                 '${CMAKE_COMMAND}' -C '${_picowt_abi_context}' -S '${_picowtmv_consumer_src}' \
                      -B '${_picowtmv_consumer_bld}' \
                      -DCMAKE_PREFIX_PATH='${PROJECT_BINARY_DIR}' \
                      -DMOQ_BUILD_ADAPTER_PICO_WT=ON \
@@ -768,7 +776,8 @@ endif()\n")
                     "${CMAKE_BUILD_TYPE}"
                     "${_picowtm_openssl_root}"
                     "${CMAKE_CURRENT_BINARY_DIR}/pkgconfig-managed-verify-consumer-work"
-                    "${CMAKE_INSTALL_LIBDIR}")
+                    "${CMAKE_INSTALL_LIBDIR}"
+                    "${_picowt_abi_context}")
             set_tests_properties(pico_wt_managed_verify_pkgconfig_consumer
                 PROPERTIES TIMEOUT 600)
         endif()

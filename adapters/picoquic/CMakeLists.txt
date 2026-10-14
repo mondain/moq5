@@ -282,6 +282,10 @@ add_library(test_adapter_compile OBJECT test_compile.c)
 target_link_libraries(test_adapter_compile PRIVATE moq::adapter-picoquic)
 
 if(MOQ_BUILD_TESTS)
+    include("${PROJECT_SOURCE_DIR}/tests/cmake/ConsumerBuildContext.cmake")
+    set(_picoquic_abi_context "${CMAKE_CURRENT_BINARY_DIR}/consumer-abi-context.cmake")
+    moq_write_consumer_abi_context("${_picoquic_abi_context}")
+
     # Compile and run the real verifier source against both public picoquic API
     # generations. The legacy row intentionally has no _ex declaration; the
     # modern row makes setter refusal and ownership observable.
@@ -755,7 +759,7 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
         COMMAND ${CMAKE_COMMAND} -E env bash -c
             "set -e; \
              '${CMAKE_COMMAND}' -E rm -rf '${_threaded_consumer_bld}'; \
-             '${CMAKE_COMMAND}' -S '${_threaded_consumer_src}' \
+             '${CMAKE_COMMAND}' -C '${_picoquic_abi_context}' -S '${_threaded_consumer_src}' \
                  -B '${_threaded_consumer_bld}' \
                  -DCMAKE_PREFIX_PATH='${PROJECT_BINARY_DIR}' \
                  -DMOQ_PICOQUIC_SOURCE_DIR='${MOQ_PICOQUIC_SOURCE_DIR}' \
@@ -801,7 +805,8 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
                 "${CMAKE_CURRENT_BINARY_DIR}/install-consumer-threaded-work"
                 "${CMAKE_INSTALL_LIBDIR}"
                 "${CMAKE_CXX_FLAGS}"
-                "${_threaded_install_staging}")
+                "${_threaded_install_staging}"
+                "${_picoquic_abi_context}")
         set_tests_properties(adapter_threaded_install_consumer
             PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
     endif()
@@ -823,7 +828,7 @@ if(MOQ_BUILD_TESTS)
         COMMAND ${CMAKE_COMMAND} -E env bash -c
             "set -e; \
              '${CMAKE_COMMAND}' -E rm -rf '${_adapter_consumer_bld}'; \
-             '${CMAKE_COMMAND}' -S '${_adapter_consumer_src}' \
+             '${CMAKE_COMMAND}' -C '${_picoquic_abi_context}' -S '${_adapter_consumer_src}' \
                  -B '${_adapter_consumer_bld}' \
                  -DCMAKE_PREFIX_PATH='${PROJECT_BINARY_DIR}' \
                  -DMOQ_PICOQUIC_SOURCE_DIR='${MOQ_PICOQUIC_SOURCE_DIR}' \

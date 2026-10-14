@@ -1020,6 +1020,9 @@ if(MOQ_BUILD_TESTS)
                 get_filename_component(_svc_o "${OPENSSL_SSL_LIBRARY}" DIRECTORY)
                 get_filename_component(_svc_openssl_root "${_svc_o}" DIRECTORY)
             endif()
+            include("${PROJECT_SOURCE_DIR}/tests/cmake/ConsumerBuildContext.cmake")
+            set(_svc_abi_context "${CMAKE_CURRENT_BINARY_DIR}/consumer-abi-context.cmake")
+            moq_write_consumer_abi_context("${_svc_abi_context}")
             add_test(NAME service_pkgconfig_consumer
                 COMMAND bash
                     "${CMAKE_SOURCE_DIR}/adapters/pico_wt/tests/run_pkgconfig_consumer.sh"
@@ -1035,7 +1038,8 @@ if(MOQ_BUILD_TESTS)
                     "${CMAKE_BUILD_TYPE}"
                     "${_svc_openssl_root}"
                     "${CMAKE_CURRENT_BINARY_DIR}/pkgconfig-consumer-work"
-                    "${CMAKE_INSTALL_LIBDIR}")
+                    "${CMAKE_INSTALL_LIBDIR}"
+                    "${_svc_abi_context}")
             set_tests_properties(service_pkgconfig_consumer
                 PROPERTIES TIMEOUT 600)
         endif()

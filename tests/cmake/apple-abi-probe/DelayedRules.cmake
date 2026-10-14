@@ -1,0 +1,5 @@
+if(NOT CMAKE_CXX_COMPILER_LOADED)
+    message(FATAL_ERROR "Delayed CXX hook executed before CXX initialization")
+endif()
+set(delayed_rules_seen TRUE)
+include("${CMAKE_CURRENT_LIST_DIR}/CallerRules.cmake")

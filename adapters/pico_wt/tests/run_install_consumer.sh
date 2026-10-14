@@ -21,11 +21,14 @@
 #   9  build type
 #  10  openssl root   (may be empty)
 #  11  work dir       (created fresh; removed on success)
+#  12  test-owned toolchain/rules preload (required)
 set -euo pipefail
 
 CMAKE="$1"; CONSUMER_SRC="$2"; LIBMOQ_BUILD="$3"; PICOQUIC_SRC="$4"
 PICOTLS_PREFIX="$5"; CC="$6"; CFLAGS="$7"; LDFLAGS="$8"; BUILD_TYPE="$9"
 OPENSSL_ROOT="${10}"; WORK="${11}"
+# Final argument: test-owned toolchain/rules preload, not installed metadata.
+ABI_PRELOAD="${12}"
 
 P="$WORK/prefix"
 PQB="$WORK/pq-build"
@@ -47,7 +50,7 @@ if [ -n "$OPENSSL_ROOT" ]; then
 fi
 
 echo "== 1. install picoquic (BUILD_HTTP=ON) -> $P =="
-"$CMAKE" -S "$PICOQUIC_SRC" -B "$PQB" \
+"$CMAKE" -C "$ABI_PRELOAD" -S "$PICOQUIC_SRC" -B "$PQB" \
     -DBUILD_HTTP=ON -DBUILD_DEMO=OFF -DBUILD_PQBENCH=OFF \
     -DBUILD_PICO_SIM=OFF -Dpicoquic_BUILD_TESTS=OFF -DBUILD_LOGLIB=ON \
     -DCMAKE_INSTALL_PREFIX="$P" \
@@ -80,7 +83,7 @@ done
 echo "== 3. configure consumer against install prefix (installed picoquic) =="
 # Deliberately NOT passing MOQ_PICOQUIC_SOURCE_DIR: forces the consumer
 # to resolve the INSTALLED picoquic and its installed HTTP headers.
-"$CMAKE" -S "$CONSUMER_SRC" -B "$CONB" \
+"$CMAKE" -C "$ABI_PRELOAD" -S "$CONSUMER_SRC" -B "$CONB" \
     -DCMAKE_PREFIX_PATH="$P" \
     "${ossl_arg[@]}" \
     -DCMAKE_C_COMPILER="$CC" \
