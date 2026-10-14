@@ -63,7 +63,9 @@ foreach(_fuzz_lib
         moqr-admin)
     if(TARGET ${_fuzz_lib})
         target_compile_options(${_fuzz_lib} PRIVATE ${FUZZ_LIB_FLAGS})
-        target_link_options(${_fuzz_lib} PUBLIC "$<BUILD_INTERFACE:${FUZZ_LIB_FLAGS}>")
+        # Installed archives retain instrumentation too. Their consumers need
+        # its runtime, but must never inherit libFuzzer's main function.
+        target_link_options(${_fuzz_lib} PUBLIC ${FUZZ_LIB_FLAGS})
     endif()
 endforeach()
 

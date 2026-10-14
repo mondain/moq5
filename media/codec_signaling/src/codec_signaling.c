@@ -1,4 +1,5 @@
 #include <moq/codec_signaling.h>
+#include "codec_asc_internal.h"
 
 #include <stddef.h>
 #include <string.h>
@@ -317,43 +318,17 @@ static size_t deemulate(const uint8_t *src, size_t src_len,
     return di;
 }
 
-typedef struct {
-    const uint8_t *d;
-    size_t         len; /* bytes */
-    size_t         bitpos;
-    bool           overrun;
-} bitr_t;
-
-/* Read n bits MSB-first as an unsigned value; sets overrun past the end. */
-static uint32_t br_u(bitr_t *b, int n)
-{
-    uint32_t v = 0;
-    for (int i = 0; i < n; i++) {
-        size_t byte = b->bitpos >> 3;
-        int bit = 7 - (int)(b->bitpos & 7);
-        uint32_t x = 0;
-        if (byte < b->len) {
-            x = (uint32_t)((b->d[byte] >> bit) & 1);
-        } else {
-            b->overrun = true;
-        }
-        v = (v << 1) | x;
-        b->bitpos++;
-    }
-    return v;
-}
-
 /* unsigned Exp-Golomb (ue(v)) per ISO/IEC 14496-10 9.1 */
-static uint32_t br_ue(bitr_t *b)
+static uint32_t br_ue(codec_bitr_t *b)
 {
     int lz = 0;
-    while (br_u(b, 1) == 0 && lz < 32 && !b->overrun) {
+    while (codec_br_u(b, 1) == 0 && lz < 32 && !b->overrun) {
         lz++;
     }
     if (lz == 0) {
         return 0;
     }
-    uint32_t suffix = br_u(b, lz);
+    uint32_t suffix = codec_br_u(b, lz);
     return ((uint32_t)1 << lz) - 1 + suffix;
 }
 
@@ -371,23 +346,10 @@ static uint32_t br_ue(bitr_t *b)
 static moq_result_t asc_leading_fields(const uint8_t *d, size_t len,
                                        uint32_t *out_aot)
 {
-    bitr_t br = { d, len, 0, false };
-
-    uint32_t aot = br_u(&br, 5);
-    if (aot == 31) {
-        aot = 32u + br_u(&br, 6);
-    }
-    uint32_t freq_idx = br_u(&br, 4);
-    if (freq_idx == 15) {
-        br_u(&br, 24);                 /* explicit samplingFrequency */
-    }
-    br_u(&br, 4);                      /* channelConfiguration */
-
-    if (br.overrun) {
-        return MOQ_ERR_PROTO;
-    }
-    *out_aot = aot;
-    return MOQ_OK;
+    codec_asc_info_t info;
+    moq_result_t rc = codec_asc_inspect(d, len, &info);
+    if (rc == MOQ_OK) *out_aot = info.object_type;
+    return rc;
 }
 
 static bool avc_profile_has_ext(uint8_t profile_idc)
@@ -412,14 +374,14 @@ static moq_result_t parse_sps_ext(const uint8_t *sps, size_t sps_len,
     uint8_t rbsp[32];
     size_t n = deemulate(sps + 1, sps_len - 1, rbsp, sizeof(rbsp));
 
-    bitr_t br = { rbsp, n, 0, false };
-    br_u(&br, 8);
-    br_u(&br, 8);
-    br_u(&br, 8);
+    codec_bitr_t br = { rbsp, n, 0, false };
+    codec_br_u(&br, 8);
+    codec_br_u(&br, 8);
+    codec_br_u(&br, 8);
     br_ue(&br);
     uint32_t chroma = br_ue(&br);
     if (chroma == 3) {
-        br_u(&br, 1);
+        codec_br_u(&br, 1);
     }
     uint32_t bd_luma = br_ue(&br);
     uint32_t bd_chroma = br_ue(&br);
@@ -568,10 +530,10 @@ static moq_result_t parse_hevc_sps(const uint8_t *sps, size_t sps_len,
         return MOQ_ERR_PROTO;
     }
 
-    bitr_t br = { rbsp, n, 0, false };
-    br_u(&br, 4);                       /* sps_video_parameter_set_id  */
-    uint32_t max_sub = br_u(&br, 3);    /* sps_max_sub_layers_minus1   */
-    uint32_t tid_nest = br_u(&br, 1);   /* sps_temporal_id_nesting     */
+    codec_bitr_t br = { rbsp, n, 0, false };
+    codec_br_u(&br, 4);                       /* sps_video_parameter_set_id  */
+    uint32_t max_sub = codec_br_u(&br, 3);    /* sps_max_sub_layers_minus1   */
+    uint32_t tid_nest = codec_br_u(&br, 1);   /* sps_temporal_id_nesting     */
     if (max_sub > 6) {
         return MOQ_ERR_PROTO;
     }
@@ -582,23 +544,23 @@ static moq_result_t parse_hevc_sps(const uint8_t *sps, size_t sps_len,
         bool profile_present[7] = { false };
         bool level_present[7] = { false };
         for (uint32_t i = 0; i < max_sub && i < 7; i++) {
-            profile_present[i] = br_u(&br, 1) != 0;
-            level_present[i] = br_u(&br, 1) != 0;
+            profile_present[i] = codec_br_u(&br, 1) != 0;
+            level_present[i] = codec_br_u(&br, 1) != 0;
         }
         for (uint32_t i = max_sub; i < 8; i++) {
-            if (br_u(&br, 2) != 0) {    /* reserved_zero_2bits         */
+            if (codec_br_u(&br, 2) != 0) {    /* reserved_zero_2bits         */
                 return MOQ_ERR_PROTO;
             }
         }
         for (uint32_t i = 0; i < max_sub && i < 7; i++) {
             if (profile_present[i]) {
-                br_u(&br, 8);           /* profile_space/tier/profile  */
-                br_u(&br, 32);          /* profile_compatibility_flags */
-                br_u(&br, 24);          /* constraint indicator flags  */
-                br_u(&br, 24);
+                codec_br_u(&br, 8);           /* profile_space/tier/profile  */
+                codec_br_u(&br, 32);          /* profile_compatibility_flags */
+                codec_br_u(&br, 24);          /* constraint indicator flags  */
+                codec_br_u(&br, 24);
             }
             if (level_present[i]) {
-                br_u(&br, 8);           /* sub_layer_level_idc         */
+                codec_br_u(&br, 8);           /* sub_layer_level_idc         */
             }
         }
         if (br.overrun) {
@@ -609,11 +571,11 @@ static moq_result_t parse_hevc_sps(const uint8_t *sps, size_t sps_len,
     br_ue(&br);                         /* sps_seq_parameter_set_id    */
     uint32_t chroma = br_ue(&br);
     if (chroma == 3) {
-        br_u(&br, 1);                   /* separate_colour_plane_flag  */
+        codec_br_u(&br, 1);                   /* separate_colour_plane_flag  */
     }
     br_ue(&br);                         /* pic_width_in_luma_samples   */
     br_ue(&br);                         /* pic_height_in_luma_samples  */
-    if (br_u(&br, 1)) {                 /* conformance_window_flag     */
+    if (codec_br_u(&br, 1)) {                 /* conformance_window_flag     */
         br_ue(&br); br_ue(&br); br_ue(&br); br_ue(&br);
     }
     uint32_t bd_luma = br_ue(&br);
@@ -738,69 +700,69 @@ static moq_result_t build_hvcc(const moq_codec_init_data_cfg_t *cfg,
 static moq_result_t parse_av1_seqhdr(const uint8_t *p, size_t len,
                                      uint8_t *cfg1, uint8_t *cfg2)
 {
-    bitr_t br = { p, len, 0, false };
-    uint32_t seq_profile = br_u(&br, 3);
-    br_u(&br, 1);                          /* still_picture              */
-    uint32_t reduced = br_u(&br, 1);       /* reduced_still_picture_hdr  */
+    codec_bitr_t br = { p, len, 0, false };
+    uint32_t seq_profile = codec_br_u(&br, 3);
+    codec_br_u(&br, 1);                          /* still_picture              */
+    uint32_t reduced = codec_br_u(&br, 1);       /* reduced_still_picture_hdr  */
 
     uint32_t level0, tier0 = 0, iddp = 0;
     if (reduced) {
-        level0 = br_u(&br, 5);
+        level0 = codec_br_u(&br, 5);
     } else {
-        if (br_u(&br, 1)) {                /* timing_info_present_flag   */
+        if (codec_br_u(&br, 1)) {                /* timing_info_present_flag   */
             return MOQ_ERR_UNSUPPORTED;
         }
-        iddp = br_u(&br, 1);               /* initial_display_delay      */
-        uint32_t opcnt = br_u(&br, 5);     /* operating_points_cnt_m1    */
-        br_u(&br, 12);                     /* operating_point_idc[0]     */
-        level0 = br_u(&br, 5);
-        if (level0 > 7) tier0 = br_u(&br, 1);
-        if (iddp && br_u(&br, 1)) br_u(&br, 4);
+        iddp = codec_br_u(&br, 1);               /* initial_display_delay      */
+        uint32_t opcnt = codec_br_u(&br, 5);     /* operating_points_cnt_m1    */
+        codec_br_u(&br, 12);                     /* operating_point_idc[0]     */
+        level0 = codec_br_u(&br, 5);
+        if (level0 > 7) tier0 = codec_br_u(&br, 1);
+        if (iddp && codec_br_u(&br, 1)) codec_br_u(&br, 4);
         for (uint32_t i = 1; i <= opcnt; i++) {
-            br_u(&br, 12);
-            uint32_t l = br_u(&br, 5);
-            if (l > 7) br_u(&br, 1);
-            if (iddp && br_u(&br, 1)) br_u(&br, 4);
+            codec_br_u(&br, 12);
+            uint32_t l = codec_br_u(&br, 5);
+            if (l > 7) codec_br_u(&br, 1);
+            if (iddp && codec_br_u(&br, 1)) codec_br_u(&br, 4);
         }
     }
 
-    uint32_t fwb = br_u(&br, 4);           /* frame_width_bits_minus_1   */
-    uint32_t fhb = br_u(&br, 4);           /* frame_height_bits_minus_1  */
-    br_u(&br, fwb + 1);                    /* max_frame_width_minus_1    */
-    br_u(&br, fhb + 1);                    /* max_frame_height_minus_1   */
-    if (!reduced && br_u(&br, 1)) {        /* frame_id_numbers_present   */
-        br_u(&br, 4); br_u(&br, 3);
+    uint32_t fwb = codec_br_u(&br, 4);           /* frame_width_bits_minus_1   */
+    uint32_t fhb = codec_br_u(&br, 4);           /* frame_height_bits_minus_1  */
+    codec_br_u(&br, fwb + 1);                    /* max_frame_width_minus_1    */
+    codec_br_u(&br, fhb + 1);                    /* max_frame_height_minus_1   */
+    if (!reduced && codec_br_u(&br, 1)) {        /* frame_id_numbers_present   */
+        codec_br_u(&br, 4); codec_br_u(&br, 3);
     }
-    br_u(&br, 3);                          /* use_128x128 + 2 intra flags */
+    codec_br_u(&br, 3);                          /* use_128x128 + 2 intra flags */
 
     uint32_t enable_order_hint = 0;
     if (!reduced) {
-        br_u(&br, 4);                      /* interintra/masked/warp/dual */
-        enable_order_hint = br_u(&br, 1);
-        if (enable_order_hint) br_u(&br, 2);  /* jnt_comp, ref_frame_mvs */
-        uint32_t sc_tools = br_u(&br, 1) ? 2u : br_u(&br, 1);
-        if (sc_tools > 0 && !br_u(&br, 1)) {
-            br_u(&br, 1);                  /* seq_force_integer_mv       */
+        codec_br_u(&br, 4);                      /* interintra/masked/warp/dual */
+        enable_order_hint = codec_br_u(&br, 1);
+        if (enable_order_hint) codec_br_u(&br, 2);  /* jnt_comp, ref_frame_mvs */
+        uint32_t sc_tools = codec_br_u(&br, 1) ? 2u : codec_br_u(&br, 1);
+        if (sc_tools > 0 && !codec_br_u(&br, 1)) {
+            codec_br_u(&br, 1);                  /* seq_force_integer_mv       */
         }
-        if (enable_order_hint) br_u(&br, 3); /* order_hint_bits_minus_1  */
+        if (enable_order_hint) codec_br_u(&br, 3); /* order_hint_bits_minus_1  */
     }
-    br_u(&br, 3);                          /* superres, cdef, restoration */
+    codec_br_u(&br, 3);                          /* superres, cdef, restoration */
 
-    uint32_t high = br_u(&br, 1);
+    uint32_t high = codec_br_u(&br, 1);
     uint32_t twelve = 0, bitdepth;
     if (seq_profile == 2 && high) {
-        twelve = br_u(&br, 1);
+        twelve = codec_br_u(&br, 1);
         bitdepth = twelve ? 12u : 10u;
     } else {
         bitdepth = high ? 10u : 8u;
     }
-    uint32_t mono = (seq_profile == 1) ? 0u : br_u(&br, 1);
+    uint32_t mono = (seq_profile == 1) ? 0u : codec_br_u(&br, 1);
 
     uint32_t cp = 2, tc = 2, mc = 2;
-    if (br_u(&br, 1)) {                    /* color_description_present  */
-        cp = br_u(&br, 8);
-        tc = br_u(&br, 8);
-        mc = br_u(&br, 8);
+    if (codec_br_u(&br, 1)) {                    /* color_description_present  */
+        cp = codec_br_u(&br, 8);
+        tc = codec_br_u(&br, 8);
+        mc = codec_br_u(&br, 8);
     }
 
     /*
@@ -811,23 +773,23 @@ static moq_result_t parse_av1_seqhdr(const uint8_t *p, size_t len,
      */
     uint32_t ssx, ssy, csp = 0;
     if (mono) {
-        br_u(&br, 1);                      /* color_range                */
+        codec_br_u(&br, 1);                      /* color_range                */
         ssx = 1; ssy = 1;
     } else if (cp == 1 && tc == 13 && mc == 0) {
         ssx = 0; ssy = 0;
     } else {
-        br_u(&br, 1);                      /* color_range                */
+        codec_br_u(&br, 1);                      /* color_range                */
         if (seq_profile == 0) {
             ssx = 1; ssy = 1;
         } else if (seq_profile == 1) {
             ssx = 0; ssy = 0;
         } else if (bitdepth == 12) {
-            ssx = br_u(&br, 1);
-            ssy = ssx ? br_u(&br, 1) : 0u;
+            ssx = codec_br_u(&br, 1);
+            ssy = ssx ? codec_br_u(&br, 1) : 0u;
         } else {
             ssx = 1; ssy = 0;
         }
-        if (ssx && ssy) csp = br_u(&br, 2);
+        if (ssx && ssy) csp = codec_br_u(&br, 2);
     }
 
     if (br.overrun) {

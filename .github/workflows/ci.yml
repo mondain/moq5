@@ -589,6 +589,7 @@ jobs:
           -DMOQ_BUILD_MSF=ON
           -DMOQ_BUILD_SIM=ON
           -DMOQ_BUILD_TESTS=ON
+          -DMOQ_BUILD_CMAF_PACKAGER=ON
 
       - name: Build
         run: cmake --build build/fuzz-ci
@@ -597,6 +598,9 @@ jobs:
       # (seconds). Long fuzzing is deferred to nightly/OSS-Fuzz.
       - name: Test (fuzz smoke + corpus)
         run: ctest --test-dir build/fuzz-ci -R '^fuzz_' --output-on-failure
+
+      - name: Test instrumented writer and installed consumers
+        run: ctest --test-dir build/fuzz-ci -R '^cmaf_packager' --output-on-failure --no-tests=error
 
   hardening:
     name: Hardening (FORTIFY/stack-protector, Linux)
