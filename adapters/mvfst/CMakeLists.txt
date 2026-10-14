@@ -352,6 +352,26 @@ if(MOQ_BUILD_TESTS)
         COMMAND test_mvfst_managed_client_contract)
     set_tests_properties(mvfst_managed_client_contract PROPERTIES TIMEOUT 30)
 
+    # Same-TU access to the real fatal path without an exported testing hook.
+    add_executable(test_mvfst_managed_fatal_history
+        tests/test_managed_fatal_history.cpp src/mvfst_endpoint_ops.cpp)
+    target_include_directories(test_mvfst_managed_fatal_history PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(test_mvfst_managed_fatal_history PRIVATE
+        moq::core mvfst::mvfst fmt::fmt Threads::Threads)
+    target_compile_features(test_mvfst_managed_fatal_history PRIVATE cxx_std_17)
+    target_compile_definitions(test_mvfst_managed_fatal_history PRIVATE MOQ_BUILDING)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_mvfst_managed_fatal_history PRIVATE
+            -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+    endif()
+    foreach(_version 16 18)
+        add_test(NAME mvfst_managed_fatal_history_d${_version}
+            COMMAND test_mvfst_managed_fatal_history ${_version})
+        set_tests_properties(mvfst_managed_fatal_history_d${_version} PROPERTIES TIMEOUT 15)
+    endforeach()
+
     # Real-transport idle app-deadline: each EventBase one-shot timer (client
     # deadline_to, server server_deadline_to) fires from the folded deadline and
     # reschedules, with no manual wakes. Counts only deadline-driven pumps.
