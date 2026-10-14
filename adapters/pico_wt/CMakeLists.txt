@@ -672,6 +672,8 @@ endif()\n")
             get_filename_component(_om "${OPENSSL_SSL_LIBRARY}" DIRECTORY)
             get_filename_component(_picowtm_openssl_root "${_om}" DIRECTORY)
         endif()
+        include("${PROJECT_SOURCE_DIR}/tests/cmake/PicoquicInstallStaging.cmake")
+        moq_picoquic_install_staging(_picowtm_install_staging)
         add_test(NAME pico_wt_managed_install_consumer
             COMMAND ${CMAKE_COMMAND} -E env ${_picowt_nested_cxx_env} bash
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_install_consumer_managed.sh"
@@ -685,9 +687,10 @@ endif()\n")
                 "${CMAKE_EXE_LINKER_FLAGS}"
                 "${CMAKE_BUILD_TYPE}"
                 "${_picowtm_openssl_root}"
-                "${CMAKE_CURRENT_BINARY_DIR}/install-consumer-managed-work")
+                "${CMAKE_CURRENT_BINARY_DIR}/install-consumer-managed-work"
+                "${_picowtm_install_staging}")
         set_tests_properties(pico_wt_managed_install_consumer
-            PROPERTIES TIMEOUT 600)
+            PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
 
         # pkg-config consumer (managed): a plain C program built with only
         # `pkg-config --cflags --libs libmoq-pico-wt-managed` — exercises

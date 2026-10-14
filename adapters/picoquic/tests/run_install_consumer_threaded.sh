@@ -27,12 +27,14 @@
 #  12  work dir       (created fresh; removed on success)
 #  13  install libdir (CMAKE_INSTALL_LIBDIR: lib, lib64, lib/<arch>, …)
 #  14  C++ flags (optional for older callers)
+#  15  generated parent staging check
 set -euo pipefail
 
 CMAKE="$1"; CONSUMER_SRC="$2"; CONSUMER_MAIN="$3"; LIBMOQ_BUILD="$4"
 PICOQUIC_SRC="$5"; PICOTLS_PREFIX="$6"; CC="$7"; CFLAGS="$8"; LDFLAGS="$9"
 BUILD_TYPE="${10}"; OPENSSL_ROOT="${11}"; WORK="${12}"; LIBDIR="${13}"
 CXXFLAGS="${14:-}"
+STAGING_CHECK="${15}"
 
 P="$WORK/prefix"
 PQB="$WORK/pq-build"
@@ -45,6 +47,8 @@ PTLS_SRC="$(dirname "$PICOTLS_PREFIX")"
 
 rm -rf "$WORK"
 mkdir -p "$WORK"
+
+"$CMAKE" -Dphase=before -P "$STAGING_CHECK"
 
 ossl_arg=()
 if [ -n "$OPENSSL_ROOT" ]; then
@@ -66,6 +70,7 @@ echo "== 1. install picoquic -> $P =="
 
 echo "== 2. install libmoq -> $P =="
 "$CMAKE" --install "$LIBMOQ_BUILD" --prefix "$P"
+"$CMAKE" -Dphase=after -Dprefix="$P" -P "$STAGING_CHECK"
 
 # Installed-header manifest: both public headers ship.
 for hdr in picoquic_threaded.h picoquic_verify.h; do
@@ -108,7 +113,12 @@ else
             echo "FAIL: pkg-config cflags leak a source-tree path"; exit 1;;
     esac
     "$CC" $CFLAGS $PC_CFLAGS -c "$CONSUMER_MAIN" -o "$WORK/pkgc.o"
-    "$CC" $LDFLAGS "$WORK/pkgc.o" $PC_LIBS -o "$WORK/pkgc-consumer"
+    # pkg-config does not choose the application's runtime search policy.
+    runtime_flags=()
+    case "$(uname -s)" in
+        Darwin|Linux) runtime_flags=("-Wl,-rpath,$P/$LIBDIR");;
+    esac
+    "$CC" $LDFLAGS "$WORK/pkgc.o" $PC_LIBS "${runtime_flags[@]}" -o "$WORK/pkgc-consumer"
     "$WORK/pkgc-consumer"
 fi
 

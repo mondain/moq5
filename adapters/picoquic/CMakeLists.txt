@@ -782,6 +782,8 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
         endif()
         include("${PROJECT_SOURCE_DIR}/tests/cmake/NestedToolchain.cmake")
         moq_nested_cxx_env(_threaded_install_cxx_env)
+        include("${PROJECT_SOURCE_DIR}/tests/cmake/PicoquicInstallStaging.cmake")
+        moq_picoquic_install_staging(_threaded_install_staging)
         add_test(NAME adapter_threaded_install_consumer
             COMMAND ${CMAKE_COMMAND} -E env ${_threaded_install_cxx_env} bash
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_install_consumer_threaded.sh"
@@ -798,9 +800,10 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
                 "${_threaded_openssl_root}"
                 "${CMAKE_CURRENT_BINARY_DIR}/install-consumer-threaded-work"
                 "${CMAKE_INSTALL_LIBDIR}"
-                "${CMAKE_CXX_FLAGS}")
+                "${CMAKE_CXX_FLAGS}"
+                "${_threaded_install_staging}")
         set_tests_properties(adapter_threaded_install_consumer
-            PROPERTIES TIMEOUT 600)
+            PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
     endif()
 endif()
 

@@ -21,11 +21,13 @@
 #   9  build type
 #  10  openssl root   (may be empty)
 #  11  work dir       (created fresh; removed on success)
+#  12  generated parent staging check
 set -euo pipefail
 
 CMAKE="$1"; CONSUMER_SRC="$2"; LIBMOQ_BUILD="$3"; PICOQUIC_SRC="$4"
 PICOTLS_PREFIX="$5"; CC="$6"; CFLAGS="$7"; LDFLAGS="$8"; BUILD_TYPE="$9"
 OPENSSL_ROOT="${10}"; WORK="${11}"
+STAGING_CHECK="${12}"
 
 P="$WORK/prefix"
 PQB="$WORK/pq-build"
@@ -38,6 +40,8 @@ PTLS_SRC="$(dirname "$PICOTLS_PREFIX")"
 
 rm -rf "$WORK"
 mkdir -p "$WORK"
+
+"$CMAKE" -Dphase=before -P "$STAGING_CHECK"
 
 ossl_arg=()
 if [ -n "$OPENSSL_ROOT" ]; then
@@ -59,6 +63,7 @@ echo "== 1. install picoquic (BUILD_HTTP=ON) -> $P =="
 
 echo "== 2. install libmoq -> $P =="
 "$CMAKE" --install "$LIBMOQ_BUILD" --prefix "$P"
+"$CMAKE" -Dphase=after -Dprefix="$P" -P "$STAGING_CHECK"
 
 # Installed-header manifest: both public headers ship; internal headers
 # must NOT.

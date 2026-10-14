@@ -407,30 +407,33 @@ if(MOQ_BUILD_ADAPTER_PICOQUIC OR MOQ_BUILD_ADAPTER_PICO_WT)
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libmoq)
 endif()
 
-# Stage the upstream picoquic static archives into the prefix libdir. The
+# Stage the reachable upstream picoquic libraries into the prefix. The
 # generated pkg-config files reference them with -L${libdir} (-lpicoquic-core
 # in libmoq.pc; -lpicohttp-core -lpicoquic-log -lpicoquic-core in the pico WT
-# .pc, because picohttp-core uses picoquic-log), but
-# picoquic ships no install rules -- so without this a clean
+# .pc, because picohttp-core uses picoquic-log). The provider subdirectory
+# is excluded from the root install, so without this staging a clean
 # `pkg-config --libs libmoq` link fails with "library 'picoquic-core' not
 # found". In source-tree mode they are add_subdirectory targets we can stage;
 # imported/system picoquic provides its own library location (out of scope).
 if(MOQ_PICOQUIC_SOURCE_DIR)
-    set(_moq_pq_install_archives "")
-    foreach(_moq_pq_target picoquic-core picoquic-log)
-        if(TARGET ${_moq_pq_target})
-            list(APPEND _moq_pq_install_archives ${_moq_pq_target})
-        endif()
-    endforeach()
-    # picohttp-core (picoquic HTTP/3) is only built and referenced when a
-    # WebTransport adapter is enabled.
+    set(_moq_pq_install_targets "")
+    if(TARGET picoquic-core)
+        list(APPEND _moq_pq_install_targets picoquic-core)
+    endif()
+    # Raw QUIC needs only core. WebTransport also needs HTTP/3 and its
+    # logging dependency; the excluded provider subtree builds only the
+    # targets needed by the enabled products.
     if((MOQ_BUILD_ADAPTER_PICO_WT OR MOQ_BUILD_PICO_WT_MANAGED)
        AND TARGET picohttp-core)
-        list(APPEND _moq_pq_install_archives picohttp-core)
+        list(APPEND _moq_pq_install_targets picoquic-log picohttp-core)
     endif()
-    foreach(_moq_pq_target IN LISTS _moq_pq_install_archives)
-        install(FILES $<TARGET_FILE:${_moq_pq_target}>
-            DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    foreach(_moq_pq_target IN LISTS _moq_pq_install_targets)
+        # Let CMake install versioned loader/linker names and apply the
+        # target's install-name/RPATH rules, not merely copy its build file.
+        install(TARGETS ${_moq_pq_target}
+            ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
     endforeach()
 endif()
 
