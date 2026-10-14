@@ -316,6 +316,10 @@ if(TARGET moq::sim)
     add_test(NAME request_stop_lifetime COMMAND test_request_stop_lifetime)
 endif()
 
+add_executable(test_request_cancel_subgroups unit/test_request_cancel_subgroups.c)
+target_link_libraries(test_request_cancel_subgroups PRIVATE moq-core-test-internals)
+add_test(NAME request_cancel_subgroups COMMAND test_request_cancel_subgroups)
+
 add_executable(test_priority_layout unit/test_priority_layout.c)
 target_link_libraries(test_priority_layout PRIVATE moq::core)
 add_test(NAME priority_layout COMMAND test_priority_layout)

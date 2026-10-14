@@ -2129,8 +2129,12 @@ static moq_result_t bidi_stream_teardown(moq_session_t *s,
     }
 
     /* A request we migrated with an outbound GOAWAY (entry kept live, §10.4): the
-     * peer's reset/stop is its old-stream close, so silently retire the request. */
-    if (request_goaway_free_on_teardown(s, stream_ref))
+     * peer's reset/stop is its old-stream close, so silently retire the request
+     * -- except a publisher-role subscription, whose reset/stop is a
+     * cancellation that still owes its subgroups' resets: it takes the
+     * retryable teardown below, which completes it silently. */
+    if (!request_stream_is_publisher_subscription(s, stream_ref) &&
+        request_goaway_free_on_teardown(s, stream_ref))
         return MOQ_OK;
 
     int32_t ns_slot = moq_index_find(s->idx_ns_by_ref, s->idx_ns_mask,

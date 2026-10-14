@@ -728,9 +728,12 @@ moq_result_t session_core_on_fetch(moq_session_t *s,
             goto joining_resolved;
         }
 
+        /* A subscription the peer has already cancelled is gone for joining
+         * purposes even while its teardown is still owed. */
         if (jsub < 0 ||
             (s->subs[jsub].state != MOQ_SUB_ESTABLISHED &&
-             s->subs[jsub].state != MOQ_SUB_PENDING_PUBLISHER)) {
+             s->subs[jsub].state != MOQ_SUB_PENDING_PUBLISHER) ||
+            s->subs[jsub].cancel_pending) {
             rc = fetch_auto_reject(s, d,
                 MOQ_REQUEST_ERROR_INVALID_JOINING_REQUEST_ID);
             if (rc < 0) { result = rc; goto cleanup_all; }

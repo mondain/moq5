@@ -2317,7 +2317,11 @@ MOQ_API moq_result_t moq_session_fetch_cancel(moq_session_t *s,
  * URI empty (else MOQ_ERR_INVAL). Draft-16 has no per-request GOAWAY ⇒
  * MOQ_ERR_INVAL. Eligible states (else MOQ_ERR_WRONG_STATE): SUBSCRIBE/
  * PUBLISH/ANNOUNCEMENT/NS_SUB/SUBSCRIBE_TRACKS established, FETCH accepted,
- * TRACK_STATUS only on the responder (the requester opened with FIN). */
+ * TRACK_STATUS only on the responder (the requester opened with FIN).
+ * A subscription this session publishes stays fully usable after its GOAWAY;
+ * the subscriber's later RESET_STREAM or STOP_SENDING of the request stream
+ * cancels it like any other cancellation (see moq_session_on_bidi_stream_reset)
+ * except that no MOQ_EVENT_UNSUBSCRIBED is surfaced for it. */
 typedef struct moq_request_goaway_cfg {
     uint32_t    struct_size;
     moq_bytes_t new_session_uri;   /* borrowed; empty (and required so for clients) */
@@ -2896,6 +2900,17 @@ MOQ_API moq_result_t moq_session_send_publish_blocked(
  * terminated its send half). Tears down the correlated request (namespace
  * subscription, or a stream-correlated subscription/fetch) and frees its state.
  * Advancing call: invalidates borrows, takes now_us.
+ *
+ * MOQ_ERR_WOULD_BLOCK means the teardown needs output capacity (an event, an
+ * action or a drain reference) it does not have yet: drain events and actions,
+ * then deliver the same signal again; it is not retried on its own. The
+ * refusal is not always free of effects. When the request is a subscription
+ * this session publishes, the subscription is cancelled from the first
+ * delivery -- its subgroups, datagrams and responses are refused with
+ * MOQ_ERR_WRONG_STATE from then on -- and a refused delivery may already
+ * have queued RESET_DATA (CANCELLED) for some of its subgroups. Delivering it
+ * again resumes without repeating them; MOQ_EVENT_UNSUBSCRIBED follows the
+ * last of them, once. moq_session_on_bidi_stream_stop() behaves the same.
  */
 MOQ_API moq_result_t moq_session_on_bidi_stream_reset(
     moq_session_t *s,
@@ -2909,7 +2924,10 @@ MOQ_API moq_result_t moq_session_on_bidi_stream_reset(
  * from RESET_STREAM and MUST NOT be routed through on_bidi_stream_reset. For a
  * stream-correlated request stream it terminates the request and frees its
  * state; for profiles/streams that do not use request bidis it is a no-op.
- * Advancing call: invalidates borrows, takes now_us.
+ * Advancing call: invalidates borrows, takes now_us. MOQ_ERR_WOULD_BLOCK is
+ * answered by delivering the same signal again once events and actions are
+ * drained, with the partial effects described at
+ * moq_session_on_bidi_stream_reset().
  */
 MOQ_API moq_result_t moq_session_on_bidi_stream_stop(
     moq_session_t *s,

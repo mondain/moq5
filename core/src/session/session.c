@@ -1265,7 +1265,9 @@ moq_result_t session_core_send_request_goaway(
      * send half still open. Resolve the request bidi + the one-per-stream marker.
      * Per §10.4 the GOAWAY "does not impact subscription state", so the entry stays
      * live -- the app keeps producing on the old request until the peer tears the
-     * old stream down (handled by request_goaway_free_on_teardown). */
+     * old stream down (request_goaway_free_on_teardown; a publisher-role
+     * subscription's RESET/STOP is a cancellation instead, see
+     * request_stream_is_publisher_subscription). */
     moq_stream_ref_t ref;
     bool *sent;
     bool eligible;

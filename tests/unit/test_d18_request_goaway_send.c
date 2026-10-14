@@ -101,6 +101,18 @@ static void goaway_cfg_server(moq_request_goaway_cfg_t *gc)
     gc->timeout_ms = SRV_TIMEOUT;
 }
 
+/* Poll and count every queued event. */
+static int count_events(moq_session_t *s)
+{
+    int n = 0;
+    moq_event_t ev;
+    while (moq_session_poll_events(s, &ev, 1) > 0) {
+        n++;
+        moq_event_cleanup(&ev);
+    }
+    return n;
+}
+
 /* Establish a SUBSCRIBE responder (server is the publisher), accept it, emit a
  * GOAWAY, and return the (still live, goaway-marked) request bidi ref + handle. */
 static moq_session_t *sub_after_goaway(moq_stream_ref_t *out_ref,
@@ -244,6 +256,46 @@ static bool sim_setup_sub(moq_simpair_t *sp, moq_subscription_t *out_client,
     }
     if (!ok) return false;
     *out_client = ch; *out_server = sh;
+    return true;
+}
+
+/* Subscriber role, our GOAWAY, then the publisher's STOP (or RESET) of the
+ * request stream: on a pair with nothing established yet, establish one
+ * subscription, send its GOAWAY and deliver the signal straight to the
+ * client. Returns false, touching nothing further, when a setup step fails;
+ * otherwise checks that the request was retired silently. */
+static bool subscriber_goaway_teardown(moq_simpair_t *sp, bool reset)
+{
+    moq_session_t *client = moq_simpair_client(sp);
+    moq_subscription_t csub = MOQ_SUBSCRIPTION_INVALID;
+    moq_subscription_t ssub = MOQ_SUBSCRIPTION_INVALID;
+    if (!client || !sim_setup_sub(sp, &csub, &ssub)) return false;
+    moq_request_goaway_cfg_t gc;
+    moq_request_goaway_cfg_init(&gc);
+    if (moq_session_request_goaway_subscribe(client, csub, &gc,
+            moq_simpair_now_us(sp)) != MOQ_OK)
+        return false;
+    int slot = sub_resolve_handle(client, csub);
+    if (slot < 0) return false;
+    moq_stream_ref_t ref = client->subs[slot].request_stream_ref;
+    (void)count_events(client);
+    drain_actions(client);
+    moq_result_t rc = reset
+        ? moq_session_on_bidi_stream_reset(client, ref, 0, moq_simpair_now_us(sp))
+        : moq_session_on_bidi_stream_stop(client, ref, 0, moq_simpair_now_us(sp));
+    MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)client->state, (int)MOQ_SESS_ESTABLISHED);
+    MOQ_TEST_CHECK(request_registry_find_by_streamref(client, ref).kind ==
+                   MOQ_REQ_NONE);
+    MOQ_TEST_CHECK(sub_resolve_handle(client, csub) < 0);
+    MOQ_TEST_CHECK_EQ_INT(count_events(client), 0);
+    int resets = 0;
+    moq_action_t a;
+    while (moq_session_poll_actions(client, &a, 1) > 0) {
+        if (a.kind == MOQ_ACTION_RESET_DATA) resets++;
+        moq_action_cleanup(&a);
+    }
+    MOQ_TEST_CHECK_EQ_INT(resets, 0);
     return true;
 }
 
@@ -646,13 +698,8 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
         MOQ_TEST_CHECK(request_registry_find_by_streamref(s, ref).kind ==
                        MOQ_REQ_NONE);   /* now retired */
-        moq_event_t ev; bool spurious = false;
-        while (moq_session_poll_events(s, &ev, 1) > 0) {
-            if (ev.kind == MOQ_EVENT_SUBSCRIBE_DONE ||
-                ev.kind == MOQ_EVENT_SUBSCRIBE_ERROR) spurious = true;
-            moq_event_cleanup(&ev);
-        }
-        MOQ_TEST_CHECK(!spurious);   /* no normal cancellation/error event */
+        /* No event at all: no cancellation, error or UNSUBSCRIBED. */
+        MOQ_TEST_CHECK_EQ_INT(count_events(s), 0);
         moq_session_destroy(s);
     }
     {   /* peer RESET silently retires it */
@@ -661,6 +708,7 @@ int main(void)
             (int)moq_session_on_bidi_stream_reset(s, ref, 0, 1), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
         MOQ_TEST_CHECK(request_registry_find_by_streamref(s, ref).kind == MOQ_REQ_NONE);
+        MOQ_TEST_CHECK_EQ_INT(count_events(s), 0);
         moq_session_destroy(s);
     }
     {   /* peer STOP_SENDING silently retires it */
@@ -669,6 +717,7 @@ int main(void)
             (int)moq_session_on_bidi_stream_stop(s, ref, 0, 1), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
         MOQ_TEST_CHECK(request_registry_find_by_streamref(s, ref).kind == MOQ_REQ_NONE);
+        MOQ_TEST_CHECK_EQ_INT(count_events(s), 0);
         moq_session_destroy(s);
     }
     {   /* a second (inbound) GOAWAY on the migrated stream ⇒ 0x3 */
@@ -870,6 +919,31 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT((int)client->state, (int)MOQ_SESS_ESTABLISHED);
         MOQ_TEST_CHECK_EQ_INT((int)server->state, (int)MOQ_SESS_ESTABLISHED);
         moq_simpair_destroy(sp);
+    }
+
+    /* Subscriber role: after our GOAWAY on a subscription we requested, the
+     * publisher's STOP or RESET of that request stream retires it at once and
+     * silently -- no event, no data-stream reset, the session established. */
+    for (int r = 0; r < 2; r++) {
+        moq_simpair_t *sp = make_pair(MOQ_VERSION_DRAFT_18);
+        MOQ_TEST_CHECK(sp != NULL);
+        if (!sp) continue;
+        MOQ_TEST_CHECK(subscriber_goaway_teardown(sp, r != 0));
+        moq_simpair_destroy(sp);
+    }
+
+    /* The same control returns safely when its setup is refused before any
+     * output handle is assigned: on a pair already started, sim_setup_sub's
+     * own start is refused, so it returns with both handles unset and the
+     * control reports the failure without using them. */
+    {
+        moq_simpair_t *sp = make_pair(MOQ_VERSION_DRAFT_18);
+        MOQ_TEST_CHECK(sp != NULL);
+        if (sp) {
+            MOQ_TEST_CHECK_EQ_INT((int)moq_simpair_start(sp), (int)MOQ_OK);
+            MOQ_TEST_CHECK(!subscriber_goaway_teardown(sp, false));
+            moq_simpair_destroy(sp);
+        }
     }
 
     /* Server responder role: a server URI reaches the client. */

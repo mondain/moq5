@@ -17,11 +17,20 @@ static void sg_note_object_published(moq_session_t *s, const moq_sg_entry_t *e,
         track_hist_merge(s->publishes[slot].hist, e->group_id, object_id);
 }
 
+/* Whether a subscription-owned subgroup belongs to a subscription the peer has
+ * cancelled. Such a subgroup is owed the cancellation's reset: nothing else may
+ * be written to it, a FIN included. A publication-owned subgroup never is. */
+static bool sg_owner_cancelled(moq_session_t *s, const moq_sg_entry_t *sg)
+{
+    return moq_subscription_is_valid(sg->sub) && sub_cancel_pending(s, sg->sub);
+}
+
 static bool sg_send_allowed(moq_session_t *s, const moq_sg_entry_t *sg)
 {
     if (moq_subscription_is_valid(sg->sub)) {
         int slot = sub_resolve_handle(s, sg->sub);
         if (slot < 0) return false;
+        if (s->subs[slot].cancel_pending) return false;
         return s->subs[slot].forward;
     }
     if (moq_publication_is_valid(sg->pub)) {
@@ -239,6 +248,7 @@ moq_result_t moq_session_open_subgroup(
     if (sub_slot < 0) return MOQ_ERR_STALE_HANDLE;
     if (s->subs[sub_slot].state != MOQ_SUB_ESTABLISHED) return MOQ_ERR_WRONG_STATE;
     if (s->subs[sub_slot].role != MOQ_SUB_ROLE_PUBLISHER) return MOQ_ERR_WRONG_STATE;
+    if (s->subs[sub_slot].cancel_pending) return MOQ_ERR_WRONG_STATE;
     if (!s->subs[sub_slot].forward) return MOQ_ERR_WRONG_STATE;
 
     if (sg_is_duplicate(s, sub, cfg->group_id, cfg->subgroup_id))
@@ -637,6 +647,9 @@ moq_result_t moq_session_close_subgroup(
             return MOQ_ERR_WRONG_STATE;
         return MOQ_ERR_STALE_HANDLE;
     }
+    /* A FIN cannot stand in for the reset a cancelled subscription owes this
+     * stream. Forward=0 alone does not forbid closing. */
+    if (sg_owner_cancelled(s, &s->subgroups[slot])) return MOQ_ERR_WRONG_STATE;
 
     if (action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
 
@@ -966,6 +979,9 @@ moq_result_t moq_session_end_object(
 
     if (entry->streaming_bytes_written != entry->streaming_payload_len)
         return MOQ_ERR_INVAL;
+    /* The stream is owed the cancellation's reset; it is not returned to
+     * service. */
+    if (sg_owner_cancelled(s, entry)) return MOQ_ERR_WRONG_STATE;
 
     entry->state = MOQ_SG_OPEN;
     entry->streaming_payload_len = 0;
@@ -1119,6 +1135,7 @@ moq_result_t moq_session_send_object_datagram(
         return MOQ_ERR_WRONG_STATE;
     if (s->subs[sub_slot].role != MOQ_SUB_ROLE_PUBLISHER)
         return MOQ_ERR_WRONG_STATE;
+    if (s->subs[sub_slot].cancel_pending) return MOQ_ERR_WRONG_STATE;
     if (!s->subs[sub_slot].forward) return MOQ_ERR_WRONG_STATE;
 
     size_t plen = payload ? moq_rcbuf_len(payload) : 0;
@@ -1161,6 +1178,7 @@ moq_result_t moq_session_send_status_datagram(
         return MOQ_ERR_WRONG_STATE;
     if (s->subs[sub_slot].role != MOQ_SUB_ROLE_PUBLISHER)
         return MOQ_ERR_WRONG_STATE;
+    if (s->subs[sub_slot].cancel_pending) return MOQ_ERR_WRONG_STATE;
     if (!s->subs[sub_slot].forward) return MOQ_ERR_WRONG_STATE;
 
     uint64_t wire_status;

@@ -197,6 +197,18 @@ typedef struct moq_sub_entry {
     bool goaway_sent;   /* a per-request GOAWAY was emitted on this request
                          * bidi; the entry stays live until the peer tears the
                          * old stream down (FIN/RESET/STOP) or the timeout fires. */
+    /* Publisher role: the peer cancelled this subscription by RESET_STREAM or
+     * STOP_SENDING on its request stream. Set when the cancellation is first
+     * recognized, before any capacity check, and cleared only when the entry
+     * is freed. While set, nothing more is produced or sent under the
+     * subscription; the entry stays resolvable only so its teardown can reset
+     * every subgroup still open under it, then surface UNSUBSCRIBED and free
+     * it. */
+    bool cancel_pending;
+    /* The peer's RESET_STREAM ended its direction of the request stream: no
+     * FIN or RESET follows it, so no receive-side identity is owed for it.
+     * Distinct from req_recv_fin, which records an observed FIN. */
+    bool req_recv_reset;
     /* The track supports dynamically started groups (DYNAMIC_GROUPS == 1 in
      * SUBSCRIBE_OK's track properties). Gates outbound new-group requests on
      * this subscription's updates. */
@@ -2136,6 +2148,9 @@ int sg_find_free(moq_session_t *s);
 moq_subgroup_handle_t sg_make_handle(moq_session_t *s, size_t slot);
 
 int sub_resolve_handle(moq_session_t *s, moq_subscription_t h);
+/* Whether `h` resolves to a subscription whose peer cancellation is pending
+ * (moq_sub_entry_t.cancel_pending). */
+bool sub_cancel_pending(moq_session_t *s, moq_subscription_t h);
 int sub_find_by_request_id(moq_session_t *s, uint64_t request_id);
 int sub_find_by_alias_subscriber(moq_session_t *s, uint64_t alias);
 bool sub_track_alias_in_use(moq_session_t *s, uint64_t alias);
@@ -3122,6 +3137,8 @@ moq_result_t session_core_send_request_goaway(
  *  - already_sent: true iff the request carries our GOAWAY marker, so a GOAWAY
  *    *received* on it is a second GOAWAY on the stream (PROTOCOL_VIOLATION). */
 bool request_goaway_free_on_teardown(moq_session_t *s, moq_stream_ref_t ref);
+bool request_stream_is_publisher_subscription(moq_session_t *s,
+                                              moq_stream_ref_t ref);
 bool request_goaway_already_sent(moq_session_t *s, moq_stream_ref_t ref);
 
 /* Retire a request migrated by a per-request GOAWAY (sent or received): when

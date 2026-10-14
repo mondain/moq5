@@ -144,6 +144,12 @@ int sub_resolve_handle(moq_session_t *s, moq_subscription_t h)
     return (int)slot;
 }
 
+bool sub_cancel_pending(moq_session_t *s, moq_subscription_t h)
+{
+    int slot = sub_resolve_handle(s, h);
+    return slot >= 0 && s->subs[slot].cancel_pending;
+}
+
 const moq_resolved_window_t *moq_session_sub_resolved_window(
     moq_session_t *s, moq_subscription_t sub)
 {
@@ -195,6 +201,9 @@ static void sub_free_entry(moq_session_t *s, size_t slot)
     }
     e->goaway_sent = false;   /* selective free: clear the migration marker so a
                                * reused slot is never seen as already migrated */
+    /* A reused slot starts uncancelled, with no peer-direction terminal. */
+    e->cancel_pending = false;
+    e->req_recv_reset = false;
     /* Clear the cached largest-object location so a reused slot can never carry
      * a prior subscription's largest state into a joining FETCH (only
      * SUBSCRIBE_OK / accept stamps current largest, and only at ESTABLISHED). */
@@ -1378,6 +1387,18 @@ moq_result_t handle_request_stream_bytes(moq_session_t *s,
     moq_request_endpoint_t ep =
         request_registry_find_by_streamref(s, stream_ref);
 
+    /* The peer already cancelled this subscription and its teardown is still
+     * owed: whatever the peer sent before or with the cancellation belongs to
+     * the cancelled request. Discard the bytes unread -- never appended, never
+     * parsed as an update or a new request -- and keep only the FIN fact, which
+     * decides whether the teardown owes a receive-side identity. Checked before
+     * the GOAWAY retirement below: a FIN never stands in for the resets the
+     * cancellation still owes. */
+    if (ep.kind == MOQ_REQ_SUBSCRIPTION && s->subs[ep.slot].cancel_pending) {
+        if (fin) s->subs[ep.slot].req_recv_fin = true;
+        return MOQ_OK;
+    }
+
     /* A request we migrated with an outbound GOAWAY stays live so the app can keep
      * producing on the old session (§10.4); the peer's empty-FIN old-stream close
      * silently retires it. Non-empty bytes fall through to the normal per-family
@@ -1738,14 +1759,27 @@ moq_result_t request_streams_refeed_deferred(moq_session_t *s)
     return MOQ_OK;
 }
 
+static moq_result_t sub_reset_subgroups(moq_session_t *s, size_t slot);
+
 /* Terminate a stream-correlated request whose request bidi the peer tore down
  * (RESET_STREAM or STOP_SENDING). Frees the entry, removes its registry keys, and
  * surfaces the cancellation event; for a fetch, the response data uni is reset if
- * it is still open. Capacity (event slot, and the fetch data-reset action) is
- * reserved before any mutation: a full queue yields MOQ_ERR_WOULD_BLOCK with the
- * entry untouched so the bridge re-drives the teardown once room frees. Returns
- * MOQ_OK for a ref that is not a stream-correlated request (the caller handles
- * other stream kinds). */
+ * it is still open. Returns MOQ_OK for a ref that is not a stream-correlated
+ * request (the caller handles other stream kinds).
+ *
+ * A full queue yields MOQ_ERR_WOULD_BLOCK, and the caller must deliver the same
+ * signal again once room frees (the bridge keeps it pending). For every family
+ * but a cancelled publisher-role subscription, capacity (event slot, and the
+ * fetch data-reset action) is reserved before any mutation, so the refusal
+ * leaves the entry untouched. A cancelled publisher-role subscription
+ * (cancel_pending, set by request_stream_teardown) owes one CANCELLED reset per
+ * subgroup still open under it, and there may be more of those than action
+ * slots: each pass queues what fits and commits it, so a refusal can follow
+ * partial progress. The entry itself -- its handle, registry key and the event
+ * -- stays as it was until the pass that has room for every remaining reset
+ * and the event, which surfaces UNSUBSCRIBED and frees it. A subscription we
+ * migrated with our request GOAWAY completes the same way but silently, with
+ * no event and so no event slot needed. */
 static moq_result_t request_stream_torn_down(moq_session_t *s,
                                              moq_request_endpoint_t ep,
                                              bool reset, uint64_t error_code,
@@ -1753,7 +1787,11 @@ static moq_result_t request_stream_torn_down(moq_session_t *s,
 {
 
     if (ep.kind == MOQ_REQ_SUBSCRIPTION) {
-        if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+        /* A request we migrated with our GOAWAY (§10.4) ends without an event:
+         * the application already moved it. It owes the same resets, and no
+         * event slot, so a full event queue never holds it back. */
+        bool silent = s->subs[ep.slot].goaway_sent;
+        if (!silent && event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
         /* A still-pending responder subscription may hold buffered Joining FETCHes
          * (§10.12.2): the subscription is gone, so each gets
          * INVALID_JOINING_REQUEST_ID on its own bidi. Reserve their capacity
@@ -1769,13 +1807,24 @@ static moq_result_t request_stream_torn_down(moq_session_t *s,
                 parent_drains, 0);
             if (pjrc < 0) return pjrc;
         }
-        moq_event_t e;
-        memset(&e, 0, sizeof(e));
-        e.kind = MOQ_EVENT_UNSUBSCRIBED;
-        e.detail_size = (uint32_t)sizeof(moq_unsubscribed_event_t);
-        e.borrow_epoch = s->borrow_epoch;
-        e.u.unsubscribed.sub = s->subs[ep.slot].handle;
-        (void)push_event(s, &e);
+        /* draft-18 §5.1.1: the publisher MUST reset every open stream of the
+         * cancelled SUBSCRIBE. Incremental and idempotent: subgroups already
+         * reset are skipped, so a refused pass resumes where it stopped. A
+         * pending subscription has no subgroups, so its joins and these resets
+         * never compete for the same action slots. */
+        if (s->subs[ep.slot].cancel_pending) {
+            moq_result_t rrc = sub_reset_subgroups(s, (size_t)ep.slot);
+            if (rrc < 0) return rrc;
+        }
+        if (!silent) {
+            moq_event_t e;
+            memset(&e, 0, sizeof(e));
+            e.kind = MOQ_EVENT_UNSUBSCRIBED;
+            e.detail_size = (uint32_t)sizeof(moq_unsubscribed_event_t);
+            e.borrow_epoch = s->borrow_epoch;
+            e.u.unsubscribed.sub = s->subs[ep.slot].handle;
+            (void)push_event(s, &e);
+        }
         if (has_joins) {
             moq_result_t prc = session_core_reject_pending_joins(
                 s, s->subs[ep.slot].request_id);
@@ -1898,7 +1947,8 @@ static bool request_peer_direction_open(const moq_session_t *s,
                                         moq_request_endpoint_t ep)
 {
     switch (ep.kind) {
-    case MOQ_REQ_SUBSCRIPTION:     return !s->subs[ep.slot].req_recv_fin;
+    case MOQ_REQ_SUBSCRIPTION:     return !s->subs[ep.slot].req_recv_fin &&
+                                          !s->subs[ep.slot].req_recv_reset;
     case MOQ_REQ_FETCH:            return !fetch_peer_fin_observed(&s->fetches[ep.slot]);
     case MOQ_REQ_TRACK_STATUS:     return !ts_peer_fin_observed(&s->track_statuses[ep.slot]);
     case MOQ_REQ_ANNOUNCEMENT:     return !ann_peer_fin_observed(&s->announcements[ep.slot]);
@@ -1915,14 +1965,29 @@ static bool request_peer_direction_open(const moq_session_t *s,
  * drain reference -- until the peer's FIN or RESET, so what the peer had
  * already sent, or still sends, is discarded rather than read as a new
  * request. The RESET_STREAM that answers the STOP is the transport binding's
- * (moq_transport_bridge_t). The drain reference is reserved before anything
- * changes; without room for it the signal is refused (WOULD_BLOCK), the
- * request left as it was. */
+ * (moq_transport_bridge_t). The drain reference is reserved before the owner
+ * is released; without room for it the signal is refused (WOULD_BLOCK). The
+ * refusal leaves the request as it was, except that a publisher-role
+ * subscription is already marked cancelled and may already have queued some
+ * of its subgroup resets (request_stream_torn_down); either way the caller
+ * delivers the same signal again to finish it. */
 moq_result_t request_stream_teardown(moq_session_t *s,
                                      moq_stream_ref_t stream_ref,
                                      bool reset, uint64_t error_code)
 {
     moq_request_endpoint_t ep = request_registry_find_by_streamref(s, stream_ref);
+    /* A publisher-role subscription, pending or established, is cancelled from
+     * the first delivery of the peer's signal, whatever capacity the teardown
+     * then finds: production under it stops here, and a refusal below leaves it
+     * cancelled for the redelivery to finish. A RESET also ends the peer's
+     * direction for good, so no later STOP can owe it a receive-side identity. */
+    if (ep.kind == MOQ_REQ_SUBSCRIPTION &&
+        s->subs[ep.slot].role == MOQ_SUB_ROLE_PUBLISHER &&
+        (s->subs[ep.slot].state == MOQ_SUB_ESTABLISHED ||
+         s->subs[ep.slot].state == MOQ_SUB_PENDING_PUBLISHER)) {
+        s->subs[ep.slot].cancel_pending = true;
+        if (reset) s->subs[ep.slot].req_recv_reset = true;
+    }
     if (reset || !moq_session_uses_request_streams(s) ||
         !request_stop_frees_owner(ep))
         return request_stream_torn_down(s, ep, reset, error_code, 0);
@@ -2110,12 +2175,31 @@ static bool request_goaway_lookup(moq_session_t *s, moq_stream_ref_t ref,
     return true;
 }
 
+/* Whether `ref` is the request stream of a publisher-role subscription the
+ * peer can still cancel (pending or established). Its RESET or STOP_SENDING is
+ * a cancellation that owes a reset of every subgroup open under it
+ * (draft-18 §5.1.1), whether or not we sent a request GOAWAY on it first, so it
+ * takes the retryable cancellation teardown (request_stream_teardown) rather
+ * than request_goaway_free_on_teardown(). */
+bool request_stream_is_publisher_subscription(moq_session_t *s,
+                                              moq_stream_ref_t ref)
+{
+    moq_request_endpoint_t ep = request_registry_find_by_streamref(s, ref);
+    if (ep.kind != MOQ_REQ_SUBSCRIPTION) return false;
+    const moq_sub_entry_t *e = &s->subs[ep.slot];
+    return e->role == MOQ_SUB_ROLE_PUBLISHER &&
+           (e->state == MOQ_SUB_ESTABLISHED ||
+            e->state == MOQ_SUB_PENDING_PUBLISHER);
+}
+
 /* The peer's spec-mandated old-stream teardown after a per-request GOAWAY we sent
  * (§10.4: "close the old request stream using ... FIN, stream reset, or
  * PUBLISH_DONE"). If this request carries our GOAWAY marker, silently retire it --
  * free the entry, no cancellation/error event -- and report handled. Used for the
- * peer's empty FIN and RESET/STOP; a legitimate terminal message (PUBLISH_DONE) is
- * left to the normal per-family path, and a duplicate GOAWAY closes 0x3 there. */
+ * peer's empty FIN, and for RESET/STOP of every request but a publisher-role
+ * subscription (see request_stream_is_publisher_subscription()); a legitimate
+ * terminal message (PUBLISH_DONE) is left to the normal per-family path, and a
+ * duplicate GOAWAY closes 0x3 there. */
 bool request_goaway_free_on_teardown(moq_session_t *s, moq_stream_ref_t ref)
 {
     moq_request_family_t fam; int slot; bool sent;
@@ -3260,6 +3344,10 @@ moq_result_t moq_session_accept_subscribe(
         if (next_alias_after == 0) next_alias_after = 1;
     }
 
+    /* The peer cancelled the request: no response may follow. Checked after
+     * the arguments are validated and before any capacity is reserved. */
+    if (s->subs[slot].cancel_pending) return MOQ_ERR_WRONG_STATE;
+
     /* Encode SUBSCRIBE_OK into send_buf without committing it (send_len unchanged)
      * so its exact size feeds the combined preflight below. */
     moq_subscribe_ok_encode_args_t args = {
@@ -3369,6 +3457,9 @@ moq_result_t moq_session_reject_subscribe(
         false /* track-scoped */);
     if (vrc < 0) return vrc;
 #undef SUB_REJ_HAS
+    /* The peer cancelled the request: no response may follow. Checked after
+     * the arguments are validated and before any capacity is reserved. */
+    if (s->subs[slot].cancel_pending) return MOQ_ERR_WRONG_STATE;
 
     /* REQUEST_ERROR + FIN closes only our send half; the requester opened the bidi
      * without FIN, so a later empty FIN / in-flight bytes on the ref must be
@@ -3450,6 +3541,8 @@ moq_result_t moq_session_request_goaway_subscribe(
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;
     int slot = sub_resolve_handle(s, sub);
     if (slot < 0) return MOQ_ERR_STALE_HANDLE;
+    /* The peer cancelled the request: nothing more is sent on it. */
+    if (s->subs[slot].cancel_pending) return MOQ_ERR_WRONG_STATE;
     return session_core_send_request_goaway(s, MOQ_REQUEST_FAMILY_SUBSCRIBE, slot,
         cfg->new_session_uri.data, cfg->new_session_uri.len, cfg->timeout_ms);
 }
@@ -3732,6 +3825,9 @@ moq_result_t moq_session_done_subscribe(
         return MOQ_ERR_WRONG_STATE;
     if (e->state != MOQ_SUB_ESTABLISHED)
         return MOQ_ERR_WRONG_STATE;
+    /* The peer cancelled the subscription: its teardown, not PUBLISH_DONE,
+     * ends it. */
+    if (e->cancel_pending) return MOQ_ERR_WRONG_STATE;
     /* Migrated by an outbound GOAWAY: no further request-bidi control. Check before
      * capacity preflight so the contract is WRONG_STATE, not WOULD_BLOCK. */
     if (e->goaway_sent) return MOQ_ERR_WRONG_STATE;
