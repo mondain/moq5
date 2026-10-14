@@ -2,3 +2,4 @@ fuzz/corpus/relay_admin_http/* binary
 # Unified diff context prefixes a space to upstream tab indentation, turns
 # blank upstream lines into a lone space, and keeps upstream trailing spaces.
 patches/picoquic/*.patch whitespace=-space-before-tab,-trailing-space,-blank-at-eof
+patches/picotls/*.patch whitespace=-space-before-tab,-trailing-space,-blank-at-eof
