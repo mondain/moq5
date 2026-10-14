@@ -48,17 +48,29 @@ static inline bool pico_wt_moq_err_to_wt(uint64_t moq_code, uint64_t *out)
     return true;
 }
 
-/* Inbound HTTP/3-space code -> MoQ code. Only genuine, non-reserved
- * WebTransport codes in [FIRST, LAST] are decoded; anything else (a legacy
- * peer's raw MoQ code, a reserved GREASE point, or a non-WT error) is
- * preserved unchanged. */
-static inline uint64_t pico_wt_wt_err_to_moq(uint64_t h3_code)
+/* Inbound HTTP/3-space code -> MoQ code. True, with *out set, only for a
+ * genuine, non-reserved WebTransport application code in [FIRST, LAST].
+ * Anything else -- an HTTP/3 or WebTransport protocol code such as
+ * WT_SESSION_GONE, a reserved GREASE point, a value above the range, or a bare
+ * small value a peer sent unmapped -- is still a reset, but carries no
+ * application error code (draft-ietf-webtrans-http3-15 §4.4): false, and the
+ * caller must not report the raw value as a MoQ code. */
+/* The code a data-stream reset with no application error code is delivered
+ * with. The bridge's stream-reset entry point has no "no code" form, so this
+ * is a stand-in: INTERNAL_ERROR (0x0), the generic stream error in both
+ * drafts' tables. The session and the application cannot tell it apart from
+ * a peer that sent INTERNAL_ERROR itself; a peer resetting with raw, unmapped
+ * MoQ codes no longer has them passed through. */
+#define PICO_WT_RESET_NO_APP_CODE 0x0u
+
+static inline bool pico_wt_wt_err_to_moq(uint64_t h3_code, uint64_t *out)
 {
     if (h3_code < PICO_WT_WT_ERR_FIRST || h3_code > PICO_WT_WT_ERR_LAST)
-        return h3_code;
+        return false;
     uint64_t shifted = h3_code - PICO_WT_WT_ERR_FIRST;
-    if (shifted % 0x1full == 0x1eull) return h3_code;  /* reserved GREASE */
-    return shifted - shifted / 0x1full;
+    if (shifted % 0x1full == 0x1eull) return false;    /* reserved GREASE */
+    *out = shifted - shifted / 0x1full;
+    return true;
 }
 
 typedef struct {
@@ -127,6 +139,47 @@ void pico_wt_endpoint_cleanup(pico_wt_endpoint_ctx_t *ctx);
 int pico_wt_endpoint_on_provide_data(pico_wt_endpoint_ctx_t *ctx,
                                      uint64_t stream_id,
                                      void *provide_ctx, size_t space);
+
+/*
+ * Remove the WT session's stream prefix from `h3`, delivering the same
+ * picohttp_callback_deregister to its bound function that
+ * h3zero_delete_stream_prefix() would. h3zero finds the control stream for
+ * that callback through the connection's callback context, which is not an
+ * h3zero context when the connection callback is wrapped (the managed
+ * client); this does the lookup in `h3` instead. Inline so the attach adapter
+ * and the managed facade share it without a cross-library private symbol.
+ */
+static inline void pico_wt_h3_delete_prefix(picoquic_cnx_t *cnx,
+                                            h3zero_callback_ctx_t *h3,
+                                            uint64_t prefix_id)
+{
+    h3zero_stream_prefix_t *prefix = h3zero_find_stream_prefix(h3, prefix_id);
+    if (!prefix) {
+        h3zero_delete_stream_prefix(cnx, h3, prefix_id);   /* logs the miss */
+        return;
+    }
+    picohttp_post_data_cb_fn fn = prefix->function_call;
+    void *fn_ctx = prefix->function_ctx;
+    h3zero_stream_ctx_t *control = fn ? h3zero_find_stream(h3, prefix_id) : NULL;
+    /* With no function bound, h3zero only unlinks and frees the prefix. */
+    prefix->function_call = NULL;
+    h3zero_delete_stream_prefix(cnx, h3, prefix_id);
+    if (fn && control)
+        (void)fn(cnx, NULL, 0, picohttp_callback_deregister, control, fn_ctx);
+}
+
+/*
+ * h3zero_callback_delete_context() for a context whose connection callback
+ * may be wrapped: every remaining prefix is removed through
+ * pico_wt_h3_delete_prefix() first, then the context is deleted.
+ */
+static inline void pico_wt_h3_delete_context(picoquic_cnx_t *cnx,
+                                             h3zero_callback_ctx_t *h3)
+{
+    while (h3->stream_prefixes.first != NULL)
+        pico_wt_h3_delete_prefix(cnx, h3, h3->stream_prefixes.first->prefix);
+    h3zero_callback_delete_context(cnx, h3);
+}
 
 /*
  * Called by the adapter when picohttp_callback_provide_datagram

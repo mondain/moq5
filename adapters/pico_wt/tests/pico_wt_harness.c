@@ -8,16 +8,38 @@
 #include <demoserver.h>
 #include <picoquic_utils.h>
 
+#include <stdbool.h>
 #include <string.h>
 
 #ifndef PICOQUIC_SOURCE_DIR
 #define PICOQUIC_SOURCE_DIR "."
 #endif
 
+/* The harness's own control-stream contexts (the live harness's client and
+ * server). Anything else reaching pico_wt_harness_wt_cb is an attached
+ * adapter's context. */
+static const void *g_harness_wt_ctxs[2];
+
+static bool harness_owns_ctx(const void *ctx)
+{
+    return ctx != NULL &&
+           (ctx == g_harness_wt_ctxs[0] || ctx == g_harness_wt_ctxs[1]);
+}
+
 int pico_wt_harness_wt_cb(picoquic_cnx_t *cnx, uint8_t *bytes,
     size_t length, picohttp_call_back_event_t event,
     h3zero_stream_ctx_t *stream_ctx, void *app_ctx)
 {
+    /* Body bytes on the server's CONNECT stream (close capsules, a capsule's
+     * FIN) arrive here: h3zero's server body branch calls the path-table
+     * callback, but with the stream's own context, which the attached adapter
+     * rebound to itself. Forward them to the adapter, as the managed server
+     * does. */
+    if ((event == picohttp_callback_post_data ||
+         event == picohttp_callback_post_fin) && !harness_owns_ctx(app_ctx))
+        return moq_pico_wt_callback(cnx, bytes, length, event, stream_ctx,
+                                    app_ctx);
+
     pico_wt_wt_cb_ctx_t *w = (pico_wt_wt_cb_ctx_t *)app_ctx;
     (void)bytes; (void)length; (void)cnx;
     switch (event) {
@@ -77,6 +99,8 @@ int pico_wt_harness_setup(pico_wt_harness_t *h,
 {
     memset(h, 0, sizeof(*h));
     picoquic_solution_dir = PICOQUIC_SOURCE_DIR;
+    g_harness_wt_ctxs[0] = &h->client_wt;
+    g_harness_wt_ctxs[1] = &h->server_wt;
 
     uint32_t cap = cfg->request_capacity ? cfg->request_capacity : 16;
 

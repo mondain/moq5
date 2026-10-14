@@ -628,6 +628,21 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
     endif()
     add_test(NAME threaded_lifecycle COMMAND test_threaded_lifecycle)
 
+    # SETUP authorization tokens through the facade over real loopback: the
+    # server's SETUP_COMPLETE carries the configured tokens by value; a set
+    # whose SETUP cannot fit the session send arena is refused at create.
+    add_executable(test_threaded_setup_tokens tests/test_threaded_setup_tokens.c)
+    target_link_libraries(test_threaded_setup_tokens PRIVATE
+        moq-adapter-picoquic-threaded-test-internals)
+    if(MOQ_PICOQUIC_SOURCE_DIR AND EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem")
+        target_compile_definitions(test_threaded_setup_tokens PRIVATE
+            MOQ_TEST_CERT_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+            MOQ_TEST_KEY_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+    endif()
+    add_test(NAME threaded_setup_tokens COMMAND test_threaded_setup_tokens)
+    set_tests_properties(threaded_setup_tokens PROPERTIES
+        TIMEOUT 120 LABELS "network")
+
     # TLS test fixtures are REQUIRED for the threaded TLS gates, not optional.
     # The threaded adapter already requires source-tree picoquic, whose certs/
     # directory ships these files, so a missing fixture is a broken checkout and
@@ -693,6 +708,9 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
     set(_threaded_consumer_bld "${CMAKE_CURRENT_BINARY_DIR}/consumer-threaded-test-build")
     include("${PROJECT_SOURCE_DIR}/tests/cmake/NestedToolchain.cmake")
     moq_nested_cxx_args(_threaded_consumer_cxx)
+    # Forward the parent's compile/link flags and build type: the consumer
+    # links the parent's archives, so a sanitizer parent build needs a
+    # consumer instrumented the same way.
     add_test(NAME adapter_threaded_consumer
         COMMAND ${CMAKE_COMMAND} -E env bash -c
             "set -e; \
@@ -702,9 +720,14 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
                  -DCMAKE_PREFIX_PATH='${PROJECT_BINARY_DIR}' \
                  -DMOQ_PICOQUIC_SOURCE_DIR='${MOQ_PICOQUIC_SOURCE_DIR}' \
                  -DMOQ_PICOTLS_PREFIX='${MOQ_PICOTLS_PREFIX}' \
-                 -DCMAKE_C_COMPILER='${CMAKE_C_COMPILER}'${_threaded_consumer_cxx} && \
+                 -DCMAKE_C_COMPILER='${CMAKE_C_COMPILER}'${_threaded_consumer_cxx} \
+                 -DCMAKE_C_FLAGS='${CMAKE_C_FLAGS}' \
+                 -DCMAKE_EXE_LINKER_FLAGS='${CMAKE_EXE_LINKER_FLAGS}' \
+                 -DCMAKE_BUILD_TYPE='${CMAKE_BUILD_TYPE}' && \
              '${CMAKE_COMMAND}' --build '${_threaded_consumer_bld}' && \
              '${_threaded_consumer_bld}/moq_adapter_threaded_consumer_test'")
+    include("${PROJECT_SOURCE_DIR}/tests/cmake/RejectConsumerWarnings.cmake")
+    moq_test_reject_consumer_warnings(adapter_threaded_consumer)
 
     # Install-tree consumer: installs picoquic + libmoq to a temp prefix
     # and consumes raw managed + the verifier helper against THAT prefix

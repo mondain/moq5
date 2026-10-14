@@ -47,6 +47,8 @@
 #include "endpoint_internal.h"
 
 #include "../../adapters/common/moq_alpn.h"
+#include "../../adapters/common/moq_setup_tokens.h"
+#include <moq/wire.h>
 
 #include <assert.h>
 #include <pthread.h>
@@ -354,6 +356,34 @@ moq_result_t moq_endpoint_resolve_cfg(const moq_endpoint_cfg_t *cfg,
         out->handshake_timeout_us = cfg->handshake_timeout_us;
     }
 
+    /* SETUP authorization tokens: the same complete-presence gate. The
+     * session refuses invalid ones at create; refusing them here keeps the
+     * error at connect, before a backend starts. The SETUP must also fit the
+     * default send arena the backends give their sessions. Only the picoquic
+     * facades forward them, so another backend refuses a non-empty list. */
+    if ((size_t)cfg->struct_size >=
+            offsetof(moq_endpoint_cfg_t, setup_auth_token_count) +
+            sizeof(cfg->setup_auth_token_count) &&
+        cfg->setup_auth_token_count > 0) {
+        if (!cfg->setup_auth_tokens || cfg->setup_auth_token_count > 16)
+            return MOQ_ERR_INVAL;
+        for (size_t i = 0; i < cfg->setup_auth_token_count; i++) {
+            const moq_auth_token_t *t = &cfg->setup_auth_tokens[i];
+            if (t->token_type > MOQ_QUIC_VARINT_MAX ||
+                (t->token_value.len && !t->token_value.data) ||
+                t->token_value.len > UINT16_MAX)
+                return MOQ_ERR_INVAL;
+        }
+        if (!moq_setup_tokens_fit(cfg->setup_auth_tokens,
+                                  cfg->setup_auth_token_count, 0,
+                                  MOQ_SETUP_TOKENS_DEFAULT_ARENA))
+            return MOQ_ERR_INVAL;
+        if (out->backend != MOQ_TRANSPORT_BACKEND_PICOQUIC)
+            return MOQ_ERR_UNSUPPORTED;
+        out->setup_auth_tokens = cfg->setup_auth_tokens;
+        out->setup_auth_token_count = cfg->setup_auth_token_count;
+    }
+
     return resolve_versions(&cfg->versions, out);
 }
 
@@ -416,6 +446,7 @@ struct moq_endpoint {
     char *ca_file; size_t ca_file_len; /* NULL = backend default roots if available */
     bool  insecure;
     uint64_t handshake_timeout_us;     /* 0 = backend default; picoquic only */
+    moq_setup_tokens_t setup_tokens;   /* presented in SETUP; picoquic only */
 
     /* The version offer as transport tokens, preference order. The ALPN
      * entries point at the static strings in moq_alpn.h (no ownership);
@@ -1161,6 +1192,7 @@ static void ep_free_strings(moq_endpoint_t *ep)
     if (ep->wt_offer) ep->alloc.free(ep->wt_offer, ep->wt_offer_len, ep->alloc.ctx);
     ep->host = ep->sni = ep->path = ep->ca_file = NULL;
     ep->wt_offer = NULL;
+    moq_setup_tokens_free(&ep->alloc, &ep->setup_tokens);
 }
 
 /* -- Backend registry ----------------------------------------------- *
@@ -1216,6 +1248,8 @@ static moq_result_t ep_create_pq(moq_endpoint_t *ep,
      * timeout (moqx default ~30s). 15s stays comfortably under a 30s idle
      * bound. Distinct from a MoQ/session deadline; see picoquic_threaded.h. */
     fc.keep_alive_interval_ms = 15000;
+    fc.setup_auth_tokens = ep->setup_tokens.tokens;
+    fc.setup_auth_token_count = ep->setup_tokens.count;
     moq_pq_threaded_t *fac = NULL;
     moq_result_t crc = moq_pq_threaded_create(&fc, &fac);
     if (crc < 0) return crc;
@@ -1253,6 +1287,8 @@ static moq_result_t ep_create_wt(moq_endpoint_t *ep,
     /* Same idle-publisher policy as raw QUIC: emit QUIC keepalive before
      * common relay idle timers can reap a quiet WebTransport publisher. */
     fc.keep_alive_interval_ms = 15000;
+    fc.setup_auth_tokens = ep->setup_tokens.tokens;
+    fc.setup_auth_token_count = ep->setup_tokens.count;
     moq_pico_wt_managed_t *fac = NULL;
     moq_result_t crc = moq_pico_wt_managed_create(&fc, &fac);
     if (crc < 0) return crc;
@@ -1618,6 +1654,16 @@ _Static_assert(offsetof(moq_endpoint_cfg_t, handshake_timeout_us) >=
                        sizeof(((moq_endpoint_cfg_t *)0)->wt_profile),
                "handshake_timeout_us must be appended after wt_profile");
 
+/* The setup-token pair is appended after handshake_timeout_us, in this order:
+ * an older caller's buffer ends before it, so the size gate reads none. */
+_Static_assert(offsetof(moq_endpoint_cfg_t, setup_auth_tokens) >=
+                   offsetof(moq_endpoint_cfg_t, handshake_timeout_us) +
+                       sizeof(((moq_endpoint_cfg_t *)0)->handshake_timeout_us),
+               "setup_auth_tokens must be appended after handshake_timeout_us");
+_Static_assert(offsetof(moq_endpoint_cfg_t, setup_auth_token_count) >
+                   offsetof(moq_endpoint_cfg_t, setup_auth_tokens),
+               "setup_auth_token_count must follow setup_auth_tokens");
+
 void moq_endpoint_cfg_init_sized(moq_endpoint_cfg_t *cfg, size_t cfg_size)
 {
     if (!cfg) return;
@@ -1700,6 +1746,11 @@ moq_result_t moq_endpoint_connect(const moq_endpoint_cfg_t *cfg,
     if (!oom && cfg->ca_file.len > 0) {
         ep->ca_file = ep_strdup_bytes(alloc, cfg->ca_file, &ep->ca_file_len);
         oom = oom || !ep->ca_file;
+    }
+    if (!oom && r.setup_auth_token_count > 0) {
+        moq_result_t src = moq_setup_tokens_copy(alloc, r.setup_auth_tokens,
+            r.setup_auth_token_count, &ep->setup_tokens);
+        oom = src != MOQ_OK;
     }
     /* Convert the resolved version offer into transport tokens, preference
      * order preserved. Every resolved version is build-supported, so every

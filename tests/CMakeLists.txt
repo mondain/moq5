@@ -165,6 +165,20 @@ add_test(NAME bridge_required_hold COMMAND test_bridge_required_hold)
 target_link_libraries(test_bridge_hold_input PRIVATE moq-core-test-internals)
 target_include_directories(test_bridge_hold_input PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
 add_test(NAME bridge_hold_input COMMAND test_bridge_hold_input)
+# FETCH and TRACK_STATUS request-stream lifecycle through two real bridges,
+# draft-16 controls and draft-18 rows: completion closes both halves, late
+# peer terminals and reordering are ordinary input, pressure is retried.
+add_executable(test_bridge_request_lifecycle unit/test_bridge_request_lifecycle.c)
+target_link_libraries(test_bridge_request_lifecycle PRIVATE moq-core-test-internals)
+target_include_directories(test_bridge_request_lifecycle PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME bridge_request_lifecycle COMMAND test_bridge_request_lifecycle)
+# SETUP authorization tokens (moq_session_cfg_t.setup_auth_tokens) on both
+# profiles through two real bridges: delivery by value, owned copy, refusals,
+# older cfg layouts, credential wiping and the draft-18 option codec.
+add_executable(test_session_setup_tokens unit/test_session_setup_tokens.c)
+target_link_libraries(test_session_setup_tokens PRIVATE moq-core-test-internals)
+target_include_directories(test_session_setup_tokens PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME session_setup_tokens COMMAND test_session_setup_tokens)
 # Receive-capacity saturation through the real bridge over fake endpoints:
 # fill receive entries, retain later deliveries, and replay after capacity
 # returns. No request loses its response or receives a fabricated terminal.
@@ -295,6 +309,12 @@ add_test(NAME namespace_cardinality COMMAND test_namespace_cardinality)
 add_executable(test_d18_fetch unit/test_d18_fetch.c)
 target_link_libraries(test_d18_fetch PRIVATE moq-core-test-internals)
 add_test(NAME d18_fetch COMMAND test_d18_fetch)
+
+if(TARGET moq::sim)
+    add_executable(test_request_stop_lifetime unit/test_request_stop_lifetime.c)
+    target_link_libraries(test_request_stop_lifetime PRIVATE moq-core-test-internals moq::sim)
+    add_test(NAME request_stop_lifetime COMMAND test_request_stop_lifetime)
+endif()
 
 add_executable(test_priority_layout unit/test_priority_layout.c)
 target_link_libraries(test_priority_layout PRIVATE moq::core)

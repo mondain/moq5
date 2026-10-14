@@ -10978,15 +10978,11 @@ static int test_local_bidi_stop_blocked_reset_retries(void)
 }
 
 /* 4. Control: a PEER-opened request bidi keeps requester-cancellation, and its
- *    own physical RESET then retires the stream exactly once.
- *
- * Only RESET is exercised. The peer-FIN variant is a separate known
- * limitation: the STOP correctly retires the peer-origin request
- * owner, but the bridge keeps no discard mapping for the peer's still-open
- * sending direction, so its later legal empty FIN reaches the ownerless
- * request parser and closes 0x3. That outcome is not encoded here as an
- * expectation. */
-static int peer_bidi_stop_then_reset(void)
+ *    own physical terminal -- RESET or FIN -- then retires the stream exactly
+ *    once. The STOP retires the request owner, while the session keeps the
+ *    peer's still-open sending direction as a drain reference, so its later
+ *    legal empty FIN is absorbed rather than read as a new request. */
+static int peer_bidi_stop_then_terminal(bool use_fin)
 {
     int failures = 0;
     test_pair_t tp;
@@ -11037,8 +11033,12 @@ static int peer_bidi_stop_then_reset(void)
     }
 
     /* The peer's own remaining direction then terminates. */
-    MOQ_TEST_CHECK(held_bridge_reset(
-                       tp.client_bridge, bidi, 0x1, 0) == MOQ_OK);
+    if (use_fin)
+        MOQ_TEST_CHECK(moq_transport_bridge_on_peer_bidi_bytes(
+                           tp.client_bridge, bidi, NULL, 0, true, 0) == MOQ_OK);
+    else
+        MOQ_TEST_CHECK(held_bridge_reset(
+                           tp.client_bridge, bidi, 0x1, 0) == MOQ_OK);
     MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(tp.client_bridge));
     MOQ_TEST_CHECK(moq_session_state(tp.client) == MOQ_SESS_ESTABLISHED);
     {
@@ -11068,7 +11068,8 @@ static int peer_bidi_stop_then_reset(void)
 
 static int test_peer_bidi_stop_is_request_cancellation(void)
 {
-    return peer_bidi_stop_then_reset();
+    return peer_bidi_stop_then_terminal(false) +
+           peer_bidi_stop_then_terminal(true);
 }
 
 /* 5. Peer FIN and peer RESET each retire a preserved mapping exactly once. */

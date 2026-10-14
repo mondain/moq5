@@ -182,6 +182,16 @@ bridge_stream_entry_t *bridge_find_by_ref(
     return NULL;
 }
 
+const bridge_stream_entry_t *bridge_find_by_id_const(
+    const moq_transport_bridge_t *b, uint64_t transport_id)
+{
+    for (uint32_t i = 0; i < b->max_streams; i++) {
+        if (b->streams[i].active && b->streams[i].transport_id == transport_id)
+            return &b->streams[i];
+    }
+    return NULL;
+}
+
 bridge_stream_entry_t *bridge_find_by_id(
     moq_transport_bridge_t *b, uint64_t transport_id)
 {
@@ -662,6 +672,18 @@ bool moq_transport_bridge_terminal_facts(const moq_transport_bridge_t *b,
         *out_observed = b != NULL && b->session != NULL &&
                         moq_session_terminal_observed(b->session);
     return enqueued;
+}
+
+bool moq_transport_bridge_stream_is_control(const moq_transport_bridge_t *b,
+                                            uint64_t stream_id)
+{
+    if (!b || stream_id == UINT64_MAX) return false;
+    if (b->control_open && b->control_stream_id == stream_id) return true;
+    if (b->peer_control_open && b->peer_control_stream_id == stream_id) return true;
+    if (b->pending_control && b->pending_control_stream_id == stream_id) return true;
+    const bridge_stream_entry_t *e = bridge_find_by_id_const(b, stream_id);
+    return e && e->kind == BRIDGE_STREAM_UNI &&
+           e->uni_disp == BRIDGE_UNI_DISP_CONTROL;
 }
 
 size_t moq_transport_bridge_stream_count(const moq_transport_bridge_t *b)

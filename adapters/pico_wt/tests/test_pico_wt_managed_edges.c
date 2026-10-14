@@ -135,6 +135,29 @@ static void test_connect_failure(void)
     moq_pico_wt_managed_destroy(cli);
 }
 
+
+/* A client whose CONNECT cannot be prepared (here a 2048-byte path) fails
+ * create before the network thread exists and before the facade installs its
+ * own connection callback: the connection still carries h3zero's callback
+ * with the h3zero context, and releasing that context must not leave the
+ * connection pointing at it while the QUIC context is freed. */
+static void test_connect_prepare_failure(void)
+{
+    static char long_path[2049];
+    long_path[0] = '/';
+    memset(long_path + 1, 'p', sizeof(long_path) - 2);
+    long_path[sizeof(long_path) - 1] = '\0';
+    moq_pico_wt_managed_cfg_t cfg;
+    base_client_cfg(&cfg, 4433);
+    cfg.insecure_skip_verify = true;
+    cfg.path = long_path;
+    moq_pico_wt_managed_t *cli = NULL;
+    moq_result_t rc = moq_pico_wt_managed_create(&cfg, &cli);
+    CHECK(rc != MOQ_OK);
+    CHECK(cli == NULL);
+    if (cli) { moq_pico_wt_managed_stop(cli); moq_pico_wt_managed_destroy(cli); }
+}
+
 /* -- stop/wake/wait lifecycle -------------------------------------- */
 
 static void test_lifecycle(void)
@@ -512,6 +535,7 @@ int main(int argc, char **argv)
     test_null_safety();
     test_ip_host_sni_policy();
     test_connect_failure();
+    test_connect_prepare_failure();
     test_lifecycle();
     test_cert_failure(cert, key);
     test_helper_cert_failure(cert, key);

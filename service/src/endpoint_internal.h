@@ -40,6 +40,10 @@ typedef struct moq_endpoint_resolved {
      * the picoquic backends -- resolve rejects a non-zero value on any backend
      * that cannot apply it. */
     uint64_t      handshake_timeout_us;
+    /* SETUP authorization tokens, struct_size-gated and validated at resolve;
+     * BORROWED from the cfg. Only the picoquic backend carries them. */
+    const moq_auth_token_t *setup_auth_tokens;
+    size_t        setup_auth_token_count;
 } moq_endpoint_resolved_t;
 
 /*

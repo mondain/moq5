@@ -637,6 +637,8 @@ endif()\n")
                  '${CMAKE_COMMAND}' --build '${_picowtm_consumer_bld}' && \
                  '${_picowtm_consumer_bld}/moq_pico_wt_managed_consumer_test'")
         set_tests_properties(pico_wt_managed_consumer PROPERTIES TIMEOUT 180)
+        include("${PROJECT_SOURCE_DIR}/tests/cmake/RejectConsumerWarnings.cmake")
+        moq_test_reject_consumer_warnings(pico_wt_managed_consumer)
 
         # Install-tree managed consumer: installs a BUILD_HTTP picoquic +
         # libmoq to a temp prefix and builds the managed consumer against
@@ -718,6 +720,8 @@ endif()\n")
                  '${_picowtmv_consumer_bld}/moq_pico_wt_managed_verify_consumer_test'")
         set_tests_properties(pico_wt_managed_verify_consumer
             PROPERTIES TIMEOUT 180)
+        include("${PROJECT_SOURCE_DIR}/tests/cmake/RejectConsumerWarnings.cmake")
+        moq_test_reject_consumer_warnings(pico_wt_managed_verify_consumer)
 
         # Verifier cross-link consumer (pkg-config): the Meson/autotools
         # path — `pkg-config --cflags --libs libmoq-pico-wt-managed libmoq`
@@ -781,6 +785,34 @@ endif()\n")
             set_tests_properties(pico_wt_managed_keepalive_server PROPERTIES
                 TIMEOUT 30 LABELS "network;pico_wt;managed")
         endif()
+    endif()
+
+    # Managed client pre-accept stream buffer: chunk order and FIN, the stream
+    # and byte limits (WT_BUFFERED_STREAM_REJECTED), peer reset, early
+    # datagrams, and a refused CONNECT (WT_SESSION_GONE). White-box: the
+    # facade source is compiled in with MOQ_PICO_WT_TESTING; no network.
+    if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR AND TARGET picoquic-test)
+        add_executable(test_pico_wt_managed_early_streams
+            tests/test_pico_wt_managed_early_streams.c
+            tests/pico_wt_harness.c)
+        target_compile_definitions(test_pico_wt_managed_early_streams PRIVATE
+            MOQ_PICO_WT_TESTING
+            PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
+        target_include_directories(test_pico_wt_managed_early_streams PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+        target_link_libraries(test_pico_wt_managed_early_streams PRIVATE
+            moq::adapter-pico-wt-managed picoquic-test)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pico_wt_managed_early_streams PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+        endif()
+        add_test(NAME pico_wt_managed_early_streams
+            COMMAND test_pico_wt_managed_early_streams)
+        set_tests_properties(pico_wt_managed_early_streams PROPERTIES
+            TIMEOUT 30 LABELS "pico_wt;managed")
     endif()
 
     # Managed client test: drives the facade against the example
@@ -901,6 +933,39 @@ endif()\n")
             TIMEOUT 30
             LABELS "network;pico_wt;managed")
 
+        # SETUP authorization tokens through the managed facade: refusal of a
+        # set the send arena cannot hold, whole delivery on both drafts, and a
+        # SETUP that cannot be queued ending as a failed connection.
+        add_executable(test_pico_wt_managed_tokens
+            tests/test_pico_wt_managed_tokens.c)
+        target_link_libraries(test_pico_wt_managed_tokens
+            PRIVATE moq::adapter-pico-wt-managed)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pico_wt_managed_tokens PRIVATE
+                -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+        endif()
+        add_test(NAME pico_wt_managed_tokens
+            COMMAND test_pico_wt_managed_tokens
+                --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                --key  "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        set_tests_properties(pico_wt_managed_tokens PROPERTIES
+            TIMEOUT 60
+            LABELS "network;pico_wt;managed")
+
+        # A managed client publishes object datagrams to a managed server that
+        # subscribed to it. The client wraps h3zero's connection callback with
+        # its own context, so the datagram send path must use the endpoint's own
+        # h3zero context. Both drafts.
+        foreach(_dg_mode datagram datagram_18)
+            add_test(NAME pico_wt_managed_${_dg_mode}
+                COMMAND test_pico_wt_managed_loopback --mode ${_dg_mode}
+                    --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                    --key  "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+            set_tests_properties(pico_wt_managed_${_dg_mode} PROPERTIES
+                TIMEOUT 30
+                LABELS "network;pico_wt;managed")
+        endforeach()
+
         # Same withdrawal against a relay that omits the reset_stream_at
         # transport parameter (imquic/moqx). The client synthesizes the TP to
         # unblock CONNECT, so the abort must downgrade to a plain RESET_STREAM;
@@ -955,6 +1020,29 @@ endif()\n")
         target_include_directories(test_pico_wt_ownership PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(test_pico_wt_ownership PRIVATE moq::adapter-pico-wt-managed)
+        # Session-terminal arbitration through the managed facade: a control
+        # reset, close capsule and connection loss scripted from one side's
+        # network thread, for client and server receivers on both drafts.
+        add_executable(test_pico_wt_managed_arbitration
+            tests/test_pico_wt_managed_arbitration.c
+            pico_wt_managed.c
+            pico_wt_adapter.c
+            pico_wt_endpoint.c
+            ../common/moq_pq_send_queue.c
+        )
+        target_compile_definitions(test_pico_wt_managed_arbitration PRIVATE
+            MOQ_PICO_WT_TESTING MOQ_PICO_WT_TEST_QUIC_LOST)
+        target_include_directories(test_pico_wt_managed_arbitration PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(test_pico_wt_managed_arbitration PRIVATE
+            moq::adapter-pico-wt-managed)
+        add_test(NAME pico_wt_managed_arbitration
+            COMMAND test_pico_wt_managed_arbitration
+                "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        set_tests_properties(pico_wt_managed_arbitration PROPERTIES
+            TIMEOUT 120 LABELS "network;pico_wt;managed")
+
         add_test(NAME pico_wt_ownership
             COMMAND test_pico_wt_ownership
                 "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"

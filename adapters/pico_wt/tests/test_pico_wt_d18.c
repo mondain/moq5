@@ -46,7 +46,8 @@ typedef struct {
     uint64_t sid;
     bool     stream_present;
     uint64_t raw_code;        /* picoquic_get_remote_stream_error while live */
-    uint64_t mapped_code;     /* pico_wt_wt_err_to_moq(raw_code) */
+    uint64_t mapped_code;     /* pico_wt_wt_err_to_moq(raw_code), when mapped */
+    bool     has_mapped_code; /* raw_code is a WebTransport application code */
     bool     reset_received;
     uint64_t reset_offset;    /* reliable prefix the RESET_STREAM_AT carried */
 } term_rec_t;
@@ -69,7 +70,7 @@ static void term_observer(moq_pico_wt_conn_t *c, int event, uint64_t sid, int ph
     picoquic_stream_head_t *st = picoquic_find_stream(cnx, sid);
     r->stream_present = st != NULL;
     r->raw_code = picoquic_get_remote_stream_error(cnx, sid);
-    r->mapped_code = pico_wt_wt_err_to_moq(r->raw_code);
+    r->has_mapped_code = pico_wt_wt_err_to_moq(r->raw_code, &r->mapped_code);
     if (st) { r->reset_received = st->reset_received != 0; r->reset_offset = st->reset_offset; }
 }
 static void term_install(pico_wt_harness_t *h)
@@ -301,7 +302,7 @@ static int run_publish_namespace_done(pico_wt_harness_t *h, bool is_d18)
             DCHECK(ann_reset.stream_present && ann_reset.reset_received);
             /* ...carrying the WT-mapped CANCELLED code, which maps back to 0x1... */
             DCHECK(ann_reset.raw_code == want);
-            DCHECK(ann_reset.mapped_code == 0x1);
+            DCHECK(ann_reset.has_mapped_code && ann_reset.mapped_code == 0x1);
             /* ...as RESET_STREAM_AT with the WT preamble as its reliable prefix,
              * exactly the size the client's endpoint recorded. */
             DCHECK(ann_reset.reset_offset > 0 &&
@@ -383,7 +384,8 @@ static int run_publish_namespace_done(pico_wt_harness_t *h, bool is_d18)
             DCHECK(n_ann2 == 1);
             if (n_ann2 == 1) {
                 DCHECK(ann2_reset.stream_present && ann2_reset.reset_received);
-                DCHECK(ann2_reset.raw_code == want && ann2_reset.mapped_code == 0x1);
+                DCHECK(ann2_reset.raw_code == want && ann2_reset.has_mapped_code &&
+                       ann2_reset.mapped_code == 0x1);
                 DCHECK(ann2_reset.reset_offset == 0);
             }
             DCHECK(term_reset_entries(h->server_conn, h->server_conn->control_stream_id, NULL) == 0);
@@ -431,7 +433,8 @@ static void run_version(uint8_t cid_byte, moq_version_t version)
  * WebTransport §4.4 error-code mapping boundaries (pure helper coverage, no
  * transport). The additive base is only correct below the first reserved
  * GREASE point; the real mapping skips one code every 0x1e, bounds the space
- * to UINT32_MAX, and preserves non-WebTransport values unchanged.
+ * to UINT32_MAX, and reports every non-WebTransport value as carrying no
+ * application code.
  */
 static void run_error_code_mapping(void)
 {
@@ -453,7 +456,9 @@ static void run_error_code_mapping(void)
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         CHECK(pico_wt_moq_err_to_wt(cases[i].n, &out));
         CHECK(out == cases[i].enc);
-        CHECK(pico_wt_wt_err_to_moq(cases[i].enc) == cases[i].n);
+        uint64_t back = UINT64_MAX;
+        CHECK(pico_wt_wt_err_to_moq(cases[i].enc, &back));
+        CHECK(back == cases[i].n);
     }
 
     /* Outbound rejects codes beyond UINT32_MAX (not WebTransport codes). */
@@ -461,14 +466,19 @@ static void run_error_code_mapping(void)
     CHECK(!pico_wt_moq_err_to_wt(UINT64_MAX, &out));
 
     /* The first reserved HTTP/3 GREASE point (FIRST + 0x1e) is not a valid
-     * WebTransport code and is preserved unchanged, never decoded. */
-    CHECK(pico_wt_wt_err_to_moq(FIRST + 0x1e) == FIRST + 0x1e);
+     * WebTransport code: no application code, and the output is untouched. */
+    out = 0xabc;
+    CHECK(!pico_wt_wt_err_to_moq(FIRST + 0x1e, &out));
+    CHECK(out == 0xabc);
 
-    /* Values outside [FIRST, LAST] pass through unchanged: a legacy peer's
-     * raw MoQ code, a plain HTTP/3 error, or anything above the range. */
-    CHECK(pico_wt_wt_err_to_moq(0x1) == 0x1);
-    CHECK(pico_wt_wt_err_to_moq(FIRST - 1) == FIRST - 1);
-    CHECK(pico_wt_wt_err_to_moq(LAST + 1) == LAST + 1);
+    /* Values outside [FIRST, LAST] carry no application code (§4.4): a bare
+     * small value a peer sent unmapped, a plain HTTP/3 error such as
+     * WT_SESSION_GONE, or anything above the range. */
+    CHECK(!pico_wt_wt_err_to_moq(0x1, &out));
+    CHECK(!pico_wt_wt_err_to_moq(0x170d7b68, &out));
+    CHECK(!pico_wt_wt_err_to_moq(FIRST - 1, &out));
+    CHECK(!pico_wt_wt_err_to_moq(LAST + 1, &out));
+    CHECK(out == 0xabc);
 }
 
 int main(void)

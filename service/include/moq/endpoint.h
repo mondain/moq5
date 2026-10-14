@@ -247,6 +247,19 @@ typedef struct moq_endpoint_cfg {
      * the v0 floor, connect() reads it ONLY when struct_size covers it fully --
      * set it via moq_endpoint_cfg_init_sized(&cfg, sizeof cfg). */
     uint64_t handshake_timeout_us;
+    /* appended (enabled by struct_size): authorization tokens the session
+     * presents in its SETUP (moq_session_cfg_t.setup_auth_tokens: sent by
+     * value, at most 16, each value at most 65535 bytes), copied at connect.
+     * The SETUP carrying them must fit the session's default 4096-byte send
+     * arena (the send-arena rule on moq_session_cfg_t.setup_auth_tokens),
+     * else MOQ_ERR_INVAL at connect, rather than a connection that fails when
+     * it starts. Only the picoquic backend (raw QUIC and
+     * WebTransport) carries them; any other backend refuses a non-empty list
+     * with MOQ_ERR_UNSUPPORTED. Because it is past the v0 floor, connect()
+     * reads it ONLY when struct_size covers setup_auth_token_count -- set it
+     * via moq_endpoint_cfg_init_sized(&cfg, sizeof cfg). */
+    const moq_auth_token_t *setup_auth_tokens;
+    size_t setup_auth_token_count;
 } moq_endpoint_cfg_t;
 
 /* Largest accepted moq_endpoint_cfg_t.handshake_timeout_us (see its doc above).

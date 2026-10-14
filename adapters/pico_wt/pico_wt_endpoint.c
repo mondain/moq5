@@ -14,6 +14,12 @@
  * Datagram bridge: push send_datagram() buffers one datagram;
  * the pull provide_datagram callback flushes it. Single-slot,
  * lossy — excess datagrams are DROPPED.
+ *
+ * Every h3zero lookup goes through the endpoint's own h3zero context. A few
+ * h3zero helpers instead recover it from the connection's callback context,
+ * which only holds when the connection callback is h3zero's own; those
+ * helpers are not used here (see ep_send_datagram, and pico_wt_h3_delete_prefix
+ * in pico_wt_endpoint.h).
  */
 
 #include "pico_wt_endpoint.h"
@@ -210,6 +216,10 @@ static moq_transport_result_t ep_send_datagram(void *ctx,
 {
     pico_wt_endpoint_ctx_t *ep = (pico_wt_endpoint_ctx_t *)ctx;
 
+    /* A detached endpoint no longer owns a connection: nothing to send on. */
+    if (!ep->cnx || !ep->h3_ctx)
+        return MOQ_TRANSPORT_DROPPED;
+
     /* Single-slot buffer — drop if occupied */
     if (ep->pending_dg_len > 0)
         return MOQ_TRANSPORT_DROPPED;
@@ -217,12 +227,22 @@ static moq_transport_result_t ep_send_datagram(void *ctx,
     if (len > sizeof(ep->pending_dg_buf))
         return MOQ_TRANSPORT_TOO_LARGE;
 
+    /* Readiness is declared on the WT session's stream prefix, looked up in
+     * the endpoint's own h3zero context. h3zero_set_datagram_ready() would
+     * instead fetch the h3zero context from the connection's callback context,
+     * which is not an h3zero context when the connection callback is wrapped
+     * (the managed client owns it): that lookup walks unrelated memory. */
+    h3zero_stream_prefix_t *prefix =
+        h3zero_find_stream_prefix(ep->h3_ctx, ep->control_stream_id);
+    if (!prefix)
+        return MOQ_TRANSPORT_DROPPED;
+
     if (data && len > 0)
         memcpy(ep->pending_dg_buf, data, len);
     ep->pending_dg_len = len;
 
-    int rc = h3zero_set_datagram_ready(ep->cnx, ep->control_stream_id);
-    if (rc != 0) {
+    prefix->ready_to_send_datagrams = 1;
+    if (picoquic_mark_datagram_ready(ep->cnx, 1) != 0) {
         ep->pending_dg_len = 0;
         return MOQ_TRANSPORT_DROPPED;
     }

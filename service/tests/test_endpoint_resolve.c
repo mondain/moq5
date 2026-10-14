@@ -5,6 +5,7 @@
  */
 #include "endpoint_internal.h"
 #include "test_support.h"
+#include "../../adapters/common/moq_setup_tokens.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -25,9 +26,129 @@ static bool bytes_eq(moq_bytes_t b, const char *s)
 static moq_endpoint_cfg_t mkcfg(const char *url)
 {
     moq_endpoint_cfg_t c;
+    /* The pointer-only init stamps only the v0 prefix; rows that then widen
+     * struct_size must not read uninitialized appended fields. */
+    memset(&c, 0, sizeof(c));
     moq_endpoint_cfg_init(&c);
     c.url = B(url);
     return c;
+}
+
+/* SETUP authorization tokens (moq_endpoint_cfg_t.setup_auth_tokens): the
+ * resolved cfg borrows them; invalid sets and sets whose SETUP cannot fit
+ * the default 4096-byte session send arena are refused at resolve; a backend
+ * that cannot forward them refuses a non-empty list; an older cfg layout
+ * sends none. */
+static void test_setup_tokens(void)
+{
+    moq_endpoint_cfg_t c;
+    moq_endpoint_resolved_t r;
+    uint8_t v[] = { 1, 2, 3 };
+    moq_auth_token_t tokens[17];
+    memset(tokens, 0, sizeof(tokens));
+    tokens[0] = (moq_auth_token_t){ 7, { v, sizeof(v) } };
+
+    moq_endpoint_cfg_init_sized(&c, sizeof(c));
+    c.url = B("moqt://relay.example:4443/live");
+    moq_result_t base = moq_endpoint_resolve_cfg(&c, &r);
+    c.setup_auth_tokens = tokens;
+    c.setup_auth_token_count = 1;
+    moq_result_t with = moq_endpoint_resolve_cfg(&c, &r);
+    MOQ_TEST_CHECK_EQ_INT((int)with, (int)base);
+    if (with == MOQ_OK)
+        MOQ_TEST_CHECK(r.setup_auth_tokens == tokens && r.setup_auth_token_count == 1);
+    c.setup_auth_token_count = 17;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), MOQ_ERR_INVAL);
+    c.setup_auth_token_count = 1;
+    c.setup_auth_tokens = NULL;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), MOQ_ERR_INVAL);
+    c.setup_auth_tokens = tokens;
+    tokens[0].token_value = (moq_bytes_t){ NULL, 2 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), MOQ_ERR_INVAL);
+    tokens[0].token_value = (moq_bytes_t){ v, sizeof(v) };
+    tokens[0].token_type = UINT64_C(1) << 62;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), MOQ_ERR_INVAL);
+    tokens[0].token_type = 7;
+
+    /* The SETUP carrying them must fit the default 4096-byte session send
+     * arena the backends use (and so a default peer's receive buffer): one
+     * 4096-byte value does not; two values that each fit alone but not
+     * together do not; the largest value that fits does. */
+    if (base == MOQ_OK) {
+        static uint8_t big[4096];
+        size_t largest = 4096 - MOQ_SETUP_TOKENS_OTHER_OPTIONS - 32;
+        tokens[0].token_value = (moq_bytes_t){ big, sizeof(big) };
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), MOQ_ERR_INVAL);
+        tokens[0].token_value = (moq_bytes_t){ big, largest + 1 };
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), MOQ_ERR_INVAL);
+        tokens[0].token_value = (moq_bytes_t){ big, largest };
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), MOQ_OK);
+        tokens[0].token_value = (moq_bytes_t){ big, 2000 };
+        tokens[1] = (moq_auth_token_t){ 8, { big, 2000 } };
+        c.setup_auth_token_count = 2;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), MOQ_ERR_INVAL);
+        c.setup_auth_token_count = 1;
+        memset(&tokens[1], 0, sizeof(tokens[1]));
+        tokens[0].token_value = (moq_bytes_t){ v, sizeof(v) };
+    }
+
+    /* A backend that cannot forward them refuses a non-empty list rather
+     * than dropping it. */
+    moq_endpoint_cfg_init_sized(&c, sizeof(c));
+    c.url = B("moqt://relay.example:4443/live");
+    c.backend = MOQ_TRANSPORT_BACKEND_MSQUIC;
+    base = moq_endpoint_resolve_cfg(&c, &r);
+    c.setup_auth_tokens = tokens;
+    c.setup_auth_token_count = 1;
+    /* Without tokens the backend resolves (when built); with them it is
+     * refused: the refusal is the tokens', not the backend's absence. */
+    if (base == MOQ_OK)
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), MOQ_ERR_UNSUPPORTED);
+    else
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)base);
+
+    /* A caller whose struct ends before the pair sends none. */
+    moq_endpoint_cfg_init_sized(&c, sizeof(c));
+    c.url = B("moqt://relay.example:4443/live");
+    c.struct_size = (uint32_t)offsetof(moq_endpoint_cfg_t, setup_auth_tokens);
+    c.setup_auth_tokens = NULL;
+    c.setup_auth_token_count = 5;
+    if (moq_endpoint_resolve_cfg(&c, &r) == MOQ_OK)
+        MOQ_TEST_CHECK_EQ_SIZE(r.setup_auth_token_count, 0);
+}
+
+/* The owned copy the facades and the endpoint keep is wiped when released:
+ * no block returned to the allocator still holds the credential. */
+static const uint8_t k_secret[] = { 0x5e, 0xc2, 0xe7, 0x7a, 0x0b, 0x3c, 0x91, 0x4d };
+static int g_secret_frees;
+static void *scan_alloc(size_t n, void *ctx) { (void)ctx; return malloc(n ? n : 1); }
+static void *scan_realloc(void *p, size_t o, size_t n, void *ctx)
+{ (void)o; (void)ctx; return realloc(p, n); }
+static void scan_free(void *p, size_t n, void *ctx)
+{
+    (void)ctx;
+    const uint8_t *b = (const uint8_t *)p;
+    for (size_t i = 0; b && i + sizeof(k_secret) <= n; i++)
+        if (memcmp(b + i, k_secret, sizeof(k_secret)) == 0) { g_secret_frees++; break; }
+    free(p);
+}
+
+static void test_setup_token_copy_wiped(void)
+{
+    moq_alloc_t a = { .ctx = NULL, .alloc = scan_alloc, .realloc = scan_realloc,
+                      .free = scan_free };
+    uint8_t value[40];
+    for (size_t i = 0; i < sizeof(value); i++) value[i] = k_secret[i % sizeof(k_secret)];
+    moq_auth_token_t in[2] = { { 3, { value, sizeof(value) } }, { 4, { value, 8 } } };
+    moq_setup_tokens_t copy;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_setup_tokens_copy(&a, in, 2, &copy), MOQ_OK);
+    MOQ_TEST_CHECK(copy.count == 2 && copy.tokens[0].token_value.data != value);
+    value[0] = 0;   /* the copy is the copy's own */
+    MOQ_TEST_CHECK(copy.tokens[0].token_value.data[0] == k_secret[0]);
+    g_secret_frees = 0;
+    moq_setup_tokens_free(&a, &copy);
+    MOQ_TEST_CHECK_EQ_INT(g_secret_frees, 0);
+    MOQ_TEST_CHECK(copy.tokens == NULL && copy.count == 0);
 }
 
 int main(void)
@@ -828,6 +949,9 @@ int main(void)
         MOQ_TEST_CHECK(strcmp(moq_strerror(MOQ_ERR_UNSUPPORTED),
                               "unknown error") != 0);
     }
+
+    test_setup_tokens();
+    test_setup_token_copy_wiped();
 
     MOQ_TEST_PASS("endpoint_resolve");
     return failures != 0;

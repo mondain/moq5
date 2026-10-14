@@ -96,7 +96,9 @@ h3zero_stream_prefix_t *h3zero_find_stream_prefix(h3zero_callback_ctx_t *ctx, ui
     { (void)ctx; (void)prefix; return &g_prefix; }
 void h3zero_delete_stream_prefix(picoquic_cnx_t *cnx, h3zero_callback_ctx_t *ctx, uint64_t prefix)
     { (void)cnx; (void)ctx; (void)prefix; }
-int h3zero_set_datagram_ready(picoquic_cnx_t *cnx, uint64_t stream_id) { (void)cnx; (void)stream_id; return 0; }
+int picoquic_mark_datagram_ready(picoquic_cnx_t *cnx, int is_ready) { (void)cnx; (void)is_ready; return 0; }
+void picoquic_get_close_reasons(picoquic_cnx_t *cnx, uint64_t *l, uint64_t *r, uint64_t *la, uint64_t *ra)
+    { (void)cnx; *l = *r = *la = *ra = 0; }
 static uint8_t g_dg_buf[2048];
 uint8_t *h3zero_provide_datagram_buffer(void *context, size_t length, int ready_to_send)
     { (void)context; (void)ready_to_send; return length <= sizeof(g_dg_buf) ? g_dg_buf : NULL; }
