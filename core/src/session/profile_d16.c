@@ -1240,6 +1240,28 @@ static moq_result_t d16_scan_extensions_dynamic_groups(
     }
 }
 
+#define D16_EXT_DEFAULT_PUBLISHER_GROUP_ORDER 0x22u
+
+/* Validate readable values only; malformed opaque extensions remain lenient. */
+static moq_result_t d16_validate_publisher_group_order(const uint8_t *data,
+                                                       size_t len)
+{
+    if (!data || len == 0) return MOQ_OK;
+    moq_kvp_decoder_t dec;
+    moq_kvp_decoder_init(&dec, data, len);
+    for (;;) {
+        moq_kvp_entry_t e;
+        moq_result_t rc = moq_kvp_decode_next(&dec, &e);
+        if (rc == MOQ_DONE) return MOQ_OK;
+        if (rc < 0) return MOQ_OK;
+        if (e.type != D16_EXT_DEFAULT_PUBLISHER_GROUP_ORDER) continue;
+        uint64_t v = 0;
+        size_t n = moq_quic_varint_decode(e.value, e.value_len, &v);
+        if (n == 0 || n != e.value_len) return MOQ_OK;
+        if (v < 1 || v > 2) return MOQ_ERR_PROTO;
+    }
+}
+
 /* -- D16 inbound SUBSCRIBE_OK decode ------------------------------- */
 
 static const uint64_t d16_subscribe_ok_allowed_params[] = {
@@ -1282,6 +1304,11 @@ static moq_result_t d16_decode_subscribe_ok(moq_session_t *s,
     out->track_alias = ok.track_alias;
     out->track_properties = ok.track_extensions;
     out->track_properties_len = ok.track_extensions_len;
+    if (d16_validate_publisher_group_order(ok.track_extensions,
+            ok.track_extensions_len) < 0) {
+        *out_consumed = true;
+        return close_with_error(s, 0x3, "invalid DEFAULT_PUBLISHER_GROUP_ORDER");
+    }
     if (d16_scan_extensions_dynamic_groups(ok.track_extensions,
             ok.track_extensions_len, &out->dynamic_groups) < 0) {
         *out_consumed = true;
@@ -1939,6 +1966,11 @@ static moq_result_t d16_decode_publish(moq_session_t *s,
     out->request_id = pub.request_id;
     out->track_properties = pub.track_extensions;
     out->track_properties_len = pub.track_extensions_len;
+    if (d16_validate_publisher_group_order(pub.track_extensions,
+            pub.track_extensions_len) < 0) {
+        *out_consumed = true;
+        return close_with_error(s, 0x3, "invalid DEFAULT_PUBLISHER_GROUP_ORDER");
+    }
     if (d16_scan_extensions_dynamic_groups(pub.track_extensions,
             pub.track_extensions_len, &out->dynamic_groups) < 0) {
         *out_consumed = true;
@@ -2512,6 +2544,12 @@ static moq_result_t d16_decode_fetch_ok_inbound(
     if (rc < 0) {
         *out_consumed = true;
         return close_with_error(s, 0x3, "malformed FETCH_OK");
+    }
+
+    if (d16_validate_publisher_group_order(ok.track_extensions,
+            ok.track_extensions_len) < 0) {
+        *out_consumed = true;
+        return close_with_error(s, 0x3, "invalid DEFAULT_PUBLISHER_GROUP_ORDER");
     }
 
     moq_request_endpoint_t ep = request_registry_find_by_id(s, ok.request_id);

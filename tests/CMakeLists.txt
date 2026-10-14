@@ -370,6 +370,11 @@ if(TARGET moq::sim)
     target_link_libraries(test_session_publish_params PRIVATE moq-core-test-internals moq::sim)
     add_test(NAME session_publish_params COMMAND test_session_publish_params)
 
+    add_executable(test_publisher_group_order_wire unit/test_publisher_group_order_wire.c)
+    target_link_libraries(test_publisher_group_order_wire PRIVATE moq-core-test-internals moq::sim)
+    add_test(NAME publisher_group_order_wire_controls COMMAND test_publisher_group_order_wire --controls)
+    add_test(NAME publisher_group_order_wire_invalid COMMAND test_publisher_group_order_wire --invalid)
+
     add_executable(test_session_stream_count unit/test_session_stream_count.c)
     target_link_libraries(test_session_stream_count PRIVATE moq-core-test-internals moq::sim)
     add_test(NAME session_stream_count COMMAND test_session_stream_count)

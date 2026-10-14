@@ -508,6 +508,7 @@ moq_result_t moq_d18_decode_track_status(const uint8_t *payload,
  * mandatory unknown may not hide inside it); a nested IMMUTABLE_PROPERTIES is
  * malformed. */
 #define D18_PROP_IMMUTABLE      0x0Bu
+#define D18_PROP_DEFAULT_PUBLISHER_GROUP_ORDER 0x22u
 #define D18_PROP_DYNAMIC_GROUPS 0x30u   /* §12.6: 0/1; >1 is a violation */
 
 /* Validate a Property KVP block structurally. A Mandatory Track Property
@@ -516,10 +517,12 @@ moq_result_t moq_d18_decode_track_status(const uint8_t *payload,
  * (*out_mandatory = true) and is NOT itself an error (the caller decides — object
  * properties are malformed and close, track properties respond
  * UNSUPPORTED_EXTENSION); when NULL it is rejected (MOQ_ERR_PROTO). Malformed
- * structure is always MOQ_ERR_PROTO. */
+ * structure is always MOQ_ERR_PROTO. Inbound track blocks additionally enforce
+ * the DEFAULT_PUBLISHER_GROUP_ORDER range, including immutable properties. */
 static moq_result_t d18_validate_props_inner(const uint8_t *data, size_t len,
                                              bool nested, bool *out_mandatory,
-                                             bool *out_dynamic_groups)
+                                             bool *out_dynamic_groups,
+                                             bool inbound_track)
 {
     moq_buf_reader_t r;
     moq_buf_reader_init(&r, data, len);
@@ -543,7 +546,7 @@ static moq_result_t d18_validate_props_inner(const uint8_t *data, size_t len,
                 if (nested) return MOQ_ERR_PROTO;   /* §12.7: no nesting */
                 moq_result_t rc = d18_validate_props_inner(
                     moq_buf_reader_ptr(&r), (size_t)vlen, true, out_mandatory,
-                    out_dynamic_groups);
+                    out_dynamic_groups, inbound_track);
                 if (rc < 0) return rc;
             }
             r.pos += (size_t)vlen;
@@ -558,6 +561,9 @@ static moq_result_t d18_validate_props_inner(const uint8_t *data, size_t len,
                  * them too. */
                 if (v > 1) return MOQ_ERR_PROTO;
                 if (out_dynamic_groups && v == 1) *out_dynamic_groups = true;
+            } else if (inbound_track &&
+                       type == D18_PROP_DEFAULT_PUBLISHER_GROUP_ORDER) {
+                if (v < 1 || v > 2) return MOQ_ERR_PROTO;
             }
         }
     }
@@ -568,7 +574,7 @@ static moq_result_t d18_validate_props_inner(const uint8_t *data, size_t len,
 static moq_result_t d18_validate_track_properties(const uint8_t *data,
                                                   size_t len)
 {
-    return d18_validate_props_inner(data, len, false, NULL, NULL);
+    return d18_validate_props_inner(data, len, false, NULL, NULL, false);
 }
 
 /* §9.8: pure per-profile timeout scanner. Extracts OBJECT_DELIVERY_TIMEOUT
@@ -646,12 +652,12 @@ static moq_result_t d18_scan_track_properties(const uint8_t *data, size_t len,
     *out_mandatory = false;
     if (out_dynamic_groups) *out_dynamic_groups = false;
     return d18_validate_props_inner(data, len, false, out_mandatory,
-                                    out_dynamic_groups);
+                                    out_dynamic_groups, true);
 }
 
 moq_result_t moq_d18_validate_properties(const uint8_t *data, size_t len)
 {
-    return d18_validate_props_inner(data, len, false, NULL, NULL);
+    return d18_validate_props_inner(data, len, false, NULL, NULL, false);
 }
 
 /* Lenient DYNAMIC_GROUPS extraction for the profile's outbound latch: walks
@@ -667,7 +673,7 @@ moq_result_t moq_d18_scan_dynamic_groups(const uint8_t *data, size_t len,
     bool mandatory_ignored = false;
     *out_dynamic_groups = false;
     return d18_validate_props_inner(data, len, false, &mandatory_ignored,
-                                    out_dynamic_groups);
+                                    out_dynamic_groups, false);
 }
 
 /* -- OBJECT_DATAGRAM (§11.3.1) + Padding Datagram (§11.5.2) -------- *
@@ -1140,7 +1146,7 @@ moq_result_t moq_d18_decode_track_status_ok(const uint8_t *payload,
     if (rc < 0) return rc;
     /* The remainder is the opaque Track Properties tail. TRACK_STATUS_OK is not in
      * the UNSUPPORTED_EXTENSION list (§10.6), so an unknown mandatory property is
-     * accepted and surfaced (validated structurally only) rather than rejected. */
+     * accepted and surfaced rather than rejected; known value checks still apply. */
     out->track_properties.data = moq_buf_reader_ptr(&r);
     out->track_properties.len = moq_buf_reader_remaining(&r);
     bool ts_mandatory_ignored = false;
