@@ -47,6 +47,8 @@
 #include "endpoint_internal.h"
 
 #include "../../adapters/common/moq_alpn.h"
+#include "../../adapters/common/moq_setup_tokens.h"
+#include <moq/wire.h>
 
 #include <assert.h>
 #include <pthread.h>
@@ -354,6 +356,71 @@ moq_result_t moq_endpoint_resolve_cfg(const moq_endpoint_cfg_t *cfg,
         out->handshake_timeout_us = cfg->handshake_timeout_us;
     }
 
+    /* SETUP authorization tokens: the same complete-presence gate. The
+     * session refuses invalid ones at create; refusing them here keeps the
+     * error at connect, before a backend starts. The SETUP must also fit the
+     * default send arena the backends give their sessions. Only the picoquic
+     * facades forward them, so another backend refuses a non-empty list. */
+    if ((size_t)cfg->struct_size >=
+            offsetof(moq_endpoint_cfg_t, setup_auth_token_count) +
+            sizeof(cfg->setup_auth_token_count) &&
+        cfg->setup_auth_token_count > 0) {
+        if (!cfg->setup_auth_tokens || cfg->setup_auth_token_count > 16)
+            return MOQ_ERR_INVAL;
+        for (size_t i = 0; i < cfg->setup_auth_token_count; i++) {
+            const moq_auth_token_t *t = &cfg->setup_auth_tokens[i];
+            if (t->token_type > MOQ_QUIC_VARINT_MAX ||
+                (t->token_value.len && !t->token_value.data) ||
+                t->token_value.len > UINT16_MAX)
+                return MOQ_ERR_INVAL;
+        }
+        if (!moq_setup_tokens_fit(cfg->setup_auth_tokens,
+                                  cfg->setup_auth_token_count, 0,
+                                  MOQ_SETUP_TOKENS_DEFAULT_ARENA))
+            return MOQ_ERR_INVAL;
+        if (out->backend != MOQ_TRANSPORT_BACKEND_PICOQUIC)
+            return MOQ_ERR_UNSUPPORTED;
+        out->setup_auth_tokens = cfg->setup_auth_tokens;
+        out->setup_auth_token_count = cfg->setup_auth_token_count;
+    }
+
+    /* Application certificate trust: the pair is read field by field, each
+     * only when struct_size covers it completely. A caller below the end of
+     * verify_certificate has the older layout. A caller that covers the
+     * callback but not its context, and asked for a callback, is refused:
+     * requested trust policy is never silently replaced by default trust, and
+     * the context is never read past the advertised size. Conflicts are
+     * malformed configuration (INVAL), judged before this field's own
+     * capability answer (UNSUPPORTED for a built backend that cannot honour
+     * the callback, or a provider without it); an explicitly selected backend
+     * that is not compiled in was already refused by backend selection above,
+     * before any appended field is read. */
+    out->verify_certificate = NULL;
+    out->verify_certificate_ctx = NULL;
+    if ((size_t)cfg->struct_size >=
+        offsetof(moq_endpoint_cfg_t, verify_certificate) +
+            sizeof(cfg->verify_certificate)) {
+        bool ctx_covered = (size_t)cfg->struct_size >=
+            offsetof(moq_endpoint_cfg_t, verify_certificate_ctx) +
+                sizeof(cfg->verify_certificate_ctx);
+        if (cfg->verify_certificate == NULL) {
+            if (ctx_covered && cfg->verify_certificate_ctx != NULL)
+                return MOQ_ERR_INVAL;
+        } else {
+            if (!ctx_covered) return MOQ_ERR_INVAL;
+            if (cfg->ca_file.len != 0 || cfg->insecure_skip_verify)
+                return MOQ_ERR_INVAL;
+            if (out->backend != MOQ_TRANSPORT_BACKEND_PICOQUIC)
+                return MOQ_ERR_UNSUPPORTED;
+#ifndef MOQ_SERVICE_HAVE_PICOQUIC_CERT_CALLBACK
+            return MOQ_ERR_UNSUPPORTED;
+#else
+            out->verify_certificate = cfg->verify_certificate;
+            out->verify_certificate_ctx = cfg->verify_certificate_ctx;
+#endif
+        }
+    }
+
     return resolve_versions(&cfg->versions, out);
 }
 
@@ -416,6 +483,12 @@ struct moq_endpoint {
     char *ca_file; size_t ca_file_len; /* NULL = backend default roots if available */
     bool  insecure;
     uint64_t handshake_timeout_us;     /* 0 = backend default; picoquic only */
+    moq_setup_tokens_t setup_tokens;   /* presented in SETUP; picoquic only */
+    /* The application certificate callback pair, copied from the resolved
+     * cfg; NULL callback = the ca_file / default-roots verifier. Valid for
+     * the endpoint's lifetime; the context is caller-owned. */
+    moq_tls_certificate_verify_fn verify_certificate;
+    void                         *verify_certificate_ctx;
 
     /* The version offer as transport tokens, preference order. The ALPN
      * entries point at the static strings in moq_alpn.h (no ownership);
@@ -716,12 +789,35 @@ static int ep_wtquic_msquic_pump(moq_wtquic_msquic_managed_t *m,
  * against ep->ca_file, or the backend default roots when available. The
  * facades' built-in default accepts the peer cert, which is NOT
  * production-safe -- making the safe path the default is this tier's job. */
+/* The service verdict onto the adapter's, at the one site where the tiers
+ * meet: only TRUST maps to TRUST; REJECT and any unrecognised value fail
+ * closed. */
+static moq_picoquic_cert_verdict_t ep_verify_certificate(
+    void *ctx, moq_bytes_t server_name,
+    const moq_bytes_t *certificates, size_t certificate_count)
+{
+    moq_endpoint_t *ep = (moq_endpoint_t *)ctx;
+    if (ep == NULL || ep->verify_certificate == NULL)
+        return MOQ_PICOQUIC_CERT_REJECT;
+    moq_tls_certificate_verdict_t v = ep->verify_certificate(
+        ep->verify_certificate_ctx, server_name, certificates, certificate_count);
+    return v == MOQ_TLS_CERTIFICATE_TRUST ? MOQ_PICOQUIC_CERT_TRUST
+                                          : MOQ_PICOQUIC_CERT_REJECT;
+}
+
 static int ep_configure_quic(picoquic_quic_t *quic, void *ctx)
 {
     moq_endpoint_t *ep = (moq_endpoint_t *)ctx;
     if (ep->handshake_timeout_us > 0)
         picoquic_set_default_handshake_timeout(quic, ep->handshake_timeout_us);
     if (ep->insecure) return 0;
+    /* A delegate selects the callback setter and never falls back to the
+     * path verifier: falling back would silently verify against a policy the
+     * caller did not ask for. Its conflicts with ca_file/insecure were
+     * refused at resolve, before this endpoint existed. */
+    if (ep->verify_certificate != NULL)
+        return moq_picoquic_set_cert_verify_callback(quic, ep_verify_certificate, ep)
+                   == MOQ_OK ? 0 : -1;
     return moq_picoquic_set_cert_verifier(quic, ep->ca_file);
 }
 #endif
@@ -1161,6 +1257,7 @@ static void ep_free_strings(moq_endpoint_t *ep)
     if (ep->wt_offer) ep->alloc.free(ep->wt_offer, ep->wt_offer_len, ep->alloc.ctx);
     ep->host = ep->sni = ep->path = ep->ca_file = NULL;
     ep->wt_offer = NULL;
+    moq_setup_tokens_free(&ep->alloc, &ep->setup_tokens);
 }
 
 /* -- Backend registry ----------------------------------------------- *
@@ -1216,6 +1313,8 @@ static moq_result_t ep_create_pq(moq_endpoint_t *ep,
      * timeout (moqx default ~30s). 15s stays comfortably under a 30s idle
      * bound. Distinct from a MoQ/session deadline; see picoquic_threaded.h. */
     fc.keep_alive_interval_ms = 15000;
+    fc.setup_auth_tokens = ep->setup_tokens.tokens;
+    fc.setup_auth_token_count = ep->setup_tokens.count;
     moq_pq_threaded_t *fac = NULL;
     moq_result_t crc = moq_pq_threaded_create(&fc, &fac);
     if (crc < 0) return crc;
@@ -1253,6 +1352,8 @@ static moq_result_t ep_create_wt(moq_endpoint_t *ep,
     /* Same idle-publisher policy as raw QUIC: emit QUIC keepalive before
      * common relay idle timers can reap a quiet WebTransport publisher. */
     fc.keep_alive_interval_ms = 15000;
+    fc.setup_auth_tokens = ep->setup_tokens.tokens;
+    fc.setup_auth_token_count = ep->setup_tokens.count;
     moq_pico_wt_managed_t *fac = NULL;
     moq_result_t crc = moq_pico_wt_managed_create(&fc, &fac);
     if (crc < 0) return crc;
@@ -1618,6 +1719,24 @@ _Static_assert(offsetof(moq_endpoint_cfg_t, handshake_timeout_us) >=
                        sizeof(((moq_endpoint_cfg_t *)0)->wt_profile),
                "handshake_timeout_us must be appended after wt_profile");
 
+/* The setup-token pair is appended after handshake_timeout_us, in this order:
+ * an older caller's buffer ends before it, so the size gate reads none. */
+_Static_assert(offsetof(moq_endpoint_cfg_t, setup_auth_tokens) >=
+                   offsetof(moq_endpoint_cfg_t, handshake_timeout_us) +
+                       sizeof(((moq_endpoint_cfg_t *)0)->handshake_timeout_us),
+               "setup_auth_tokens must be appended after handshake_timeout_us");
+_Static_assert(offsetof(moq_endpoint_cfg_t, setup_auth_token_count) >
+                   offsetof(moq_endpoint_cfg_t, setup_auth_tokens),
+               "setup_auth_token_count must follow setup_auth_tokens");
+_Static_assert(offsetof(moq_endpoint_cfg_t, verify_certificate) >=
+                   offsetof(moq_endpoint_cfg_t, setup_auth_token_count) +
+                       sizeof(((moq_endpoint_cfg_t *)0)->setup_auth_token_count),
+               "verify_certificate must be appended after setup_auth_token_count");
+_Static_assert(offsetof(moq_endpoint_cfg_t, verify_certificate_ctx) >=
+                   offsetof(moq_endpoint_cfg_t, verify_certificate) +
+                       sizeof(((moq_endpoint_cfg_t *)0)->verify_certificate),
+               "verify_certificate_ctx must follow verify_certificate");
+
 void moq_endpoint_cfg_init_sized(moq_endpoint_cfg_t *cfg, size_t cfg_size)
 {
     if (!cfg) return;
@@ -1636,7 +1755,7 @@ void moq_endpoint_cfg_init(moq_endpoint_cfg_t *cfg)
 {
     /* Pointer-only: clear and stamp ONLY the frozen v0 prefix, so this can
      * never overflow the buffer of an old caller that predates a tail field.
-     * Tail fields (wt_profile) require moq_endpoint_cfg_init_sized(). */
+     * Tail fields require moq_endpoint_cfg_init_sized(). */
     moq_endpoint_cfg_init_sized(cfg, MOQ_ENDPOINT_CFG_V0_SIZE);
 }
 
@@ -1685,6 +1804,8 @@ moq_result_t moq_endpoint_connect(const moq_endpoint_cfg_t *cfg,
     ep->protocol = r.protocol;
     ep->insecure = cfg->insecure_skip_verify;
     ep->handshake_timeout_us = r.handshake_timeout_us;
+    ep->verify_certificate = r.verify_certificate;
+    ep->verify_certificate_ctx = r.verify_certificate_ctx;
     atomic_init(&ep->interrupted, false);
     atomic_init(&ep->closed, false);
     pthread_mutex_init(&ep->mu, NULL);
@@ -1700,6 +1821,11 @@ moq_result_t moq_endpoint_connect(const moq_endpoint_cfg_t *cfg,
     if (!oom && cfg->ca_file.len > 0) {
         ep->ca_file = ep_strdup_bytes(alloc, cfg->ca_file, &ep->ca_file_len);
         oom = oom || !ep->ca_file;
+    }
+    if (!oom && r.setup_auth_token_count > 0) {
+        moq_result_t src = moq_setup_tokens_copy(alloc, r.setup_auth_tokens,
+            r.setup_auth_token_count, &ep->setup_tokens);
+        oom = src != MOQ_OK;
     }
     /* Convert the resolved version offer into transport tokens, preference
      * order preserved. Every resolved version is build-supported, so every

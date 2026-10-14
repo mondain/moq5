@@ -93,6 +93,26 @@ static moq_result_t d18_maybe_complete(moq_session_t *s)
     return MOQ_OK;
 }
 
+/* Encode this side's SETUP into `w`: the auth-token cache size when
+ * configured (§10.3.1.3) so the peer may register aliases, and the configured
+ * authorization tokens by value (§10.3.1.4). */
+static moq_result_t d18_encode_own_setup(moq_session_t *s, moq_buf_writer_t *w)
+{
+    moq_d18_setup_opts_t opts;
+    memset(&opts, 0, sizeof(opts));
+    if (s->send_auth_token_cache_size) {
+        opts.has_max_auth_token_cache_size = true;
+        opts.max_auth_token_cache_size = s->auth_token_cache_size;
+    }
+    for (size_t i = 0; i < s->setup_token_count; i++) {
+        opts.auth_tokens[i].alias_type = MOQ_AUTH_TOKEN_USE_VALUE;
+        opts.auth_tokens[i].token_type = s->setup_tokens[i].token_type;
+        opts.auth_tokens[i].token_value = s->setup_tokens[i].token_value;
+    }
+    opts.auth_token_count = s->setup_token_count;
+    return moq_d18_encode_setup_opts(w, &opts);
+}
+
 /*
  * Draft-18 start is valid for both client and server: each opens its own
  * unidirectional control channel and sends SETUP without waiting for the peer.
@@ -103,22 +123,25 @@ static moq_result_t d18_start(moq_session_t *s)
     if (s->state != MOQ_SESS_IDLE)
         return MOQ_ERR_WRONG_STATE;
 
-    uint8_t buf[32];
-    moq_buf_writer_t w;
-    moq_buf_writer_init(&w, buf, sizeof(buf));
-    /* Advertise the auth-token cache size when configured (§10.3.1.3) so the
-     * peer may register aliases; no other Setup Option is sourced yet. */
-    moq_d18_setup_opts_t opts;
-    memset(&opts, 0, sizeof(opts));
-    if (s->send_auth_token_cache_size) {
-        opts.has_max_auth_token_cache_size = true;
-        opts.max_auth_token_cache_size = s->auth_token_cache_size;
+    size_t cap = 32;
+    for (size_t i = 0; i < s->setup_token_count; i++)
+        cap += s->setup_tokens[i].token_value.len + 32u;
+    uint8_t stack_buf[32];
+    uint8_t *buf = stack_buf;
+    if (cap > sizeof(stack_buf)) {
+        buf = (uint8_t *)s->alloc.alloc(cap, s->alloc.ctx);
+        if (!buf) return MOQ_ERR_NOMEM;
     }
-    moq_result_t rc = moq_d18_encode_setup_opts(&w, &opts);
-    if (rc < 0) return rc;
-
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, buf, cap);
+    moq_result_t rc = d18_encode_own_setup(s, &w);
     moq_stream_ref_t ref = moq_stream_ref_from_u64(s->next_stream_ref);
-    rc = queue_open_uni_control(s, ref, buf, moq_buf_writer_offset(&w));
+    if (rc == MOQ_OK)
+        rc = queue_open_uni_control(s, ref, buf, moq_buf_writer_offset(&w));
+    if (buf != stack_buf) {
+        session_wipe(buf, cap);   /* the encoded SETUP carries the tokens */
+        s->alloc.free(buf, cap, s->alloc.ctx);
+    }
     if (rc < 0) return rc;
     s->next_stream_ref++;
 
@@ -146,12 +169,17 @@ static moq_result_t d18_handle_setup(moq_session_t *s,
 
     /* Decode the Setup Options (§10.3.1): unknown options are skipped, a
      * duplicate known non-repeatable option / over-cap length closes 0x3, a
-     * malformed token structure closes 0x6. */
+     * malformed token structure closes 0x6, and more tokens than this side
+     * holds closes with the local-capacity INTERNAL_ERROR (0x1), as on
+     * draft-16: the peer broke no rule. */
     moq_d18_setup_opts_t opts;
     moq_result_t orc = moq_d18_decode_setup_opts(env->payload, env->payload_len,
                                                  &opts);
     if (orc == MOQ_D18_ERR_KVP_FORMAT)
         return close_with_error(s, 0x6, "malformed auth token structure");
+    if (orc == MOQ_ERR_BUFFER)
+        return close_with_error(s, 0x1,
+            "SETUP has more authorization tokens than this side holds");
     if (orc < 0)
         return close_with_error(s, 0x3, "malformed SETUP options");
 
@@ -221,10 +249,9 @@ static moq_result_t d18_handle_setup(moq_session_t *s,
     if (s->state == MOQ_SESS_CLOSED) return MOQ_OK;
     if (reject_code != 0) {
         /* There is no request to reject at SETUP time: an unusable token here
-         * is a session error. A request-level MALFORMED_AUTH_TOKEN (0x4 --
-         * semantically invalid or duplicate resolved value) maps to the
-         * MALFORMED_AUTH_TOKEN session error (0x16); anything else keeps the
-         * generic formatting close. */
+         * is a session error. A request-level MALFORMED_AUTH_TOKEN (0x4 -- a
+         * duplicate resolved value) maps to the MALFORMED_AUTH_TOKEN session
+         * error (0x16); anything else keeps the generic formatting close. */
         process_auth_tokens_free_staging(s, resolved, staged, token_count);
         process_auth_tokens_abort_txn(s, &txn);
         if (reject_code == 0x4)
@@ -3121,6 +3148,7 @@ static const moq_profile_ops_t d18_ops = {
     .process_request_stream  = d18_process_request_stream,
     .process_response_stream = d18_process_response_stream,
     .scan_delivery_timeouts  = d18_scan_delivery_timeouts_op,
+    .encode_own_setup        = d18_encode_own_setup,
     .encode_subscribe        = d18_encode_subscribe,
     .encode_subscribe_ok     = d18_encode_subscribe_ok,
     .encode_request_error    = d18_encode_request_error,

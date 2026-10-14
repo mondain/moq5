@@ -39,6 +39,14 @@ if(MOQ_BUILD_PICO_WT_MANAGED)
         list(APPEND _MOQ_SERVICE_FACADE_LIBS moq::adapter-picoquic)
     endif()
 endif()
+if((MOQ_BUILD_PQ_THREADED OR MOQ_BUILD_PICO_WT_MANAGED) AND
+   MOQ_ADAPTER_PICOQUIC_VERIFY_BACKEND STREQUAL "openssl")
+    # The service honours its application certificate callback only when the
+    # selected picoquic TLS provider can apply it. PRIVATE implementation
+    # capability, mirrored into the white-box tests through
+    # _MOQ_SERVICE_FACADE_DEFS; not consumer configuration.
+    list(APPEND _MOQ_SERVICE_FACADE_DEFS MOQ_SERVICE_HAVE_PICOQUIC_CERT_CALLBACK=1)
+endif()
 if(MOQ_BUILD_ADAPTER_MVFST)
     # RAW_QUIC over Meta's mvfst (exact-version only; see src/endpoint.c). The
     # managed C facade lives in moq::adapter-mvfst -- there is no separate
@@ -294,6 +302,38 @@ if(MOQ_BUILD_TESTS)
             ${CMAKE_SOURCE_DIR}/tests/unit)
         add_test(NAME endpoint_handshake_timeout
                  COMMAND test_endpoint_handshake_timeout)
+
+        if(MOQ_ADAPTER_PICOQUIC_VERIFY_BACKEND STREQUAL "openssl")
+            # Application certificate callback propagation through the real
+            # endpoint create path. Private recorders observe verifier install
+            # and select the existing eager raw-QUIC session for the lane
+            # retirement test; shipping objects never see these renames.
+            add_library(moq-service-cert-test-internals OBJECT src/endpoint.c)
+            target_include_directories(moq-service-cert-test-internals
+                PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+                PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+            target_link_libraries(moq-service-cert-test-internals
+                PUBLIC moq::core Threads::Threads ${_MOQ_SERVICE_FACADE_LIBS})
+            target_compile_definitions(moq-service-cert-test-internals PRIVATE
+                ${_MOQ_SERVICE_FACADE_DEFS}
+                moq_picoquic_set_cert_verify_callback=moq_test_set_cert_verify_callback
+                moq_pq_threaded_create=moq_test_pq_threaded_create)
+            target_compile_features(moq-service-cert-test-internals PUBLIC c_std_11)
+
+            add_executable(test_endpoint_certificate_verify
+                tests/test_endpoint_certificate_verify.c)
+            target_link_libraries(test_endpoint_certificate_verify PRIVATE
+                moq-service-cert-test-internals moq::core Threads::Threads)
+            target_compile_options(test_endpoint_certificate_verify PRIVATE
+                -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            target_compile_definitions(test_endpoint_certificate_verify PRIVATE
+                ${_MOQ_SERVICE_FACADE_DEFS})
+            target_include_directories(test_endpoint_certificate_verify PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/src
+                ${CMAKE_SOURCE_DIR}/tests/unit)
+            add_test(NAME endpoint_certificate_verify
+                     COMMAND test_endpoint_certificate_verify)
+        endif()
     endif()
 
     # Service picoquic keepalive default (Vojtech idle-publisher report): prove

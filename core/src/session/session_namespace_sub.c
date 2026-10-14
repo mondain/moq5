@@ -2118,10 +2118,15 @@ static moq_result_t bidi_stream_teardown(moq_session_t *s,
 {
     if (s->state == MOQ_SESS_CLOSED) return MOQ_ERR_CLOSED;
 
-    /* A bidi we locally cancelled and are draining: the peer's reset/stop is the
-     * terminal we were waiting for, so retire the drain ref and we are done. */
-    if (drain_ref_remove(s, stream_ref))
+    /* A bidi whose request already ended locally and whose peer half is being
+     * drained. A RESET ends that half: retire the drain ref. A STOP_SENDING
+     * only concerns our own, already-finished half -- the peer's FIN or RESET
+     * is still owed and must still find the drain ref, or it would read as a
+     * fresh request. */
+    if (drain_ref_contains(s, stream_ref)) {
+        if (reset) (void)drain_ref_remove(s, stream_ref);
         return MOQ_OK;
+    }
 
     /* A request we migrated with an outbound GOAWAY (entry kept live, §10.4): the
      * peer's reset/stop is its old-stream close, so silently retire the request. */

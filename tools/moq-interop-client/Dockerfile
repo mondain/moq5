@@ -24,32 +24,38 @@ COPY picotls/ picotls/
 COPY picoquic/ picoquic/
 COPY libmoq/ libmoq/
 
-# Apply only the ownership correction still required by the adapter. Accept
-# patched contexts, but refuse conflicting provider sources before building.
+# Apply the ordered lists from scripts/setup_picoquic_deps.sh. Accept patched
+# contexts, but refuse missing patches or conflicting sources before building.
 RUN cd /src/picoquic \
-    && { test "$(git rev-parse --show-toplevel 2>/dev/null)" = /src/picoquic \
+    && { test -d .git && test "$(git rev-parse --show-toplevel 2>/dev/null)" = /src/picoquic \
          || { echo 'picoquic patch input must be its own git root' >&2; exit 1; }; } \
-    && patch=/src/libmoq/patches/picoquic/0006-own-application-close-reason.patch \
-    && if git apply --check "$patch" >/dev/null 2>&1; then \
-         git apply "$patch"; \
-       elif git apply --reverse --check "$patch" >/dev/null 2>&1; then \
-         echo 'picoquic close-reason ownership patch already applied'; \
-       else \
-         echo 'picoquic close-reason ownership patch conflicts' >&2; exit 1; \
-       fi
+    && for name in 0002-reset-stream-after-fin 0006-own-application-close-reason; do \
+         patch=/src/libmoq/patches/picoquic/$name.patch; \
+         test -f "$patch" || { echo "picoquic patch $name missing" >&2; exit 1; }; \
+         if git apply --check "$patch" >/dev/null 2>&1; then \
+           git apply "$patch" || exit $?; \
+         elif git apply --reverse --check "$patch" >/dev/null 2>&1; then \
+           echo "picoquic patch $name already applied"; \
+         else \
+           echo "picoquic patch $name conflicts" >&2; exit 1; \
+         fi; \
+       done
 
-# GCC needs explicit initialization of picotls's bounded scratch storage.
+# Initialize compiler-visible scratch and keep minicrypto archive members distinct.
 RUN cd /src/picotls \
-    && { test "$(git rev-parse --show-toplevel 2>/dev/null)" = /src/picotls \
+    && { test -d .git && test "$(git rev-parse --show-toplevel 2>/dev/null)" = /src/picotls \
          || { echo 'picotls patch input must be its own git root' >&2; exit 1; }; } \
-    && patch=/src/libmoq/patches/picotls/0001-initialize-compiler-visible-scratch.patch \
-    && if git apply --check "$patch" >/dev/null 2>&1; then \
-         git apply "$patch"; \
-       elif git apply --reverse --check "$patch" >/dev/null 2>&1; then \
-         echo 'picotls scratch initialization patch already applied'; \
-       else \
-         echo 'picotls scratch initialization patch conflicts' >&2; exit 1; \
-       fi
+    && for name in 0001-initialize-compiler-visible-scratch 0002-minicrypto-distinct-chacha20-object; do \
+         patch=/src/libmoq/patches/picotls/$name.patch; \
+         test -f "$patch" || { echo "picotls patch $name missing" >&2; exit 1; }; \
+         if git apply --check "$patch" >/dev/null 2>&1; then \
+           git apply "$patch" || exit $?; \
+         elif git apply --reverse --check "$patch" >/dev/null 2>&1; then \
+           echo "picotls patch $name already applied"; \
+         else \
+           echo "picotls patch $name conflicts" >&2; exit 1; \
+         fi; \
+       done
 
 # Build picotls (fresh build dir to avoid host CMakeCache)
 RUN cmake -B /build/picotls -S picotls \
