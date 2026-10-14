@@ -342,7 +342,8 @@ if(MOQ_BUILD_TESTS)
     set_tests_properties(mvfst_managed_app_deadline PROPERTIES TIMEOUT 30)
 
     # Managed client contract: the client session outlives stop() and the
-    # transport offer is standard QUIC v1. No network, no TLS.
+    # first transport offer is standard QUIC v1 (loopback UDP capture, no
+    # responding server or completed TLS handshake).
     add_executable(test_mvfst_managed_client_contract
         tests/test_managed_client_contract.cpp)
     target_link_libraries(test_mvfst_managed_client_contract PRIVATE
