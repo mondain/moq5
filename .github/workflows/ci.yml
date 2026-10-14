@@ -600,6 +600,8 @@ jobs:
         run: ctest --test-dir build/fuzz-ci -R '^fuzz_' --output-on-failure
 
       - name: Test instrumented writer and installed consumers
+        env:
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: ctest --test-dir build/fuzz-ci -R '^cmaf_packager' --output-on-failure --no-tests=error
 
   hardening:

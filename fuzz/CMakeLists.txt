@@ -54,6 +54,7 @@ foreach(_fuzz_lib
         moq-core
         moq-loc
         moq-cmaf
+        moq-cmaf-packager
         moq-codec-signaling
         moq-media-object
         moq-msf
