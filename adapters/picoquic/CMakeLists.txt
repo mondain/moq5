@@ -311,6 +311,58 @@ if(MOQ_BUILD_TESTS)
                  COMMAND test_picoquic_verify_api_${_verify_api})
     endforeach()
 
+    if(_moq_pq_verify_backend STREQUAL "openssl")
+        # The delegated-trust contract on the OpenSSL provider: the real
+        # verifier source against a tiny picoquic setter recorder, picotls and
+        # OpenSSL real, under both public setter generations.
+        foreach(_verify_callback_api IN ITEMS legacy modern)
+            add_executable(test_picoquic_verify_callback_${_verify_callback_api}
+                tests/test_verify_callback.c
+                moq_picoquic_verify.c)
+            target_include_directories(
+                test_picoquic_verify_callback_${_verify_callback_api}
+                BEFORE PRIVATE
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/support/verify_callback
+                    ${CMAKE_CURRENT_SOURCE_DIR}/include
+                    ${PROJECT_SOURCE_DIR}/core/include
+                    ${PTLS_INCLUDE_DIR})
+            target_compile_definitions(
+                test_picoquic_verify_callback_${_verify_callback_api} PRIVATE
+                    MOQ_PICOQUIC_VERIFY_OPENSSL
+                    MOQ_PICOQUIC_VERIFY_TESTING=1
+                    calloc=moq_test_verify_calloc
+                    free=moq_test_verify_free
+                    X509_STORE_new=moq_test_verify_store_new
+                    X509_STORE_free=moq_test_verify_store_free
+                    ptls_openssl_init_verify_certificate=moq_test_openssl_init_verify_certificate
+                    ptls_openssl_dispose_verify_certificate=moq_test_openssl_dispose_verify_certificate)
+            if(_verify_callback_api STREQUAL "modern")
+                target_compile_definitions(
+                    test_picoquic_verify_callback_${_verify_callback_api} PRIVATE
+                        MOQ_TEST_PICOQUIC_MODERN_API
+                        picoquic_set_verify_certificate_callback_ex=moq_test_set_verify_certificate_callback_ex)
+            else()
+                target_compile_definitions(
+                    test_picoquic_verify_callback_${_verify_callback_api} PRIVATE
+                        picoquic_set_verify_certificate_callback=moq_test_set_verify_certificate_callback)
+            endif()
+            target_link_libraries(
+                test_picoquic_verify_callback_${_verify_callback_api} PRIVATE
+                    moq::core ${_PQ} ${_adapter_tls_link})
+            set_target_properties(
+                test_picoquic_verify_callback_${_verify_callback_api}
+                PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+            if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+                target_compile_options(
+                    test_picoquic_verify_callback_${_verify_callback_api}
+                    PRIVATE -Wall -Wextra -Wpedantic
+                        $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME picoquic_verify_callback_${_verify_callback_api}
+                     COMMAND test_picoquic_verify_callback_${_verify_callback_api})
+        endforeach()
+    endif()
+
     # Backpressure test provides its own picoquic function stubs so it
     # can exercise moq_pq_callback/moq_pq_service without a real QUIC
     # stack. Links the adapter source directly with picoquic headers
@@ -745,7 +797,8 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
                 "${CMAKE_BUILD_TYPE}"
                 "${_threaded_openssl_root}"
                 "${CMAKE_CURRENT_BINARY_DIR}/install-consumer-threaded-work"
-                "${CMAKE_INSTALL_LIBDIR}")
+                "${CMAKE_INSTALL_LIBDIR}"
+                "${CMAKE_CXX_FLAGS}")
         set_tests_properties(adapter_threaded_install_consumer
             PROPERTIES TIMEOUT 600)
     endif()

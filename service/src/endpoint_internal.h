@@ -44,6 +44,13 @@ typedef struct moq_endpoint_resolved {
      * BORROWED from the cfg. Only the picoquic backend carries them. */
     const moq_auth_token_t *setup_auth_tokens;
     size_t        setup_auth_token_count;
+    /* Application certificate trust, struct_size-gated at resolve as one pair
+     * (see moq_endpoint_cfg_t): both NULL when the cfg predates the callback
+     * or supplies none; the caller's fn/ctx only when the pair is fully
+     * covered, no other trust authority is configured, and the selected
+     * backend and provider can honour it. */
+    moq_tls_certificate_verify_fn verify_certificate;
+    void                         *verify_certificate_ctx;
 } moq_endpoint_resolved_t;
 
 /*

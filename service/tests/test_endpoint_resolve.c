@@ -23,6 +23,23 @@ static bool bytes_eq(moq_bytes_t b, const char *s)
     return b.len == strlen(s) && (b.len == 0 || memcmp(b.data, s, b.len) == 0);
 }
 
+/* Store one field of a prefix-sized config into raw storage by offset. The
+ * storage is deliberately smaller than the full struct, so it is never an
+ * object of the struct type and must not be written through an lvalue of
+ * that type. The value must have the field's exact size and the field must
+ * lie entirely inside the allocation; nothing is written otherwise. */
+static bool put_cfg_field(void *raw, size_t alloc_size, size_t offset,
+                          size_t field_size, const void *value, size_t value_size)
+{
+    if (value_size != field_size) return false;
+    if (offset > alloc_size || field_size > alloc_size - offset) return false;
+    memcpy((unsigned char *)raw + offset, value, field_size);
+    return true;
+}
+#define PUT_CFG_FIELD(raw, alloc_size, field, value) \
+    put_cfg_field((raw), (alloc_size), offsetof(moq_endpoint_cfg_t, field), \
+                  sizeof(((moq_endpoint_cfg_t *)0)->field), &(value), sizeof(value))
+
 static moq_endpoint_cfg_t mkcfg(const char *url)
 {
     moq_endpoint_cfg_t c;
@@ -32,6 +49,14 @@ static moq_endpoint_cfg_t mkcfg(const char *url)
     moq_endpoint_cfg_init(&c);
     c.url = B(url);
     return c;
+}
+
+static moq_tls_certificate_verdict_t trust_certificate(
+    void *ctx, moq_bytes_t server_name,
+    const moq_bytes_t *certificates, size_t certificate_count)
+{
+    (void)ctx; (void)server_name; (void)certificates; (void)certificate_count;
+    return MOQ_TLS_CERTIFICATE_TRUST;
 }
 
 /* SETUP authorization tokens (moq_endpoint_cfg_t.setup_auth_tokens): the
@@ -178,6 +203,10 @@ int main(void)
                               (uint64_t)MOQ_WT_PROFILE_BACKEND_DEFAULT);
         /* Same for the handshake bound: 0 = the backend's own default. */
         MOQ_TEST_CHECK_EQ_U64(s.handshake_timeout_us, 0);
+        MOQ_TEST_CHECK(s.setup_auth_tokens == NULL);
+        MOQ_TEST_CHECK_EQ_SIZE(s.setup_auth_token_count, 0);
+        MOQ_TEST_CHECK(s.verify_certificate == NULL);
+        MOQ_TEST_CHECK(s.verify_certificate_ctx == NULL);
         /* The v0 floor must sit exactly at wt_profile (the first tail field). */
         MOQ_TEST_CHECK_EQ_U64(MOQ_ENDPOINT_CFG_V0_SIZE,
                               offsetof(moq_endpoint_cfg_t, wt_profile));
@@ -939,6 +968,162 @@ int main(void)
         MOQ_TEST_CHECK_EQ_U64(detail, 0);
     }
 #endif /* MOQ_SERVICE_HAVE_WTQUIC_NETWORK_MANAGED */
+
+    /* == application certificate trust: appended after SETUP tokens ===== *
+     * verify_certificate + verify_certificate_ctx are read only when
+     * struct_size covers them; the callback is read first, and a callback the
+     * caller asked for is never silently replaced by default trust because its
+     * context did not fit. Conflicting trust authorities are malformed (INVAL)
+     * before any capability answer (UNSUPPORTED). */
+    {
+        static int marker;
+        moq_endpoint_resolved_t r;
+        moq_endpoint_cfg_t c;
+        moq_endpoint_cfg_init_sized(&c, sizeof(c));
+        c.url = B("moqt://relay.example:4433");
+        c.verify_certificate = trust_certificate;
+        c.verify_certificate_ctx = &marker;
+
+        /* trust.pair.propagated / trust.pair.unsupported_provider */
+#ifdef MOQ_SERVICE_HAVE_PICOQUIC_CERT_CALLBACK
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK(r.verify_certificate == trust_certificate);
+        MOQ_TEST_CHECK(r.verify_certificate_ctx == &marker);
+
+        /* trust.coexists_with_setup_tokens: both tails survive composition. */
+        uint8_t token_value[] = { 1, 2, 3 };
+        moq_auth_token_t token = { 7, { token_value, sizeof(token_value) } };
+        c.setup_auth_tokens = &token;
+        c.setup_auth_token_count = 1;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK(r.setup_auth_tokens == &token);
+        MOQ_TEST_CHECK_EQ_SIZE(r.setup_auth_token_count, 1);
+        MOQ_TEST_CHECK(r.verify_certificate == trust_certificate);
+        MOQ_TEST_CHECK(r.verify_certificate_ctx == &marker);
+        c.setup_auth_tokens = NULL;
+        c.setup_auth_token_count = 0;
+
+        /* trust.pair.null_ctx_allowed: a stateless callback needs no context. */
+        c.verify_certificate_ctx = NULL;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK(r.verify_certificate == trust_certificate);
+        MOQ_TEST_CHECK(r.verify_certificate_ctx == NULL);
+        c.verify_certificate_ctx = &marker;
+#else
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
+                              (int)MOQ_ERR_UNSUPPORTED);
+#endif
+
+        /* trust.conflict.ca_file / trust.conflict.insecure: two trust
+         * authorities are malformed, on every backend. */
+        c.ca_file = B("roots.pem");
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_ERR_INVAL);
+        c.ca_file = (moq_bytes_t){0};
+        c.insecure_skip_verify = true;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_ERR_INVAL);
+        c.insecure_skip_verify = false;
+
+        /* trust.unbuilt_backend: an explicitly selected backend that is not
+         * compiled in is refused by backend selection itself, before ANY
+         * appended field is read (the same order as handshake_timeout_us),
+         * whether or not the callback conflicts with ca_file. Nothing is
+         * installed on that path, so no trust policy is downgraded. */
+        c.backend = MOQ_TRANSPORT_BACKEND_MVFST;
+        c.ca_file = B("roots.pem");
+#ifdef MOQ_SERVICE_HAVE_MVFST_MANAGED
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
+                              (int)MOQ_ERR_INVAL);
+#else
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
+                              (int)MOQ_ERR_UNSUPPORTED);
+#endif
+        c.ca_file = (moq_bytes_t){0};
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
+                              (int)MOQ_ERR_UNSUPPORTED);
+        c.backend = MOQ_TRANSPORT_BACKEND_AUTO;
+#ifdef MOQ_SERVICE_HAVE_MSQUIC_MANAGED
+        /* trust.conflict.before_capability: on a BUILT backend that cannot
+         * honour the callback, the conflict is still INVAL first, and the
+         * callback alone is UNSUPPORTED. */
+        c.backend = MOQ_TRANSPORT_BACKEND_MSQUIC;
+        c.ca_file = B("roots.pem");
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_ERR_INVAL);
+        c.ca_file = (moq_bytes_t){0};
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
+                              (int)MOQ_ERR_UNSUPPORTED);
+        c.backend = MOQ_TRANSPORT_BACKEND_AUTO;
+#endif
+
+        /* trust.ctx_without_callback */
+        c.verify_certificate = NULL;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_ERR_INVAL);
+        c.verify_certificate = trust_certificate;
+
+        /* trust.partial_ctx.refused: the callback is fully covered, its
+         * context only partly -- a requested policy that cannot be read in
+         * full is refused, never downgraded to default trust. */
+        c.struct_size = (uint32_t)(offsetof(moq_endpoint_cfg_t, verify_certificate_ctx) + 1);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_ERR_INVAL);
+        /* trust.partial_ctx.absent_callback_ok: with no callback requested the
+         * same size is simply the older layout. */
+        c.verify_certificate = NULL;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK(r.verify_certificate == NULL);
+        MOQ_TEST_CHECK(r.verify_certificate_ctx == NULL);
+    }
+
+    /* == old-caller guards, on real allocations of exactly the old sizes == *
+     * Nothing past the advertised size is ever read (ASan pins it). */
+    {
+        /* trust.old_size.absent: a buffer ending where verify_certificate
+         * begins is the post-token, pre-callback layout. */
+        const size_t old_size = offsetof(moq_endpoint_cfg_t, verify_certificate);
+        MOQ_TEST_CHECK(old_size < sizeof(moq_endpoint_cfg_t));
+        MOQ_TEST_CHECK(old_size >= offsetof(moq_endpoint_cfg_t, setup_auth_token_count) +
+                                  sizeof(((moq_endpoint_cfg_t *)0)->setup_auth_token_count));
+        void *raw = malloc(old_size);
+        MOQ_TEST_CHECK(raw != NULL);
+        if (raw != NULL) {
+            const moq_endpoint_cfg_t *old = (const moq_endpoint_cfg_t *)raw;
+            moq_endpoint_cfg_init_sized(raw, old_size);
+            moq_bytes_t old_url = B("moqt://relay.example:4433");
+            MOQ_TEST_CHECK(PUT_CFG_FIELD(raw, old_size, url, old_url));
+            moq_endpoint_resolved_t r;
+            MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(old, &r), (int)MOQ_OK);
+            MOQ_TEST_CHECK(r.verify_certificate == NULL);
+            MOQ_TEST_CHECK(r.verify_certificate_ctx == NULL);
+            free(raw);
+        }
+    }
+    {
+        /* trust.callback_only_size.refused: a buffer ending exactly where the
+         * context begins, carrying a non-NULL callback: INVAL, and the context
+         * -- which does not exist in this allocation -- is never read. */
+        const size_t cb_size = offsetof(moq_endpoint_cfg_t, verify_certificate_ctx);
+        MOQ_TEST_CHECK(cb_size < sizeof(moq_endpoint_cfg_t));
+        void *raw = malloc(cb_size);
+        MOQ_TEST_CHECK(raw != NULL);
+        if (raw != NULL) {
+            /* The allocation is shorter than the struct, so it is never an
+             * object of the struct type: fields are stored by offset. */
+            const moq_endpoint_cfg_t *cb = (const moq_endpoint_cfg_t *)raw;
+            moq_endpoint_cfg_init_sized(raw, cb_size);
+            moq_bytes_t url = B("moqt://relay.example:4433");
+            moq_tls_certificate_verify_fn verify = trust_certificate;
+            MOQ_TEST_CHECK(PUT_CFG_FIELD(raw, cb_size, url, url));
+            MOQ_TEST_CHECK(PUT_CFG_FIELD(raw, cb_size, verify_certificate, verify));
+            moq_endpoint_resolved_t r;
+            MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(cb, &r), (int)MOQ_ERR_INVAL);
+            /* trust.callback_only_size.absent_ok: the same allocation with no
+             * callback resolves as the older layout. */
+            verify = NULL;
+            MOQ_TEST_CHECK(PUT_CFG_FIELD(raw, cb_size, verify_certificate, verify));
+            MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(cb, &r), (int)MOQ_OK);
+            MOQ_TEST_CHECK(r.verify_certificate == NULL);
+            MOQ_TEST_CHECK(r.verify_certificate_ctx == NULL);
+            free(raw);
+        }
+    }
 
     /* == New result codes are wired ================================== */
     {
