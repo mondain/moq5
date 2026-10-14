@@ -141,6 +141,7 @@ struct moq_pico_wt_managed {
     struct {
         uint64_t             sid;
         h3zero_stream_ctx_t *sc;         /* NULL once h3zero freed it */
+        bool                 retired;    /* complete, and freed by h3zero */
     }                  early_streams[MOQ_PWM_EARLY_MAX_STREAMS];
     bool               early_ended;      /* CONNECT answered: buffer closed */
 
@@ -202,6 +203,8 @@ struct moq_pico_wt_managed {
     moq_pwt_test_ev_t test_ev[MOQ_PWT_EV_MAX];
     size_t            test_ev_n;
     size_t            test_ev_overflow;
+    unsigned          test_connect_enqueued;     /* deferred CONNECT queued */
+    unsigned          test_connect_left_pending; /* still pending after SETTINGS */
 #endif
 };
 
@@ -317,8 +320,36 @@ static int managed_client_h3_callback(picoquic_cnx_t *cnx,
         pico_wt_conn_on_quic_lost(m->conn, cnx,
             picoquic_get_quic_time(picoquic_get_quic_ctx(cnx)));
     }
+#if defined(MOQ_PICO_WT_TESTING)
+    /* TEST-ONLY: classify what became of a CONNECT deferred until the
+     * server's SETTINGS, across the h3zero call that receives them. h3zero
+     * either queues it on the CONNECT stream (no longer pending; this says
+     * nothing about the wire), refuses it for the peer's settings (no longer
+     * pending, and the facade latches fatal), or fails to submit it: it is
+     * then left pending and h3zero closes the connection. Left pending covers
+     * both a CONNECT that could not be prepared and one that could not be
+     * queued. A connection close may delete the h3zero context, so those
+     * events are not read. */
+    bool connect_pending = fin_or_event != picoquic_callback_close &&
+        fin_or_event != picoquic_callback_application_close &&
+        fin_or_event != picoquic_callback_stateless_reset &&
+        m->ctrl_ctx != NULL && !m->h3_ctx->settings.settings_received &&
+        m->h3_ctx->pending_wt_connect == m->ctrl_ctx;
+    int rc = h3zero_callback(cnx, stream_id, bytes, length, fin_or_event,
+                             m->h3_ctx, v_stream_ctx);
+    if (connect_pending && m->h3_ctx->settings.settings_received) {
+        if (m->h3_ctx->pending_wt_connect == NULL) {
+            if (rc == 0 && !m->fatal)
+                m->test_connect_enqueued++;
+        } else if (m->h3_ctx->pending_wt_connect == m->ctrl_ctx) {
+            m->test_connect_left_pending++;
+        }
+    }
+    return rc;
+#else
     return h3zero_callback(cnx, stream_id, bytes, length, fin_or_event,
                            m->h3_ctx, v_stream_ctx);
+#endif
 }
 
 static void mark_activity(moq_pico_wt_managed_t *m)
@@ -420,6 +451,15 @@ static void pwm_early_drop_stream(moq_pico_wt_managed_t *m, uint64_t sid)
 }
 
 /* Forget a buffered stream: its entries and its slot. */
+/* True when the buffered entries of `sid` end the stream (its FIN). */
+static bool pwm_early_has_fin(const moq_pico_wt_managed_t *m, uint64_t sid)
+{
+    for (const pwm_early_chunk_t *ch = m->early_head; ch; ch = ch->next)
+        if (ch->sid == sid && ch->kind == PWM_EARLY_FIN)
+            return true;
+    return false;
+}
+
 static void pwm_early_release(moq_pico_wt_managed_t *m, size_t slot)
 {
     pwm_early_drop_stream(m, m->early_streams[slot].sid);
@@ -484,6 +524,7 @@ static int pwm_early_buffer(moq_pico_wt_managed_t *m, picoquic_cnx_t *cnx,
         slot = m->early_nstreams++;
         m->early_streams[slot].sid = sc->stream_id;
         m->early_streams[slot].sc = sc;
+        m->early_streams[slot].retired = false;
     }
     pwm_early_chunk_t *ch = NULL;
     if (m->early_entries < MOQ_PWM_EARLY_MAX_ENTRIES &&
@@ -541,9 +582,13 @@ int (*moq_pico_wt_managed_test_replay)(picoquic_cnx_t *, uint8_t *, size_t,
                                        void *);
 #endif
 
+/* `complete`: the stream's FIN arrived early, so the transport already
+ * delivered all of it and may have retired it. The adapter is told so for
+ * the duration of the delivery and must not try to take the stream's window. */
 static void pwm_early_deliver(picoquic_cnx_t *cnx, uint8_t *bytes, size_t len,
                               picohttp_call_back_event_t event,
-                              h3zero_stream_ctx_t *sc, moq_pico_wt_conn_t *conn)
+                              h3zero_stream_ctx_t *sc, moq_pico_wt_conn_t *conn,
+                              bool complete)
 {
 #if defined(MOQ_PICO_WT_TESTING)
     if (moq_pico_wt_managed_test_replay) {
@@ -552,45 +597,30 @@ static void pwm_early_deliver(picoquic_cnx_t *cnx, uint8_t *bytes, size_t len,
         return;
     }
 #endif
+    if (complete) pico_wt_conn_rx_replay_complete_begin(conn, sc->stream_id);
     (void)moq_pico_wt_callback(cnx, bytes, len, event, sc, conn);
-}
-
-/* Returns false when the adapter could not record the mark (it has then
- * failed with its inbound failure): the stream must not be delivered. */
-static bool pwm_early_mark_complete(picoquic_cnx_t *cnx,
-                                    moq_pico_wt_conn_t *conn, uint64_t sid)
-{
-#if defined(MOQ_PICO_WT_TESTING)
-    if (moq_pico_wt_managed_test_replay) return true;   /* no live adapter */
-#endif
-    return pico_wt_conn_rx_mark_complete(
-        conn, sid, picoquic_get_quic_time(picoquic_get_quic_ctx(cnx))) == 0;
+    if (complete) pico_wt_conn_rx_replay_complete_end(conn);
 }
 
 /* The session exists: hand every buffered stream to the adapter. Each
  * stream's h3zero context still names this facade's callback (h3zero bound it
  * when the stream arrived, and the adapter rebinds only the session prefix and
  * the CONNECT stream), so it is rebound to the adapter first; then the entries
- * are replayed in arrival order, as if just delivered. A stream whose h3zero
- * context is gone has nothing to rebind or deliver to: its entries are
- * dropped. */
+ * are replayed in arrival order, as if just delivered. A complete stream that
+ * picoquic already retired has no h3zero context left: its entries are
+ * delivered through a stand-in context that carries only its stream id, the
+ * one field the adapter reads from it. Any other stream whose h3zero context
+ * is gone has nothing to deliver to: its entries are dropped. */
 static void pwm_early_replay(moq_pico_wt_managed_t *m, picoquic_cnx_t *cnx,
                              moq_pico_wt_conn_t *conn)
 {
+    h3zero_stream_ctx_t retired_ctx;
     for (size_t i = 0; i < m->early_nstreams; i++) {
         h3zero_stream_ctx_t *sc = m->early_streams[i].sc;
-        if (sc == NULL) continue;
-        sc->path_callback = moq_pico_wt_callback;
-        sc->path_callback_ctx = conn;
-        /* A stream whose FIN arrived early is complete at the transport,
-         * which retires it: the adapter must not try to take its window. */
-        for (const pwm_early_chunk_t *ch = m->early_head; ch; ch = ch->next) {
-            if (ch->sid == m->early_streams[i].sid && ch->kind == PWM_EARLY_FIN) {
-                if (!pwm_early_mark_complete(cnx, conn,
-                                             m->early_streams[i].sid))
-                    m->early_streams[i].sc = NULL;   /* never delivered */
-                break;
-            }
+        if (sc == NULL && !m->early_streams[i].retired) continue;
+        if (sc != NULL) {
+            sc->path_callback = moq_pico_wt_callback;
+            sc->path_callback_ctx = conn;
         }
     }
     while (m->early_head) {
@@ -599,13 +629,22 @@ static void pwm_early_replay(moq_pico_wt_managed_t *m, picoquic_cnx_t *cnx,
         size_t slot = pwm_early_slot(m, ch->sid);
         h3zero_stream_ctx_t *sc =
             slot == SIZE_MAX ? NULL : m->early_streams[slot].sc;
+        if (sc == NULL && slot != SIZE_MAX && m->early_streams[slot].retired) {
+            memset(&retired_ctx, 0, sizeof(retired_ctx));
+            retired_ctx.stream_id = ch->sid;
+            retired_ctx.path_callback = moq_pico_wt_callback;
+            retired_ctx.path_callback_ctx = conn;
+            sc = &retired_ctx;
+        }
         if (sc) {
             picohttp_call_back_event_t ev =
                 ch->kind == PWM_EARLY_STOP ? picohttp_callback_stop_sending
               : ch->kind == PWM_EARLY_FIN  ? picohttp_callback_post_fin
                                            : picohttp_callback_post_data;
             pwm_early_deliver(cnx, ch->len ? (uint8_t *)(ch + 1) : NULL,
-                              ch->len, ev, sc, conn);
+                              ch->len, ev, sc, conn,
+                              ch->kind == PWM_EARLY_FIN ||
+                                  pwm_early_has_fin(m, ch->sid));
         }
         pwm_early_free_chunk(m, ch);
     }
@@ -629,8 +668,9 @@ static int managed_client_wt_cb(picoquic_cnx_t *cnx, uint8_t *bytes,
     /* Peer stream events reaching this callback arrive before the CONNECT
      * response (the stream is buffered), or after it was answered and before
      * the stream was detached. A reset aborts the peer's stream: its buffered
-     * entries are moot. h3zero freeing a stream's context forgets it. Early
-     * datagrams are dropped (§4.6). */
+     * entries are moot. h3zero freeing a stream's context forgets it, unless
+     * the stream is complete (see the free case). Early datagrams are dropped
+     * (§4.6). */
     if (stream_ctx && stream_ctx != m->ctrl_ctx) {
         uint64_t sid = stream_ctx->stream_id;
         size_t slot = pwm_early_slot(m, sid);
@@ -638,7 +678,15 @@ static int managed_client_wt_cb(picoquic_cnx_t *cnx, uint8_t *bytes,
         case picohttp_callback_free:
             if (slot != SIZE_MAX) {
                 m->early_streams[slot].sc = NULL;
-                pwm_early_release(m, slot);
+                /* h3zero frees a stream's context as soon as picoquic retires
+                 * the stream, which for a peer stream whose bytes and FIN have
+                 * all arrived happens before the CONNECT is answered. Those
+                 * buffered entries are complete and still owed to the session;
+                 * only an unfinished stream's are moot. */
+                if (pwm_early_has_fin(m, sid))
+                    m->early_streams[slot].retired = true;
+                else
+                    pwm_early_release(m, slot);
             }
             return 0;
         case picohttp_callback_reset:
@@ -821,21 +869,19 @@ static int managed_server_wt_cb(picoquic_cnx_t *cnx, uint8_t *bytes,
 
     moq_pico_wt_managed_t *m = (moq_pico_wt_managed_t *)app_ctx;
 
-    /* DUAL CONTEXT, decided by event -- h3zero calls this function with two
-     * different `app_ctx` owners on the control stream:
+    /* CONTEXT, decided by event. CONNECT is a direct path-table call, so
+     * `app_ctx` is the FACADE (`m`). moq_pico_wt_conn_create() then rebinds
+     * the control stream's path_callback and path_callback_ctx to the
+     * ADAPTER, and h3zero delivers the CONNECT stream's body and FIN through
+     * that binding. (h3zero re-resolves the path table, and sends the
+     * synthetic POST notification, only for POST requests.) Should any other
+     * event still arrive here, it carries the stream's retained context and
+     * is forwarded as is.
      *
-     *   - CONNECT and the synthetic POST notification are direct path-table
-     *     calls, so `app_ctx` is the FACADE (`m`);
-     *   - every other event is delivered with the stream's retained
-     *     `path_callback_ctx`, which moq_pico_wt_conn_create() set to the
-     *     ADAPTER. h3zero's body branch restores only `path_callback` from the
-     *     path table, never that context.
-     *
-     * So the adapter's context is NOT rebound here: leaving it in place is what
+     * The adapter's context is never rebound here: leaving it in place is what
      * keeps clear_all_stream_callbacks()/detach_from_picoquic() able to
      * recognise and clear this stream, i.e. the adapter keeps ownership and no
-     * callback can reach a detached adapter. Adapter-owned events are simply
-     * forwarded with the context they already carry. */
+     * callback can reach a detached adapter. */
     if (event == picohttp_callback_post)
         return 0;   /* synthetic notification on the facade context; no-op */
 
@@ -851,6 +897,11 @@ static int managed_server_wt_cb(picoquic_cnx_t *cnx, uint8_t *bytes,
      * managed_client_wt_cb latches as fatal. So refusal is a deterministic
      * client-terminal fatal, not a silent timeout. */
     if (m->conn)
+        return -1;
+    /* Only a WebTransport CONNECT opens a session. The route's
+     * connect_protocol already makes h3zero refuse anything else; this keeps
+     * the callback correct on its own. */
+    if (!picowt_is_webtransport_connect(stream_ctx))
         return -1;
 
     h3zero_callback_ctx_t *h3 =
@@ -1380,15 +1431,21 @@ moq_result_t moq_pico_wt_managed_create(
 
     if (persp == MOQ_PERSPECTIVE_SERVER) {
         /* Designated initializers: picohttp_server_path_item_t grows new
-         * trailing fields upstream (connect_protocol, origin_validator,
-         * connect_error_status, ...); naming the fields we set zero-fills the
-         * rest to their defaults and stays warning-clean under
-         * -Werror=missing-field-initializers as the struct evolves. */
+         * trailing fields upstream (origin_validator, connect_error_status,
+         * ...); naming the fields we set zero-fills the rest to their
+         * defaults and stays warning-clean under
+         * -Werror=missing-field-initializers as the struct evolves.
+         * connect_protocol makes this a WebTransport route: h3zero accepts an
+         * extended CONNECT only on a path that names its :protocol, and a
+         * path without one only takes classic CONNECT. */
         m->path_table[0] = (picohttp_server_path_item_t){
             .path = m->path,
             .path_length = strlen(m->path),
             .path_callback = managed_server_wt_cb,
             .path_app_ctx = m,
+            .connect_protocol = H3ZERO_WEBTRANSPORT_H3_PROTOCOL,
+            .connect_protocol_length =
+                sizeof(H3ZERO_WEBTRANSPORT_H3_PROTOCOL) - 1,
         };
         m->server_param.path_table = m->path_table;
         m->server_param.path_table_nb = 1;
@@ -1859,6 +1916,12 @@ moq_pico_wt_conn_t *moq_pico_wt_managed_test_conn(moq_pico_wt_managed_t *m)
 
 picoquic_cnx_t *moq_pico_wt_managed_test_cnx(moq_pico_wt_managed_t *m)
 { return m ? m->active_cnx : NULL; }
+
+unsigned moq_pico_wt_managed_test_connect_enqueued(moq_pico_wt_managed_t *m)
+{ return m ? m->test_connect_enqueued : 0; }
+
+unsigned moq_pico_wt_managed_test_connect_left_pending(moq_pico_wt_managed_t *m)
+{ return m ? m->test_connect_left_pending : 0; }
 
 void moq_pico_wt_managed_test_detach_conn(moq_pico_wt_managed_t *m)
 {

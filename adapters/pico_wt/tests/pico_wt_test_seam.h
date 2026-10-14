@@ -60,6 +60,14 @@ void moq_pico_wt_managed_test_detach_conn(moq_pico_wt_managed_t *m);
 moq_pico_wt_conn_t *moq_pico_wt_managed_test_conn(moq_pico_wt_managed_t *m);
 picoquic_cnx_t *moq_pico_wt_managed_test_cnx(moq_pico_wt_managed_t *m);
 
+/* A client's CONNECT, deferred until the server's SETTINGS: how often h3zero
+ * queued it on the CONNECT stream once they arrived (not proof it reached the
+ * wire), and how often it was instead still pending after them (submission
+ * failed: not prepared, or not queued). Read after stop(), which joins the
+ * network thread that counts them. */
+unsigned moq_pico_wt_managed_test_connect_enqueued(moq_pico_wt_managed_t *m);
+unsigned moq_pico_wt_managed_test_connect_left_pending(moq_pico_wt_managed_t *m);
+
 /* Declare or withdraw MOQ_TRANSPORT_CAP_HOLD_INPUT on an attached adapter
  * (receive-admission tests; adapter compiled with MOQ_PICO_WT_TESTING). */
 void moq_pico_wt_test_set_hold_input(moq_pico_wt_conn_t *conn, bool on);

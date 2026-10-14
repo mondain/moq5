@@ -308,6 +308,9 @@ static void detach_from_picoquic(moq_pico_wt_conn_t *conn)
     conn->endpoint_ctx.cnx = NULL;
     conn->endpoint_ctx.h3_ctx = NULL;
     conn->endpoint_ctx.control_stream_ctx = NULL;
+    /* Deregistering resets every unfinished session stream with
+     * WT_SESSION_GONE, deferred ones included. */
+    pico_wt_endpoint_settle_deferred(&conn->endpoint_ctx);
 
     if (cnx && h3 && ctrl) {
         picowt_deregister(cnx, h3, ctrl);
@@ -355,6 +358,10 @@ void moq_pico_wt_conn_notify_transport_closed(moq_pico_wt_conn_t *conn,
 }
 
 /* -- Service -------------------------------------------------------- */
+/* A deferred reset that picoquic failed to issue fails the transport with the
+ * code the bridge records when an endpoint refuses a reset on the spot. */
+#define PICO_WT_RESET_FATAL_CODE 0x1
+
 
 int moq_pico_wt_service(moq_pico_wt_conn_t *conn, uint64_t now_us)
 {
@@ -362,6 +369,11 @@ int moq_pico_wt_service(moq_pico_wt_conn_t *conn, uint64_t now_us)
     if (moq_transport_bridge_is_fatal(conn->bridge)) return -1;
     if (moq_transport_bridge_is_closed(conn->bridge)) return 0;
 
+    if (pico_wt_endpoint_flush_resets(&conn->endpoint_ctx) != 0) {
+        moq_transport_bridge_on_transport_error(
+            conn->bridge, PICO_WT_RESET_FATAL_CODE, now_us);
+        return -1;
+    }
     moq_result_t rc = moq_transport_bridge_service(
         conn->bridge, now_us);
     if (rc >= 0 && !moq_transport_bridge_is_terminal(conn->bridge)) {
@@ -391,8 +403,8 @@ int moq_pico_wt_service(moq_pico_wt_conn_t *conn, uint64_t now_us)
  * Per-stream bounds are direct. Connection-level arrest is DERIVATIVE: picoquic
  * grows connection MAX_DATA from delivery, so once every stream's window is
  * frozen, delivery stops and the connection stops advancing too. There is no
- * per-connection control here (picoquic_set_max_data_control is quic-wide and
- * mutually exclusive with picoquic_open_flow_control).
+ * per-connection control here (picoquic_set_max_data_control is quic-wide, and
+ * while it is set picoquic_open_flow_control no longer raises MAX_DATA).
  */
 
 static pw_rx_stream_t *pw_rx_find(moq_pico_wt_conn_t *c, uint64_t sid)
@@ -561,21 +573,6 @@ static moq_result_t pw_rx_feed(moq_pico_wt_conn_t *c, pw_rx_stream_t *st,
  * by the post-service sweep once ready. Returns 0, or -1 if picoquic rejected
  * the grant (the claimed window ownership no longer holds: fatal).
  */
-int pico_wt_conn_rx_mark_complete(moq_pico_wt_conn_t *c, uint64_t sid,
-                                  uint64_t now)
-{
-    if (c == NULL) return -1;
-    pw_rx_stream_t *st = pw_rx_get(
-        c, sid, PICOQUIC_IS_BIDIR_STREAM_ID(sid) ? PW_RX_BIDI : PW_RX_UNI);
-    if (st == NULL) {
-        moq_transport_bridge_on_transport_error(
-            c->bridge, PICO_WT_INBOUND_FATAL_CODE, now);
-        return -1;
-    }
-    st->rx_complete = true;
-    return 0;
-}
-
 static int pw_rx_refresh_credit(moq_pico_wt_conn_t *c, pw_rx_stream_t *st)
 {
     if (!st->app_fc || c->cnx == NULL) return 0;
@@ -622,6 +619,9 @@ static int pw_rx_on_data(moq_pico_wt_conn_t *c, uint64_t sid, pw_rx_kind_t kind,
             c->bridge, PICO_WT_INBOUND_FATAL_CODE, now);
         return -1;
     }
+    if (!st->app_fc && !st->rx_complete && c->rx_replay_complete &&
+        c->rx_replay_complete_sid == sid)
+        st->rx_complete = true;   /* complete at the transport: no window */
     if (!st->app_fc && !st->rx_complete) {   /* first sight: take the window */
         if (c->cnx == NULL ||
             picoquic_set_app_flow_control(c->cnx, sid, 1) != 0) {
@@ -979,6 +979,7 @@ int moq_pico_wt_callback(picoquic_cnx_t *cnx,
         c->endpoint_ctx.cnx = NULL;
         c->endpoint_ctx.h3_ctx = NULL;
         c->endpoint_ctx.control_stream_ctx = NULL;
+        pico_wt_endpoint_settle_deferred(&c->endpoint_ctx);
         if (local_detach) {
             if (!moq_transport_bridge_is_terminal(c->bridge))
                 moq_transport_bridge_on_transport_close(c->bridge, 0, now);
@@ -987,8 +988,17 @@ int moq_pico_wt_callback(picoquic_cnx_t *cnx,
         }
         return 0;
     }
-    if (event == picohttp_callback_free)
+    if (event == picohttp_callback_free) {
+        /* h3zero frees a stream's context as soon as the stream retires,
+         * which can happen mid-session. The adapter keeps no data-stream
+         * context, but it does hold the WT control stream's: once both
+         * directions of that stream are done the session is over, so detach
+         * now, while the context is still valid, exactly as destroy would.
+         * Deregistering the session also reports the transport close. */
+        if (stream_ctx != NULL && stream_ctx == c->control_stream_ctx)
+            detach_from_picoquic(c);
         return 0;
+    }
 
     /* Pull send: h3zero is ready to put bytes on the wire for this WT data
      * stream. Serviced even while terminal so picoquic always gets a buffer
@@ -997,6 +1007,14 @@ int moq_pico_wt_callback(picoquic_cnx_t *cnx,
     if (event == picohttp_callback_provide_data)
         return pico_wt_endpoint_on_provide_data(&c->endpoint_ctx, sid,
                                                 bytes, length);
+
+    /* Resets whose preamble picoquic has sent since the last callback. */
+    if (pico_wt_endpoint_flush_resets(&c->endpoint_ctx) != 0) {
+        moq_transport_bridge_on_transport_error(
+            c->bridge, PICO_WT_RESET_FATAL_CODE,
+            picoquic_get_quic_time(picoquic_get_quic_ctx(cnx)));
+        return -1;
+    }
 
     if (moq_transport_bridge_is_terminal(c->bridge)) return 0;
 

@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 
-# picoquic-core and picoquic-log are mutually dependent static archives.
-# Let capable linkers de-duplicate CMake's cycle expansion, while traditional
-# one-pass linkers retain the repeated archives they need to resolve it.
+# Let capable linkers de-duplicate repeated link items (one library reached
+# through several targets), while traditional one-pass linkers keep the
+# repetitions they need.
 if(POLICY CMP0156)
     cmake_policy(SET CMP0156 NEW)
 endif()
@@ -409,7 +409,8 @@ endif()
 
 # Stage the upstream picoquic static archives into the prefix libdir. The
 # generated pkg-config files reference them with -L${libdir} (-lpicoquic-core
-# / -lpicoquic-log in libmoq.pc, plus -lpicohttp-core in the pico WT .pc), but
+# in libmoq.pc; -lpicohttp-core -lpicoquic-log -lpicoquic-core in the pico WT
+# .pc, because picohttp-core uses picoquic-log), but
 # picoquic ships no install rules -- so without this a clean
 # `pkg-config --libs libmoq` link fails with "library 'picoquic-core' not
 # found". In source-tree mode they are add_subdirectory targets we can stage;

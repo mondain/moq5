@@ -44,8 +44,9 @@
 #   OPENSSL_ROOT_DIR  passed to picotls' cmake if set (macOS/brew)
 #   MOQ_PICOTLS_BUILD_CONFIG  dependency configuration (default: Release)
 #
-# The tracked dependency patches are applied after checkout. Already-patched
-# inputs are accepted; conflicting inputs fail before any dependency build.
+# The tracked dependency patches (patches/picoquic, patches/picotls) are
+# applied after checkout. Already-patched inputs are accepted; conflicting
+# inputs fail before any dependency build.
 # --self-test checks patching and the compiler policy with offline fixtures.
 #
 # Requires: git, cmake, a C compiler, and OpenSSL dev headers
@@ -58,15 +59,17 @@ set -euo pipefail
 
 # -- Pinned, known-good dependency commits -----------------------------
 PICOQUIC_REPO="${PICOQUIC_REPO:-https://github.com/private-octopus/picoquic}"
-PICOQUIC_REF="${PICOQUIC_REF:-55b473e207e436d06ea9a2895cc1fc555d42c81c}"
+PICOQUIC_REF="${PICOQUIC_REF:-a602e60babea48da7849169d716aaf68684e66d6}"
 PICOTLS_REPO="${PICOTLS_REPO:-https://github.com/h2o/picotls.git}"
-PICOTLS_REF="${PICOTLS_REF:-7c32032f91449d695b24b82955f20d04d47e6cff}"
+PICOTLS_REF="${PICOTLS_REF:-f06553b877ada93c860dd1db9002eabf7365292d}"
 
 PICOQUIC_PATCHES=(
-    0001-h3zero-reset-capsule-value-read.patch
     0002-reset-stream-after-fin.patch
-    0005-reliable-reset-prefix-ack-range.patch
     0006-own-application-close-reason.patch
+)
+PICOTLS_PATCHES=(
+    0001-initialize-compiler-visible-scratch.patch
+    0002-minicrypto-distinct-chacha20-object.patch
 )
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
@@ -228,39 +231,76 @@ CMAKE
     printf 'picotls compiler policy self-test: assertions, caller flags, three archives, warning refusal, Debug/Release selection, MSVC source control PASS\n'
 )
 
-apply_picoquic_patch() {
-    local dir=$1 name=$2
-    local patch="$repo_root/patches/picoquic/$name"
-    [ -f "$patch" ] || die "missing picoquic patch: $patch"
+# Tracked provider patches live in patches/<provider>/ and are applied in the
+# declared order. Each one is applied, accepted when already applied, or
+# refused when it conflicts, before any dependency build.
+apply_provider_patch() {
+    local provider=$1 dir=$2 name=$3
+    local patch="$repo_root/patches/$provider/$name"
+    [ -f "$patch" ] || die "missing $provider patch: $patch"
     # A non-repository child of libmoq can silently skip every patch path.
     [ "$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" = "$(cd "$dir" && pwd -P)" ] \
-        || die "picoquic patch input is not its own git root: $dir"
+        || die "$provider patch input is not its own git root: $dir"
     if git -C "$dir" apply --check "$patch" >/dev/null 2>&1; then
-        git -C "$dir" apply "$patch" || die "picoquic patch $name failed to apply"
-        log "applied picoquic patch $name"
+        git -C "$dir" apply "$patch" || die "$provider patch $name failed to apply"
+        log "applied $provider patch $name"
     elif git -C "$dir" apply --reverse --check "$patch" >/dev/null 2>&1; then
-        log "picoquic patch $name already applied"
+        log "$provider patch $name already applied"
     else
-        die "picoquic patch $name conflicts with $dir"
+        die "$provider patch $name conflicts with $dir"
     fi
 }
 
-apply_picoquic_patches() {
-    local dir=$1 name i
-    local files=("$repo_root/patches/picoquic/"*.patch)
-    for name in "${PICOQUIC_PATCHES[@]}"; do
-        [ -f "$repo_root/patches/picoquic/$name" ] \
-            || die "missing picoquic patch: $repo_root/patches/picoquic/$name"
+# apply_provider_patches <provider> <dir> <declared patch names...>
+# The declared list must name every tracked patch, in tracked order.
+apply_provider_patches() {
+    local provider=$1 dir=$2 name i
+    shift 2
+    local declared=("$@")
+    local files=()
+    for name in "$repo_root/patches/$provider/"*.patch; do
+        [ -f "$name" ] && files+=("$name")
     done
-    [ "${#files[@]}" -eq "${#PICOQUIC_PATCHES[@]}" ] \
-        || die "declared picoquic patch list does not match tracked patches"
+    for name in "${declared[@]}"; do
+        [ -f "$repo_root/patches/$provider/$name" ] \
+            || die "missing $provider patch: $repo_root/patches/$provider/$name"
+    done
+    [ "${#files[@]}" -eq "${#declared[@]}" ] \
+        || die "declared $provider patch list does not match tracked patches"
     for ((i=0; i<${#files[@]}; ++i)); do
-        [ "${files[$i]##*/}" = "${PICOQUIC_PATCHES[$i]}" ] \
-            || die "declared picoquic patch list does not match tracked order"
+        [ "${files[$i]##*/}" = "${declared[$i]}" ] \
+            || die "declared $provider patch list does not match tracked order"
     done
-    for name in "${PICOQUIC_PATCHES[@]}"; do
-        apply_picoquic_patch "$dir" "$name"
+    for name in "${declared[@]}"; do
+        apply_provider_patch "$provider" "$dir" "$name"
     done
+}
+
+apply_picoquic_patch() { apply_provider_patch picoquic "$@"; }
+apply_picoquic_patches() { apply_provider_patches picoquic "$1" "${PICOQUIC_PATCHES[@]}"; }
+apply_picotls_patch() { apply_provider_patch picotls "$@"; }
+apply_picotls_patches() { apply_provider_patches picotls "$1" "${PICOTLS_PATCHES[@]}"; }
+
+# Write the minimal upstream context of a patch under <root>: each file holds
+# only the pre-image of its hunks (context and removed lines), which the patch
+# then applies to at an offset.
+patch_preimage() {
+    local patch=$1 root=$2
+    awk -v root="$root" '
+        /^diff --git / { file = ""; hunk = 0; next }
+        /^--- / && !hunk { next }
+        /^\+\+\+ b\// && !hunk {
+            file = root "/" substr($0, 7)
+            dir = file; sub(/\/[^\/]*$/, "", dir)
+            system("mkdir -p \"" dir "\"")
+            next
+        }
+        /^@@ / { hunk = (file != ""); next }
+        hunk && /^[ -]/ { print substr($0, 2) > file; next }
+        hunk && /^$/ { print "" > file; next }
+        hunk && /^\+/ { next }
+        { hunk = 0 }
+    ' "$patch"
 }
 
 patch_selftest() (
@@ -270,38 +310,109 @@ patch_selftest() (
     for name in "${PICOQUIC_PATCHES[@]}"; do
         [ -f "$repo_root/patches/picoquic/$name" ] || die "self-test: missing $name"
     done
-    local capsule_patch=0001-h3zero-reset-capsule-value-read.patch
-    mkdir -p "$tmp/tree/picohttp"
+    local close_patch=0006-own-application-close-reason.patch
+    local patch="$repo_root/patches/picoquic/$close_patch"
+    mkdir -p "$tmp/tree"
     git -C "$tmp/tree" init -q
-    # Minimal upstream context; the behavioral regression links picohttp-core.
-    printf '\t\t%s\n' \
-        '/* reset the fields to expected value */' \
-        'capsule->header_length = 0;' \
-        'capsule->header_read = 0;' \
-        'capsule->capsule_type = 0;' \
-        'capsule->capsule_length = 0;' \
-        'capsule->is_stored = 0;' > "$tmp/tree/picohttp/h3zero_common.c"
-    apply_picoquic_patch "$tmp/tree" "$capsule_patch"
-    grep -qF 'capsule->value_read = 0;' "$tmp/tree/picohttp/h3zero_common.c"
-    cp "$tmp/tree/picohttp/h3zero_common.c" "$tmp/expected"
-    apply_picoquic_patch "$tmp/tree" "$capsule_patch"
-    cmp "$tmp/expected" "$tmp/tree/picohttp/h3zero_common.c"
-    printf 'conflicting source\n' > "$tmp/tree/picohttp/h3zero_common.c"
-    if (apply_picoquic_patch "$tmp/tree" "$capsule_patch") > "$tmp/log" 2>&1; then
+    # Minimal upstream context. The behavioural regression is
+    # test_pq_close_reason.
+    patch_preimage "$patch" "$tmp/tree"
+    local sender="$tmp/tree/picoquic/sender.c"
+    [ -f "$sender" ] || die "self-test: no fixture for $close_patch"
+    apply_picoquic_patch "$tmp/tree" "$close_patch"
+    grep -qF '#define PICOQUIC_CLOSE_REASON_COPIED 1' "$tmp/tree/picoquic/picoquic.h"
+    grep -qF 'cnx->local_error_reason = reason_copy;' "$sender"
+    cp -R "$tmp/tree/picoquic" "$tmp/expected"
+    apply_picoquic_patch "$tmp/tree" "$close_patch"
+    diff -r "$tmp/expected" "$tmp/tree/picoquic" >/dev/null
+    printf 'conflicting source\n' > "$sender"
+    if (apply_picoquic_patch "$tmp/tree" "$close_patch") > "$tmp/log" 2>&1; then
         die "self-test: conflicting source was accepted"
     fi
-    grep -qF "picoquic patch $capsule_patch conflicts" "$tmp/log"
-    test "$(cat "$tmp/tree/picohttp/h3zero_common.c")" = 'conflicting source'
-    if (repo_root="$tmp/missing"; apply_picoquic_patch "$tmp/tree" "$capsule_patch") > "$tmp/log" 2>&1; then
+    grep -qF "picoquic patch $close_patch conflicts" "$tmp/log"
+    test "$(cat "$sender")" = 'conflicting source'
+    if (repo_root="$tmp/missing"; apply_picoquic_patch "$tmp/tree" "$close_patch") > "$tmp/log" 2>&1; then
         die "self-test: missing patch was accepted"
     fi
     grep -qF 'missing picoquic patch' "$tmp/log"
     mkdir -p "$tmp/tree/child"
-    if (apply_picoquic_patch "$tmp/tree/child" "$capsule_patch") > "$tmp/log" 2>&1; then
+    if (apply_picoquic_patch "$tmp/tree/child" "$close_patch") > "$tmp/log" 2>&1; then
         die "self-test: non-root patch input was accepted"
     fi
     grep -qF 'picoquic patch input is not its own git root' "$tmp/log"
-    printf 'capsule patch self-test: apply, repeat, conflict, missing PASS\n'
+    printf 'close-reason patch self-test: apply, repeat, conflict, missing PASS\n'
+)
+
+picotls_patch_selftest() (
+    set -eu
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    local scratch_patch=0001-initialize-compiler-visible-scratch.patch
+    local member_patch=0002-minicrypto-distinct-chacha20-object.patch
+    local name
+    for name in "$scratch_patch" "$member_patch"; do
+        [ -f "$repo_root/patches/picotls/$name" ] || die "self-test: missing $name"
+    done
+    mkdir -p "$tmp/tree"
+    git -C "$tmp/tree" init -q
+    patch_preimage "$repo_root/patches/picotls/$scratch_patch" "$tmp/tree"
+    patch_preimage "$repo_root/patches/picotls/$member_patch" "$tmp/tree"
+    # The rename carries no hunk; any content stands in for the wrapper.
+    mkdir -p "$tmp/tree/lib/cifra"
+    printf '/* picotls chacha20 wrappers */\n' > "$tmp/tree/lib/cifra/chacha20.c"
+    cp "$tmp/tree/lib/cifra/chacha20.c" "$tmp/wrapper"
+    local uecc="$tmp/tree/deps/micro-ecc/uECC.c" test_src="$tmp/tree/t/picotls.c"
+    local cmake="$tmp/tree/CMakeLists.txt"
+    [ -f "$uecc" ] && [ -f "$test_src" ] && [ -f "$cmake" ] \
+        || die "self-test: no fixture for the picotls patches"
+    # micro-ecc is a submodule of picotls: 0001 crosses that boundary.
+    git -C "$tmp/tree/deps/micro-ecc" init -q
+    apply_picotls_patches "$tmp/tree"
+    test "$(grep -cF 't5[uECC_MAX_WORDS] = {0};' "$uecc")" = 2
+    grep -qF 'ptls_cipher_suite_t *selected = NULL;' "$test_src"
+    # The wrapper moved byte for byte and every reference followed it.
+    test ! -e "$tmp/tree/lib/cifra/chacha20.c"
+    cmp "$tmp/wrapper" "$tmp/tree/lib/cifra/minicrypto-chacha20.c"
+    test "$(grep -cF 'lib/cifra/minicrypto-chacha20.c' "$cmake")" = 3
+    ! grep -qF 'lib/cifra/chacha20.c' "$cmake"
+    mkdir -p "$tmp/expected-dir"
+    cp -R "$tmp/tree/deps" "$tmp/tree/t" "$tmp/tree/lib" "$cmake" "$tmp/expected-dir/"
+    apply_picotls_patches "$tmp/tree"
+    cmp "$tmp/expected-dir/deps/micro-ecc/uECC.c" "$uecc"
+    cmp "$tmp/expected-dir/t/picotls.c" "$test_src"
+    cmp "$tmp/expected-dir/CMakeLists.txt" "$cmake"
+    cmp "$tmp/wrapper" "$tmp/tree/lib/cifra/minicrypto-chacha20.c"
+    printf 'conflicting source\n' > "$test_src"
+    if (apply_picotls_patch "$tmp/tree" "$scratch_patch") > "$tmp/log" 2>&1; then
+        die "self-test: conflicting picotls source was accepted"
+    fi
+    grep -qF "picotls patch $scratch_patch conflicts" "$tmp/log"
+    test "$(cat "$test_src")" = 'conflicting source'
+    cmp "$tmp/expected-dir/deps/micro-ecc/uECC.c" "$uecc"
+    printf 'conflicting source\n' > "$cmake"
+    if (apply_picotls_patch "$tmp/tree" "$member_patch") > "$tmp/log" 2>&1; then
+        die "self-test: conflicting picotls build description was accepted"
+    fi
+    grep -qF "picotls patch $member_patch conflicts" "$tmp/log"
+    test "$(cat "$cmake")" = 'conflicting source'
+    cmp "$tmp/wrapper" "$tmp/tree/lib/cifra/minicrypto-chacha20.c"
+    if (repo_root="$tmp/missing"; apply_picotls_patch "$tmp/tree" "$scratch_patch") > "$tmp/log" 2>&1; then
+        die "self-test: missing picotls patch was accepted"
+    fi
+    grep -qF 'missing picotls patch' "$tmp/log"
+    if (apply_picotls_patch "$tmp/tree/t" "$scratch_patch") > "$tmp/log" 2>&1; then
+        die "self-test: non-root picotls patch input was accepted"
+    fi
+    grep -qF 'picotls patch input is not its own git root' "$tmp/log"
+    if (PICOTLS_PATCHES=("$scratch_patch"); apply_picotls_patches "$tmp/tree") > "$tmp/log" 2>&1; then
+        die "self-test: omitted picotls patch was accepted"
+    fi
+    grep -qF 'declared picotls patch list does not match tracked patches' "$tmp/log"
+    if (PICOTLS_PATCHES=("$member_patch" "$scratch_patch"); apply_picotls_patches "$tmp/tree") > "$tmp/log" 2>&1; then
+        die "self-test: reordered picotls patch list was accepted"
+    fi
+    grep -qF 'declared picotls patch list does not match tracked order' "$tmp/log"
+    printf 'picotls patch self-test: apply, repeat, submodule path, rename, conflict, missing, list PASS\n'
 )
 
 patch_list_selftest() (
@@ -356,6 +467,7 @@ patch_list_selftest() (
 
 if [ "${1:-}" = "--self-test" ]; then
     patch_selftest
+    picotls_patch_selftest
     patch_list_selftest
     compiler_policy_selftest
     exit $?
@@ -405,6 +517,8 @@ fetch_at "$PICOTLS_REPO"  "$PICOTLS_REF"  "$picotls_dir"
 # commit - deterministic with the pinned ref.
 log "picotls submodules"
 git -C "$picotls_dir" submodule update --init --recursive --depth 1
+# The tracked picotls patches may touch submodule sources, so they follow it.
+apply_picotls_patches "$picotls_dir"
 
 log "building picotls -> $picotls_build"
 build_picotls "$picotls_dir" "$picotls_build"

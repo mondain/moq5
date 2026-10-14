@@ -141,6 +141,8 @@ static struct { uint64_t sid; uint64_t code; } g_stops[SIG_MAX];
 static int g_stop_n = 0, g_stop_seen = 0;
 static int g_reset_n = 0;
 int picoquic_reset_stream(picoquic_cnx_t *c, uint64_t sid, uint64_t ec) { (void)c; (void)sid; (void)ec; g_reset_n++; return 0; }
+int picoquic_reset_stream_at(picoquic_cnx_t *c, uint64_t sid, uint64_t ec, uint64_t reliable_size)
+    { (void)c; (void)sid; (void)ec; (void)reliable_size; g_reset_n++; return 0; }
 int picowt_reset_stream(picoquic_cnx_t *cnx, h3zero_stream_ctx_t *stream_ctx, uint64_t local_stream_error)
     { (void)cnx; (void)stream_ctx; (void)local_stream_error; g_reset_n++; return 0; }
 int picoquic_stop_sending(picoquic_cnx_t *c, uint64_t sid, uint64_t ec)

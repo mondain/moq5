@@ -117,6 +117,11 @@ struct moq_pico_wt_conn {
     pw_rx_stream_t             *rx;
     size_t                      rx_count;
     size_t                      rx_cap;
+
+    /* Set only while a host feeds a stream the transport already completed
+     * (pico_wt_conn_rx_replay_complete_begin/_end). */
+    bool                        rx_replay_complete;
+    uint64_t                    rx_replay_complete_sid;
 };
 
 /*
@@ -135,15 +140,27 @@ struct moq_pico_wt_conn {
  */
 #define PICO_WT_INBOUND_FATAL_CODE 0x10
 
-/* Record that every byte of peer stream `sid`, and its FIN, was delivered by
- * the transport before this adapter existed, so the transport may already
- * have retired the stream: its bytes will be fed to this adapter, but there is
- * no receive window to take or advance. Call before feeding them. Returns 0,
- * or -1 if no receive state could be created: that is the adapter's inbound
- * failure (the bridge is failed with PICO_WT_INBOUND_FATAL_CODE), and the
- * stream's bytes must not be fed. */
-int pico_wt_conn_rx_mark_complete(moq_pico_wt_conn_t *c, uint64_t sid,
-                                  uint64_t now);
+/* Bracket the feeding of a peer stream whose every byte, and its FIN, the
+ * transport delivered before this adapter existed, so the transport may
+ * already have retired it: the stream's receive state, created on first
+ * sight, is recorded complete, with no receive window to take or advance.
+ * Failing to create that state is the adapter's ordinary inbound failure.
+ *
+ * Inline over the private layout, like pico_wt_conn_on_quic_lost: the managed
+ * facade is a separate library from this adapter, and the adapter exports
+ * only its public API. */
+static inline void pico_wt_conn_rx_replay_complete_begin(moq_pico_wt_conn_t *c,
+                                                         uint64_t sid)
+{
+    if (!c) return;
+    c->rx_replay_complete = true;
+    c->rx_replay_complete_sid = sid;
+}
+
+static inline void pico_wt_conn_rx_replay_complete_end(moq_pico_wt_conn_t *c)
+{
+    if (c) c->rx_replay_complete = false;
+}
 
 /* Whether the QUIC connection ended in order: no transport error on either
  * side (idle timeout, stateless reset and local failures are transport

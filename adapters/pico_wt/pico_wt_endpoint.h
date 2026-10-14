@@ -25,12 +25,13 @@
  * not what caused the observed draft-18 WT teardown — that came from picoquic
  * locally rejecting the non-negotiated reliable-size reset; see ep_reset.)
  *
- * The §4.4 mapping is NOT a plain additive base (that is picoquic's
- * simplified H3ZERO_WEBTRANSPORT_APPLICATION_ERROR, correct only for
- * n < 0x1e): it skips the reserved HTTP/3 GREASE points (0x1f*N + 0x21).
+ * The §4.4 mapping is NOT a plain additive base: it skips the reserved
+ * HTTP/3 GREASE points (0x1f*N + 0x21).
  *   encode(n) = FIRST + n + n/0x1e            (n <= UINT32_MAX)
  *   decode(h) = shifted - shifted/0x1f        (shifted = h - FIRST)
- * FIRST is picoquic's pinned base (H3ZERO_WEBTRANSPORT_APPLICATION_ERROR(0));
+ * picoquic's H3ZERO_WEBTRANSPORT_APPLICATION_ERROR(n) encodes the same way
+ * but has no range check or decoder, so the adapter keeps its own pair.
+ * FIRST is picoquic's base (H3ZERO_WEBTRANSPORT_APPLICATION_ERROR(0));
  * LAST = encode(UINT32_MAX) bounds the space. WebTransport codes are limited
  * to UINT32_MAX, so encode of a larger MoQ code fails. */
 #define PICO_WT_WT_ERR_FIRST (H3ZERO_WEBTRANSPORT_APPLICATION_ERROR(0))
@@ -72,6 +73,15 @@ static inline bool pico_wt_wt_err_to_moq(uint64_t h3_code, uint64_t *out)
     *out = shifted - shifted / 0x1full;
     return true;
 }
+
+/* A reset accepted from the bridge whose WebTransport preamble picoquic has
+ * not sent yet. */
+#define PICO_WT_DEFERRED_RESETS_MAX 64u   /* the bridge's default max_pending */
+typedef struct {
+    uint64_t sid;
+    uint64_t wt_code;
+    uint64_t reliable_size;   /* the preamble */
+} pico_wt_deferred_reset_t;
 
 typedef struct {
     picoquic_cnx_t *cnx;
@@ -120,7 +130,20 @@ typedef struct {
      * genuine reliable-reset negotiation, 0 for the plain RESET_STREAM
      * downgrade. Lets a white-box test pin the branch directly. */
     size_t last_reset_reliable_size;
+
+    /* Resets waiting for their preamble to be sent (see ep_reset). Bounded:
+     * a reset that finds this full is refused with WOULD_BLOCK, so the
+     * bridge keeps it in its own bounded pending queue and retries it. */
+    pico_wt_deferred_reset_t deferred[PICO_WT_DEFERRED_RESETS_MAX];
+    size_t deferred_count;
 } pico_wt_endpoint_ctx_t;
+
+#if defined(MOQ_PICO_WT_TESTING)
+/* Test builds only: replaces picoquic_reset_stream_at for the deferred-reset
+ * retry, so a test can make the provider fail deterministically. */
+extern int (*pw_test_reset_stream_at)(picoquic_cnx_t *cnx, uint64_t stream_id,
+                                      uint64_t error, uint64_t reliable_size);
+#endif
 
 /* Returns 0 on success, -1 on allocation failure (queue create). */
 int pico_wt_endpoint_init(moq_transport_endpoint_ops_t *ops,
@@ -131,6 +154,18 @@ int pico_wt_endpoint_init(moq_transport_endpoint_ops_t *ops,
                            const moq_alloc_t *alloc);
 
 void pico_wt_endpoint_cleanup(pico_wt_endpoint_ctx_t *ctx);
+
+/* Issue every deferred reset whose preamble picoquic has now sent. Called
+ * outside the provide_data callback: from moq_pico_wt_service and at the
+ * start of the other WebTransport callbacks. Returns 0, or -1 when picoquic
+ * failed to issue one of them; the caller then fails the transport, as it
+ * would for a reset refused on the spot. */
+int pico_wt_endpoint_flush_resets(pico_wt_endpoint_ctx_t *ctx);
+
+/* Forget every deferred reset once the session is detached. The streams
+ * themselves are not left open: their send side was never marked finished,
+ * so deregistering the session resets them with WT_SESSION_GONE. */
+void pico_wt_endpoint_settle_deferred(pico_wt_endpoint_ctx_t *ctx);
 
 /* Service an h3zero picohttp_callback_provide_data for `stream_id`: copy up to
  * `space` queued bytes into picoquic's buffer via `provide_ctx`, setting FIN

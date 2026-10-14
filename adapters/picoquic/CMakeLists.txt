@@ -120,14 +120,6 @@ else()
         "Expected auto, openssl, or mbedtls.")
 endif()
 
-# Resolve picoquic-log target name before linking.
-set(_PQ_LOG "")
-if(TARGET picoquic::picoquic-log)
-    set(_PQ_LOG "picoquic::picoquic-log")
-elseif(TARGET picoquic-log)
-    set(_PQ_LOG "picoquic-log")
-endif()
-
 target_link_libraries(moq-adapter-picoquic
     PUBLIC moq::core ${_adapter_tls_link}
     PUBLIC $<BUILD_INTERFACE:${_PQ}>)
@@ -181,18 +173,14 @@ endif()\n")
 
 # Install-tree targets (relocatable via prefix detection).
 # Always use namespaced names since install-tree consumers will have
-# installed picoquic with picoquic::picoquic-core / picoquic::picoquic-log.
+# installed picoquic with picoquic::picoquic-core. The adapter needs only
+# picoquic-core: it uses nothing from picoquic-log, and picoquic-core does
+# not depend on it.
 set(_adapter_lib_name "$<TARGET_FILE_NAME:moq-adapter-picoquic>")
 set(_adapter_lib_type "$<IF:$<STREQUAL:$<TARGET_PROPERTY:moq-adapter-picoquic,TYPE>,STATIC_LIBRARY>,STATIC,SHARED>")
 set(_adapter_libdir "${CMAKE_INSTALL_LIBDIR}")
 set(_adapter_incdir "${CMAKE_INSTALL_INCLUDEDIR}")
 set(_adapter_pq_target "picoquic::picoquic-core")
-set(_adapter_pq_log "")
-set(_adapter_pq_grouped FALSE)
-if(_PQ_LOG)
-    set(_adapter_pq_log ";picoquic::picoquic-log")
-    set(_adapter_pq_grouped TRUE)   # core/log form a static-archive cycle
-endif()
 configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/cmake/libmoqAdapterTargets.cmake.in
     ${CMAKE_CURRENT_BINARY_DIR}/libmoqAdapterTargets-install.cmake.in

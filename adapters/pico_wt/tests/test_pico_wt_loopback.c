@@ -322,6 +322,52 @@ static void test_close_double_close(void)
     pico_wt_harness_cleanup(&h);
 }
 
+static void test_control_stream_retired_detaches(void)
+{
+    /* The server ends the session (GOAWAY, then CLOSE capsule + FIN on the
+     * WT control stream) and keeps its adapter. The client sees the close
+     * and releases its session, which sends its own FIN. Once both
+     * directions are acknowledged the server's control stream retires and
+     * h3zero frees its context while the server adapter still exists. The
+     * adapter must detach right then and keep no pointer to the freed
+     * context, so the later destroy is safe (ASAN). */
+    pico_wt_harness_t h;
+    pico_wt_harness_cfg_t cfg = { .cid_byte = 0x32, .request_capacity = 10,
+                                  .server_goaway_timeout_us = 100000 };
+    if (pico_wt_harness_setup(&h, &cfg) != 0 ||
+        pico_wt_harness_handshake(&h) != 0) {
+        CHECK(0);
+        pico_wt_harness_cleanup(&h);
+        return;
+    }
+    uint64_t ctrl_id = h.server_conn->control_stream_id;
+    h3zero_callback_ctx_t *server_h3 = h.server_conn->h3_ctx;
+    CHECK(moq_session_goaway(h.server_session, NULL, 0, h.now) == MOQ_OK);
+    moq_pico_wt_service(h.server_conn, h.now);
+    pico_wt_harness_pump_until_closed(&h, 5000, h.server_conn);
+    CHECK(moq_pico_wt_conn_is_closed(h.server_conn));
+    CHECK(!moq_pico_wt_conn_is_fatal(h.server_conn));
+    CHECK(h.server_conn->control_stream_ctx != NULL);
+
+    /* The client lets go of its session: its FIN completes the stream. */
+    pico_wt_harness_pump_until_closed(&h, 5000, h.client_conn);
+    moq_pico_wt_conn_destroy(h.client_conn);
+    h.client_conn = NULL;
+    pico_wt_harness_pump(&h, 2000);
+
+    /* The control stream really retired... */
+    CHECK(h3zero_find_stream(server_h3, ctrl_id) == NULL);
+    /* ...and the adapter let go of it without turning the clean close into
+     * a failure. */
+    CHECK(h.server_conn->control_stream_ctx == NULL);
+    CHECK(h.server_conn->endpoint_ctx.control_stream_ctx == NULL);
+    CHECK(h.server_conn->cnx == NULL);
+    CHECK(moq_pico_wt_conn_is_closed(h.server_conn));
+    CHECK(!moq_pico_wt_conn_is_fatal(h.server_conn));
+
+    pico_wt_harness_cleanup(&h);
+}
+
 static void test_goaway_close_not_fatal(void)
 {
     /* GOAWAY-driven close sets closed but not fatal.
@@ -1248,6 +1294,7 @@ int main(void)
     test_datagram_too_large();
     test_stop_sending_round_trip();
     test_close_double_close();
+    test_control_stream_retired_detaches();
     test_goaway_close_not_fatal();
     test_deregister_after_close_not_fatal();
     test_drain_then_close_recovers();
@@ -1266,7 +1313,7 @@ int main(void)
             test_control_arbitration(v ? MOQ_VERSION_DRAFT_18 : MOQ_VERSION_DRAFT_16, srv != 0);
 
     if (failures == 0)
-        printf("test_pico_wt_loopback: PASS (%d tests)\n", 21);
+        printf("test_pico_wt_loopback: PASS (%d tests)\n", 22);
     else
         fprintf(stderr, "test_pico_wt_loopback: %d failure(s)\n",
                 failures);

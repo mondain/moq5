@@ -44,6 +44,8 @@ int pico_wt_harness_wt_cb(picoquic_cnx_t *cnx, uint8_t *bytes,
     (void)bytes; (void)length; (void)cnx;
     switch (event) {
     case picohttp_callback_connect:
+        if (!picowt_is_webtransport_connect(stream_ctx))
+            return -1;
         w->h3_ctx = (h3zero_callback_ctx_t *)
             picoquic_get_callback_context(cnx);
         w->ctrl_ctx = stream_ctx;
@@ -109,7 +111,9 @@ int pico_wt_harness_setup(pico_wt_harness_t *h,
 
     h->path_table[0] = (picohttp_server_path_item_t){
         .path = "/moq", .path_length = 4,
-        .path_callback = pico_wt_harness_wt_cb, .path_app_ctx = &h->server_wt};
+        .path_callback = pico_wt_harness_wt_cb, .path_app_ctx = &h->server_wt,
+        .connect_protocol = H3ZERO_WEBTRANSPORT_H3_PROTOCOL,
+        .connect_protocol_length = sizeof(H3ZERO_WEBTRANSPORT_H3_PROTOCOL) - 1};
     h->server_param.path_table = h->path_table;
     h->server_param.path_table_nb = 1;
 

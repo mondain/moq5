@@ -1,15 +1,15 @@
 Retain accepted application-close reasons for the entire connection lifetime.
 
-Applies to picoquic 55b473e207e436d06ea9a2895cc1fc555d42c81c.
+Applies to picoquic a602e60babea48da7849169d716aaf68684e66d6.
 Allocation failure leaves the connection unchanged. The capability macro
 identifies this contract for adapter builds using external providers.
 Tests: adapters/picoquic/tests/test_pq_close_reason{,_oom}.c.
 
 diff --git a/picoquic/picoquic.h b/picoquic/picoquic.h
-index ca61ef0..b458da6 100644
+index 0e1619f1..b82643f7 100644
 --- a/picoquic/picoquic.h
 +++ b/picoquic/picoquic.h
-@@ -948,6 +948,10 @@ int picoquic_start_client_cnx(picoquic_cnx_t* cnx);
+@@ -1040,6 +1040,10 @@ int picoquic_start_client_cnx(picoquic_cnx_t* cnx);
   */
  int picoquic_close(picoquic_cnx_t* cnx, uint64_t application_reason_code);
  
@@ -21,10 +21,10 @@ index ca61ef0..b458da6 100644
  
  void picoquic_close_immediate(picoquic_cnx_t* cnx);
 diff --git a/picoquic/picoquic_internal.h b/picoquic/picoquic_internal.h
-index 9e6a956..f2e18f9 100644
+index 66043883..83fda317 100644
 --- a/picoquic/picoquic_internal.h
 +++ b/picoquic/picoquic_internal.h
-@@ -1382,6 +1382,7 @@ typedef struct st_picoquic_cnx_t {
+@@ -1368,6 +1368,7 @@ typedef struct st_picoquic_cnx_t {
      uint64_t application_error;
      uint64_t local_error;
      char const * local_error_reason;
@@ -33,10 +33,10 @@ index 9e6a956..f2e18f9 100644
      uint64_t remote_error;
      uint64_t offending_frame_type;
 diff --git a/picoquic/quicctx.c b/picoquic/quicctx.c
-index 820087a..b373e7c 100644
+index 58be3c09..c83f9150 100644
 --- a/picoquic/quicctx.c
 +++ b/picoquic/quicctx.c
-@@ -4846,6 +4846,9 @@ void picoquic_delete_cnx(picoquic_cnx_t* cnx)
+@@ -4922,6 +4922,9 @@ void picoquic_delete_cnx(picoquic_cnx_t* cnx)
          picoquic_unregister_net_icid(cnx);
          picoquic_unregister_net_secret(cnx);
  
@@ -47,10 +47,10 @@ index 820087a..b373e7c 100644
      }
  }
 diff --git a/picoquic/sender.c b/picoquic/sender.c
-index ed112f9..f7d55a0 100644
+index 05e7f0bf..d1b042a9 100644
 --- a/picoquic/sender.c
 +++ b/picoquic/sender.c
-@@ -3891,6 +3891,18 @@ int picoquic_close(picoquic_cnx_t* cnx, uint64_t application_reason_code)
+@@ -3853,6 +3853,18 @@ int picoquic_close(picoquic_cnx_t* cnx, uint64_t application_reason_code)
  int picoquic_close_ex(picoquic_cnx_t* cnx, uint64_t application_reason_code, char const* error_reason)
  {
      int ret = 0;
@@ -69,7 +69,7 @@ index ed112f9..f7d55a0 100644
      uint64_t current_time = picoquic_get_quic_time(cnx->quic);
  
      if (cnx->cnx_state == picoquic_state_ready ||
-@@ -3906,7 +3918,9 @@ int picoquic_close_ex(picoquic_cnx_t* cnx, uint64_t application_reason_code, cha
+@@ -3868,7 +3880,9 @@ int picoquic_close_ex(picoquic_cnx_t* cnx, uint64_t application_reason_code, cha
      }
  
      if (ret == 0) {
