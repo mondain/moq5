@@ -883,26 +883,11 @@ typedef struct {
     size_t                     side_count;
 } input_row_t;
 
-static void check_input_row(const cap_log_t *log, size_t from,
-                            const input_row_t *w)
+static void check_input_record(const cap_t *g, const input_row_t *w)
 {
-    const cap_t *g = first_input(log, from);
-
     /* A missing INPUT is a failure -- no fallback to an ACTION record. */
     if (!g) { checkf(w->cls, "record_present", false); return; }
-
-    /* The triggered subtype must be what the FIRST input record carries, and
-     * it must occur exactly once in this row's slice. A later side-effect
-     * INPUT of another kind is permitted; a second one of this kind is not. */
     checkf(w->cls, "prefix.input_kind", g->input_kind == w->kind);
-    checkf(w->cls, "prefix.input_kind_once",
-           count_input_kind(log, from, w->kind) == 1);
-    /* declared side effects, counted exactly; anything else is unaccounted */
-    if (w->side_kind != 0)
-        checkf(w->cls, "prefix.side_effect_count",
-               count_input_kind(log, from, w->side_kind) == w->side_count);
-    checkf(w->cls, "prefix.no_undeclared_input",
-           inputs_accounted(log, from, w->kind, w->side_kind));
 
     /* the mapping oracle: exact equality with the value read from the live map */
     checkf(w->cls, "detail.mapped_ref", g->stream_ref == w->want_ref);
@@ -936,6 +921,20 @@ static void check_input_row(const cap_log_t *log, size_t from,
     checkf(w->cls, "prefix.result",     g->result == w->want_result);
     checkf(w->cls, "prefix.struct_size",
            g->struct_size == sizeof(moq_sim_trace_record_t));
+}
+
+static void check_input_row(const cap_log_t *log, size_t from,
+                            const input_row_t *w)
+{
+    /* The FIRST non-TICK input is always the trigger, never a selected kind. */
+    check_input_record(first_input(log, from), w);
+    checkf(w->cls, "prefix.input_kind_once",
+           count_input_kind(log, from, w->kind) == 1);
+    if (w->side_kind != 0)
+        checkf(w->cls, "prefix.side_effect_count",
+               count_input_kind(log, from, w->side_kind) == w->side_count);
+    checkf(w->cls, "prefix.no_undeclared_input",
+           inputs_accounted(log, from, w->kind, w->side_kind));
 }
 
 
@@ -1183,10 +1182,17 @@ static void run_input_row(bool delay_all, const char *lane,
 
     mapsnap_t m = is_data ? snap_data_map(&r, cls) : snap_bidi_map(&r, cls);
     if (!m.ok) { moq_simpair_destroy(r.sp); return; }
+    bool cancels_sub = rk == ROW_BIDI_STOP || rk == ROW_BIDI_RESET;
+    mapsnap_t data_m = {0};
+    if (cancels_sub) {
+        data_m = snap_data_map(&r, cls);
+        if (!data_m.ok) { moq_simpair_destroy(r.sp); return; }
+    }
 
     /* the declared precondition, reasserted immediately before delivery */
     if (is_data) map_check_data(&r, &m, cls, "map.pre");
     else         map_check_bidi(&r, &m, cls, "map.pre");
+    if (cancels_sub) map_check_data(&r, &data_m, cls, "side.map.pre");
 
     moq_session_t *cl = moq_simpair_client(r.sp);
     moq_session_t *sv = moq_simpair_server(r.sp);
@@ -1264,6 +1270,7 @@ static void run_input_row(bool delay_all, const char *lane,
         w.want_ref = m.far_ref; w.other_ref = m.near_ref;
         w.want_from = MOQ_PERSPECTIVE_CLIENT; w.want_to = MOQ_PERSPECTIVE_SERVER;
         w.want_error_code = IN_CODE_BIDI_STOP;
+        w.side_kind = MOQ_SIM_INPUT_DATA_RESET; w.side_count = 1;
         break;
     default:
         drc = deliver_or_delay_bidi_reset(
@@ -1275,6 +1282,7 @@ static void run_input_row(bool delay_all, const char *lane,
         w.want_ref = m.far_ref; w.other_ref = m.near_ref;
         w.want_from = MOQ_PERSPECTIVE_CLIENT; w.want_to = MOQ_PERSPECTIVE_SERVER;
         w.want_error_code = IN_CODE_BIDI_RESET;
+        w.side_kind = MOQ_SIM_INPUT_DATA_RESET; w.side_count = 1;
         break;
     }
 
@@ -1282,6 +1290,25 @@ static void run_input_row(bool delay_all, const char *lane,
     lrig_settle(&r, cls, "row");
     drain_events(drain_at);
     check_input_row(&r.log, mark, &w);
+    if (cancels_sub) {
+        char side_cls[192];
+        snprintf(side_cls, sizeof(side_cls), "%s.side_reset", cls);
+        input_row_t side = {0};
+        side.cls = side_cls;
+        side.kind = MOQ_SIM_INPUT_DATA_RESET;
+        side.want_ref = data_m.far_ref;
+        side.other_ref = data_m.near_ref;
+        side.want_from = MOQ_PERSPECTIVE_SERVER;
+        side.want_to = MOQ_PERSPECTIVE_CLIENT;
+        side.want_error_code = 0x1; /* CANCELLED, not the request's code */
+        side.want_result = MOQ_OK;
+        /* Exact inventory above permits only the trigger and this reset.
+         * Select the next input by position so a wrong kind cannot be skipped. */
+        const cap_t *trigger = first_input(&r.log, mark);
+        const cap_t *reset = trigger
+            ? first_input(&r.log, (size_t)(trigger - r.log.recs) + 1) : NULL;
+        check_input_record(reset, &side);
+    }
     checkf(cls, "no_overflow",     !r.log.overflow);
     checkf(cls, "comparable",      !r.log.incomparable);
     moq_simpair_destroy(r.sp);

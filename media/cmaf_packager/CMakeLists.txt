@@ -57,7 +57,9 @@ if(MOQ_BUILD_TESTS)
     add_test(NAME cmaf_packager_regression COMMAND test_cmaf_packager_regression)
     add_test(NAME cmaf_packager COMMAND test_cmaf_packager)
     add_test(NAME cmaf_packager_symbols COMMAND ${CMAKE_COMMAND}
-        -DNM=${CMAKE_NM} -DLIBRARY=$<TARGET_FILE:moq-cmaf-packager>
+        -DNM=${CMAKE_NM} -DREADELF=${CMAKE_READELF}
+        -DELF=$<STREQUAL:${CMAKE_EXECUTABLE_FORMAT},ELF>
+        -DLIBRARY=$<TARGET_FILE:moq-cmaf-packager>
         -DSHARED=$<BOOL:${BUILD_SHARED_LIBS}>
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_symbols.cmake)
     add_executable(test_cmaf_packager_audio tests/test_cmaf_packager_audio.c)
@@ -71,9 +73,10 @@ if(MOQ_BUILD_TESTS)
     endif()
     add_test(NAME cmaf_packager_aac_metadata COMMAND test_cmaf_packager_audio aac)
     add_test(NAME cmaf_packager_opus_metadata COMMAND test_cmaf_packager_audio opus)
-    if(UNIX AND NOT APPLE)
+    if(CMAKE_EXECUTABLE_FORMAT STREQUAL "ELF")
         add_test(NAME cmaf_packager_export_oracle COMMAND ${CMAKE_COMMAND}
             -DCC=${CMAKE_C_COMPILER} -DNM=${CMAKE_NM}
+            -DREADELF=${CMAKE_READELF} -DAR=${CMAKE_AR}
             -DCHECK_DIR=${CMAKE_CURRENT_BINARY_DIR}/symbol-fixtures
             -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/tests
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_symbols_oracle.cmake)

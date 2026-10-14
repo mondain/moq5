@@ -2204,11 +2204,9 @@ static void test_demand_loss_after_emission(uint64_t version)
     };
     expect_status(&fix, terminal, 1, "demand-loss-terminal");
     expect_terminals(&fix, terms, 2, "demand-loss-fin");
-    expect_resets(&fix, departure, version == MOQ_VERSION_DRAFT_16 ? 1 : 0,
-                  "demand-loss-departure");
-    /* The service discharges its abandonment once. Draft-16 reset the old
-     * stream on unsubscribe; draft-18's missing cancellation reset is the
-     * separate core limitation tracked in #36, not proof of stream retirement. */
+    expect_resets(&fix, departure, 1, "demand-loss-departure");
+    /* Both versions reset the departing subscription's open subgroup with
+     * CANCELLED. The service discharges its abandonment once. */
     moq_media_sender_stats_t st;
     memset(&st, 0, sizeof(st));
     MOQ_TEST_CHECK(moq_media_sender_get_stats(fix.s, &st, sizeof(st)) == MOQ_OK);

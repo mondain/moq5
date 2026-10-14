@@ -14,3 +14,9 @@ DEFINE(moq_cmaf_packager_write)
 #ifdef EXTRA_EXPORT
 DEFINE(accidental_export)
 #endif
+#ifdef HIDDEN_SUPPORT
+__attribute__((visibility("hidden"), common)) unsigned long ___asan_globals_registered;
+#endif
+#ifdef PUBLIC_SUPPORT
+PUBLIC __attribute__((common)) unsigned long ___asan_globals_registered;
+#endif

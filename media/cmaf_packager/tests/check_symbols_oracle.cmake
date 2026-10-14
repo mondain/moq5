@@ -1,19 +1,39 @@
 file(MAKE_DIRECTORY "${CHECK_DIR}")
 set(failures 0)
-foreach(case good hidden extra)
+foreach(case good hidden extra static_good static_hidden static_extra
+        static_hidden_support static_public_support)
     set(flags)
-    if(case STREQUAL hidden)
+    if(case MATCHES "^(static_)?hidden$")
         list(APPEND flags -DHIDE_WRITE)
-    elseif(case STREQUAL extra)
+    elseif(case MATCHES "^(static_)?extra$")
         list(APPEND flags -DEXTRA_EXPORT)
+    elseif(case STREQUAL static_hidden_support)
+        list(APPEND flags -DHIDDEN_SUPPORT)
+    elseif(case STREQUAL static_public_support)
+        list(APPEND flags -DPUBLIC_SUPPORT)
     endif()
+    set(shared ON)
+    set(link_flags -shared)
     set(library "${CHECK_DIR}/${case}.so")
-    execute_process(COMMAND "${CC}" -shared -fPIC -fvisibility=hidden
+    if(case MATCHES "^static_")
+        set(shared OFF)
+        set(link_flags -c)
+        set(library "${CHECK_DIR}/${case}.o")
+    endif()
+    execute_process(COMMAND "${CC}" ${link_flags} -fPIC -fvisibility=hidden
         -Wall -Wextra -Wpedantic -Werror ${flags}
         "${SOURCE_DIR}/symbol_fixture.c" -o "${library}"
         RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
     if(NOT rc EQUAL 0 OR NOT "${err}" STREQUAL "")
         message(FATAL_ERROR "fixture compile failed: ${out}${err}")
+    endif()
+    if(NOT shared)
+        execute_process(COMMAND "${AR}" rcs "${CHECK_DIR}/${case}.a" "${library}"
+            RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+        if(NOT rc EQUAL 0 OR NOT "${err}" STREQUAL "")
+            message(FATAL_ERROR "fixture archive failed: ${out}${err}")
+        endif()
+        set(library "${CHECK_DIR}/${case}.a")
     endif()
     if(case STREQUAL hidden)
         # Retain a GLOBAL ordinary-symtab symbol which is absent from dynsym.
@@ -25,10 +45,11 @@ foreach(case good hidden extra)
         endif()
     endif()
     execute_process(COMMAND "${CMAKE_COMMAND}" "-DNM=${NM}"
-        "-DLIBRARY=${library}" -DSHARED=ON
+        "-DLIBRARY=${library}" "-DSHARED=${shared}" "-DREADELF=${READELF}" -DELF=ON
         -P "${SOURCE_DIR}/check_symbols.cmake"
         RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
-    if(case STREQUAL good)
+    if(case STREQUAL good OR case STREQUAL static_good
+            OR case STREQUAL static_hidden_support)
         if(NOT rc EQUAL 0)
             message(FATAL_ERROR "valid export set refused: ${out}${err}")
         endif()
