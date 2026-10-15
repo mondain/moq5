@@ -186,26 +186,77 @@ jobs:
   swift-service-binding:
     name: Swift Service Binding (macOS)
     runs-on: macos-latest
+    defaults:
+      run:
+        shell: bash
+    # Every C input of this lane (LibMoQ, picoquic, picotls, OpenSSL) is
+    # built for the lowest macOS any Swift product here links at: 11.0, the
+    # root package's arm64 floor (it declares no `platforms:`). The Swift
+    # floors are untouched. OpenSSL is a pinned static build from source,
+    # because a Homebrew bottle targets the runner's own macOS. The
+    # deployment and OpenSSL settings are confined to the steps below, and
+    # the dependency trees live in this job's own temporary directory.
+    env:
+      MOQ_MACOS_DEPLOYMENT_TARGET: "11.0"
+      MOQ_DEPS_DIR: ${{ runner.temp }}/picoquic-deps
+      MOQ_MACOS_OPENSSL_ROOT: ${{ runner.temp }}/macos-openssl
+      MOQ_LANE_LOGS: ${{ runner.temp }}/swift-service-logs
     steps:
       - uses: actions/checkout@v5
 
+      - name: Deployment diagnostic fake-command controls
+        run: python3 scripts/tests/test_macos_deploy_diagnostics.py
+
+      - name: Build pinned static OpenSSL (macOS 11.0)
+        run: |
+          scripts/build_macos_openssl.sh "$MOQ_MACOS_OPENSSL_ROOT" > "$RUNNER_TEMP/openssl.env"
+          prefix=$(sed -n 's/^OPENSSL_ROOT_DIR=//p' "$RUNNER_TEMP/openssl.env")
+          test -f "$prefix/moq-openssl-receipt"
+          echo "MOQ_MACOS_OPENSSL_PREFIX=$prefix" >> "$GITHUB_ENV"
+
+      # picotls is built here (setup_picoquic_deps.sh) against that OpenSSL,
+      # at the same deployment target.
       - name: Set up pinned picoquic/picotls
-        run: scripts/setup_picoquic_deps.sh
+        run: |
+          mkdir -p "$MOQ_LANE_LOGS"
+          OPENSSL_ROOT_DIR="$MOQ_MACOS_OPENSSL_PREFIX" \
+          MACOSX_DEPLOYMENT_TARGET="$MOQ_MACOS_DEPLOYMENT_TARGET" \
+          scripts/setup_picoquic_deps.sh 2>&1 | tee "$MOQ_LANE_LOGS/deps.log"
+          scripts/check_macos_deploy_lane.sh diagnostic-logs "$MOQ_LANE_LOGS/deps.log"
+          scripts/check_macos_deploy_lane.sh probe-logs "$MOQ_DEPS_DIR/picotls/build/CMakeFiles"
 
       # Installed-prefix service tier (picoquic-family only: an mvfst/
       # proxygen service install has no pkg-config file by design).
+      # PTLS_INCLUDE_DIR is pinned because picoquic's FindPTLS otherwise
+      # also searches a sibling ../picotls checkout for headers.
       - name: Configure service install tree
-        run: >
-          cmake -B build/swift-service
-          -DCMAKE_BUILD_TYPE=Release
-          -DMOQ_BUILD_TESTS=OFF
-          -DMOQ_BUILD_MSF=ON
-          -DMOQ_BUILD_MEDIA_OBJECT=ON
-          -DMOQ_BUILD_SERVICE=ON
-          -DMOQ_BUILD_ADAPTER_PICOQUIC=ON
-          -DMOQ_BUILD_PQ_THREADED=ON
-          -DMOQ_PICOQUIC_SOURCE_DIR="$MOQ_PICOQUIC_SOURCE_DIR"
-          -DMOQ_PICOTLS_PREFIX="$MOQ_PICOTLS_PREFIX"
+        run: |
+          # This CI-owned post-project hook serializes the actual producer
+          # selection using the existing test helper, with tests disabled.
+          # It is not installed and does not replace any rules/toolchain hook.
+          mkdir -p "$MOQ_LANE_LOGS"
+          cat > "$MOQ_LANE_LOGS/consumer-context.cmake" <<'CMAKE'
+          include("${PROJECT_SOURCE_DIR}/tests/cmake/ConsumerBuildContext.cmake")
+          moq_write_consumer_abi_context("${PROJECT_BINARY_DIR}/consumer-abi-context.cmake")
+          CMAKE
+          cmake -B build/swift-service \
+            -DCMAKE_PROJECT_libmoq_INCLUDE="$MOQ_LANE_LOGS/consumer-context.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DMOQ_BUILD_TESTS=OFF \
+            -DMOQ_BUILD_MSF=ON \
+            -DMOQ_BUILD_MEDIA_OBJECT=ON \
+            -DMOQ_BUILD_SERVICE=ON \
+            -DMOQ_BUILD_ADAPTER_PICOQUIC=ON \
+            -DMOQ_BUILD_PQ_THREADED=ON \
+            -DMOQ_PICOQUIC_SOURCE_DIR="$MOQ_PICOQUIC_SOURCE_DIR" \
+            -DMOQ_PICOTLS_PREFIX="$MOQ_PICOTLS_PREFIX" \
+            -DPTLS_INCLUDE_DIR="$MOQ_DEPS_DIR/picotls/include" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="$MOQ_MACOS_DEPLOYMENT_TARGET" \
+            -DOPENSSL_ROOT_DIR="$MOQ_MACOS_OPENSSL_PREFIX" \
+            -DOPENSSL_USE_STATIC_LIBS=TRUE 2>&1 | tee "$MOQ_LANE_LOGS/sdk-configure.log"
+          scripts/check_macos_deploy_lane.sh diagnostic-logs "$MOQ_LANE_LOGS/sdk-configure.log"
+          # Retain failed feature probes, but never waive their warnings.
+          scripts/check_macos_deploy_lane.sh probe-logs build/swift-service/CMakeFiles
 
       # The nested picoquic tree is installed into the SAME prefix, because
       # the installed <moq/picoquic_threaded.h> includes <picoquic.h>: the
@@ -214,11 +265,33 @@ jobs:
       # LibMoQ configure only builds the picoquic libraries it links, while
       # picoquic's install rules also ship that tool.
       - name: Build + install prefix
-        run: >
-          cmake --build build/swift-service -j3 &&
-          cmake --build build/swift-service/_deps/picoquic --target picolog_t -j3 &&
-          cmake --install build/swift-service/_deps/picoquic --prefix "$PWD/build/service-prefix" &&
-          cmake --install build/swift-service --prefix "$PWD/build/service-prefix"
+        run: |
+          cmake --build build/swift-service -j3 2>&1 | tee "$MOQ_LANE_LOGS/sdk-build.log"
+          cmake --build build/swift-service/_deps/picoquic --target picolog_t -j3 2>&1 | tee "$MOQ_LANE_LOGS/picolog-build.log"
+          cmake --install build/swift-service/_deps/picoquic --prefix "$PWD/build/service-prefix" 2>&1 | tee "$MOQ_LANE_LOGS/picoquic-install.log"
+          cmake --install build/swift-service --prefix "$PWD/build/service-prefix" 2>&1 | tee "$MOQ_LANE_LOGS/sdk-install.log"
+          scripts/check_macos_deploy_lane.sh diagnostic-logs \
+              "$MOQ_LANE_LOGS/sdk-build.log" "$MOQ_LANE_LOGS/picolog-build.log" \
+              "$MOQ_LANE_LOGS/picoquic-install.log" "$MOQ_LANE_LOGS/sdk-install.log"
+
+      # Resolved inputs, not just requested ones: both CMake caches took the
+      # private OpenSSL (headers and static libraries) and the owned picotls;
+      # every archive member is a macOS object at or below the target; a
+      # plain-C pkg-config consumer links the installed closure warning-free,
+      # with OpenSSL static, and runs; so does an installed CMake consumer,
+      # through the exported targets.
+      - name: Deployment-target and link-closure checks
+        run: |
+          ptls="$MOQ_DEPS_DIR/picotls/build"
+          scripts/check_macos_deploy_lane.sh resolution "$MOQ_MACOS_DEPLOYMENT_TARGET" \
+            "$MOQ_MACOS_OPENSSL_PREFIX" "$ptls" build/swift-service "$PWD/build/service-prefix"
+          scripts/check_macos_deploy_lane.sh archives "$MOQ_MACOS_DEPLOYMENT_TARGET" \
+            "$PWD/build/service-prefix" "$ptls" "$MOQ_MACOS_OPENSSL_PREFIX"
+          scripts/check_macos_deploy_lane.sh consumer "$MOQ_MACOS_DEPLOYMENT_TARGET" \
+            "$PWD/build/service-prefix" "$MOQ_LANE_LOGS/c-consumer"
+          scripts/check_macos_deploy_lane.sh consumer-cmake "$MOQ_MACOS_DEPLOYMENT_TARGET" \
+            "$PWD/build/service-prefix" "$MOQ_MACOS_OPENSSL_PREFIX" "$MOQ_LANE_LOGS/cmake-consumer" \
+            "$PWD/build/swift-service/consumer-abi-context.cmake"
 
       # Gated suite: MoQService bridge mapping tests + the C-free suites
       # (the MoQ-linking test targets run in the ungated swift-binding job;
@@ -230,7 +303,9 @@ jobs:
       # swift-binding job (they cannot share this service test bundle -- the
       # moq_swift_stack_guard duplicate-symbol canary).
       - name: Gated Swift test (MOQ_SERVICE=1)
-        run: MOQ_SERVICE=1 swift test
+        run: |
+          mkdir -p "$MOQ_LANE_LOGS"
+          MOQ_SERVICE=1 swift test 2>&1 | tee "$MOQ_LANE_LOGS/swift-test.log"
         env:
           PKG_CONFIG_PATH: ${{ github.workspace }}/build/service-prefix/lib/pkgconfig
 
@@ -245,7 +320,7 @@ jobs:
       - name: Consumer cold-build smoke
         run: >
           cd bindings/swift/Tests/fixtures/ServiceConsumer &&
-          MOQ_SERVICE=1 swift build
+          MOQ_SERVICE=1 swift build 2>&1 | tee "$MOQ_LANE_LOGS/service-consumer.log"
         env:
           PKG_CONFIG_PATH: ${{ github.workspace }}/build/service-prefix/lib/pkgconfig
 
@@ -255,7 +330,7 @@ jobs:
       - name: SimplePlayer example build (macOS)
         run: >
           cd bindings/swift/Examples/SimplePlayer &&
-          MOQ_SERVICE=1 swift build
+          MOQ_SERVICE=1 swift build 2>&1 | tee "$MOQ_LANE_LOGS/simpleplayer.log"
         env:
           PKG_CONFIG_PATH: ${{ github.workspace }}/build/service-prefix/lib/pkgconfig
 
@@ -266,9 +341,39 @@ jobs:
       # contract again, this step fails. That drift is exactly what went
       # unnoticed while this target was unexercised.
       - name: Transport target + live examples build (MOQ_TRANSPORT=1)
-        run: MOQ_TRANSPORT=1 swift build
+        run: MOQ_TRANSPORT=1 swift build 2>&1 | tee "$MOQ_LANE_LOGS/transport.log"
         env:
           PKG_CONFIG_PATH: ${{ github.workspace }}/build/service-prefix/lib/pkgconfig
+
+      # No Swift link above may pull an object or dylib built for a newer
+      # macOS than the product it links into, and each product keeps its own
+      # floor: root products 11.0 (no declared floor), the two fixtures 13.0
+      # (declared), the test bundle XCTest's own minimum (read from the
+      # toolchain, not forced).
+      - name: Deployment-target link gate
+        run: |
+          scripts/check_macos_deploy_lane.sh diagnostic-logs "$MOQ_LANE_LOGS"/*.log
+          if grep -E "built for newer .macOS. version|linking with dylib .* built for newer version" \
+               "$MOQ_LANE_LOGS"/*.log; then
+            echo "deployment-target mismatch in a Swift link" >&2; exit 1
+          else
+            status=$?
+            if [ "$status" -ne 1 ]; then exit "$status"; fi
+          fi
+          xctest="$(xcode-select -p)/Platforms/MacOSX.platform/Developer/Library/Frameworks/XCTest.framework/Versions/A/XCTest"
+          otool -l "$xctest" > "$MOQ_LANE_LOGS/xctest-load.txt" 2> "$MOQ_LANE_LOGS/xctest-load.stderr"
+          cat "$MOQ_LANE_LOGS/xctest-load.txt" "$MOQ_LANE_LOGS/xctest-load.stderr"
+          test ! -s "$MOQ_LANE_LOGS/xctest-load.stderr"
+          xctest_min=$(awk '/LC_BUILD_VERSION/ {f=1} f && $1 == "minos" {print $2; exit}' "$MOQ_LANE_LOGS/xctest-load.txt")
+          test -n "$xctest_min"
+          python3 scripts/macho_deploy_audit.py binaries \
+            .build/debug/MoQServiceTrapProbe=11.0 \
+            .build/debug/moq-service-player=11.0 \
+            .build/debug/moq-swift-player=11.0 \
+            .build/debug/moq-swift-recv-live=11.0 \
+            ".build/debug/MOQ5PackageTests.xctest/Contents/MacOS/MOQ5PackageTests=$xctest_min" \
+            bindings/swift/Tests/fixtures/ServiceConsumer/.build/debug/service-consumer=13.0 \
+            bindings/swift/Examples/SimplePlayer/.build/debug/SimplePlayer=13.0
 
   swift-service-ios:
     name: Swift Service iOS (simulator, macOS)

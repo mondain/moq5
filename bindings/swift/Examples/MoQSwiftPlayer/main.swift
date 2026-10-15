@@ -79,6 +79,9 @@ final class PlayerState {
 
 // MARK: - Main
 
+/// AppKit setup and the run loop: everything here touches main-actor UI and
+/// runs on the main thread.
+@MainActor
 func run() throws {
     let args = try RecvArgs.parse(CommandLine.arguments)
     guard !args.demo else {
@@ -111,7 +114,25 @@ func run() throws {
 
     let state = PlayerState(displayLayer: playerView.displayLayer)
 
-    let conn = try ThreadedConnection(
+    let conn = try connect(relay: relay, args: args, ns: ns,
+                           state: state, window: window)
+
+    let delegate = PlayerWindowDelegate()
+    delegate.onClose = { try? conn.stop(); DispatchQueue.main.async { app.terminate(nil) } }
+    window.delegate = delegate
+    window.makeKeyAndOrderFront(nil)
+    app.activate(ignoringOtherApps: true)
+    log("Connected, rendering...\n")
+    app.run()
+}
+
+/// Opens the connection. The pump closure runs on the connection's network
+/// thread, so it is formed here, outside the main actor, and stays
+/// nonisolated. Its only UI access is the window title, posted to the main
+/// queue.
+func connect(relay: ParsedRelay, args: RecvArgs, ns: Namespace,
+             state: PlayerState, window: NSWindow) throws -> ThreadedConnection {
+    try ThreadedConnection(
         host: relay.host, port: relay.port,
         insecureSkipVerify: args.tlsDisableVerify,
         onPump: { ctx in
@@ -283,14 +304,6 @@ func run() throws {
             return 0
         }
     )
-
-    let delegate = PlayerWindowDelegate()
-    delegate.onClose = { try? conn.stop(); DispatchQueue.main.async { app.terminate(nil) } }
-    window.delegate = delegate
-    window.makeKeyAndOrderFront(nil)
-    app.activate(ignoringOtherApps: true)
-    log("Connected, rendering...\n")
-    app.run()
 }
 
 class PlayerWindowDelegate: NSObject, NSWindowDelegate {

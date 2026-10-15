@@ -91,17 +91,18 @@ build_picotls() {
     if [ -n "${OPENSSL_ROOT_DIR:-}" ]; then
         cmake_args+=(-DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR")
     fi
-    cmake "${cmake_args[@]}" >/dev/null || return $?
+    # Preserve both streams for the caller's log (normal mode routes stdout
+    # to stderr below so the two result assignments remain machine-readable).
+    cmake "${cmake_args[@]}" || return $?
     # Only the library targets used by FindPTLS; not dependency CLI/test tools.
     cmake --build "$build_dir" --config "$config" \
         --target picotls-core picotls-openssl picotls-minicrypto \
-        -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)" >/dev/null
+        -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
 }
 
 compiler_policy_selftest() (
     set -eu
-    # Ninja prints compiler diagnostics on stdout, discarded by build_picotls.
-    cmake() { command cmake "$@" 1>&2; }
+    # Each call captures both streams, including Ninja's stdout diagnostics.
     tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"' EXIT
     mkdir -p "$tmp/source"
