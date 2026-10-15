@@ -213,6 +213,152 @@ The output (`moq_media_parsed_object_t`) contains:
 Codec configuration comes from MSF catalog `initData` or the
 playback pipeline's CONFIGURE commands, not from the normalizer.
 
+### MPEG-2 TS packaging (`mpeg2ts`)
+
+`moq::mpeg2ts` (`-DMOQ_BUILD_MPEG2TS=ON`, default OFF; depends only on
+`moq-core`) carries MPEG-2 Transport Stream source packets as the MSF
+`"mpeg2ts"` packaging of draft-gregoire-moq-msfts (MSFTS format version 3,
+editor's copy of 2026-10-09). It is a demultiplexer-lite, not a decoder:
+stateless parsers plus caller-owned state structs, no heap, every field
+bounds-checked, only constant shared data (independent states may run on
+different threads). No state struct points into itself, so a state can be
+moved by copying its bytes; state that refers to caller storage (reorder
+slots, Object and lead-in buffers, section storage) still shares it, so only
+one copy may go on being used.
+
+Catalog side (`<moq/msf.h>`, always built with `moq-msf`): the `mpeg2ts*`
+track keys form one record, `moq_msf_mpeg2ts_t` (sized, one `has_` flag per
+key), carried as an entry of kind `MOQ_MSF_EXT_MPEG2TS` in the track's list
+of packaging records (`moq_msf_track_ext_t`, see `msf.h`). Read it with
+`moq_msf_track_mpeg2ts(track)` (NULL when absent); to author, point an entry
+at a record set up with `moq_msf_mpeg2ts_init`. Parsing is lenient -- a bad mpeg2ts track never
+fails the catalog, and any JSON spelling of an integral value is accepted --
+and the subscriber's verdict comes from `moq_msf_track_mpeg2ts_check()`.
+Authoring is strict, for independent catalogs, delta `add`/`clone` tracks and
+the referenced initialization data alike.
+`moq_msf_track_mpeg2ts_init_data()` resolves `initRef` to the `initDataList`
+entry and checks it is `"inline"` whole source packets.
+
+```c
+moq_msf_mpeg2ts_error_t why;
+if (moq_msf_track_mpeg2ts_check(track, &why) != MOQ_OK)
+    return reject_track(why);          /* e.g. an unrecognized mpeg2tsMode */
+
+moq_mpeg2ts_reorder_slot_t slots[16];
+moq_mpeg2ts_receiver_cfg_t rc;
+moq_mpeg2ts_receiver_cfg_init(&rc);   /* random access on the video PID */
+const moq_msf_mpeg2ts_t *m = moq_msf_track_mpeg2ts(track);  /* checked */
+rc.packet_size = m->packet_size;         /* 188 or 192 */
+rc.es_packets  = m->mode == MOQ_MSF_MPEG2TS_MODE_ES_PACKETS;
+rc.es_pid      = (uint16_t)m->es_pid;
+rc.reorder_slots = slots;
+rc.reorder_slot_count = 16;
+rc.reorder_window_us = 300000;
+moq_mpeg2ts_receiver_t rx;
+moq_mpeg2ts_receiver_init(&rx, sizeof(rx), &rc);
+
+/* Per received Object, as it arrives (the payload stays alive until it is
+ * handed back below). obj.end_of_group is the subgroup header bit. */
+moq_mpeg2ts_receiver_offer(&rx, now_us, obj.group_id, obj.object_id,
+    obj.end_of_group ? MOQ_MPEG2TS_OBJ_SUBGROUP_ENDS_GROUP : 0, payload, obj_ref);
+/* After each moq_sub_poll_object(), with moq_sub_cfg_t.surface_group_ends
+ * set (or on MOQ_EVENT_SUBGROUP_FINISHED with end_of_group, when the session
+ * events are visible): */
+moq_sub_group_end_t ge;
+while (moq_sub_poll_group_end(sub, &ge) == MOQ_OK)
+    moq_mpeg2ts_receiver_end_group(&rx, ge.group_id);
+/* An END_OF_GROUP status Object at (g, n): Objects n and above do not exist. */
+moq_mpeg2ts_receiver_end_group_at(&rx, obj.group_id, obj.object_id);
+
+moq_mpeg2ts_delivery_t d;
+while (moq_mpeg2ts_receiver_poll(&rx, now_us, &d, sizeof(d)) == MOQ_OK) {
+    if (d.result.gap && !d.result.gap_tail_unknown)
+        report_gap(d.result.gap_group, d.result.gap_object,
+                   d.result.gap_duration_27mhz);
+    if (d.result.accepted) forward_unchanged(d.payload);  /* never rewrite CCs */
+    release(d.ctx);
+}
+/* Wake again by moq_mpeg2ts_receiver_next_deadline_us(&rx). */
+```
+
+Group ends and ordering. MoQT drafts 16 and 18 put the END_OF_GROUP bit in
+the subgroup header, so it rides on every Object of the subgroup, and the
+Group's final Object is only known from the stream's FIN (or an END_OF_GROUP
+status Object). Objects of adjacent Groups travel on different streams and
+can arrive out of order. The receiver therefore takes per-Object flags rather
+than a "last Object" boolean, keeps a bounded reorder window (caller slots,
+a time window, release when full, `finish()` at the end of the track), and
+moves to the next Group without a gap only when the previous one's end is
+confirmed (`end_group()` on the subgroup's FIN, `end_group_at()` on an
+END_OF_GROUP status Object, or `MOQ_MPEG2TS_OBJ_LAST_IN_GROUP`). A status
+Object's ID is the first ID that does not exist, so its final Object is the
+one before it, and a missing one is a known gap, not a confirmed end; a
+status at Object 0 marks the Group empty. The END_OF_GROUP bit alone does not confirm
+it -- the bit names the subgroup holding the largest Object, and only its FIN
+says which Object that is (a reset stream says nothing) -- so otherwise the
+move is reported as `gap_tail_unknown`, distinct from a known loss. The core
+subscriber facade surfaces those FINs when `moq_sub_cfg_t.surface_group_ends`
+is set: `moq_sub_poll_group_end()` returns each one only after every object
+queued before it, so polling it after each object keeps the session's order.
+A subscriber that cannot see FINs pays up to the window at each Group
+boundary; `moq_mpeg2ts_receiver_push()` is the immediate, in-order form.
+
+Subscriber helpers: `moq_mpeg2ts_strip_prefix` (192 -> 188 for a TS
+receiver), `moq_mpeg2ts_align_join_psi` (catalog PAT/PMT copies with
+join-safe continuity counters, duplicates kept duplicates),
+`moq_mpeg2ts_switcher_*` (discontinuity_indicator on the first PCR and, where
+an adaptation field can carry it, on each other PID's first packet; PAT/PMT
+re-versioning across alternate-track switches, whole tables included; PMT PIDs
+can be named at the switch), `moq_mpeg2ts_pmt_subset` (ES-level output
+carrying a subset of streams), and `moq_mpeg2ts_pcr_interpolate` /
+`moq_mpeg2ts_stuffing_packets` for an egress scheduler. Publisher helpers:
+`moq_mpeg2ts_packetizer_*` (whole packets only, Groups opened at random access
+points of the video PID with the PAT/PMT run that precedes them in the same
+first Object, PCR-measured Group duration and peak rate for `mpeg2tsMuxRate`;
+`moq_mpeg2ts_packetizer_end_object` makes a write boundary an Object boundary
+and leaves a held PAT/PMT run for the next Group)
+and `moq_mpeg2ts_program_filter_*` (per-program mode: one program's PIDs, PAT
+and CAT tracked as whole tables, PAT rewritten with its own version_number and
+CRC_32, ECM and EMM PIDs kept).
+
+What stays with the application: subscribing to the PAT/PMT and PCR tracks of
+an ES-level program and emitting the tables before the elementary streams at
+the required interval; scheduling egress on the PCR; publishing a new
+catalog or track when the PSI changes; aligning alternate tracks' Group
+boundaries; keeping an unmodified-mode pipeline byte-exact (configure the
+packetizer with `wait_for_random_access = false`); and CAT or SI table
+rewriting, which these helpers do not do.
+
+The normalizer accepts `MOQ_MEDIA_PACKAGING_MPEG2TS`, with the packet size
+(188 or 192) in `moq_media_object_parse_cfg_t.mpeg2ts_packet_size`, passed to
+`moq_media_object_parse_sized`, when the build
+has `moq::mpeg2ts` (otherwise `MOQ_ERR_UNSUPPORTED`): it rejects
+partial packets and missing sync bytes (`MOQ_MEDIA_DROP_MALFORMED_MPEG2TS`),
+and for a video track takes the keyframe flag and timing from the program's
+video stream. `moq_msf_track_to_media_info_sized` maps an `"mpeg2ts"` track
+that passes `moq_msf_track_mpeg2ts_check()` (packaging, packet size, the
+catalog PSI as the init buffer, video unless the role says audio; PSI/SI
+table roles are not media); the legacy `moq_msf_track_to_media_info` cannot
+carry the packet size and refuses such a track.
+
+Service tier or helpers? `moq_media_sender` / `moq_media_receiver` carry the
+packaging like LOC and CMAF: a TS track is added with packaging `MPEG2TS` and
+its record as a `moq_msf_track_ext_t` entry of the track cfg, fed with
+`moq_media_sender_write_mpeg2ts()` (TS bytes in any chunking; the service
+runs the program filter a per-program record implies and the packetizer) or,
+with `mpeg2ts_app_objects`, with Objects the app forms through
+`moq_media_sender_write()`. The receiver auto-subscribes TS tracks in a build
+with `moq::mpeg2ts`, runs the reorder window per track, and delivers Objects
+in Location order through `poll_object` with the loss report
+(`has_loss_report`, `gap*`, `discontinuous`); `mpeg2ts_strip_prefix` and
+`mpeg2ts_join_psi` apply the 192-to-188 and join-PSI steps. Choose the service
+for "TS bytes in, TS bytes out"; choose the helpers for what it leaves out:
+es-packets authoring, CAT/SI rewriting, egress pacing on the PCR, a custom
+Group policy, rendition switching, and relays.
+
+The `es-units` / `media-frames` modes of draft -01, which the editor's copy
+removed, are rejected as unrecognized modes.
+
 ### Playback pipeline
 
 For applications that need keyframe gating, gap timeout, backlog

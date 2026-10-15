@@ -32,6 +32,7 @@ option(MOQ_BUILD_CPP_BINDING       "Build C++ binding"              OFF)
 option(MOQ_BUILD_LOC               "Build moq-loc LOC helpers"      ON)
 option(MOQ_BUILD_MSF               "Build moq-msf catalog parser"   OFF)
 option(MOQ_BUILD_CMAF              "Build moq-cmaf segment parser"  ON)
+option(MOQ_BUILD_MPEG2TS           "Build moq-mpeg2ts MPEG-2 TS packaging helpers" OFF)
 option(MOQ_BUILD_CODEC_SIGNALING   "Build the codec-signaling helpers" ON)
 option(MOQ_BUILD_CMAF_PACKAGER     "Build the single-track CMAF writer" OFF)
 if(MOQ_BUILD_CMAF_PACKAGER AND
@@ -140,6 +141,13 @@ endif()
 # -- CMAF segment parser --------------------------------------------
 if(MOQ_BUILD_CMAF)
     add_subdirectory(media/cmaf)
+endif()
+
+# -- MPEG-2 TS packaging helpers --------------------------------------
+# Depends only on moq-core. Built before the media object normalizer, which
+# links it (and accepts the mpeg2ts packaging) when this target exists.
+if(MOQ_BUILD_MPEG2TS)
+    add_subdirectory(media/mpeg2ts)
 endif()
 
 # -- Codec-signaling helpers ----------------------------------------
@@ -482,6 +490,9 @@ if(MOQ_BUILD_CMAF)
 endif()
 if(MOQ_BUILD_CODEC_SIGNALING)
     string(APPEND LIBMOQ_PC_LIBS " -lmoq-codec-signaling")
+endif()
+if(MOQ_BUILD_MPEG2TS)
+    string(APPEND LIBMOQ_PC_LIBS " -lmoq-mpeg2ts")
 endif()
 if(MOQ_BUILD_LOC)
     string(APPEND LIBMOQ_PC_LIBS " -lmoq-loc")

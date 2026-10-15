@@ -14,15 +14,18 @@
  * CATALOG_READY exactly once. Objects are parsed, queued, and handed to the
  * application with exclusive ownership via moq_media_receiver_poll_object().
  *
- * Subscription modes:
- *  - auto_subscribe = true: every ELIGIBLE media track is subscribed after
- *    discovery (simple-player default). Not eligible: eventtimeline tracks
- *    (e.g. a CMSF SAP timeline -- subscribe explicitly and drain poll_sap),
- *    mediatimeline tracks (MSF §7 -- discovered but not auto-subscribed;
- *    subscribe explicitly to decode their payload via poll_media_timeline) and
- *    MSF §5.2.2 namespace-override tracks
- *    (subscribe_track returns MOQ_ERR_UNSUPPORTED, as the MSF namespace has no
- *    defined MoQT mapping).
+ * Subscription modes. One rule decides what can be subscribed: the receiver
+ * has a DELIVERY PATH for a track when it is a media track whose structured
+ * info derived from the catalog and whose packaging this build parses
+ * (poll_object), or a CMSF SAP timeline (poll_sap) or MSF §7 media timeline
+ * (poll_media_timeline). subscribe_track refuses any other track with
+ * MOQ_ERR_UNSUPPORTED: a track whose info did not derive (e.g. an unknown
+ * packaging), an MPEG2TS track in a build without moq::mpeg2ts, an
+ * eventtimeline of another kind, and an MSF §5.2.2 namespace-override track
+ * (the MSF namespace has no defined MoQT mapping).
+ *  - auto_subscribe = true: every media track with a delivery path is
+ *    subscribed after discovery (simple-player default); timeline tracks are
+ *    not -- subscribe them explicitly.
  *  - auto_subscribe = false: discovery-only until the application selects
  *    tracks with moq_media_receiver_subscribe_track() and later
  *    moq_media_receiver_unsubscribe_track() -- the model FFmpeg/VLC/GStreamer
@@ -97,11 +100,14 @@ typedef struct moq_media_receiver_cfg {
                                            structural, not documented */
     moq_namespace_t namespace_;        /* REQUIRED: what to receive */
     moq_bytes_t catalog_track;         /* empty = "catalog" */
-    bool auto_subscribe;               /* true: subscribe every ELIGIBLE media
-                                          track after discovery and deliver
-                                          objects via poll_object (skips
-                                          eventtimeline, mediatimeline and MSF
-                                          namespace-override tracks). false:
+    bool auto_subscribe;               /* true: subscribe every media track
+                                          with a delivery path (see the top of
+                                          this header) after discovery and
+                                          deliver objects via poll_object.
+                                          MPEG2TS es-packets tracks are media
+                                          tracks too: each carries one PID, and
+                                          combining them with the PAT/PMT
+                                          tracks is the app's job. false:
                                           discover only, then
                                           the app chooses tracks with
                                           moq_media_receiver_subscribe_track() /
@@ -112,15 +118,66 @@ typedef struct moq_media_receiver_cfg {
                                           Overflow is terminal (§6.3): losing
                                           a discovery event is unrecoverable
                                           miswiring, never a silent drop. */
+    /* Permanently reserved, never read: the four bytes of tail padding the
+     * struct had after max_track_events, so no appended field can be read
+     * from an older caller's uninitialized padding. */
+    uint8_t  _reserved_cfg[4];
+    /* Appended after max_track_events. MPEG2TS tracks only: each subscribed
+     * TS track releases its Objects in Location order through a reorder
+     * window (see moq_media_object_t). Slots held per track (0 = 64) and how
+     * long an Object may wait for those before it (0 = 300 ms). */
+    uint32_t mpeg2ts_reorder_slots;
+    uint64_t mpeg2ts_reorder_window_us;
+    /* Remove the four-octet prefix of 192-octet source packets, so every
+     * delivered payload of such a track is 188-octet TS packets
+     * (draft-gregoire-moq-msfts, Timestamp Mode: a receiver expecting 188
+     * MUST remove it). The catalog's packet size on the desc is unchanged. */
+    bool     mpeg2ts_strip_prefix;
+    /* Prefix the first Object delivered for each subscription with the
+     * catalog's PAT/PMT packets (the track's init_data), their continuity
+     * counters aligned to that Object (Use of MSF Initialization Data). */
+    bool     mpeg2ts_join_psi;
 } moq_media_receiver_cfg_t;
+
+/* Frozen v0 sizeof includes tail padding. Its alignment is determined by
+ * the original pointer and uint64_t members, not by future appended fields. */
+#ifdef __cplusplus
+#define MOQ_MEDIA_RECEIVER_CFG_V0_ALIGNMENT \
+    (alignof(void *) > alignof(uint64_t) ? alignof(void *) : alignof(uint64_t))
+#else
+#define MOQ_MEDIA_RECEIVER_CFG_V0_ALIGNMENT \
+    (_Alignof(void *) > _Alignof(uint64_t) ? _Alignof(void *) : _Alignof(uint64_t))
+#endif
+/* The receiver
+ * accepts any struct_size at or above it and reads an appended field only
+ * when struct_size covers the whole field. */
+#define MOQ_MEDIA_RECEIVER_CFG_V0_SIZE \
+    ((offsetof(moq_media_receiver_cfg_t, max_track_events) + sizeof(uint32_t) + \
+      MOQ_MEDIA_RECEIVER_CFG_V0_ALIGNMENT - 1) & \
+     ~(size_t)(MOQ_MEDIA_RECEIVER_CFG_V0_ALIGNMENT - 1))
 
 /* Plain init leaves overflow.policy UNSET on purpose -- a deliberate
  * departure from the everywhere-else convention that zero-init works:
- * the overflow choice is forced, not defaulted. Use the presets. */
+ * the overflow choice is forced, not defaulted. Use the presets.
+ *
+ * These pointer-only initializers clear and stamp ONLY the frozen v0 prefix
+ * (MOQ_MEDIA_RECEIVER_CFG_V0_SIZE), so the appended mpeg2ts_ fields stay at
+ * their defaults. To set any of them, use the _sized forms below. */
 MOQ_API void moq_media_receiver_cfg_init(moq_media_receiver_cfg_t *cfg);
 MOQ_API void moq_media_receiver_cfg_init_live(moq_media_receiver_cfg_t *cfg);
 MOQ_API void moq_media_receiver_cfg_init_flow_control(
     moq_media_receiver_cfg_t *cfg);
+
+/* Sized forms: clear and stamp min(cfg_size, this library's struct size) and
+ * apply the preset only where the prefix covers it. Safe for a caller
+ * compiled against an older, smaller header too. No-op if cfg is NULL or
+ * cfg_size cannot hold struct_size. */
+MOQ_API void moq_media_receiver_cfg_init_sized(moq_media_receiver_cfg_t *cfg,
+                                               size_t cfg_size);
+MOQ_API void moq_media_receiver_cfg_init_live_sized(
+    moq_media_receiver_cfg_t *cfg, size_t cfg_size);
+MOQ_API void moq_media_receiver_cfg_init_flow_control_sized(
+    moq_media_receiver_cfg_t *cfg, size_t cfg_size);
 
 /* -- Track description ------------------------------------------------ *
  * Lifetimes (§6.2): every span and array in the description (name, codec, the
@@ -156,8 +213,13 @@ typedef struct moq_media_track_desc {
 
     /* Structured info derived via the MSF/media helpers. When derivation
      * was not possible for this track (unknown packaging, missing init
-     * data), `info` holds zeroed/unknown values and has_init is false --
-     * the track is still announced with its catalog strings. */
+     * data, an mpeg2ts track that fails moq_msf_track_mpeg2ts_check), `info`
+     * holds zeroed/unknown values and has_init is false -- the track is
+     * still announced with its catalog strings, and has no delivery path.
+     * An mpeg2ts track derives packaging MPEG2TS; its packet size is in the
+     * typed extensions below. Its init_data (below) is the catalog's PSI
+     * source packets, and init.codec_config stays empty. An es-packets track
+     * carries the packets of one PID. */
     moq_media_track_info_t info;  /* media type, packaging, timescale */
     bool                   has_init;
     /* Parsed decoder config. init.codec_config is the DECODER EXTRADATA
@@ -249,6 +311,23 @@ typedef struct moq_media_track_desc {
      * track_duration may appear) on the SAME handle, which fires a
      * MOQ_MEDIA_TRACK_UPDATED event. A plain value, no backing allocation. */
     bool                     is_live;
+
+    /* Never read: reserves the original tail padding on ABIs whose uint64_t
+     * alignment exceeds pointer alignment. Appended data must not occupy it. */
+    uint32_t _reserved_desc;
+    /* Appended after is_live; read only when the stamped struct_size covers
+     * them. Both are immutable for the handle's life.
+     *
+     * The catalog's packaging-extension records (see moq_msf_track_ext_t);
+     * read the MPEG-2 TS record with
+     * moq_msf_ext_mpeg2ts(extensions, extension_count). Handle-owned: the
+     * entries, the records and their spans and arrays stay valid until the
+     * receiver is destroyed. Empty when the track carries none. */
+    const moq_msf_track_ext_t *extensions;
+    size_t                     extension_count;
+    /* MSF altGroup, for every packaging (0 / false when absent). */
+    bool                     has_alt_group;
+    int                      alt_group;
 } moq_media_track_desc_t;
 
 /* -- Track discovery events (§6.2) ------------------------------------ */
@@ -449,10 +528,42 @@ typedef struct moq_media_receiver_track_subscribe_cfg {
     moq_media_start_mode_t  start;          /* CURRENT (default) | NEXT_GROUP */
     bool                    has_priority;   /* set the subscriber priority */
     uint8_t                 priority;       /* used when has_priority */
+    /* Permanently reserved, never read: the two bytes of tail padding the
+     * struct had after priority, so no appended field can be read from an
+     * older caller's uninitialized padding. */
+    uint8_t                 _reserved_sub[2];
+    /* Appended after priority. MPEG2TS only: the program whose PMT gives the
+     * random access and PCR PIDs the track's reorder window measures with
+     * (it matters on an unmodified-multiplex track). 0 = the catalog's
+     * mpeg2tsProgramNumber, else the first program of the PAT. Auto-subscribe
+     * uses 0. */
+    uint32_t                mpeg2ts_program_number;
 } moq_media_receiver_track_subscribe_cfg_t;
 
+/* Frozen v0 sizeof: through priority, rounded to the original uint32_t
+ * alignment, including tail padding. subscribe_track accepts any
+ * struct_size at or above it and reads an appended field only when
+ * struct_size covers the whole field. */
+#ifdef __cplusplus
+#define MOQ_MEDIA_RECEIVER_TRACK_SUBSCRIBE_CFG_V0_ALIGNMENT alignof(uint32_t)
+#else
+#define MOQ_MEDIA_RECEIVER_TRACK_SUBSCRIBE_CFG_V0_ALIGNMENT _Alignof(uint32_t)
+#endif
+#define MOQ_MEDIA_RECEIVER_TRACK_SUBSCRIBE_CFG_V0_SIZE \
+    ((offsetof(moq_media_receiver_track_subscribe_cfg_t, priority) + \
+      sizeof(uint8_t) + MOQ_MEDIA_RECEIVER_TRACK_SUBSCRIBE_CFG_V0_ALIGNMENT - 1) & \
+     ~(size_t)(MOQ_MEDIA_RECEIVER_TRACK_SUBSCRIBE_CFG_V0_ALIGNMENT - 1))
+
+/* Pointer-only initializer: clears and stamps ONLY the frozen v0 prefix, so
+ * the appended fields keep their defaults. To set any of them, use
+ * moq_media_receiver_track_subscribe_cfg_init_sized(cfg, sizeof *cfg). */
 MOQ_API void moq_media_receiver_track_subscribe_cfg_init(
     moq_media_receiver_track_subscribe_cfg_t *cfg);
+
+/* Sized initializer: clears and stamps min(cfg_size, this library's struct
+ * size). No-op if cfg is NULL or cfg_size cannot hold struct_size. */
+MOQ_API void moq_media_receiver_track_subscribe_cfg_init_sized(
+    moq_media_receiver_track_subscribe_cfg_t *cfg, size_t cfg_size);
 
 /* Schedule a subscription for `track` (a handle from a polled TRACK_ADDED).
  * cfg NULL == defaults (CURRENT start, no priority).
@@ -464,16 +575,22 @@ MOQ_API void moq_media_receiver_track_subscribe_cfg_init(
  * Returns:
  *   MOQ_OK            desired state recorded and reconciliation scheduled
  *   MOQ_ERR_INVAL     NULL r/track, a foreign track, or a malformed cfg
- *                     (struct_size too small, or an unknown `start` value)
+ *                     (struct_size below
+ *                     MOQ_MEDIA_RECEIVER_TRACK_SUBSCRIBE_CFG_V0_SIZE, or an
+ *                     unknown `start` value)
  *   MOQ_ERR_WRONG_STATE  the track has already ended (TRACK_ENDED): a
  *                     rejected/finished track cannot be (re)subscribed
+ *   MOQ_ERR_UNSUPPORTED  the receiver has no delivery path for this track
+ *                     (info not derived, packaging not parseable in this
+ *                     build, a timeline of a kind it does not decode, or a
+ *                     namespace override); nothing is recorded
  *   MOQ_ERR_CLOSED    the receiver is terminal
  *
  * Objects for the track surface via poll_object after the peer accepts; a peer
  * rejection surfaces MOQ_MEDIA_TRACK_ENDED for that track and does not fail the
  * receiver.
  *
- * cfg lifetime: the start mode and priority are applied ONLY when the underlying
+ * cfg lifetime: the start mode, priority and mpeg2ts_program_number are applied ONLY when the underlying
  * subscription is first issued for this track. Any later subscribe_track call --
  * while the first subscription is still pending, already active, or paused by a
  * prior unsubscribe_track -- is an idempotent enable/resume command: it (re)sets
@@ -523,7 +640,13 @@ MOQ_API moq_result_t moq_media_receiver_track_state(
 /* -- Objects (§6.3) ---------------------------------------------------- *
  * The validated parsed shape (moq_media_parsed_object_t fields) plus the
  * track and wire metadata: the TRACK_ADDED handle, the config generation,
- * and the object's wire identity. Objects surface in arrival order.
+ * and the object's wire identity. Objects surface in arrival order, except
+ * that an MPEG2TS track's Objects surface in Location order: they pass
+ * through that track's reorder window (mpeg2ts_reorder_slots /
+ * mpeg2ts_reorder_window_us), which also fills the loss report below. The
+ * track's END_OF_TRACK takes its Location in that window too, so
+ * TRACK_ENDED follows every earlier Object that arrives in time, even one
+ * whose stream the END_OF_TRACK overtook.
  * poll_object returning MOQ_OK TRANSFERS EXCLUSIVE OWNERSHIP
  * of the object's backing buffers to the caller: the payload/fragment
  * spans stay valid until moq_media_object_cleanup(&obj), which releases
@@ -610,6 +733,36 @@ typedef struct moq_media_object {
     uint64_t              object_id;
     uint8_t               publisher_priority;
     bool                  has_subgroup;
+    /* Permanently reserved, never read: the six bytes of tail padding the
+     * struct had after has_subgroup, so the stamped size of an older
+     * library can never appear to cover the loss report. */
+    uint8_t               _reserved_obj[6];
+
+    /* Loss report, appended after has_subgroup; available when the stamped
+     * struct_size reaches the end of discontinuous. has_loss_report is true
+     * when the receiver tracks Location continuity for this track's
+     * packaging (MPEG2TS today) and the fields below are meaningful; false
+     * means not tracked, and says nothing about loss.
+     *
+     *   gap                  a run of missing, rejected or locally dropped
+     *                        Objects precedes this one; gap_group /
+     *                        gap_object is the Location of its first Object;
+     *   gap_tail_unknown     the run is only the unconfirmed tail of the
+     *                        previous Group (its final Object was never
+     *                        confirmed): not a known loss;
+     *   gap_duration_known / gap_duration_27mhz
+     *                        the run's PCR span, when the packaging has an
+     *                        in-band clock;
+     *   discontinuous        informational: no random access point on the
+     *                        selected stream since the gap. */
+    bool                  has_loss_report;
+    bool                  gap;
+    uint64_t              gap_group;
+    uint64_t              gap_object;
+    bool                  gap_tail_unknown;
+    bool                  gap_duration_known;
+    uint64_t              gap_duration_27mhz;
+    bool                  discontinuous;
 } moq_media_object_t;
 
 /* Release the buffers a successful poll transferred. Safe on a zeroed
@@ -732,6 +885,12 @@ typedef struct moq_media_receiver_stats {
      * completion beyond the per-track TRACK_REMOVED events a terminating
      * (empty-tracks) catalog emits. */
     bool     catalog_complete;
+    /* Appended after catalog_complete: the loss reports poll_object handed
+     * out with gap set, the subset with gap_tail_unknown, and the Objects a
+     * reorder window refused as late or duplicated. */
+    uint64_t gaps_reported;
+    uint64_t gap_tails_unknown;
+    uint64_t reorder_refused;
 } moq_media_receiver_stats_t;
 
 /* Snapshot stats into *out. Pass `out_size = sizeof(*out)`; same size contract as

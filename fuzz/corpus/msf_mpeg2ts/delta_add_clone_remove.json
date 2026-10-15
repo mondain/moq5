@@ -1,0 +1,1 @@
+{"deltaUpdate":[{"op":"add","tracks":[{"name":"a","packaging":"mpeg2ts","isLive":true,"mpeg2tsMode":"es-packets","mpeg2tsPacketSize":188,"mpeg2tsEsPid":256}]},{"op":"clone","tracks":[{"parentName":"p","name":"q","mpeg2tsPacketSize":204}]},{"op":"remove","tracks":[{"name":"p"}]}]}

@@ -85,7 +85,21 @@ extern "C" {
  *   zeroed. When the track has no initData, or out_init_buf is
  *   NULL, *out_init_buf stays NULL and out_init stays zeroed.
  *
- * alloc is required to decode initData (CMAF, or RAW/LOC with
+ * MPEG-2 TS ("mpeg2ts", draft-gregoire-moq-msfts):
+ *   Mapped only by moq_msf_track_to_media_info_sized(); the legacy entry returns
+ *   MOQ_ERR_INVAL for such a track. The track must pass
+ *   moq_msf_track_mpeg2ts_check() (otherwise MOQ_ERR_INVAL: a subscriber
+ *   MUST reject it). Packaging MOQ_MEDIA_PACKAGING_MPEG2TS and timescale from
+ *   the catalog or 0. Packet size stays in the typed catalog extension: pass
+ *   it through moq_media_object_parse_cfg_t, never the frozen info. Media type:
+ *   role "audio" is audio; a PSI/SI table role ("pat", "pmt", "nit",
+ *   "sdt", "eit", "tdt", "scte35") or a reserved non-media role is
+ *   MOQ_ERR_INVAL; any other role, or none, is video. With out_init_buf,
+ *   initData (the PAT/PMT source packets) is decoded into *out_init_buf when
+ *   it is whole source packets with their sync bytes, and left out
+ *   otherwise; out_init->codec_config stays empty either way.
+ *
+ * alloc is required to decode initData (CMAF, or RAW/LOC or MPEG2TS with
  * out_init_buf). If NULL for such tracks, returns MOQ_ERR_INVAL.
  *
  * Returns MOQ_OK on success.

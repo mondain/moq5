@@ -93,8 +93,21 @@ if(MOQ_BUILD_WTQUIC_MSQUIC_MANAGED)
     list(APPEND _MOQ_SERVICE_FACADE_DEFS MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED=1)
     list(APPEND _MOQ_SERVICE_FACADE_LIBS moq::adapter-wtquic-msquic-managed)
 endif()
-target_compile_definitions(moq-service PRIVATE ${_MOQ_SERVICE_FACADE_DEFS})
-target_link_libraries(moq-service PRIVATE ${_MOQ_SERVICE_FACADE_LIBS})
+# MPEG-2 TS packaging (draft-gregoire-moq-msfts): the sender's packetizer and
+# the receiver's reorder window come from moq::mpeg2ts when it is in the
+# build. Without it the TS service entry points return MOQ_ERR_UNSUPPORTED
+# and TS tracks have no delivery path; the ABI is the same either way.
+# Linked privately: no service header includes <moq/mpeg2ts.h>.
+set(_MOQ_SERVICE_TS_DEFS "")
+set(_MOQ_SERVICE_TS_LIBS "")
+if(TARGET moq::mpeg2ts)
+    set(_MOQ_SERVICE_TS_DEFS MOQ_SERVICE_HAVE_MPEG2TS=1)
+    set(_MOQ_SERVICE_TS_LIBS moq::mpeg2ts)
+endif()
+target_compile_definitions(moq-service PRIVATE ${_MOQ_SERVICE_FACADE_DEFS}
+                                               ${_MOQ_SERVICE_TS_DEFS})
+target_link_libraries(moq-service PRIVATE ${_MOQ_SERVICE_FACADE_LIBS}
+                                          ${_MOQ_SERVICE_TS_LIBS})
 
 set_target_properties(moq-service PROPERTIES
     C_VISIBILITY_PRESET hidden
@@ -179,7 +192,7 @@ endif()
 # `service` component branch in libmoqConfig loads those targets first.
 set(_service_libdir "${CMAKE_INSTALL_LIBDIR}")
 set(_service_incdir "${CMAKE_INSTALL_INCLUDEDIR}")
-set(_service_iface "moq::core;moq::msf;Threads::Threads;${_MOQ_SERVICE_FACADE_LIBS}")
+set(_service_iface "moq::core;moq::msf;Threads::Threads;${_MOQ_SERVICE_FACADE_LIBS};${_MOQ_SERVICE_TS_LIBS}")
 string(REPLACE ";" "$<SEMICOLON>" _service_iface_gen "${_service_iface}")
 
 file(GENERATE
@@ -458,9 +471,9 @@ if(MOQ_BUILD_TESTS)
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         target_link_libraries(moq-service-receiver-test-internals
-            PUBLIC moq::core moq::msf Threads::Threads)
+            PUBLIC moq::core moq::msf Threads::Threads ${_MOQ_SERVICE_TS_LIBS})
         target_compile_definitions(moq-service-receiver-test-internals
-            PRIVATE MOQ_MEDIA_RECEIVER_TESTING=1 ${_MOQ_SERVICE_FACADE_DEFS})
+            PRIVATE ${_MOQ_SERVICE_TS_DEFS} MOQ_MEDIA_RECEIVER_TESTING=1 ${_MOQ_SERVICE_FACADE_DEFS})
         target_link_libraries(moq-service-receiver-test-internals
             PUBLIC ${_MOQ_SERVICE_FACADE_LIBS})
         target_compile_features(moq-service-receiver-test-internals
@@ -660,9 +673,9 @@ if(MOQ_BUILD_TESTS)
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         target_link_libraries(moq-service-sender-test-internals
-            PUBLIC moq::core moq::msf Threads::Threads)
+            PUBLIC moq::core moq::msf Threads::Threads ${_MOQ_SERVICE_TS_LIBS})
         target_compile_definitions(moq-service-sender-test-internals
-            PRIVATE MOQ_MEDIA_SENDER_TESTING=1 ${_MOQ_SERVICE_FACADE_DEFS})
+            PRIVATE ${_MOQ_SERVICE_TS_DEFS} MOQ_MEDIA_SENDER_TESTING=1 ${_MOQ_SERVICE_FACADE_DEFS})
         target_link_libraries(moq-service-sender-test-internals
             PUBLIC ${_MOQ_SERVICE_FACADE_LIBS})
         target_compile_features(moq-service-sender-test-internals
@@ -792,6 +805,22 @@ if(MOQ_BUILD_TESTS)
         add_test(NAME media_sender_pacing
             COMMAND test_media_sender_pacing)
 
+        add_executable(test_media_sender_mpeg2ts
+            tests/test_media_sender_mpeg2ts.c)
+        target_link_libraries(test_media_sender_mpeg2ts PRIVATE
+            moq-service-sender-test-internals Threads::Threads)
+        target_include_directories(test_media_sender_mpeg2ts PRIVATE
+            ${CMAKE_SOURCE_DIR}/tests/unit
+            ${CMAKE_SOURCE_DIR}/media/mpeg2ts/tests)
+        if(TARGET moq::mpeg2ts)
+            target_compile_definitions(test_media_sender_mpeg2ts PRIVATE
+                MOQ_TEST_HAVE_MPEG2TS)
+        endif()
+        target_compile_options(test_media_sender_mpeg2ts PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        add_test(NAME media_sender_mpeg2ts COMMAND test_media_sender_mpeg2ts)
+        set_tests_properties(media_sender_mpeg2ts PROPERTIES TIMEOUT 60)
+
         add_executable(test_media_sender_reject
             tests/test_media_sender_reject.c)
         target_link_libraries(test_media_sender_reject PRIVATE
@@ -814,9 +843,10 @@ if(MOQ_BUILD_TESTS)
                 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
             target_link_libraries(moq-service-refresh-test-internals
-                PUBLIC moq::core moq::msf Threads::Threads)
+                PUBLIC moq::core moq::msf Threads::Threads
+                       ${_MOQ_SERVICE_TS_LIBS})
             target_compile_definitions(moq-service-refresh-test-internals
-                PRIVATE MOQ_MEDIA_SENDER_TESTING=1 MOQ_MEDIA_RECEIVER_TESTING=1
+                PRIVATE ${_MOQ_SERVICE_TS_DEFS} MOQ_MEDIA_SENDER_TESTING=1 MOQ_MEDIA_RECEIVER_TESTING=1
                 ${_MOQ_SERVICE_FACADE_DEFS})
             target_link_libraries(moq-service-refresh-test-internals
                 PUBLIC ${_MOQ_SERVICE_FACADE_LIBS})
@@ -831,6 +861,24 @@ if(MOQ_BUILD_TESTS)
                 ${CMAKE_SOURCE_DIR}/tests/unit)
             add_test(NAME media_sender_refresh
                 COMMAND test_media_sender_refresh)
+
+            add_executable(test_media_mpeg2ts tests/test_media_mpeg2ts.c
+                ${CMAKE_SOURCE_DIR}/tests/support/media_builders.c)
+            target_link_libraries(test_media_mpeg2ts PRIVATE
+                moq-service-refresh-test-internals moq::sim)
+            target_include_directories(test_media_mpeg2ts PRIVATE
+                ${CMAKE_SOURCE_DIR}/tests/unit
+                ${CMAKE_SOURCE_DIR}/tests/support
+                ${CMAKE_SOURCE_DIR}/media/mpeg2ts/tests)
+            if(TARGET moq::mpeg2ts)
+                target_compile_definitions(test_media_mpeg2ts PRIVATE
+                    MOQ_TEST_HAVE_MPEG2TS)
+            endif()
+            target_compile_options(test_media_mpeg2ts PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            add_test(NAME media_mpeg2ts COMMAND test_media_mpeg2ts)
+            set_tests_properties(media_mpeg2ts PROPERTIES TIMEOUT 120)
 
             # Negotiated-profile closure tests. Two independent directions
             # over the SAME substrate: a real sender's LOC-01 property bytes
@@ -952,6 +1000,29 @@ if(MOQ_BUILD_TESTS)
                 --key "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
         set_tests_properties(media_receiver PROPERTIES
             LABELS "network" TIMEOUT 60 RESOURCE_LOCK service_network)
+
+        # MPEG-2 TS through the service tier over a real loopback, both
+        # drafts: the sender's and the receiver's halves, each against a
+        # raw-session server (media endpoints are clients; no relay here).
+        if(TARGET moq::mpeg2ts)
+            add_executable(test_media_mpeg2ts_loopback
+                tests/test_media_mpeg2ts_loopback.c)
+            target_link_libraries(test_media_mpeg2ts_loopback PRIVATE
+                moq::service moq::adapter-picoquic-threaded moq::msf
+                moq::mpeg2ts Threads::Threads)
+            target_include_directories(test_media_mpeg2ts_loopback PRIVATE
+                ${CMAKE_SOURCE_DIR}/tests/unit
+                ${CMAKE_SOURCE_DIR}/media/mpeg2ts/tests)
+            target_compile_options(test_media_mpeg2ts_loopback PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            add_test(NAME media_mpeg2ts_loopback
+                COMMAND test_media_mpeg2ts_loopback
+                    --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                    --key "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+            set_tests_properties(media_mpeg2ts_loopback PROPERTIES
+                LABELS "network" TIMEOUT 120 RESOURCE_LOCK service_network)
+        endif()
 
         add_executable(test_media_receiver_subscribe
             tests/test_media_receiver_subscribe.c)

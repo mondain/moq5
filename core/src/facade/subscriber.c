@@ -55,6 +55,14 @@ struct moq_sub_fetch_req {
     moq_subscriber_t   *sub;
 };
 
+/* A queued Group end, with the object and chunk queue positions it waits
+ * behind: it is pollable once both heads have reached them. */
+typedef struct sub_group_end_entry {
+    moq_sub_group_end_t end;
+    size_t              obj_seq;
+    size_t              chunk_seq;
+} sub_group_end_entry_t;
+
 struct moq_subscriber {
     moq_session_t      *session;
     moq_alloc_t         alloc;
@@ -113,6 +121,17 @@ struct moq_subscriber {
 
     bool                has_pending_chunk;
     moq_sub_chunk_t     pending_chunk;
+
+    /* Group ends (surface_group_ends): a ring of ge_cap entries, allocated
+     * only when the option is set, plus the same one-deep pending slot the
+     * other queues use under backpressure. */
+    bool                   surface_group_ends;
+    sub_group_end_entry_t *group_ends;
+    size_t                 ge_cap;
+    size_t                 ge_head;
+    size_t                 ge_tail;
+    bool                   has_pending_ge;
+    sub_group_end_entry_t  pending_ge;
 
     moq_sub_stats_t     stats;
 };
@@ -319,6 +338,17 @@ static moq_sub_chunk_t *chunk_push(moq_subscriber_t *s)
     return c;
 }
 
+static bool ge_queue_full(const moq_subscriber_t *s)
+{
+    return (s->ge_tail - s->ge_head) >= s->ge_cap;
+}
+
+static void ge_push(moq_subscriber_t *s, const sub_group_end_entry_t *e)
+{
+    s->group_ends[s->ge_tail % s->ge_cap] = *e;
+    s->ge_tail++;
+}
+
 static void chunk_release_refs(moq_sub_chunk_t *c)
 {
     if (c->chunk) { moq_rcbuf_decref(c->chunk); c->chunk = NULL; }
@@ -416,6 +446,17 @@ _Static_assert(offsetof(moq_sub_cfg_t, on_update_ok) ==
                  (_Alignof(moq_sub_cfg_t) - 1)) &
                 ~(size_t)(_Alignof(moq_sub_cfg_t) - 1)),
                "on_update_ok must sit exactly at the v0 sizeof");
+/* ABI boundary: surface_group_ends starts outside the sizeof of the struct that
+ * ended with on_update_ok, so an older caller's storage never reaches it. */
+_Static_assert(offsetof(moq_sub_cfg_t, surface_group_ends) >=
+               ((offsetof(moq_sub_cfg_t, on_update_ok) +
+                 sizeof(((moq_sub_cfg_t *)0)->on_update_ok) +
+                 (_Alignof(moq_sub_cfg_t) - 1)) &
+                ~(size_t)(_Alignof(moq_sub_cfg_t) - 1)),
+               "surface_group_ends must not consume old tail padding");
+_Static_assert(offsetof(moq_sub_cfg_t, surface_group_ends) ==
+               offsetof(moq_sub_cfg_t, _reserved_group_ends) + sizeof(uint32_t),
+               "surface_group_ends must follow its reserved slot");
 
 #define SUB_CFG_HAS(field) \
     (cfg->struct_size >= offsetof(moq_sub_cfg_t, field) + sizeof(cfg->field))
@@ -429,6 +470,8 @@ _Static_assert(offsetof(moq_sub_cfg_t, on_update_ok) ==
     size_t cc = SUB_CFG_HAS(max_chunks) && cfg->max_chunks
         ? cfg->max_chunks : SUB_DEFAULT_MAX_CHUNKS;
     bool streaming = SUB_CFG_HAS(streaming_objects) && cfg->streaming_objects;
+    bool group_ends = SUB_CFG_HAS(surface_group_ends) &&
+                      cfg->surface_group_ends;
     size_t qbytes = SUB_DEFAULT_MAX_QUEUED_BYTES;
     if (SUB_CFG_HAS(max_queued_object_bytes) && cfg->max_queued_object_bytes) {
         /* Clamp (not truncate) a configured value that cannot fit in size_t. */
@@ -531,6 +574,31 @@ _Static_assert(offsetof(moq_sub_cfg_t, on_update_ok) ==
     }
     memset(s->chunks, 0, cc * sizeof(moq_sub_chunk_t));
 
+    /* One Group end per finished subgroup: the object bound is the natural
+     * bound for them too. */
+    if (group_ends) {
+        s->group_ends = (sub_group_end_entry_t *)alloc->alloc(
+            oc * sizeof(sub_group_end_entry_t), alloc->ctx);
+        if (!s->group_ends) {
+            alloc->free(s->chunks, cc * sizeof(moq_sub_chunk_t), alloc->ctx);
+            alloc->free(s->fetch_items,
+                fic * sizeof(moq_sub_fetch_item_t), alloc->ctx);
+            alloc->free(s->fetch_reqs,
+                fc * sizeof(moq_sub_fetch_req_t), alloc->ctx);
+            alloc->free(s->status_results,
+                sc * sizeof(moq_sub_status_result_t), alloc->ctx);
+            alloc->free(s->status_reqs,
+                sc * sizeof(moq_sub_status_req_t), alloc->ctx);
+            alloc->free(s->objects, oc * sizeof(moq_sub_object_t), alloc->ctx);
+            alloc->free(s->tracks, tc * sizeof(moq_sub_track_t), alloc->ctx);
+            alloc->free(s, sizeof(moq_subscriber_t), alloc->ctx);
+            return MOQ_ERR_NOMEM;
+        }
+        memset(s->group_ends, 0, oc * sizeof(sub_group_end_entry_t));
+        s->ge_cap = oc;
+        s->surface_group_ends = true;
+    }
+
     s->callbacks = cfg->callbacks;
     s->track_cap = tc;
     s->obj_cap = oc;
@@ -594,6 +662,9 @@ void moq_sub_destroy(moq_subscriber_t *sub)
     }
 
     moq_alloc_t alloc = sub->alloc;
+    if (sub->group_ends)
+        alloc.free(sub->group_ends,
+            sub->ge_cap * sizeof(sub_group_end_entry_t), alloc.ctx);
     alloc.free(sub->chunks,
         sub->chunk_cap * sizeof(moq_sub_chunk_t), alloc.ctx);
     alloc.free(sub->fetch_items,
@@ -814,6 +885,13 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
         *c = sub->pending_chunk;
         memset(&sub->pending_chunk, 0, sizeof(sub->pending_chunk));
         sub->has_pending_chunk = false;
+    }
+
+    if (sub->has_pending_ge) {
+        if (ge_queue_full(sub)) return sub_would_block(sub);
+        ge_push(sub, &sub->pending_ge);
+        memset(&sub->pending_ge, 0, sizeof(sub->pending_ge));
+        sub->has_pending_ge = false;
     }
 
     moq_event_t ev;
@@ -1183,8 +1261,30 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
         case MOQ_EVENT_SUBGROUP_FINISHED: {
             moq_sub_track_t *t = find_track_by_handle(sub,
                 ev.u.subgroup_finished.sub);
-            if (t && t->state == SUB_TRACK_ACTIVE)
+            if (t && t->state == SUB_TRACK_ACTIVE) {
                 sub->stats.subgroup_finished++;
+                /* The session emits this strictly after the subgroup's last
+                 * object, so recording the queue tails here puts the Group
+                 * end behind every object of the subgroup. No object is
+                 * pending at this point: a pending one returns early. */
+                if (sub->surface_group_ends &&
+                    ev.u.subgroup_finished.end_of_group) {
+                    sub_group_end_entry_t ge;
+                    memset(&ge, 0, sizeof(ge));
+                    ge.end.track = t;
+                    ge.end.group_id = ev.u.subgroup_finished.group_id;
+                    ge.end.subgroup_id = ev.u.subgroup_finished.subgroup_id;
+                    ge.obj_seq = sub->obj_tail;
+                    ge.chunk_seq = sub->chunk_tail;
+                    if (ge_queue_full(sub)) {
+                        sub->pending_ge = ge;
+                        sub->has_pending_ge = true;
+                        moq_event_cleanup(&ev);
+                        return sub_would_block(sub);
+                    }
+                    ge_push(sub, &ge);
+                }
+            }
             break;
         }
 
@@ -1244,6 +1344,21 @@ moq_result_t moq_sub_poll_object(moq_subscriber_t *sub,
     sub->obj_head++;
     sub_bytes_sub(sub, rcbuf_pair_bytes(out->payload, out->properties));
     sub->stats.objects_polled++;
+    return MOQ_OK;
+}
+
+moq_result_t moq_sub_poll_group_end(moq_subscriber_t *sub,
+                                    moq_sub_group_end_t *out)
+{
+    if (!sub || !out) return MOQ_ERR_INVAL;
+    if (sub->ge_head >= sub->ge_tail) return MOQ_DONE;
+    const sub_group_end_entry_t *e =
+        &sub->group_ends[sub->ge_head % sub->ge_cap];
+    /* Held until the objects and chunks queued before it are polled. */
+    if (sub->obj_head < e->obj_seq || sub->chunk_head < e->chunk_seq)
+        return MOQ_DONE;
+    *out = e->end;
+    sub->ge_head++;
     return MOQ_OK;
 }
 

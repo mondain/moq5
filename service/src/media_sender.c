@@ -22,6 +22,10 @@
 
 #include "endpoint_internal.h"
 
+#ifdef MOQ_SERVICE_HAVE_MPEG2TS
+#include <moq/mpeg2ts.h>
+#endif
+
 #include <errno.h>
 #include <limits.h>
 #include <pthread.h>
@@ -57,6 +61,21 @@
 _Static_assert(offsetof(moq_media_track_cfg_t, has_publisher_priority) >=
                MEDIA_TRACK_CFG_SIZE_THROUGH_ALT_GROUP,
                "publisher priority must follow the complete historical layout");
+/* The add_track floor ends where the first appended field begins. */
+_Static_assert(MOQ_MEDIA_TRACK_CFG_V0_SIZE ==
+                   offsetof(moq_media_track_cfg_t, sap_timeline_history_groups) +
+                   sizeof(uint32_t),
+               "the track cfg floor is the layout through "
+               "sap_timeline_history_groups");
+/* The packaging-extension block starts at or past the struct size the
+ * layout had through publisher_priority, so no older caller's storage is read
+ * as part of it. */
+_Static_assert(offsetof(moq_media_track_cfg_t, extensions) >=
+                   ((offsetof(moq_media_track_cfg_t, publisher_priority) +
+                     sizeof(uint8_t) + _Alignof(uint64_t) - 1u) &
+                    ~((size_t)_Alignof(uint64_t) - 1u)),
+               "extensions must follow the complete layout through "
+               "publisher_priority");
 
 /* Minimum accepted moq_media_sender_cfg_t size: the prefix through the last
  * pre-callbacks field. A create/attach caller must supply at least this; the
@@ -277,6 +296,25 @@ struct moq_media_track {
     bool                  mt_open;            /* a timeline group is open on the wire */
     uint64_t              mt_obj_id;          /* next object id in the open timeline group */
     uint64_t              mt_cur_media_group; /* media group of the open timeline group */
+
+    /* MSF packaging-extension records, deep-copied at add_track into one
+     * block (entries, then each record with its SI PIDs and names); the
+     * catalog encode borrows them. */
+    moq_msf_track_ext_t  *ext;
+    size_t                ext_count;
+    size_t                ext_block_size;
+
+    /* Generic per-track counters (mu), maintained at the same chokepoints as
+     * the sender-wide stats; the mpeg2ts_ counters are filled at snapshot. */
+    moq_media_sender_track_stats_t tstats;
+
+    /* MPEG2TS. ts_app_objects: Objects come through write(); otherwise the
+     * byte-stream state below (allocated at add_track) forms them.
+     * ts_random_access: Group starts must hold a random access point
+     * (app-Object mode, when the record declares it). */
+    bool                  ts_app_objects;
+    bool                  ts_random_access;
+    void                 *ts;
 };
 
 /* One queued media object (owns its refs until drained or freed). */
@@ -286,7 +324,8 @@ typedef struct sender_preq_entry {
                                                (payload/properties NULL) */
     moq_rcbuf_t       *payload;
     moq_rcbuf_t       *properties;          /* app EXTRA props (passthrough) */
-    bool               is_sync;
+    bool               is_sync;             /* a stream anchor (see admit) */
+    bool               keyframe;            /* holds a sync point */
     bool               starts_group;
     bool               ends_group;
     uint64_t           group_seq;
@@ -610,9 +649,17 @@ static void preq_note_dropped(moq_media_sender_t *s, moq_media_track_t *t,
 {
     s->preq_bytes -= e->bytes;
     s->stats.objects_dropped++;
-    if (e->is_sync) s->stats.keyframes_dropped++;
-    if (!t->drop_group_valid || t->drop_group_last != e->group_seq)
+    t->tstats.objects_dropped++;
+    t->tstats.objects_queued--;
+    t->tstats.bytes_queued -= e->bytes;
+    if (e->keyframe) {
+        s->stats.keyframes_dropped++;
+        t->tstats.keyframes_dropped++;
+    }
+    if (!t->drop_group_valid || t->drop_group_last != e->group_seq) {
         s->stats.groups_dropped++;
+        t->tstats.groups_dropped++;
+    }
     t->drop_group_valid = true;
     t->drop_group_last = e->group_seq;
 }
@@ -671,6 +718,16 @@ static void preq_evict_group(moq_media_sender_t *s,
         rd++;
     }
     s->preq_tail = wr;
+    /* A Group that lost queued media to eviction cannot be continued: a later
+     * Object would follow a hole in it, and once its wire subgroup is reset
+     * the drain would reopen the Group at Object 0 and repeat a Location. It
+     * is closed for writes, so the next write must be a sync point, which
+     * opens a new Group. (A no-demand drop instead leaves the Group open and
+     * discards the rest of it in the drain; see skip_open.) */
+    if (dropped_any && t->group_open && g == t->group_seq) {
+        t->group_open = false;
+        t->cur_group_anchored = false;
+    }
     if (dropped_any) {
         /* Counting is done by preq_note_dropped above. What remains here is
          * this path's own wire semantics: if the subgroup for this group is
@@ -699,6 +756,33 @@ static bool preq_track_anchor(const moq_media_sender_t *s,
     return found;
 }
 
+/* Whether an entry's group is evictable for an incoming object of
+ * `in_track` (in_anchors = the incoming object re-anchors its own track,
+ * making all of that track's queued groups droppable). The one eviction
+ * rule: preq_evict_one and preq_make_room's feasibility count both use it.
+ * mu held. */
+static bool entry_evictable(moq_media_sender_t *s,
+                            const sender_preq_entry_t *e,
+                            const moq_media_track_t *in_track, bool in_anchors)
+{
+    /* A queued END_OF_TRACK marker is the ONLY chance to emit EOS reliably
+     * (end_track is idempotent and later writes are refused), so it is never
+     * evictable -- a drop policy must surface WOULD_BLOCK rather than discard
+     * it. Excluding it here keeps preq_make_room's feasibility count honest. */
+    if (e->is_end) return false;
+    if (e->track == in_track) {
+        if (in_anchors) return true;
+        /* The incoming object continues its track's open Group, so that
+         * Group is kept: evicting it would close the Group the object is
+         * about to join. */
+        if (in_track->group_open && e->group_seq == in_track->group_seq)
+            return false;
+    }
+    uint64_t aseq = 0;
+    bool found = preq_track_anchor(s, e->track, &aseq);
+    return !found || e->group_seq < aseq;
+}
+
 /* Evict the oldest group that can go without stranding any track's
  * retained GOP: a group (track T, seq g) is evictable iff g precedes T's
  * retained anchor. The incoming object's own track, when the incoming
@@ -710,40 +794,12 @@ static bool preq_evict_one(moq_media_sender_t *s,
 {
     for (uint32_t i = s->preq_head; i != s->preq_tail; i++) {
         sender_preq_entry_t *e = &s->preq[i % s->ring_cap];
-        if (e->is_end) continue;   /* terminal marker: never an eviction target */
-        bool evictable;
-        if (e->track == in_track && in_anchors) {
-            evictable = true;
-        } else {
-            uint64_t aseq = 0;
-            bool found = preq_track_anchor(s, e->track, &aseq);
-            evictable = !found || e->group_seq < aseq;
-        }
-        if (evictable) {
+        if (entry_evictable(s, e, in_track, in_anchors)) {
             preq_evict_group(s, e->track, e->group_seq);
             return true;
         }
     }
     return false;
-}
-
-/* Whether an entry's group is evictable for an incoming object of
- * `in_track` (in_anchors = the incoming object re-anchors its own track,
- * making all of that track's queued groups droppable). Same rule as
- * preq_evict_one. mu held. */
-static bool entry_evictable(moq_media_sender_t *s,
-                            const sender_preq_entry_t *e,
-                            const moq_media_track_t *in_track, bool in_anchors)
-{
-    /* A queued END_OF_TRACK marker is the ONLY chance to emit EOS reliably
-     * (end_track is idempotent and later writes are refused), so it is never
-     * evictable -- a drop policy must surface WOULD_BLOCK rather than discard
-     * it. Excluding it here keeps preq_make_room's feasibility count honest. */
-    if (e->is_end) return false;
-    if (e->track == in_track && in_anchors) return true;
-    uint64_t aseq = 0;
-    bool found = preq_track_anchor(s, e->track, &aseq);
-    return !found || e->group_seq < aseq;
 }
 
 /* Make room for one entry of `need` bytes per the backpressure policy,
@@ -851,9 +907,20 @@ static void track_fill_msf(const moq_media_track_t *t, moq_msf_track_t *m)
         return;
     }
 
-    m->packaging = (t->packaging == MOQ_MEDIA_PACKAGING_CMAF)
-        ? (moq_bytes_t){ (const uint8_t *)"cmaf", 4 }
-        : (moq_bytes_t){ (const uint8_t *)"loc", 3 };
+    if (t->packaging == MOQ_MEDIA_PACKAGING_CMAF)
+        m->packaging = (moq_bytes_t){ (const uint8_t *)"cmaf", 4 };
+    else if (t->packaging == MOQ_MEDIA_PACKAGING_MPEG2TS)
+        m->packaging = (moq_bytes_t){ (const uint8_t *)"mpeg2ts", 7 };
+    else
+        m->packaging = (moq_bytes_t){ (const uint8_t *)"loc", 3 };
+    /* draft-gregoire-moq-msfts: the media type of a TS track, and its
+     * mpeg2ts* fields from the sender-owned record copy. */
+    if (t->packaging == MOQ_MEDIA_PACKAGING_MPEG2TS) {
+        m->has_mime_type = true;
+        m->mime_type = (moq_bytes_t){ (const uint8_t *)"video/mp2t", 10 };
+    }
+    m->extensions = t->ext;
+    m->extension_count = t->ext_count;
     m->is_live = t->is_live;
     m->has_role = true;
     m->role = t->role.len ? t->role : default_role(t->media_type);
@@ -995,9 +1062,12 @@ static moq_result_t sender_build_catalog_at(moq_media_sender_t *s,
         if (!track_in_catalog(t, only_registered)) continue;
         track_fill_msf(t, &mt[k]);
         if (t->init_data.len > 0) {
-            if (t->packaging == MOQ_MEDIA_PACKAGING_CMAF) {
+            if (t->packaging == MOQ_MEDIA_PACKAGING_CMAF ||
+                t->packaging == MOQ_MEDIA_PACKAGING_MPEG2TS) {
                 /* CMSF §3.1: the init segment lives in initDataList[]; the track
-                 * references it via initRef. MSF-01 lets several tracks share one
+                 * references it via initRef. An mpeg2ts track's PSI packets go
+                 * the same way, as the "inline" entry the draft requires (Use of
+                 * MSF Initialization Data). MSF-01 lets several tracks share one
                  * entry, so reuse an existing entry whose raw init bytes are
                  * identical instead of duplicating it; the entry id is the name
                  * of the track that introduced it. */
@@ -1118,7 +1188,7 @@ static bool sender_build_props(moq_media_sender_t *s,
     h.timestamp = e->has_capture_time ? e->capture_time_us : e->pts_us;
     if (t->media_type == MOQ_MEDIA_TYPE_VIDEO) {
         h.has_video_frame_marking = true;
-        h.video_frame_marking.independent = e->is_sync;
+        h.video_frame_marking.independent = e->keyframe;
     }
     /* Fail closed on an unobserved or unsupported draft: an object may not
      * be encoded before the session's version has been latched, and there
@@ -1484,6 +1554,7 @@ static moq_result_t sender_flush_reset(moq_media_sender_t *s,
     t->pending_reset = false;
     t->emit_open = false;
     s->stats.groups_abandoned++;
+    t->tstats.groups_abandoned++;
     return MOQ_OK;
 }
 
@@ -1705,6 +1776,9 @@ static void sender_drain(moq_media_sender_t *s, uint64_t now_us)
                                          queued tail, so no spurious reset */
         t->emit_obj = oid + 1;
         s->stats.objects_sent++;
+        t->tstats.objects_sent++;
+        t->tstats.objects_queued--;
+        t->tstats.bytes_queued -= e->bytes;
 
         /* Generated SAP timeline: record this Object's declared SAP at its real
          * wire Location (group, oid). Group starts always record (write()
@@ -3438,9 +3512,14 @@ static moq_result_t sender_validate_cfg(const moq_media_sender_cfg_t *cfg)
     return MOQ_OK;
 }
 
+static void sender_ts_free(moq_media_sender_t *s, moq_media_track_t *t);
+
 static void track_free(moq_media_sender_t *s, moq_media_track_t *t)
 {
     if (!t) return;
+    sender_ts_free(s, t);
+    if (t->ext)
+        s->alloc.free(t->ext, t->ext_block_size, s->alloc.ctx);
     if (t->cp_ref_ids)
         s->alloc.free(t->cp_ref_ids,
             t->cp_ref_id_count * sizeof(moq_bytes_t), s->alloc.ctx);
@@ -3994,6 +4073,350 @@ void moq_media_sender_destroy(moq_media_sender_t *s)
 
 /* -- Track management (app thread) ------------------------------------ */
 
+/* -- Packaging extensions and MPEG2TS (add_track) ----------------------- */
+
+/* The first published size of a draft-gregoire-moq-msfts record: through
+ * `malformed`. */
+#define SENDER_TS_RECORD_V0_SIZE \
+    (offsetof(moq_msf_mpeg2ts_t, malformed) + sizeof(uint32_t))
+#define SENDER_TS_DEFAULT_OBJECT_PACKETS 64u
+/* Objects one packetizer call can hand over, and so the most a track holds
+ * back under backpressure: a push ends the open Object and then fills at
+ * most one more (a lead-in is shorter than an Object), and a flush ends the
+ * Object the lead-in completes and then the Group's last one. */
+#define SENDER_TS_STAGE_MAX 2u
+/* SI PIDs the per-program filter holds (no byte-stream track is added in a
+ * build without moq::mpeg2ts). */
+#ifdef MOQ_SERVICE_HAVE_MPEG2TS
+#define SENDER_TS_MAX_SI_PIDS MOQ_MPEG2TS_FILTER_MAX_SI_PIDS
+#else
+#define SENDER_TS_MAX_SI_PIDS 0u
+#endif
+
+static size_t sender_align8(size_t n) { return (n + 7u) & ~(size_t)7u; }
+
+/* The list rules (the catalog encoder's, restated for add_track): an array
+ * when count > 0, a known kind once, a record of at least its first
+ * published size with coherent spans, and only on the packaging the kind
+ * belongs to. Sets *rec to the MPEG2TS record (or NULL). No allocation. */
+static moq_result_t sender_check_extensions(const moq_media_track_cfg_t *cfg,
+                                            const moq_msf_mpeg2ts_t **rec)
+{
+    *rec = NULL;
+    if (cfg->extension_count > 0 && !cfg->extensions) return MOQ_ERR_INVAL;
+    if (!sender_product_fits(cfg->extension_count, sizeof(moq_msf_track_ext_t)))
+        return MOQ_ERR_INVAL;
+    for (size_t i = 0; i < cfg->extension_count; i++) {
+        const moq_msf_track_ext_t *e = &cfg->extensions[i];
+        if (e->kind != MOQ_MSF_EXT_MPEG2TS) return MOQ_ERR_INVAL;
+        if (*rec) return MOQ_ERR_INVAL;                   /* duplicate kind */
+        const moq_msf_mpeg2ts_t *m = e->u.mpeg2ts;
+        if (!m || m->struct_size < SENDER_TS_RECORD_V0_SIZE)
+            return MOQ_ERR_INVAL;
+        if ((m->si_pid_count > 0 && !m->si_pids) ||
+            (m->mode_name.len > 0 && !m->mode_name.data) ||
+            (m->timestamp_mode_name.len > 0 && !m->timestamp_mode_name.data))
+            return MOQ_ERR_INVAL;
+        if (!sender_product_fits(m->si_pid_count, sizeof(uint32_t)))
+            return MOQ_ERR_INVAL;
+        *rec = m;
+    }
+    bool is_ts = cfg->packaging == MOQ_MEDIA_PACKAGING_MPEG2TS;
+    if ((*rec != NULL) != is_ts) return MOQ_ERR_INVAL;
+    return MOQ_OK;
+}
+
+/* Deep-copy the checked list into one block (entries, record, SI PIDs,
+ * names), so the caller's buffers need not outlive add_track. */
+static moq_result_t sender_copy_extensions(moq_media_sender_t *s,
+                                           moq_media_track_t *t,
+                                           const moq_msf_mpeg2ts_t *src)
+{
+    if (!src) return MOQ_OK;
+    size_t pids = src->si_pid_count * sizeof(uint32_t);
+    size_t need = sender_align8(sizeof(moq_msf_track_ext_t));
+    if (!sender_sum_fits(&need, sender_align8(sizeof(moq_msf_mpeg2ts_t))) ||
+        pids > SIZE_MAX - 8u ||
+        !sender_sum_fits(&need, sender_align8(pids)) ||
+        src->mode_name.len > SIZE_MAX - 8u ||
+        !sender_sum_fits(&need, sender_align8(src->mode_name.len)) ||
+        src->timestamp_mode_name.len > SIZE_MAX - 8u ||
+        !sender_sum_fits(&need, sender_align8(src->timestamp_mode_name.len)))
+        return MOQ_ERR_INVAL;
+    uint8_t *blk = (uint8_t *)s->alloc.alloc(need, s->alloc.ctx);
+    if (!blk) return MOQ_ERR_NOMEM;
+    memset(blk, 0, need);
+    moq_msf_track_ext_t *list = (moq_msf_track_ext_t *)(void *)blk;
+    size_t off = sender_align8(sizeof(moq_msf_track_ext_t));
+    moq_msf_mpeg2ts_t *rec = (moq_msf_mpeg2ts_t *)(void *)(blk + off);
+    off += sender_align8(sizeof(*rec));
+    moq_msf_mpeg2ts_init(rec);
+    memcpy(rec, src, src->struct_size < sizeof(*rec) ? src->struct_size
+                                                     : sizeof(*rec));
+    rec->struct_size = (uint32_t)sizeof(*rec);
+    rec->si_pids = NULL;
+    rec->mode_name = (moq_bytes_t){ NULL, 0 };
+    rec->timestamp_mode_name = (moq_bytes_t){ NULL, 0 };
+    if (pids > 0) {
+        memcpy(blk + off, src->si_pids, pids);
+        rec->si_pids = (uint32_t *)(void *)(blk + off);
+        off += sender_align8(pids);
+    }
+    if (src->mode_name.len > 0) {
+        memcpy(blk + off, src->mode_name.data, src->mode_name.len);
+        rec->mode_name = (moq_bytes_t){ blk + off, src->mode_name.len };
+        off += sender_align8(src->mode_name.len);
+    }
+    if (src->timestamp_mode_name.len > 0) {
+        memcpy(blk + off, src->timestamp_mode_name.data,
+               src->timestamp_mode_name.len);
+        rec->timestamp_mode_name =
+            (moq_bytes_t){ blk + off, src->timestamp_mode_name.len };
+    }
+    list[0].kind = MOQ_MSF_EXT_MPEG2TS;
+    list[0].u.mpeg2ts = rec;
+    t->ext = list;
+    t->ext_count = 1;
+    t->ext_block_size = need;
+    return MOQ_OK;
+}
+
+/* The sender-owned record of a track (NULL for other packagings). */
+static moq_msf_mpeg2ts_t *sender_ts_record(moq_media_track_t *t)
+{
+    return t->ext_count ? (moq_msf_mpeg2ts_t *)(uintptr_t)t->ext[0].u.mpeg2ts
+                        : NULL;
+}
+
+/* Whole source packets of `ps` octets with their sync bytes, at least one. */
+static bool sender_ts_whole_packets(moq_bytes_t b, uint32_t ps)
+{
+    if (b.len == 0 || b.len % ps != 0) return false;
+    size_t sync = ps == 192u ? 4u : 0u;
+    for (size_t off = 0; off < b.len; off += ps)
+        if (b.data[off + sync] != 0x47u) return false;
+    return true;
+}
+
+#ifdef MOQ_SERVICE_HAVE_MPEG2TS
+/* One Object the packetizer emitted, copied out of its buffer, or (lost)
+ * the place of one that could not be copied. */
+typedef struct sender_ts_obj {
+    moq_rcbuf_t *payload;        /* NULL when lost */
+    bool         new_group;
+    bool         random_access;  /* holds a random access point */
+    bool         lost;
+} sender_ts_obj_t;
+
+/* Byte-stream state of a TS track (allocated at add_track, freed with the
+ * track). Touched only under s->mu by the one writer the busy latch admits. */
+typedef struct sender_ts {
+    moq_alloc_t                   alloc;
+    uint32_t                      ps;
+    moq_mpeg2ts_packetizer_t      pz;
+    moq_mpeg2ts_program_filter_t *filter;     /* per-program record only */
+    uint8_t                      *obj_buf;
+    size_t                        obj_cap;
+    uint8_t                      *lead_buf;
+    size_t                        lead_cap;
+    uint8_t                       carry[MOQ_MPEG2TS_M2TS_PACKET_SIZE];
+    size_t                        carry_len;  /* bytes of an unfinished packet */
+    sender_ts_obj_t               staged[SENDER_TS_STAGE_MAX];
+    size_t                        staged_n;   /* emitted by the current call */
+    sender_ts_obj_t               parked[SENDER_TS_STAGE_MAX];
+    size_t                        parked_n;   /* held back under backpressure */
+    bool                          emit_lost;  /* an Object could not be copied */
+    bool                          broken;     /* the open Group lost an Object */
+    bool                          busy;       /* a writer is in the call */
+    bool                          ending;     /* end_track flushed the source */
+    uint64_t                      partial_bytes_discarded;
+    uint64_t                      continuation_discarded;
+} sender_ts_t;
+
+/* Packetizer emit callback: runs inside packetizer calls, under s->mu. The
+ * payload is valid only during the callback, so it is copied. */
+static void sender_ts_emit(void *ctx, const moq_mpeg2ts_emitted_object_t *obj)
+{
+    moq_media_track_t *t = (moq_media_track_t *)ctx;
+    sender_ts_t *ts = (sender_ts_t *)t->ts;
+    moq_rcbuf_t *b = NULL;
+    if (ts->staged_n == SENDER_TS_STAGE_MAX) {
+        /* Beyond the packetizer's bound: the last staged Object gives up its
+         * place so the loss still lands in order. */
+        sender_ts_obj_t *last = &ts->staged[SENDER_TS_STAGE_MAX - 1u];
+        if (last->payload) moq_rcbuf_decref(last->payload);
+        last->payload = NULL;
+        last->lost = true;
+        last->new_group = last->new_group || obj->new_group;
+        ts->emit_lost = true;
+        return;
+    }
+    sender_ts_obj_t *o = &ts->staged[ts->staged_n++];
+    o->new_group = obj->new_group;
+    o->random_access = obj->random_access;
+    o->lost = moq_rcbuf_create(&ts->alloc, obj->payload.data,
+                               obj->payload.len, &b) != MOQ_OK;
+    o->payload = b;
+    if (o->lost) ts->emit_lost = true;
+}
+
+static moq_result_t sender_ts_new(moq_media_sender_t *s, moq_media_track_t *t,
+                                  const moq_media_track_cfg_t *cfg)
+{
+    const moq_msf_mpeg2ts_t *rec = sender_ts_record(t);
+    uint32_t op = cfg->mpeg2ts_object_packets
+                      ? cfg->mpeg2ts_object_packets
+                      : SENDER_TS_DEFAULT_OBJECT_PACKETS;
+    if (!sender_product_fits(op, rec->packet_size)) return MOQ_ERR_INVAL;
+    sender_ts_t *ts = (sender_ts_t *)s->alloc.alloc(sizeof(*ts), s->alloc.ctx);
+    if (!ts) return MOQ_ERR_NOMEM;
+    memset(ts, 0, sizeof(*ts));
+    ts->alloc = s->alloc;
+    ts->ps = rec->packet_size;
+    ts->obj_cap = (size_t)op * rec->packet_size;
+    ts->lead_cap = (size_t)(op - 1u) * rec->packet_size;
+    ts->obj_buf = (uint8_t *)s->alloc.alloc(ts->obj_cap, s->alloc.ctx);
+    if (ts->lead_cap)
+        ts->lead_buf = (uint8_t *)s->alloc.alloc(ts->lead_cap, s->alloc.ctx);
+    bool per_program = rec->has_mode &&
+                       rec->mode == MOQ_MSF_MPEG2TS_MODE_PER_PROGRAM;
+    if (per_program)
+        ts->filter = (moq_mpeg2ts_program_filter_t *)s->alloc.alloc(
+            sizeof(*ts->filter), s->alloc.ctx);
+    t->ts = ts;
+    if (!ts->obj_buf || (ts->lead_cap && !ts->lead_buf) ||
+        (per_program && !ts->filter)) {
+        sender_ts_free(s, t);
+        return MOQ_ERR_NOMEM;
+    }
+
+    moq_mpeg2ts_packetizer_cfg_t pc;
+    moq_mpeg2ts_packetizer_cfg_init(&pc);
+    pc.packet_size = rec->packet_size;
+    pc.object_packets = op;
+    pc.group_at_random_access = true;
+    pc.program_number = rec->has_program_number
+                            ? (uint16_t)rec->program_number : 0;
+    pc.min_group_ms = cfg->mpeg2ts_min_group_ms;
+    pc.wait_for_random_access = !cfg->mpeg2ts_forward_before_random_access;
+    if (rec->has_pcr_pid) pc.pcr_pid = (uint16_t)rec->pcr_pid;
+    pc.object_buf = ts->obj_buf;
+    pc.object_cap = ts->obj_cap;
+    pc.lead_buf = ts->lead_buf;
+    pc.lead_cap = ts->lead_cap;
+    pc.emit = sender_ts_emit;
+    pc.ctx = t;
+    moq_result_t rc = moq_mpeg2ts_packetizer_init(&ts->pz, sizeof(ts->pz), &pc);
+    if (rc == MOQ_OK && per_program) {
+        /* Per-Program: the record's program, its SI PIDs, and the CAT. */
+        uint16_t si[MOQ_MPEG2TS_FILTER_MAX_SI_PIDS];
+        for (size_t i = 0; i < rec->si_pid_count; i++)
+            si[i] = (uint16_t)rec->si_pids[i];
+        moq_mpeg2ts_program_filter_cfg_t fc;
+        moq_mpeg2ts_program_filter_cfg_init(&fc);
+        fc.packet_size = rec->packet_size;
+        fc.program_number = (uint16_t)rec->program_number;
+        fc.si_pids = rec->si_pid_count ? si : NULL;
+        fc.si_pid_count = rec->si_pid_count;
+        rc = moq_mpeg2ts_program_filter_init(ts->filter, sizeof(*ts->filter),
+                                             &fc);
+    }
+    if (rc != MOQ_OK) {
+        sender_ts_free(s, t);
+        return MOQ_ERR_INVAL;
+    }
+    return MOQ_OK;
+}
+
+static void sender_ts_drop_list(sender_ts_obj_t *list, size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+        if (list[i].payload) moq_rcbuf_decref(list[i].payload);
+}
+
+static void sender_ts_free(moq_media_sender_t *s, moq_media_track_t *t)
+{
+    sender_ts_t *ts = (sender_ts_t *)t->ts;
+    if (!ts) return;
+    sender_ts_drop_list(ts->staged, ts->staged_n);
+    sender_ts_drop_list(ts->parked, ts->parked_n);
+    if (ts->obj_buf) s->alloc.free(ts->obj_buf, ts->obj_cap, s->alloc.ctx);
+    if (ts->lead_buf) s->alloc.free(ts->lead_buf, ts->lead_cap, s->alloc.ctx);
+    if (ts->filter)
+        s->alloc.free(ts->filter, sizeof(*ts->filter), s->alloc.ctx);
+    s->alloc.free(ts, sizeof(*ts), s->alloc.ctx);
+    t->ts = NULL;
+}
+#else
+static void sender_ts_free(moq_media_sender_t *s, moq_media_track_t *t)
+{
+    (void)s; (void)t;
+}
+#endif
+
+/* add_track's MPEG2TS rules (draft-gregoire-moq-msfts) and the record the
+ * service authors: everything checked before the track is registered. */
+static moq_result_t sender_ts_prepare(moq_media_sender_t *s,
+                                      moq_media_track_t *t,
+                                      const moq_media_track_cfg_t *cfg)
+{
+    moq_msf_mpeg2ts_t *rec = sender_ts_record(t);
+    /* ES-packets authoring needs the multi-track split and the PAT/PMT
+     * tracks, which stay helper-level; timelines need per-Object
+     * presentation times, which TS keeps inside the packets. */
+    if (rec->has_mode && rec->mode == MOQ_MSF_MPEG2TS_MODE_ES_PACKETS)
+        return MOQ_ERR_INVAL;
+    if (cfg->emit_sap_timeline || cfg->emit_media_timeline)
+        return MOQ_ERR_INVAL;
+    if (!rec->has_packet_size ||
+        (rec->packet_size != 188u && rec->packet_size != 192u))
+        return MOQ_ERR_INVAL;
+    if (t->init_data.len > 0 &&
+        !sender_ts_whole_packets(t->init_data, rec->packet_size))
+        return MOQ_ERR_INVAL;
+
+    if (!cfg->mpeg2ts_app_objects) {
+        /* Byte stream: the program filter the record implies needs its
+         * program number, and SI PIDs it can hold. */
+        if (rec->has_mode && rec->mode == MOQ_MSF_MPEG2TS_MODE_PER_PROGRAM &&
+            (!rec->has_program_number ||
+             rec->si_pid_count > SENDER_TS_MAX_SI_PIDS))
+            return MOQ_ERR_INVAL;
+        /* mpeg2tsRandomAccess is the service's to declare: Groups open at
+         * random access points, so it holds unless packets before the first
+         * one are forwarded. An unmodified multiplex without a reference
+         * program names no stream to hold it on (the field is absent). */
+        bool multiplex_unref =
+            rec->has_mode &&
+            rec->mode == MOQ_MSF_MPEG2TS_MODE_UNMODIFIED_MULTIPLEX &&
+            !rec->has_program_number;
+        bool derived = !cfg->mpeg2ts_forward_before_random_access;
+        if (rec->has_random_access &&
+            (multiplex_unref || rec->random_access != derived))
+            return MOQ_ERR_INVAL;
+        if (!multiplex_unref) {
+            rec->has_random_access = true;
+            rec->random_access = derived;
+        }
+    } else {
+        t->ts_app_objects = true;
+        t->ts_random_access = rec->has_random_access && rec->random_access;
+    }
+
+    /* The track as the catalog will carry it must pass the subscriber's
+     * check, so a bad track fails here rather than at catalog encode. */
+    moq_msf_track_t m;
+    track_fill_msf(t, &m);
+    if (moq_msf_track_mpeg2ts_check(&m, NULL) != MOQ_OK) return MOQ_ERR_INVAL;
+
+#ifdef MOQ_SERVICE_HAVE_MPEG2TS
+    if (!cfg->mpeg2ts_app_objects) return sender_ts_new(s, t, cfg);
+#else
+    (void)s;
+#endif
+    return MOQ_OK;
+}
+
 /* Every size add_track derives from a validated track cfg, each checked for
  * representability BEFORE the first allocation, copy or registration: the
  * six media spans plus the resolved ref-id bytes (one strings buffer), the
@@ -4045,6 +4468,51 @@ static moq_result_t track_derive_sizes(const moq_media_track_cfg_t *cfg,
     return MOQ_OK;
 }
 
+/* Read a caller's track cfg into a full current struct: the v0 prefix, then
+ * each appended field only when struct_size covers all of it, and a has_X /
+ * X pair or an array / count pair only when it covers the whole pair. Fields
+ * left out keep their zero default. The caller has checked struct_size >=
+ * MEDIA_TRACK_CFG_MIN_SIZE. */
+static void sender_track_cfg_read(const moq_media_track_cfg_t *in,
+                                  moq_media_track_cfg_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    memcpy(out, in, MEDIA_TRACK_CFG_MIN_SIZE);
+#define TCFG_HAS(f) \
+    (in->struct_size >= offsetof(moq_media_track_cfg_t, f) + sizeof(in->f))
+    if (TCFG_HAS(track_duration_ms)) {
+        out->has_track_duration = in->has_track_duration;
+        out->track_duration_ms = in->track_duration_ms;
+    }
+    if (TCFG_HAS(emit_media_timeline))
+        out->emit_media_timeline = in->emit_media_timeline;
+    if (TCFG_HAS(media_timeline_history_groups))
+        out->media_timeline_history_groups = in->media_timeline_history_groups;
+    if (TCFG_HAS(alt_group)) {
+        out->has_alt_group = in->has_alt_group;
+        out->alt_group = in->alt_group;
+    }
+    if (TCFG_HAS(publisher_priority)) {
+        out->has_publisher_priority = in->has_publisher_priority;
+        out->publisher_priority = in->publisher_priority;
+    }
+    if (TCFG_HAS(extension_count)) {
+        out->extensions = in->extensions;
+        out->extension_count = in->extension_count;
+    }
+    if (TCFG_HAS(mpeg2ts_app_objects))
+        out->mpeg2ts_app_objects = in->mpeg2ts_app_objects;
+    if (TCFG_HAS(mpeg2ts_object_packets))
+        out->mpeg2ts_object_packets = in->mpeg2ts_object_packets;
+    if (TCFG_HAS(mpeg2ts_min_group_ms))
+        out->mpeg2ts_min_group_ms = in->mpeg2ts_min_group_ms;
+    if (TCFG_HAS(mpeg2ts_forward_before_random_access))
+        out->mpeg2ts_forward_before_random_access =
+            in->mpeg2ts_forward_before_random_access;
+#undef TCFG_HAS
+    out->struct_size = (uint32_t)sizeof(*out);
+}
+
 moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
                                         const moq_media_track_cfg_t *cfg,
                                         moq_media_track_t **out)
@@ -4053,30 +4521,29 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
     if (!s || !cfg || !out) return MOQ_ERR_INVAL;
     if (cfg->struct_size < MEDIA_TRACK_CFG_MIN_SIZE)
         return MOQ_ERR_INVAL;
-    /* Prefix-safe by struct_size: copy the caller's (possibly older/smaller, or
-     * newer/larger) cfg into a zero-filled local clamped to our struct, so
-     * appended fields an older caller lacks default to absent and a newer
-     * caller's unknown trailing fields are ignored. All reads below use the
-     * local copy. */
+    /* Prefix-safe by struct_size: read the caller's (possibly older/smaller,
+     * or newer/larger) cfg into a zero-filled local, so appended fields an
+     * older caller lacks default to absent and a newer caller's unknown
+     * trailing fields are ignored. All reads below use the local copy. */
     moq_media_track_cfg_t cfg_local;
-    memset(&cfg_local, 0, sizeof(cfg_local));
-    memcpy(&cfg_local, cfg,
-           cfg->struct_size < sizeof(cfg_local) ? cfg->struct_size
-                                                : sizeof(cfg_local));
-    if (cfg->struct_size < offsetof(moq_media_track_cfg_t, publisher_priority) +
-                           sizeof(cfg->publisher_priority)) {
-        cfg_local.has_publisher_priority = false;
-        cfg_local.publisher_priority = 0;
-    }
-    cfg_local.struct_size = sizeof(cfg_local);
+    sender_track_cfg_read(cfg, &cfg_local);
     cfg = &cfg_local;
     if (cfg->name.len == 0 || !cfg->name.data) return MOQ_ERR_INVAL;
     if (cfg->media_type != MOQ_MEDIA_TYPE_VIDEO &&
         cfg->media_type != MOQ_MEDIA_TYPE_AUDIO)
         return MOQ_ERR_INVAL;
+    bool is_ts = cfg->packaging == MOQ_MEDIA_PACKAGING_MPEG2TS;
     if (cfg->packaging != MOQ_MEDIA_PACKAGING_RAW &&
-        cfg->packaging != MOQ_MEDIA_PACKAGING_CMAF)
+        cfg->packaging != MOQ_MEDIA_PACKAGING_CMAF && !is_ts)
         return MOQ_ERR_INVAL;
+#ifndef MOQ_SERVICE_HAVE_MPEG2TS
+    if (is_ts) return MOQ_ERR_UNSUPPORTED;   /* not in this build */
+#endif
+    const moq_msf_mpeg2ts_t *ts_rec = NULL;
+    {
+        moq_result_t erc = sender_check_extensions(cfg, &ts_rec);
+        if (erc < 0) return erc;
+    }
     /* Every optional span must be coherent: a non-zero length with a NULL
      * data pointer would crash the deep-copy below. */
     if ((cfg->codec.len && !cfg->codec.data) ||
@@ -4093,9 +4560,11 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
      * always VIDEO or AUDIO here (checked above). Generated timeline tracks
      * (.sap/.timeline) are synthesized on a separate internal path and never
      * reach this public entry, so they remain exempt. */
-    if (cfg->codec.len == 0) return MOQ_ERR_INVAL;       /* 5.2.18 codec */
+    /* An MPEG2TS track is a multiplex: it has no inherent codec, and
+     * samplerate / channelConfig describe one elementary stream, not it. */
+    if (cfg->codec.len == 0 && !is_ts) return MOQ_ERR_INVAL;   /* 5.2.18 */
     if (cfg->bitrate == 0) return MOQ_ERR_INVAL;         /* 5.2.22 max bitrate */
-    if (cfg->media_type == MOQ_MEDIA_TYPE_AUDIO) {
+    if (cfg->media_type == MOQ_MEDIA_TYPE_AUDIO && !is_ts) {
         if (cfg->samplerate == 0) return MOQ_ERR_INVAL;          /* 5.2.28 */
         if (cfg->channel_config.len == 0) return MOQ_ERR_INVAL;  /* 5.2.29 */
     }
@@ -4187,7 +4656,9 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
     }
     t->media_type = cfg->media_type;
     t->packaging = cfg->packaging;
-    t->timescale = cfg->timescale ? cfg->timescale : 1000000u;
+    /* A TS track's timing travels in the packets: its catalog carries a
+     * timescale only when the app gives one. */
+    t->timescale = cfg->timescale ? cfg->timescale : is_ts ? 0u : 1000000u;
     t->is_live = cfg->is_live;
     t->has_track_duration = cfg->has_track_duration;
     t->track_duration_ms = cfg->track_duration_ms;
@@ -4232,6 +4703,13 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
     t->framerate_millis = cfg->framerate_millis;
     t->samplerate = cfg->samplerate;
     t->bitrate = cfg->bitrate;
+
+    /* The packaging-extension records, and an MPEG2TS track's own rules. */
+    {
+        moq_result_t xrc = sender_copy_extensions(s, t, ts_rec);
+        if (xrc == MOQ_OK && is_ts) xrc = sender_ts_prepare(s, t, cfg);
+        if (xrc < 0) { track_free(s, t); return xrc; }
+    }
 
     /* Build the generated timeline siblings before the lock (they borrow the
      * media track's stable name bytes). A media track may opt into both the SAP
@@ -4329,6 +4807,195 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
     *out = t;
     return MOQ_OK;
 }
+
+/* What the queue needs to admit one media object. */
+typedef struct sender_admit {
+    moq_rcbuf_t *payload;            /* transferred on MOQ_OK */
+    moq_rcbuf_t *properties;         /* transferred on MOQ_OK; may be NULL */
+    bool         is_sync;            /* holds a sync point */
+    bool         anchors_group;      /* opens a Group as its anchor without
+                                        one (a TS Group forwarded before the
+                                        first random access point) */
+    bool         starts_group;
+    bool         ends_group;
+    uint64_t     pts_us;
+    bool         has_capture_time;
+    uint64_t     capture_time_us;
+    bool         has_sap_type;
+    uint8_t      sap_type;
+} sender_admit_t;
+
+/* Admit one media object of `track` into the send queue: the sync-anchor
+ * rule, the backpressure policy, the Group id, and the enqueue. Called and
+ * returns with s->mu held; a BLOCK_TIMEOUT wait releases it while waiting.
+ * On MOQ_OK the queue owns the object's refs; on any other result nothing
+ * was taken. The caller wakes the endpoint after unlocking when ready. */
+static moq_result_t sender_admit_locked(moq_media_sender_t *s,
+                                        moq_media_track_t *track,
+                                        const sender_admit_t *a)
+{
+    /* The queue takes ownership of both refs, so both count toward the
+     * byte budget. */
+    size_t need = moq_rcbuf_len(a->payload);
+    if (a->properties) need += moq_rcbuf_len(a->properties);
+
+    /* Would this object open a new group? (Pure -- no mutation until the
+     * enqueue is committed.) A sync point that opens a group is a stream
+     * anchor: every group must begin with one. */
+    bool opened = a->starts_group || !track->group_open;
+    bool anchor = a->is_sync || (a->anchors_group && a->starts_group);
+    bool incoming_anchors = anchor && opened;
+
+    /* Sync-anchor invariant (§7.2), PER TRACK, against EMITTED-or-queued
+     * anchor state (not just the queue): a group opened by a sync point
+     * stays anchored even after that keyframe has drained off the ring, so
+     * later deltas of a still-open group are accepted. A new group must be
+     * opened by a sync point; a delta may only continue an already-anchored
+     * group. Otherwise the object would be a non-decodable lead -- refuse,
+     * taking no ownership. */
+    if (opened) {
+        if (!anchor) {
+            s->stats.last_error = MOQ_ERR_WOULD_BLOCK;
+            return MOQ_ERR_WOULD_BLOCK;   /* a group cannot lead with a delta */
+        }
+    } else if (!track->cur_group_anchored) {
+        s->stats.last_error = MOQ_ERR_WOULD_BLOCK;
+        return MOQ_ERR_WOULD_BLOCK;
+    }
+
+    /* Make room per the backpressure policy. Drop policies evict (and may
+     * arm a wire reset); RETURN_WOULD_BLOCK refuses immediately;
+     * BLOCK_TIMEOUT waits for the drain to free space, breaking promptly on
+     * terminal/interrupt and surfacing WOULD_BLOCK on timeout -- never a
+     * silent drop. */
+    if (!preq_make_room(s, track, incoming_anchors, need)) {
+        if (s->backpressure != MOQ_MEDIA_SEND_BP_BLOCK_TIMEOUT) {
+            s->stats.last_error = MOQ_ERR_WOULD_BLOCK;
+            return MOQ_ERR_WOULD_BLOCK;
+        }
+        s->stats.backpressure_stalls++;
+        SENDER_WAIT_ENTRY_HOOK();
+        moq_result_t wres = MOQ_OK;
+        struct timespec origin;
+        if (SENDER_CLOCK_REALTIME(&origin) != 0) {
+            /* The budget cannot be anchored: report the system failure rather
+             * than waiting against an unknown origin. */
+            wres = MOQ_ERR_INTERNAL;
+        } else {
+            const uint64_t dur_sec = s->block_timeout_us / 1000000ull;
+            const long dur_nsec =
+                (long)((s->block_timeout_us % 1000000ull) * 1000ull);
+            for (;;) {
+                if (preq_fits(s, need)) { wres = MOQ_OK; break; }
+                if (s->fatal) { wres = MOQ_ERR_CLOSED; break; }
+                /* ep->mu-free closed check (sender_ep_closed): this loop holds s->mu,
+                 * and the endpoint hook lock order is ep->mu -> s->mu, so calling the
+                 * public moq_endpoint_is_closed() (which takes ep->mu) here would
+                 * invert it and can deadlock the network thread. */
+                if (sender_ep_closed(s)) { wres = MOQ_ERR_CLOSED; break; }
+                if (moq_endpoint_interrupted_internal(s->ep)) {
+                    wres = MOQ_ERR_INTERRUPTED; break;
+                }
+                struct timespec now;
+                if (SENDER_CLOCK_REALTIME(&now) != 0) {
+                    wres = MOQ_ERR_INTERNAL; break;
+                }
+                long rem_ns = 0;
+                sender_budget_t cls = sender_budget(origin, dur_sec, dur_nsec,
+                                                    now, &rem_ns);
+                if (cls == SENDER_BUDGET_EXPIRED) {
+                    /* The capacity check at the top of this iteration already
+                     * ran under this same lock hold, so it cannot have changed
+                     * since: the budget is spent with no room. */
+                    wres = MOQ_ERR_WOULD_BLOCK;
+                    break;
+                }
+                /* Bounded slice so external terminal/interrupt (which do not
+                 * signal space_cv) are observed promptly, not at full timeout;
+                 * a shorter remainder is waited exactly, to the nanosecond. */
+                struct timespec until = now;
+                until.tv_nsec += (cls == SENDER_BUDGET_AT_LEAST_SLICE)
+                                 ? SENDER_SLICE_NS : rem_ns;
+                if (until.tv_nsec >= SENDER_NS_PER_S) {
+                    if (until.tv_sec >= SENDER_TIME_T_MAX) {
+                        /* The next required instant is not representable. A
+                         * maximum second is legal; going past it is not, and
+                         * clamping would either expire the wait early or make
+                         * no progress. */
+                        wres = MOQ_ERR_INTERNAL; break;
+                    }
+                    until.tv_sec++;
+                    until.tv_nsec -= SENDER_NS_PER_S;
+                }
+                int wrc = SENDER_COND_TIMEDWAIT(&s->space_cv, &s->mu, &until);
+                if (wrc != 0 && wrc != ETIMEDOUT) {
+                    wres = MOQ_ERR_INTERNAL; break;
+                }
+                /* A wake or a slice timeout re-enters the loop, where capacity,
+                 * terminal state, the interrupt latch and then expiry are all
+                 * re-evaluated in that order. */
+            }
+        }
+        if (wres != MOQ_OK) {
+            s->stats.last_error = wres;
+            return wres;   /* no ownership taken */
+        }
+        /* The wait released s->mu. The track may have been ended or removed
+         * meanwhile, or its open Group closed by a drop; the object is then
+         * refused as it would be now, and the caller retries. */
+        if (track->end_requested || track->removed || track->vod_converted) {
+            s->stats.last_error = MOQ_ERR_WRONG_STATE;
+            return MOQ_ERR_WRONG_STATE;
+        }
+        if ((a->starts_group || !track->group_open) != opened) {
+            s->stats.last_error = MOQ_ERR_WOULD_BLOCK;
+            return MOQ_ERR_WOULD_BLOCK;
+        }
+    }
+
+    /* Commit the service group id: a new group bumps the seq (the first
+     * group ever is 0). group_open tracks completion separately so an
+     * ends_group does not make the next group reuse the same id.
+     * cur_group_anchored records that this group was opened by a sync
+     * point, so a later delta is accepted even after the keyframe drains. */
+    if (opened) {
+        track->group_seq = track->group_started ? track->group_seq + 1 : 0;
+        track->group_started = true;
+        track->group_open = true;
+        track->cur_group_anchored = anchor;
+    }
+
+    sender_preq_entry_t *e = &s->preq[s->preq_tail % s->ring_cap];
+    memset(e, 0, sizeof(*e));
+    e->track = track;
+    e->payload = a->payload;            /* ownership transfers */
+    e->properties = a->properties;
+    e->is_sync = anchor;
+    e->keyframe = a->is_sync;
+    e->starts_group = opened;
+    e->ends_group = a->ends_group;
+    e->group_seq = track->group_seq;
+    e->pts_us = a->pts_us;
+    e->has_capture_time = a->has_capture_time;
+    e->capture_time_us = a->capture_time_us;
+    e->bytes = need;
+    /* Carry the SAP declaration so the timeline record is generated at emit
+     * time with the real wire Location (a dropped Object then yields no record). */
+    if (track->sap_timeline && a->has_sap_type) {
+        e->has_sap_type = true;
+        e->sap_type = a->sap_type;
+    }
+    s->preq_bytes += need;
+    s->preq_tail++;
+    preq_note_enqueued(s, e);
+    s->stats.objects_written++;
+    track->tstats.objects_written++;
+    track->tstats.objects_queued++;
+    track->tstats.bytes_queued += need;
+    if (a->ends_group) track->group_open = false;
+    return MOQ_OK;
+}
+
 
 /* -- Write (app thread) ----------------------------------------------- */
 
@@ -4453,6 +5120,48 @@ moq_result_t moq_media_sender_write(moq_media_sender_t *s,
         }
     }
 
+    /* MPEG2TS: write() is the app-Object mode; a byte-stream track takes
+     * write_mpeg2ts() only. Each Object is whole source packets with their
+     * sync bytes (Object Payload Format), and with mpeg2tsRandomAccess
+     * declared, a Group's first Object holds a random access point (Random
+     * Access). No ownership is taken on rejection. */
+    if (track->packaging == MOQ_MEDIA_PACKAGING_MPEG2TS) {
+        if (!track->ts_app_objects) {
+            pthread_mutex_unlock(&s->mu);
+            return MOQ_ERR_WRONG_STATE;
+        }
+        bool ok = true;
+#ifdef MOQ_SERVICE_HAVE_MPEG2TS
+        const moq_msf_mpeg2ts_t *rec = sender_ts_record(track);
+        moq_bytes_t pl = { moq_rcbuf_data(obj->payload),
+                           moq_rcbuf_len(obj->payload) };
+        moq_mpeg2ts_object_rules_t rules;
+        moq_mpeg2ts_object_rules_init(&rules);
+        rules.packet_size = rec->packet_size;
+        moq_mpeg2ts_object_report_t rep;
+        moq_mpeg2ts_object_report_init(&rep);
+        ok = moq_mpeg2ts_validate_object(&rules, pl, &rep, sizeof(rep)) == MOQ_OK;
+        if (ok && track->ts_random_access &&
+            (obj->starts_group || !track->group_open)) {
+            moq_mpeg2ts_inspect_cfg_t ip;
+            moq_mpeg2ts_inspect_cfg_init(&ip);
+            ip.packet_size = rec->packet_size;
+            ip.random_access_pid = MOQ_MPEG2TS_PID_AUTO;
+            if (rec->has_program_number)
+                ip.program_number = (uint16_t)rec->program_number;
+            moq_mpeg2ts_object_info_t info;
+            moq_mpeg2ts_object_info_init(&info);
+            ok = moq_mpeg2ts_inspect_object(&ip, pl, &info, sizeof(info)) == MOQ_OK &&
+                 info.has_random_access;
+        }
+#endif
+        if (!ok) {
+            s->stats.last_error = MOQ_ERR_PROTO;
+            pthread_mutex_unlock(&s->mu);
+            return MOQ_ERR_PROTO;
+        }
+    }
+
     /* LOC ownership (§7.4): for RAW/LOC media the service GENERATES the
      * whole property block from the typed fields. App-supplied `properties`
      * cannot be carried on a RAW object in v0: the property block is a
@@ -4469,16 +5178,8 @@ moq_result_t moq_media_sender_write(moq_media_sender_t *s,
         return MOQ_ERR_INVAL;   /* no ownership taken */
     }
 
-    /* The queue takes ownership of both refs, so both count toward the
-     * byte budget. */
-    size_t need = moq_rcbuf_len(obj->payload);
-    if (obj->properties) need += moq_rcbuf_len(obj->properties);
-
-    /* Would this object open a new group? (Pure -- no mutation until the
-     * enqueue is committed.) A sync point that opens a group is a stream
-     * anchor: every group must begin with one. */
+    /* Would this object open a new group? (Pure.) */
     bool opened = obj->starts_group || !track->group_open;
-    bool incoming_anchors = obj->is_sync && opened;
 
     /* CMSF §3.6.1 / §3.4: when this track generates a SAP timeline, every
      * group-start Object MUST declare a concrete SAP type of 1 or 2 (the value
@@ -4493,143 +5194,22 @@ moq_result_t moq_media_sender_write(moq_media_sender_t *s,
         return MOQ_ERR_INVAL;
     }
 
-    /* Sync-anchor invariant (§7.2), PER TRACK, against EMITTED-or-queued
-     * anchor state (not just the queue): a group opened by a sync point
-     * stays anchored even after that keyframe has drained off the ring, so
-     * later deltas of a still-open group are accepted. A new group must be
-     * opened by a sync point; a delta may only continue an already-anchored
-     * group. Otherwise the object would be a non-decodable lead -- refuse,
-     * taking no ownership. */
-    if (opened) {
-        if (!obj->is_sync) {
-            s->stats.last_error = MOQ_ERR_WOULD_BLOCK;
-            pthread_mutex_unlock(&s->mu);
-            return MOQ_ERR_WOULD_BLOCK;   /* a group cannot lead with a delta */
-        }
-    } else if (!track->cur_group_anchored) {
-        s->stats.last_error = MOQ_ERR_WOULD_BLOCK;
-        pthread_mutex_unlock(&s->mu);
-        return MOQ_ERR_WOULD_BLOCK;
-    }
-
-    /* Make room per the backpressure policy. Drop policies evict (and may
-     * arm a wire reset); RETURN_WOULD_BLOCK refuses immediately;
-     * BLOCK_TIMEOUT waits for the drain to free space, breaking promptly on
-     * terminal/interrupt and surfacing WOULD_BLOCK on timeout -- never a
-     * silent drop. */
-    if (!preq_make_room(s, track, incoming_anchors, need)) {
-        if (s->backpressure != MOQ_MEDIA_SEND_BP_BLOCK_TIMEOUT) {
-            s->stats.last_error = MOQ_ERR_WOULD_BLOCK;
-            pthread_mutex_unlock(&s->mu);
-            return MOQ_ERR_WOULD_BLOCK;
-        }
-        s->stats.backpressure_stalls++;
-        SENDER_WAIT_ENTRY_HOOK();
-        moq_result_t wres = MOQ_OK;
-        struct timespec origin;
-        if (SENDER_CLOCK_REALTIME(&origin) != 0) {
-            /* The budget cannot be anchored: report the system failure rather
-             * than waiting against an unknown origin. */
-            wres = MOQ_ERR_INTERNAL;
-        } else {
-            const uint64_t dur_sec = s->block_timeout_us / 1000000ull;
-            const long dur_nsec =
-                (long)((s->block_timeout_us % 1000000ull) * 1000ull);
-            for (;;) {
-                if (preq_fits(s, need)) { wres = MOQ_OK; break; }
-                if (s->fatal) { wres = MOQ_ERR_CLOSED; break; }
-                /* ep->mu-free closed check (sender_ep_closed): this loop holds s->mu,
-                 * and the endpoint hook lock order is ep->mu -> s->mu, so calling the
-                 * public moq_endpoint_is_closed() (which takes ep->mu) here would
-                 * invert it and can deadlock the network thread. */
-                if (sender_ep_closed(s)) { wres = MOQ_ERR_CLOSED; break; }
-                if (moq_endpoint_interrupted_internal(s->ep)) {
-                    wres = MOQ_ERR_INTERRUPTED; break;
-                }
-                struct timespec now;
-                if (SENDER_CLOCK_REALTIME(&now) != 0) {
-                    wres = MOQ_ERR_INTERNAL; break;
-                }
-                long rem_ns = 0;
-                sender_budget_t cls = sender_budget(origin, dur_sec, dur_nsec,
-                                                    now, &rem_ns);
-                if (cls == SENDER_BUDGET_EXPIRED) {
-                    /* The capacity check at the top of this iteration already
-                     * ran under this same lock hold, so it cannot have changed
-                     * since: the budget is spent with no room. */
-                    wres = MOQ_ERR_WOULD_BLOCK;
-                    break;
-                }
-                /* Bounded slice so external terminal/interrupt (which do not
-                 * signal space_cv) are observed promptly, not at full timeout;
-                 * a shorter remainder is waited exactly, to the nanosecond. */
-                struct timespec until = now;
-                until.tv_nsec += (cls == SENDER_BUDGET_AT_LEAST_SLICE)
-                                 ? SENDER_SLICE_NS : rem_ns;
-                if (until.tv_nsec >= SENDER_NS_PER_S) {
-                    if (until.tv_sec >= SENDER_TIME_T_MAX) {
-                        /* The next required instant is not representable. A
-                         * maximum second is legal; going past it is not, and
-                         * clamping would either expire the wait early or make
-                         * no progress. */
-                        wres = MOQ_ERR_INTERNAL; break;
-                    }
-                    until.tv_sec++;
-                    until.tv_nsec -= SENDER_NS_PER_S;
-                }
-                int wrc = SENDER_COND_TIMEDWAIT(&s->space_cv, &s->mu, &until);
-                if (wrc != 0 && wrc != ETIMEDOUT) {
-                    wres = MOQ_ERR_INTERNAL; break;
-                }
-                /* A wake or a slice timeout re-enters the loop, where capacity,
-                 * terminal state, the interrupt latch and then expiry are all
-                 * re-evaluated in that order. */
-            }
-        }
-        if (wres != MOQ_OK) {
-            s->stats.last_error = wres;
-            pthread_mutex_unlock(&s->mu);
-            return wres;   /* no ownership taken */
-        }
-    }
-
-    /* Commit the service group id: a new group bumps the seq (the first
-     * group ever is 0). group_open tracks completion separately so an
-     * ends_group does not make the next group reuse the same id.
-     * cur_group_anchored records that this group was opened by a sync
-     * point, so a later delta is accepted even after the keyframe drains. */
-    if (opened) {
-        track->group_seq = track->group_started ? track->group_seq + 1 : 0;
-        track->group_started = true;
-        track->group_open = true;
-        track->cur_group_anchored = obj->is_sync;
-    }
-
-    sender_preq_entry_t *e = &s->preq[s->preq_tail % s->ring_cap];
-    memset(e, 0, sizeof(*e));
-    e->track = track;
-    e->payload = obj->payload;          /* ownership transfers */
-    e->properties = obj->properties;
-    e->is_sync = obj->is_sync;
-    e->starts_group = opened;
-    e->ends_group = obj->ends_group;
-    e->group_seq = track->group_seq;
-    e->pts_us = obj->presentation_time_us;
-    e->has_capture_time = obj->has_capture_time;
-    e->capture_time_us = obj->capture_time_us;
-    e->bytes = need;
-    /* Carry the SAP declaration so the timeline record is generated at emit
-     * time with the real wire Location (a dropped Object then yields no record). */
+    sender_admit_t a;
+    memset(&a, 0, sizeof(a));
+    a.payload = obj->payload;
+    a.properties = obj->properties;
+    a.is_sync = obj->is_sync;
+    a.starts_group = obj->starts_group;
+    a.ends_group = obj->ends_group;
+    a.pts_us = obj->presentation_time_us;
+    a.has_capture_time = obj->has_capture_time;
+    a.capture_time_us = obj->capture_time_us;
     if (track->sap_timeline && obj->has_sap_type) {
-        e->has_sap_type = true;
-        e->sap_type = (uint8_t)obj->sap_type;
+        a.has_sap_type = true;
+        a.sap_type = (uint8_t)obj->sap_type;
     }
-    s->preq_bytes += need;
-    s->preq_tail++;
-    preq_note_enqueued(s, e);
-    s->stats.objects_written++;
-    if (obj->ends_group) track->group_open = false;
-    bool wake = s->ready;   /* post-ready: kick the drain (see below) */
+    moq_result_t rc = sender_admit_locked(s, track, &a);
+    bool wake = rc == MOQ_OK && s->ready;  /* post-ready: kick the drain */
     pthread_mutex_unlock(&s->mu);
 
     /* Wake the network thread so the drain runs without waiting for unrelated
@@ -4638,7 +5218,262 @@ moq_result_t moq_media_sender_write(moq_media_sender_t *s,
      * transition itself drives the first drain. */
     if (wake)
         moq_endpoint_wake(s->ep);
+    return rc;
+}
+
+/* -- MPEG-2 TS byte stream (app thread) -------------------------------- */
+
+/* The first published size of moq_media_send_mpeg2ts_t: through
+ * end_object. */
+#define MEDIA_SEND_MPEG2TS_V0_SIZE \
+    (offsetof(moq_media_send_mpeg2ts_t, end_object) + sizeof(bool))
+
+#ifdef MOQ_SERVICE_HAVE_MPEG2TS
+/* The track's open Group lost an Object that never reached the queue:
+ * drop what is still queued of it (counted, as any drop) and, when its wire
+ * subgroup is open, arm the reset that abandons it. The Group is closed for
+ * writes. s->mu held. */
+static void sender_abandon_open_group_locked(moq_media_sender_t *s,
+                                             moq_media_track_t *t)
+{
+    if (!t->group_open) return;
+    uint64_t g = t->group_seq;
+    preq_evict_group(s, t, g);
+    if (t->emit_open && t->emit_group == g) t->pending_reset = true;
+    t->group_open = false;
+    t->cur_group_anchored = false;
+}
+
+/* Queue the Objects of `list` (the staged or the parked ones) in order,
+ * through the same admission as write(). A continuation of a Group that lost
+ * media is discarded and counted, never queued: the next Group start ends
+ * that. When an Object cannot be queued, it and every later one are parked,
+ * in order, and the next call queues them first -- unless the sender is
+ * closed or the track can take no more writes (MOQ_ERR_CLOSED,
+ * MOQ_ERR_WRONG_STATE), when they are released. So a refusal that can pass
+ * (WOULD_BLOCK, an interrupt, a clock failure in the wait) never leaves a
+ * hole in a Group. s->mu held (a BLOCK_TIMEOUT wait releases it while
+ * waiting). */
+static moq_result_t sender_ts_queue(moq_media_sender_t *s,
+                                    moq_media_track_t *t,
+                                    sender_ts_obj_t *list, size_t *n,
+                                    bool *queued_any)
+{
+    sender_ts_t *ts = (sender_ts_t *)t->ts;
+    moq_result_t rc = MOQ_OK;
+    size_t i = 0;
+    for (; i < *n; i++) {
+        sender_ts_obj_t *o = &list[i];
+        if (o->lost) {
+            /* The rest of its Group is discarded (broken). A lost
+             * continuation abandons the open Group: what is still queued of
+             * it is dropped and an open wire subgroup is reset, so the
+             * truncated Group is never finished as if complete. A lost Group
+             * start takes its Group ID with it, so the next Group follows a
+             * visible hole, and leaves the Group before it, already
+             * complete, alone. */
+            ts->broken = true;
+            if (o->new_group) {
+                t->group_seq = t->group_started ? t->group_seq + 1 : 0;
+                t->group_started = true;
+                t->group_open = false;
+                t->cur_group_anchored = false;
+            } else {
+                sender_abandon_open_group_locked(s, t);
+            }
+            o->lost = false;
+            continue;
+        }
+        if (o->new_group) {
+            ts->broken = false;
+        } else if (ts->broken || !t->group_open) {
+            moq_rcbuf_decref(o->payload);
+            o->payload = NULL;
+            ts->continuation_discarded++;
+            continue;
+        }
+        sender_admit_t a;
+        memset(&a, 0, sizeof(a));
+        a.payload = o->payload;
+        a.is_sync = o->random_access;
+        a.anchors_group = o->new_group; /* every Group start is the anchor */
+        a.starts_group = o->new_group;
+        rc = sender_admit_locked(s, t, &a);
+        if (rc != MOQ_OK) break;
+        o->payload = NULL;
+        *queued_any = true;
+    }
+    size_t rest = *n - i;
+    *n = 0;
+    if (rc != MOQ_OK && rc != MOQ_ERR_CLOSED && rc != MOQ_ERR_WRONG_STATE) {
+        /* Staged Objects are queued only once nothing is parked, so the
+         * parked list is either this list or empty. */
+        sender_ts_obj_t keep[SENDER_TS_STAGE_MAX];
+        memcpy(keep, &list[i], rest * sizeof(*keep));
+        memcpy(ts->parked, keep, rest * sizeof(*keep));
+        ts->parked_n = rest;
+    } else {
+        sender_ts_drop_list(&list[i], rest);
+    }
+    return rc;
+}
+
+/* Queue what the packetizer just emitted (an Object it could not copy is a
+ * local loss of its Group). */
+static moq_result_t sender_ts_queue_staged(moq_media_sender_t *s,
+                                           moq_media_track_t *t,
+                                           bool *queued_any)
+{
+    sender_ts_t *ts = (sender_ts_t *)t->ts;
+    moq_result_t rc = sender_ts_queue(s, t, ts->staged, &ts->staged_n,
+                                      queued_any);
+    if (rc == MOQ_OK && ts->emit_lost) {
+        ts->emit_lost = false;
+        return MOQ_ERR_NOMEM;
+    }
+    return rc;
+}
+
+/* Filter (per-program) and packetize one whole source packet, then queue
+ * what it completed. */
+static moq_result_t sender_ts_packet(moq_media_sender_t *s,
+                                     moq_media_track_t *t,
+                                     const uint8_t *pkt, bool *queued_any)
+{
+    sender_ts_t *ts = (sender_ts_t *)t->ts;
+    moq_bytes_t in = { pkt, ts->ps };
+    uint8_t out[MOQ_MPEG2TS_M2TS_PACKET_SIZE];
+    if (ts->filter) {
+        moq_mpeg2ts_filter_action_t act = MOQ_MPEG2TS_FILTER_DROP;
+        /* A packet the filter cannot parse is one it does not keep. */
+        if (moq_mpeg2ts_program_filter_push(ts->filter, in, out, sizeof(out),
+                                            &act) != MOQ_OK ||
+            act == MOQ_MPEG2TS_FILTER_DROP)
+            return MOQ_OK;
+        in = (moq_bytes_t){ out, ts->ps };
+    }
+    if (moq_mpeg2ts_packetizer_push(&ts->pz, in) != MOQ_OK)
+        return MOQ_ERR_PROTO;
+    return sender_ts_queue_staged(s, t, queued_any);
+}
+
+/* After an Object was queued the writer lets go of s->mu, so the drain is
+ * never shut out for longer than one Object; the busy latch keeps the track
+ * to this writer meanwhile. Returns non-OK when the track or sender changed
+ * state in between. */
+static moq_result_t sender_ts_yield(moq_media_sender_t *s,
+                                    moq_media_track_t *t, bool *queued_any)
+{
+    if (!*queued_any) return MOQ_OK;
+    *queued_any = false;
+    bool wake = s->ready;
+    pthread_mutex_unlock(&s->mu);
+    if (wake) moq_endpoint_wake(s->ep);
+    pthread_mutex_lock(&s->mu);
+    if (s->fatal || sender_ep_closed(s)) return MOQ_ERR_CLOSED;
+    if (t->removed || t->vod_converted) return MOQ_ERR_WRONG_STATE;
     return MOQ_OK;
+}
+#endif
+
+moq_result_t moq_media_sender_write_mpeg2ts(moq_media_sender_t *s,
+                                            moq_media_track_t *track,
+                                            const moq_media_send_mpeg2ts_t *in,
+                                            size_t *consumed)
+{
+    if (consumed) *consumed = 0;
+    if (!s || !track || !in || !consumed) return MOQ_ERR_INVAL;
+    if (in->struct_size < MEDIA_SEND_MPEG2TS_V0_SIZE) return MOQ_ERR_INVAL;
+    if (in->data.len > 0 && !in->data.data) return MOQ_ERR_INVAL;
+#ifndef MOQ_SERVICE_HAVE_MPEG2TS
+    (void)track;
+    return MOQ_ERR_UNSUPPORTED;
+#else
+    if (s->ep && moq_endpoint_interrupted_internal(s->ep))
+        return MOQ_ERR_INTERRUPTED;
+    if (sender_terminal(s)) return MOQ_ERR_CLOSED;
+
+    pthread_mutex_lock(&s->mu);
+    if (s->fatal) { pthread_mutex_unlock(&s->mu); return MOQ_ERR_CLOSED; }
+    bool owned = false;
+    for (size_t i = 0; i < s->track_count; i++)
+        if (s->tracks[i] == track) { owned = true; break; }
+    if (!owned || track->packaging != MOQ_MEDIA_PACKAGING_MPEG2TS) {
+        pthread_mutex_unlock(&s->mu);
+        return MOQ_ERR_INVAL;
+    }
+    sender_ts_t *ts = (sender_ts_t *)track->ts;
+    if (!ts || ts->busy || ts->ending || track->end_requested ||
+        track->removed || track->vod_converted) {
+        pthread_mutex_unlock(&s->mu);
+        return MOQ_ERR_WRONG_STATE;
+    }
+    ts->busy = true;
+
+    bool queued_any = false, progressed = false;
+    /* What a previous call could not queue goes first. */
+    moq_result_t rc = sender_ts_queue(s, track, ts->parked, &ts->parked_n,
+                                      &queued_any);
+    const uint8_t *data = in->data.data;
+    size_t len = in->data.len, off = 0;
+    const size_t ps = ts->ps;
+    const size_t sync = ps == MOQ_MPEG2TS_M2TS_PACKET_SIZE
+                            ? MOQ_MPEG2TS_PREFIX_SIZE : 0u;
+    while (rc == MOQ_OK && off < len) {
+        if (ts->carry_len > 0 || len - off < ps) {
+            /* Assemble a packet that spans calls. Its sync byte is checked
+             * as it arrives, before any byte of it is taken. */
+            size_t take = ps - ts->carry_len;
+            if (take > len - off) take = len - off;
+            if (ts->carry_len <= sync && ts->carry_len + take > sync &&
+                data[off + (sync - ts->carry_len)] != MOQ_MPEG2TS_SYNC_BYTE) {
+                /* The bytes kept from earlier calls belong to the bad
+                 * packet: discarded and counted, so the next call starts at
+                 * a packet boundary. */
+                ts->partial_bytes_discarded += ts->carry_len;
+                ts->carry_len = 0;
+                rc = MOQ_ERR_PROTO;
+                break;
+            }
+            memcpy(ts->carry + ts->carry_len, data + off, take);
+            ts->carry_len += take;
+            off += take;
+            *consumed = off;
+            if (ts->carry_len < ps) break;
+            ts->carry_len = 0;
+            rc = sender_ts_packet(s, track, ts->carry, &queued_any);
+        } else {
+            if (data[off + sync] != MOQ_MPEG2TS_SYNC_BYTE) {
+                rc = MOQ_ERR_PROTO;
+                break;
+            }
+            const uint8_t *pkt = data + off;
+            off += ps;
+            *consumed = off;
+            rc = sender_ts_packet(s, track, pkt, &queued_any);
+        }
+        if (queued_any) progressed = true;
+        if (rc == MOQ_OK) rc = sender_ts_yield(s, track, &queued_any);
+    }
+    /* end_object: this call's last packet closes an Object. */
+    if (rc == MOQ_OK && in->end_object) {
+        progressed = true;
+        if (moq_mpeg2ts_packetizer_end_object(&ts->pz) != MOQ_OK)
+            rc = MOQ_ERR_INTERNAL;
+        else
+            rc = sender_ts_queue_staged(s, track, &queued_any);
+    }
+    /* A short write: Objects held back after any progress are reported by
+     * *consumed and the parked count, not by an error. */
+    if (queued_any || *consumed > 0) progressed = true;
+    if (rc == MOQ_ERR_WOULD_BLOCK && progressed) rc = MOQ_OK;
+    if (rc != MOQ_OK) s->stats.last_error = rc;
+    ts->busy = false;
+    bool wake = queued_any && s->ready;
+    pthread_mutex_unlock(&s->mu);
+    if (wake) moq_endpoint_wake(s->ep);
+    return rc;
+#endif
 }
 
 moq_result_t moq_media_sender_end_track(moq_media_sender_t *s,
@@ -4664,6 +5499,40 @@ moq_result_t moq_media_sender_end_track(moq_media_sender_t *s,
     /* Idempotent: a second end_track is a no-op success (the terminal is
      * already queued/sent). */
     if (track->end_requested) { pthread_mutex_unlock(&s->mu); return MOQ_OK; }
+
+#ifdef MOQ_SERVICE_HAVE_MPEG2TS
+    /* A byte-stream TS track ends its source first: the Objects held back,
+     * then the packetizer's last ones, each through the normal admission. A
+     * WOULD_BLOCK on the way is retried by the next end_track. */
+    if (track->ts) {
+        sender_ts_t *ts = (sender_ts_t *)track->ts;
+        if (ts->busy) { pthread_mutex_unlock(&s->mu); return MOQ_ERR_WRONG_STATE; }
+        ts->busy = true;
+        bool queued_any = false;
+        moq_result_t rc = sender_ts_queue(s, track, ts->parked, &ts->parked_n,
+                                          &queued_any);
+        if (rc == MOQ_OK && !ts->ending) {
+            ts->ending = true;
+            if (moq_mpeg2ts_packetizer_flush(&ts->pz) != MOQ_OK)
+                rc = MOQ_ERR_INTERNAL;
+            else
+                rc = sender_ts_queue_staged(s, track, &queued_any);
+        }
+        ts->busy = false;
+        /* MOQ_ERR_NOMEM (a last Object lost) is reported like any other
+         * failure: the track is not ended yet, and the next end_track
+         * queues the END_OF_TRACK. */
+        if (rc != MOQ_OK) {
+            bool wake = queued_any && s->ready;
+            pthread_mutex_unlock(&s->mu);
+            if (wake) moq_endpoint_wake(s->ep);
+            return rc;
+        }
+        /* A partial packet is not a packet: discarded and counted. */
+        ts->partial_bytes_discarded += ts->carry_len;
+        ts->carry_len = 0;
+    }
+#endif
 
     /* The terminal marker needs one slot against the ACTIVE queue OBJECT bound
      * -- the same bound write() is held to (preq_fits) -- not against the
@@ -4847,6 +5716,64 @@ moq_result_t moq_media_sender_get_stats(const moq_media_sender_t *s,
      * public answer. O(1): maintained at the enqueue/release chokepoints. */
     snap.objects_queued = ms->preq_media;
     snap.bytes_queued = ms->preq_bytes;
+    pthread_mutex_unlock(&ms->mu);
+    size_t n = out_size < sizeof(*out) ? out_size : sizeof(*out);
+    snap.struct_size = (uint32_t)n;
+    memcpy(out, &snap, n);
+    return MOQ_OK;
+}
+
+/* The first published size of moq_media_sender_track_stats_t: the whole
+ * struct as first released, through mpeg2ts_continuation_objects_discarded. */
+#define MEDIA_SENDER_TRACK_STATS_V0_SIZE \
+    (offsetof(moq_media_sender_track_stats_t, \
+              mpeg2ts_continuation_objects_discarded) + sizeof(uint64_t))
+
+moq_result_t moq_media_sender_get_track_stats(
+    const moq_media_sender_t *s, const moq_media_track_t *track,
+    moq_media_sender_track_stats_t *out, size_t out_size)
+{
+    if (!s || !track || !out || out_size < MEDIA_SENDER_TRACK_STATS_V0_SIZE)
+        return MOQ_ERR_INVAL;
+    moq_media_sender_t *ms = (moq_media_sender_t *)(uintptr_t)s;
+    moq_media_sender_track_stats_t snap;
+    pthread_mutex_lock(&ms->mu);
+    /* Only a handle of this sender is dereferenced. */
+    moq_media_track_t *t = NULL;
+    for (size_t i = 0; i < ms->track_count; i++)
+        if (ms->tracks[i] == track) { t = ms->tracks[i]; break; }
+    if (!t) {
+        pthread_mutex_unlock(&ms->mu);
+        return MOQ_ERR_INVAL;
+    }
+    snap = t->tstats;
+#ifdef MOQ_SERVICE_HAVE_MPEG2TS
+    if (t->ts) {
+        const sender_ts_t *ts = (const sender_ts_t *)t->ts;
+        moq_mpeg2ts_packetizer_stats_t ps;
+        if (moq_mpeg2ts_packetizer_get_stats(&ts->pz, &ps, sizeof(ps))
+                == MOQ_OK) {
+            snap.mpeg2ts_groups = ps.groups;
+            snap.mpeg2ts_objects = ps.objects;
+            snap.mpeg2ts_packets_in = ps.packets_in;
+            snap.mpeg2ts_packets_dropped_before_random_access =
+                ps.packets_dropped_before_random_access;
+            snap.mpeg2ts_max_group_27mhz = ps.max_group_27mhz;
+            snap.mpeg2ts_groups_over_2s = ps.groups_over_2s;
+            snap.mpeg2ts_peak_rate_bps = ps.peak_rate_bps;
+            snap.mpeg2ts_source_pcr_discontinuities =
+                ps.source_pcr_discontinuities;
+        }
+        const moq_msf_mpeg2ts_t *rec = sender_ts_record(t);
+        snap.mpeg2ts_mux_rate_below_peak =
+            rec->has_mux_rate && rec->mux_rate < snap.mpeg2ts_peak_rate_bps;
+        snap.mpeg2ts_program_gone =
+            ts->filter && moq_mpeg2ts_program_filter_program_gone(ts->filter);
+        snap.mpeg2ts_objects_parked = ts->parked_n;
+        snap.mpeg2ts_partial_bytes_discarded = ts->partial_bytes_discarded;
+        snap.mpeg2ts_continuation_objects_discarded = ts->continuation_discarded;
+    }
+#endif
     pthread_mutex_unlock(&ms->mu);
     size_t n = out_size < sizeof(*out) ? out_size : sizeof(*out);
     snap.struct_size = (uint32_t)n;
@@ -5141,6 +6068,85 @@ size_t moq_media_sender_test_track_count(moq_media_sender_t *s)
 }
 
 /* Simulate the post-ready transition (so add/remove dirty the catalog). */
+/* The i-th queued entry, oldest first: its track, payload (borrowed), Group
+ * id, and whether it opens its Group. False past the end. */
+bool moq_media_sender_test_queue_entry(moq_media_sender_t *s, size_t i,
+                                       const moq_media_track_t **track,
+                                       const moq_rcbuf_t **payload,
+                                       uint64_t *group, bool *starts_group);
+bool moq_media_sender_test_queue_entry(moq_media_sender_t *s, size_t i,
+                                       const moq_media_track_t **track,
+                                       const moq_rcbuf_t **payload,
+                                       uint64_t *group, bool *starts_group)
+{
+    pthread_mutex_lock(&s->mu);
+    bool ok = i < (size_t)(s->preq_tail - s->preq_head);
+    if (ok) {
+        const sender_preq_entry_t *e =
+            &s->preq[(s->preq_head + (uint32_t)i) % s->ring_cap];
+        if (track) *track = e->track;
+        if (payload) *payload = e->payload;
+        if (group) *group = e->group_seq;
+        if (starts_group) *starts_group = e->starts_group;
+    }
+    pthread_mutex_unlock(&s->mu);
+    return ok;
+}
+
+/* Take the queue head as the drain would after a successful write to the
+ * session: the wire state (open Group, next Object id) and the sent counters
+ * advance, and the payload reference passes to the caller. False when the
+ * queue is empty or the head is the END_OF_TRACK marker. */
+bool moq_media_sender_test_emit_head(moq_media_sender_t *s,
+                                     moq_rcbuf_t **payload);
+bool moq_media_sender_test_emit_head(moq_media_sender_t *s,
+                                     moq_rcbuf_t **payload)
+{
+    pthread_mutex_lock(&s->mu);
+    if (s->preq_head == s->preq_tail ||
+        s->preq[s->preq_head % s->ring_cap].is_end) {
+        pthread_mutex_unlock(&s->mu);
+        return false;
+    }
+    sender_preq_entry_t *e = &s->preq[s->preq_head % s->ring_cap];
+    moq_media_track_t *t = e->track;
+    bool new_group = !t->emit_open || t->emit_group != e->group_seq;
+    t->emit_obj = (new_group ? 0 : t->emit_obj) + 1;
+    t->emit_group = e->group_seq;
+    t->emit_open = true;
+    s->stats.objects_sent++;
+    t->tstats.objects_sent++;
+    t->tstats.objects_queued--;
+    t->tstats.bytes_queued -= e->bytes;
+    s->preq_bytes -= e->bytes;
+    *payload = e->payload;
+    e->payload = NULL;
+    preq_entry_release(s, e);
+    s->preq_head++;
+    pthread_cond_broadcast(&s->space_cv);
+    pthread_mutex_unlock(&s->mu);
+    return true;
+}
+
+/* Discard every queued object of `t` through the drop path, as a policy
+ * would. Caller holds s->mu (e.g. from the cond-wait hook). */
+void moq_media_sender_test_drop_track_locked(moq_media_sender_t *s,
+                                             moq_media_track_t *t);
+void moq_media_sender_test_drop_track_locked(moq_media_sender_t *s,
+                                             moq_media_track_t *t)
+{
+    for (;;) {
+        bool any = false;
+        uint64_t g = 0;
+        for (uint32_t i = s->preq_head; i != s->preq_tail; i++) {
+            const sender_preq_entry_t *e = &s->preq[i % s->ring_cap];
+            if (e->track == t && !e->is_end) { any = true; g = e->group_seq; break; }
+        }
+        if (!any) return;
+        preq_evict_group(s, t, g);
+    }
+}
+
 void moq_media_sender_test_set_ready(moq_media_sender_t *s)
 {
     pthread_mutex_lock(&s->mu);

@@ -5,6 +5,7 @@
 
 #include <moq/msf.h>
 #include <moq/rcbuf.h>
+#include "msf_extension_eq.h"
 #if defined(MOQ_FUZZ_MSF_HAS_MEDIA)
 #include <moq/msf_media.h>
 #endif
@@ -203,6 +204,7 @@ static bool url_eq(const moq_cmsf_url_t *a, const moq_cmsf_url_t *b)
 
 static bool track_eq(const moq_msf_track_t *a, const moq_msf_track_t *b)
 {
+    if (!fuzz_msf_extensions_eq(a, b)) return false;
     if (!bytes_eq(a->name, b->name) ||
         a->has_packaging != b->has_packaging ||
         (a->has_packaging && !bytes_eq(a->packaging, b->packaging)) ||

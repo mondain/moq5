@@ -1,0 +1,1 @@
+{"version":"draft-01","tracks":[{"name":"t","packaging":"mpeg2ts","isLive":true,"mpeg2tsMode":"per-program","mpeg2tsPacketSize":188.0,"mpeg2tsMuxRate":1e6,"mpeg2tsProgramNumber":2.0e0,"mpeg2tsSiPids":[1.7e1,18E0],"mpeg2tsPcrPid":256.5}]}

@@ -250,11 +250,14 @@ typedef struct moq_media_track_cfg {
     uint32_t struct_size;
     moq_bytes_t name;                  /* REQUIRED: catalog track name */
     moq_media_type_t      media_type;  /* REQUIRED: VIDEO | AUDIO */
-    moq_media_packaging_t packaging;   /* REQUIRED: RAW | CMAF */
+    moq_media_packaging_t packaging;   /* REQUIRED: RAW | CMAF | MPEG2TS */
     moq_bytes_t codec;                 /* codec string, e.g. "avc1.64001f".
                                           MSF-01 5.2.18: REQUIRED for audio and
                                           video tracks (add_track returns
-                                          MOQ_ERR_INVAL if empty). */
+                                          MOQ_ERR_INVAL if empty), except on an
+                                          MPEG2TS track: a multiplex has no
+                                          inherent codec, so there it is
+                                          optional. */
     uint32_t    timescale;             /* 0 = 1000000 (microseconds) */
     moq_bytes_t init_data;             /* OPTIONAL codec/decoder init config,
                                           carried in the catalog for ANY
@@ -392,6 +395,52 @@ typedef struct moq_media_track_cfg {
 #endif
     bool        has_publisher_priority;
     uint8_t     publisher_priority;
+
+    /* Packaging-extension records for this track's catalog entry, one per
+     * kind (see moq_msf_track_ext_t). An MPEG2TS track carries exactly one
+     * MOQ_MSF_EXT_MPEG2TS record (draft-gregoire-moq-msfts: mode, packet
+     * size, program number, ...); read it back with
+     * moq_msf_ext_mpeg2ts(extensions, extension_count). Borrowed for the
+     * call: add_track deep-copies the entry array, each record (up to its own
+     * struct_size), its spans and its si_pids. add_track returns
+     * MOQ_ERR_INVAL for a count without an array, an unknown or NONE kind, a
+     * kind listed twice, a NULL record, a record below its first published
+     * size, a kind that does not belong to the track's packaging, an MPEG2TS
+     * track without its record, or a record that fails
+     * moq_msf_track_mpeg2ts_check(). Empty (the default) for other
+     * packagings.
+     *
+     * Appended after publisher_priority, aligned as uint64_t (the ABI's own
+     * alignment for it, as on the priority pair), so the block starts at or
+     * past the struct size of every older layout. */
+#ifdef __cplusplus
+    alignas(uint64_t)
+#else
+    _Alignas(uint64_t)
+#endif
+    const moq_msf_track_ext_t *extensions;
+    size_t                     extension_count;
+
+    /* MPEG2TS only. false (the default): the app hands the service TS bytes
+     * with moq_media_sender_write_mpeg2ts(), and the service forms Objects
+     * and Groups with the <moq/mpeg2ts.h> packetizer (and, for a per-program
+     * record with a program number, the program filter ahead of it). true:
+     * the app forms Objects itself and submits each with
+     * moq_media_sender_write(), which then checks every Object (whole
+     * source packets with sync bytes, and a random access point at each
+     * Group start when the record declares mpeg2tsRandomAccess). Each
+     * track takes one of the two calls; the other returns
+     * MOQ_ERR_WRONG_STATE. */
+    bool        mpeg2ts_app_objects;
+    /* MPEG2TS byte-stream mode only (ignored with mpeg2ts_app_objects).
+     * Source packets per Object at most, 0 = 64; the shortest Group in PCR
+     * time, 0 = a new Group at every random access point; and whether to
+     * forward the packets before the first random access point (false, the
+     * default, discards them so every Group starts at one -- which is also
+     * what makes the service declare mpeg2tsRandomAccess). */
+    uint32_t    mpeg2ts_object_packets;
+    uint32_t    mpeg2ts_min_group_ms;
+    bool        mpeg2ts_forward_before_random_access;
 } moq_media_track_cfg_t;
 
 #define MOQ_MEDIA_TRACK_CFG_V0_SIZE \
@@ -433,7 +482,24 @@ MOQ_API void moq_media_track_cfg_init_sized(moq_media_track_cfg_t *cfg,
  * track that is invalid by construction: an audio or video track MUST carry a
  * non-empty codec (5.2.18) and a non-zero bitrate (5.2.22), and an audio track
  * MUST additionally carry a non-zero samplerate (5.2.28) and a non-empty
- * channel_config (5.2.29). A track missing a required field is MOQ_ERR_INVAL. */
+ * channel_config (5.2.29). A track missing a required field is MOQ_ERR_INVAL.
+ *
+ * MPEG2TS tracks (draft-gregoire-moq-msfts). The catalog entry is
+ * packaging "mpeg2ts", mimeType "video/mp2t", the record's mpeg2ts* fields,
+ * and init_data (when given: whole source packets of the record's packet
+ * size, normally the PAT and PMT) as an "inline" initDataList entry
+ * referenced by initRef. bitrate stays required; codec, samplerate and
+ * channel_config are not (they describe one elementary stream, not a
+ * multiplex). In byte-stream mode the service declares mpeg2tsRandomAccess
+ * itself -- true unless mpeg2ts_forward_before_random_access, absent for an
+ * unmodified-multiplex record without a program number -- and a record value
+ * that contradicts it is MOQ_ERR_INVAL; in app-Object mode the record's value
+ * is used as given. MOQ_ERR_INVAL also for an es-packets record (authoring
+ * es-packets tracks is helper-level), a per-program record without a program
+ * number (the service runs the program filter for it), emit_sap_timeline or
+ * emit_media_timeline (TS keeps presentation times inside the packets), and
+ * init_data that is not whole source packets. A build without moq::mpeg2ts
+ * returns MOQ_ERR_UNSUPPORTED for an MPEG2TS track. */
 MOQ_API moq_result_t moq_media_sender_add_track(
     moq_media_sender_t *s, const moq_media_track_cfg_t *cfg,
     moq_media_track_t **out);
@@ -501,7 +567,13 @@ typedef struct moq_media_send_object {
     moq_sap_type_t sap_type;
 } moq_media_send_object_t;
 
-/* Submit one media object in decode order.
+/* Submit one media object in decode order. On an MPEG2TS track this is the
+ * app-Object mode (mpeg2ts_app_objects): the payload must be whole source
+ * packets with their sync bytes, and with mpeg2tsRandomAccess declared a
+ * starts_group Object must hold a random access point; a failing Object is
+ * MOQ_ERR_PROTO with no ownership taken. On a byte-stream MPEG2TS track it
+ * returns MOQ_ERR_WRONG_STATE.
+ *
  *
  * Objects are enqueued in decode order into one bounded queue (the
  * pre-ready bound applies before ready, the send-queue bound after) and
@@ -516,7 +588,13 @@ typedef struct moq_media_send_object {
  *   RETURN_WOULD_BLOCK -- MOQ_ERR_WOULD_BLOCK immediately when full.
  * A non-anchor object for a track with no queued anchor, or a GOP larger
  * than the bound under a drop policy, returns MOQ_ERR_WOULD_BLOCK with no
- * ownership taken.
+ * ownership taken. A Group that loses queued media to a drop policy is
+ * closed for writes: a non-sync object that would continue it returns
+ * MOQ_ERR_WOULD_BLOCK, and the next sync point opens a new Group, so no
+ * Location is ever sent twice. (A Group that loses its head to
+ * drop_without_demand stays writable and the rest of it is discarded; see
+ * that field.) An object that continues its track's open Group never evicts
+ * that Group to make room for itself.
  *
  * Terminal: MOQ_ERR_CLOSED once the endpoint/sender is terminal,
  * MOQ_ERR_INTERRUPTED while the endpoint interrupt latch is set; the
@@ -527,6 +605,86 @@ MOQ_API moq_result_t moq_media_sender_write(
     moq_media_sender_t *s, moq_media_track_t *track,
     const moq_media_send_object_t *obj);
 
+/* -- MPEG-2 TS byte stream (draft-gregoire-moq-msfts) ----------------- */
+
+/* One write_mpeg2ts() input. A sized input: the library reads it only when
+ * struct_size covers end_object. */
+typedef struct moq_media_send_mpeg2ts {
+    uint32_t    struct_size;
+    moq_bytes_t data;        /* source packets of the track's packet size, in
+                                any chunking; borrowed for the call */
+    bool        end_object;  /* after data, end the Object being filled so
+                                this call's last packet closes an Object */
+} moq_media_send_mpeg2ts_t;
+
+/* Hand TS bytes to a byte-stream MPEG2TS track. The service runs the
+ * program filter (per-program record with a program number) and the
+ * packetizer: Groups open at random access points (with the PAT/PMT run
+ * that precedes them), Objects hold at most mpeg2ts_object_packets source
+ * packets, and every Object goes through the same queue, backpressure
+ * policy and drain as write(). PTS, DTS and PCR stay inside the packets.
+ *
+ * *consumed (required) is always written, on success and on every error:
+ * the number of bytes of in->data the service now owns. A packet is taken
+ * whole or not at all; bytes that do not complete a packet are kept (at
+ * most packet_size - 1 of them) and count as consumed.
+ *
+ * Writes can be short, as with POSIX write(). When an Object cannot be
+ * queued under the backpressure policy (RETURN_WOULD_BLOCK, or a
+ * BLOCK_TIMEOUT expiry) it is held by the track (at most two are, the
+ * per-track stat mpeg2ts_objects_parked) and the call stops after the packet
+ * that completed it. Held Objects are queued first by the next
+ * write_mpeg2ts() or end_track(); a caller with no more input passes empty
+ * data until mpeg2ts_objects_parked is 0.
+ *   MOQ_OK                the call made progress: it took *consumed bytes
+ *                         (less than in->data.len for a short write, which
+ *                         may also be the whole input with Objects held),
+ *                         or queued held Objects, or ended an Object.
+ *   MOQ_ERR_WOULD_BLOCK   no progress: the first held Object still cannot be
+ *                         queued, *consumed is 0 and nothing changed. Retry
+ *                         after moq_media_sender_wait().
+ *   MOQ_ERR_NOMEM         an Object could not be copied: it is lost, and so
+ *                         is the rest of its Group. Later Objects of that
+ *                         Group are discarded and counted as below. When it
+ *                         was not the Group's first Object, what is still
+ *                         queued of the Group is dropped (objects_dropped)
+ *                         and its subgroup, if already open on the wire, is
+ *                         reset (groups_abandoned), so the truncated Group
+ *                         is never finished as complete. A lost first Object
+ *                         takes its Group ID with it, so the next Group
+ *                         follows a hole a subscriber can see. *consumed
+ *                         covers the packet that completed it.
+ *   MOQ_ERR_PROTO         a packet lacks its sync byte (offset 0, or 4 for
+ *                         192-octet packets): *consumed stops before that
+ *                         packet's bytes in this call and nothing else
+ *                         changes. The service does not resync. Bytes of an
+ *                         unfinished packet kept by an earlier call are
+ *                         discarded with it and counted
+ *                         (mpeg2ts_partial_bytes_discarded): the next call
+ *                         starts at a packet boundary.
+ *   MOQ_ERR_WRONG_STATE   an app-Object track, another write_mpeg2ts() or
+ *                         end_track() in progress on the same track (one
+ *                         writer per track; writes to different tracks stay
+ *                         concurrent), or a track that is ended, removed or
+ *                         converted to VOD.
+ *   MOQ_ERR_INVAL         NULL s/track/in/consumed, a foreign track, a track
+ *                         that is not MPEG2TS, in->struct_size below its
+ *                         first published size, or data.len > 0 with a NULL
+ *                         data pointer.
+ *   MOQ_ERR_CLOSED / MOQ_ERR_INTERRUPTED  as for write(). An interrupt
+ *                         that stops a call after it took packets reports
+ *                         them in *consumed, and the Object that could not
+ *                         be queued stays held, as above, for the next call
+ *                         once the latch clears.
+ *   MOQ_ERR_UNSUPPORTED   a build without moq::mpeg2ts.
+ *
+ * Under a drop policy, when an open Group has lost queued media, the
+ * packetizer's later Objects of that Group are discarded and counted
+ * (mpeg2ts_continuation_objects_discarded) until its next Group starts. */
+MOQ_API moq_result_t moq_media_sender_write_mpeg2ts(
+    moq_media_sender_t *s, moq_media_track_t *track,
+    const moq_media_send_mpeg2ts_t *in, size_t *consumed);
+
 /* End a finite track: after this track's already-queued objects drain, the
  * service emits a reliable END_OF_TRACK status object (a subgroup-stream object,
  * NOT a datagram), which surfaces on receivers as MOQ_MEDIA_TRACK_ENDED. Ending
@@ -536,7 +694,20 @@ MOQ_API moq_result_t moq_media_sender_write(
  * MOQ_ERR_WRONG_STATE. end_track is IDEMPOTENT: a second call returns MOQ_OK and
  * does nothing. Returns MOQ_OK (queued), MOQ_ERR_INVAL (NULL/foreign track),
  * MOQ_ERR_CLOSED (terminal), MOQ_ERR_INTERRUPTED (latch set), or
- * MOQ_ERR_WOULD_BLOCK when the send queue is momentarily full (retry). */
+ * MOQ_ERR_WOULD_BLOCK when the send queue is momentarily full (retry).
+ *
+ * On a byte-stream MPEG2TS track, end_track first queues the Objects
+ * write_mpeg2ts() held, then the packetizer's last Objects (the end of the
+ * source), and only then the END_OF_TRACK; a MOQ_ERR_WOULD_BLOCK on the way
+ * is retried by calling end_track again. MOQ_ERR_NOMEM means one of those
+ * last Objects could not be copied and is lost (the rest of its Group is
+ * discarded); the track is not ended yet, and calling end_track again queues
+ * the END_OF_TRACK. Bytes of an incomplete packet are discarded and counted
+ * (mpeg2ts_partial_bytes_discarded). On such a track end_track belongs to
+ * the track's writer thread, the one that calls write_mpeg2ts(): from any
+ * other thread, while a write_mpeg2ts() on the same track is in progress, it
+ * returns MOQ_ERR_WRONG_STATE, the same code as for a removed or converted
+ * track, so the two cannot be told apart there. */
 MOQ_API moq_result_t moq_media_sender_end_track(
     moq_media_sender_t *s, moq_media_track_t *track);
 
@@ -652,6 +823,54 @@ typedef struct moq_media_sender_stats {
 MOQ_API moq_result_t moq_media_sender_get_stats(
     const moq_media_sender_t *s, moq_media_sender_stats_t *out,
     size_t out_size);
+
+/* -- Per-track stats --------------------------------------------------- *
+ * The generic counters are the per-track slice of the sender-wide stats
+ * above, with the same meanings: summed over every track they equal the
+ * sender-wide values, and objects_written == objects_sent + objects_queued +
+ * objects_dropped holds per track. The mpeg2ts_ counters follow, zero for a
+ * track of any other packaging; the packetizer ones (groups through
+ * source_pcr_discontinuities) are counted only in byte-stream mode. */
+typedef struct moq_media_sender_track_stats {
+    uint32_t struct_size;
+    uint64_t objects_written;
+    uint64_t objects_sent;
+    uint64_t objects_queued;
+    uint64_t objects_dropped;
+    uint64_t bytes_queued;
+    uint64_t groups_dropped;
+    uint64_t keyframes_dropped;
+    uint64_t groups_abandoned;
+    /* MPEG2TS. */
+    uint64_t mpeg2ts_groups;              /* Groups the packetizer opened */
+    uint64_t mpeg2ts_objects;             /* Objects the packetizer emitted */
+    uint64_t mpeg2ts_packets_in;          /* source packets it was given */
+    uint64_t mpeg2ts_packets_dropped_before_random_access;
+    uint64_t mpeg2ts_max_group_27mhz;     /* longest Group, PCR time */
+    uint64_t mpeg2ts_groups_over_2s;      /* Groups longer than 2 s */
+    uint64_t mpeg2ts_peak_rate_bps;       /* peak rate between PCRs */
+    uint64_t mpeg2ts_source_pcr_discontinuities;
+    /* The record declares mpeg2tsMuxRate below mpeg2ts_peak_rate_bps (MSF
+     * does not let a published track's fields change, so the service only
+     * reports it). */
+    bool     mpeg2ts_mux_rate_below_peak;
+    /* The carried program left the PAT (per-program): MSFTS says the
+     * publisher SHOULD then end the track, which is left to the app. */
+    bool     mpeg2ts_program_gone;
+    uint64_t mpeg2ts_objects_parked;      /* Objects held now (0..2) */
+    uint64_t mpeg2ts_partial_bytes_discarded;
+    uint64_t mpeg2ts_continuation_objects_discarded;
+} moq_media_sender_track_stats_t;
+
+/* Snapshot one track's counters. Pass `out_size = sizeof(*out)`; same size
+ * contract as moq_media_sender_get_stats() (requires the first published
+ * size, writes min(out_size, current), stamps out->struct_size with the
+ * bytes written). MOQ_ERR_INVAL for NULL arguments, out_size below the first
+ * published size, or a track that is not one of this sender's media tracks.
+ * Callable from any thread. */
+MOQ_API moq_result_t moq_media_sender_get_track_stats(
+    const moq_media_sender_t *s, const moq_media_track_t *track,
+    moq_media_sender_track_stats_t *out, size_t out_size);
 
 /* -- Lifecycle (§5.5 ownership) --------------------------------------- */
 

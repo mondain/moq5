@@ -5,6 +5,9 @@
 #include <moq/rcbuf.h>
 #include <stddef.h>
 #include <string.h>
+#ifdef MOQ_MEDIA_OBJECT_HAVE_MPEG2TS
+#include <moq/mpeg2ts.h>
+#endif
 
 /* -- Init functions -------------------------------------------------- */
 
@@ -15,6 +18,11 @@
 #define TRACK_INFO_VERSION_SIZE \
     (offsetof(moq_media_track_info_t, transport_version) + \
      sizeof(((moq_media_track_info_t *)0)->transport_version))
+
+_Static_assert(MOQ_MEDIA_OBJECT_PARSE_CFG_V0_SIZE == 8,
+               "config floor through companion_profile must remain eight bytes");
+_Static_assert(MOQ_MEDIA_PARSED_OBJECT_V0_SIZE == sizeof(moq_media_parsed_object_t),
+               "parsed output floor must include original tail padding");
 
 /*
  * Which transport draft's integer codec this track's LOC properties are
@@ -121,19 +129,85 @@ static bool cmaf_sample_is_keyframe(uint32_t flags)
     return (flags == 0);
 }
 
+/* -- MPEG-2 TS ------------------------------------------------------- */
+
+#ifdef MOQ_MEDIA_OBJECT_HAVE_MPEG2TS
+/* 90 kHz ticks (below 2^33) to microseconds; exact for whole ticks. */
+static uint64_t ts90k_to_us(uint64_t t)
+{
+    return t / 9u * 100u + (t % 9u) * 100u / 9u;
+}
+
+static moq_result_t parse_mpeg2ts(const moq_media_track_info_t *track,
+                                  const moq_media_object_input_t *in,
+                                  uint32_t ps,
+                                  moq_media_parsed_object_t *out,
+                                  moq_media_drop_reason_t *drop_reason)
+{
+    moq_bytes_t payload = { moq_rcbuf_data(in->payload),
+                            moq_rcbuf_len(in->payload) };
+    if (!payload.data) payload.len = 0;
+
+    /* Object Payload Format: whole source packets only. */
+    moq_mpeg2ts_object_rules_t rules;
+    moq_mpeg2ts_object_rules_init(&rules);
+    rules.packet_size = ps;
+    moq_mpeg2ts_object_report_t rep;
+    moq_mpeg2ts_object_report_init(&rep);
+    if (moq_mpeg2ts_validate_object(&rules, payload, &rep, sizeof(rep)) != MOQ_OK) {
+        if (drop_reason) *drop_reason = MOQ_MEDIA_DROP_MALFORMED_MPEG2TS;
+        return MOQ_ERR_PROTO;
+    }
+
+    moq_mpeg2ts_inspect_cfg_t ip;
+    moq_mpeg2ts_inspect_cfg_init(&ip);
+    ip.packet_size = ps;
+    /* A video track's keyframe and timing come from the program's video
+     * stream: muxers commonly set random_access_indicator on every audio
+     * frame too. */
+    if (track->media_type == MOQ_MEDIA_TYPE_VIDEO) {
+        ip.random_access_pid = MOQ_MPEG2TS_PID_AUTO;
+        ip.timing_pid = MOQ_MPEG2TS_PID_AUTO;
+    }
+    moq_mpeg2ts_object_info_t info;
+    moq_mpeg2ts_object_info_init(&info);
+    if (moq_mpeg2ts_inspect_object(&ip, payload, &info, sizeof(info)) != MOQ_OK) {
+        if (drop_reason) *drop_reason = MOQ_MEDIA_DROP_MALFORMED_MPEG2TS;
+        return MOQ_ERR_PROTO;
+    }
+
+    out->payload = payload;
+    out->chunk_count = info.packet_count > UINT32_MAX
+                     ? UINT32_MAX : (uint32_t)info.packet_count;
+    out->sap_type = MOQ_SAP_UNKNOWN;
+    out->keyframe = track->media_type == MOQ_MEDIA_TYPE_AUDIO ||
+                    info.has_random_access;
+    if (info.has_pts) {
+        uint64_t dts = info.has_dts ? info.dts : info.pts;
+        out->track_id = info.timing_pid;
+        out->decode_time_us = ts90k_to_us(dts);
+        out->presentation_time_us = ts90k_to_us(info.pts);
+        out->composition_offset_us =
+            (int64_t)ts90k_to_us(moq_mpeg2ts_pts_delta(dts, info.pts));
+    }
+    return MOQ_OK;
+}
+#endif
+
 /* -- Parse ----------------------------------------------------------- */
 
 #define OBJECT_INPUT_MIN_SIZE \
     (offsetof(moq_media_object_input_t, properties) + \
      sizeof(((moq_media_object_input_t *)0)->properties))
 
-moq_result_t moq_media_object_parse(
+static moq_result_t media_object_parse_into(
     const moq_media_track_info_t *track,
     const moq_media_object_input_t *in,
     moq_cmaf_sample_t *samples,
     size_t sample_cap,
     moq_media_parsed_object_t *out,
-    moq_media_drop_reason_t *drop_reason)
+    moq_media_drop_reason_t *drop_reason,
+    uint32_t packet_size)
 {
     if (drop_reason) *drop_reason = 0;
     if (!track || !in || !out) return MOQ_ERR_INVAL;
@@ -151,9 +225,15 @@ moq_result_t moq_media_object_parse(
     if (track->media_type != MOQ_MEDIA_TYPE_VIDEO &&
         track->media_type != MOQ_MEDIA_TYPE_AUDIO)
         return MOQ_ERR_INVAL;
+    bool is_mpeg2ts = track->packaging == MOQ_MEDIA_PACKAGING_MPEG2TS;
     if (track->packaging != MOQ_MEDIA_PACKAGING_RAW &&
-        track->packaging != MOQ_MEDIA_PACKAGING_CMAF)
+        track->packaging != MOQ_MEDIA_PACKAGING_CMAF && !is_mpeg2ts)
         return MOQ_ERR_INVAL;
+    if (is_mpeg2ts && packet_size != 188 && packet_size != 192)
+        return MOQ_ERR_INVAL;
+#ifndef MOQ_MEDIA_OBJECT_HAVE_MPEG2TS
+    if (is_mpeg2ts) return MOQ_ERR_UNSUPPORTED;
+#endif
 
     if (in->status != MOQ_OBJECT_NORMAL &&
         in->status != MOQ_OBJECT_END_OF_GROUP &&
@@ -173,6 +253,11 @@ moq_result_t moq_media_object_parse(
 
     if (in->status != MOQ_OBJECT_NORMAL)
         return MOQ_OK;
+
+#ifdef MOQ_MEDIA_OBJECT_HAVE_MPEG2TS
+    if (is_mpeg2ts)
+        return parse_mpeg2ts(track, in, packet_size, out, drop_reason);
+#endif
 
     /* -- Parse LOC properties (both RAW and CMAF) -------------------- */
     moq_loc_headers_t loc;
@@ -340,6 +425,62 @@ moq_result_t moq_media_object_parse(
     out->mdat_len = frag.mdat.len;
 
     return MOQ_OK;
+}
+
+moq_result_t moq_media_object_parse(
+    const moq_media_track_info_t *track,
+    const moq_media_object_input_t *in,
+    moq_cmaf_sample_t *samples, size_t sample_cap,
+    moq_media_parsed_object_t *out, moq_media_drop_reason_t *drop_reason)
+{
+    return media_object_parse_into(track, in, samples, sample_cap, out,
+                                   drop_reason, 0);
+}
+
+moq_result_t moq_media_object_parse_sized(
+    const moq_media_track_info_t *track,
+    const moq_media_object_input_t *in,
+    const moq_media_object_parse_cfg_t *cfg,
+    moq_cmaf_sample_t *samples, size_t sample_cap,
+    moq_media_parsed_object_t *out, size_t out_size,
+    moq_media_drop_reason_t *drop_reason)
+{
+    if (!track || !in || !out || track->struct_size < TRACK_INFO_MIN_SIZE ||
+        in->struct_size < OBJECT_INPUT_MIN_SIZE ||
+        out_size < MOQ_MEDIA_PARSED_OBJECT_V0_SIZE)
+        return MOQ_ERR_INVAL;
+    if (cfg && cfg->struct_size < MOQ_MEDIA_OBJECT_PARSE_CFG_V0_SIZE)
+        return MOQ_ERR_INVAL;
+    uint32_t profile = cfg ? cfg->companion_profile :
+        MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01;
+    if (profile != MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01 &&
+        profile != MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC)
+        return MOQ_ERR_INVAL;
+    if (profile == MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC)
+        return MOQ_ERR_UNSUPPORTED;
+    moq_version_t version;
+    if (!track_transport_version(track, &version)) return MOQ_ERR_INVAL;
+#define PARSE_CFG_HAS(field) \
+    (cfg && cfg->struct_size >= offsetof(moq_media_object_parse_cfg_t, field) + \
+                               sizeof(cfg->field))
+    if (PARSE_CFG_HAS(track_loc_metadata) && cfg->track_loc_metadata)
+        return MOQ_ERR_UNSUPPORTED;
+    uint32_t packet_size = PARSE_CFG_HAS(mpeg2ts_packet_size) ?
+        cfg->mpeg2ts_packet_size : 0;
+#undef PARSE_CFG_HAS
+    if (track->packaging == MOQ_MEDIA_PACKAGING_MPEG2TS &&
+        packet_size != 188 && packet_size != 192)
+        return MOQ_ERR_INVAL;
+    moq_media_parsed_object_t tmp;
+    moq_media_parsed_object_init(&tmp);
+    moq_result_t rc = media_object_parse_into(track, in, samples, sample_cap,
+                                             &tmp, drop_reason, packet_size);
+    if (rc == MOQ_OK || rc == MOQ_ERR_BUFFER) {
+        size_t n = out_size < sizeof(tmp) ? out_size : sizeof(tmp);
+        tmp.struct_size = (uint32_t)n;
+        memcpy(out, &tmp, n);
+    }
+    return rc;
 }
 
 /* -- Subscriber input helper ----------------------------------------- */

@@ -18,6 +18,8 @@ static int failures = 0;
 
 /* Test seam (media_receiver.c, MOQ_MEDIA_RECEIVER_TESTING). */
 moq_media_receiver_t *moq_media_receiver_test_new(bool auto_subscribe);
+void moq_media_receiver_test_set_transport_version(moq_media_receiver_t *r,
+                                                   moq_version_t v);
 void moq_media_receiver_test_free(moq_media_receiver_t *r);
 void moq_media_receiver_test_ingest(moq_media_receiver_t *r, uint64_t group,
                                     uint64_t object, const char *json,
@@ -274,6 +276,9 @@ int main(void)
     /* -- 8. auto-subscribe seeds new tracks in any generation ---------- */
     {
         moq_media_receiver_t *r = moq_media_receiver_test_new(true);
+        /* Auto-subscribe takes tracks whose info derived, which needs the
+         * session's draft. */
+        moq_media_receiver_test_set_transport_version(r, MOQ_VERSION_DRAFT_16);
         ingest(r, 0, 0, "{\"version\":\"1\",\"tracks\":[" TRK("a", "video") "]}");
         n = drain(r, k, tr, 16);
         moq_media_track_t *a = NULL;
@@ -370,6 +375,7 @@ int main(void)
             "{\"name\":\"m\",\"packaging\":\"loc\",\"isLive\":true,\"role\":\"video\"},"
             "{\"name\":\"x\",\"namespace\":\"other\",\"packaging\":\"loc\",\"isLive\":true,\"role\":\"video\"}]}";
         moq_media_receiver_t *r = moq_media_receiver_test_new(true);  /* auto */
+        moq_media_receiver_test_set_transport_version(r, MOQ_VERSION_DRAFT_16);
         ingest(r, 0, 0, g0);
         n = drain(r, k, tr, 16);
         moq_media_track_t *m = NULL, *x = NULL;

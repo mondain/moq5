@@ -463,7 +463,12 @@ typedef struct moq_pub_object_cfg {
     bool                has_status;      /* datagram only */
     moq_object_status_t status;         /* NORMAL, END_OF_GROUP, or END_OF_TRACK */
     uint8_t             _reserved_obj[5];
-    bool                end_of_group;   /* stream: set END_OF_GROUP in subgroup header */
+    /* Stream: the END_OF_GROUP bit of the subgroup header, which says the
+     * subgroup holds the Group's largest Object (drafts 16 and 18). It is
+     * fixed when the subgroup opens, so every Object written into one
+     * subgroup carries the same value: a publisher that puts a whole Group in
+     * one subgroup sets it on every Object of the Group. */
+    bool                end_of_group;
 } moq_pub_object_cfg_t;
 
 /* Pointer-only initializer: clears/stamps ONLY the frozen v0 prefix (through
@@ -473,7 +478,19 @@ MOQ_API void moq_pub_object_cfg_init(moq_pub_object_cfg_t *cfg);
 MOQ_API void moq_pub_object_cfg_init_sized(moq_pub_object_cfg_t *cfg,
                                            size_t cfg_size);
 
-/* Fan-out ownership and retry contract (write_object[_ex], begin_object,
+/* Subgroup header contract (write_object[_ex], begin_object): the header a
+ * destination sent when it opened the subgroup for a Group fixes two things
+ * for every later object of that Group on that destination (drafts 16 and
+ * 18). end_of_group must equal the header's END_OF_GROUP bit. Properties are
+ * asymmetric: an object with properties needs a header with the properties
+ * field, while an object without them (NULL) fits either header -- under a
+ * header with the field it is written with an empty list. An object that does
+ * not fit is refused with MOQ_ERR_WRONG_STATE before anything is committed;
+ * no operation is left pending, and the same object written to fit can be
+ * written next. A new Group opens new subgroups with the header its first
+ * object asks for.
+ *
+ * Fan-out ownership and retry contract (write_object[_ex], begin_object,
  * write_data, end_object, end_group, end_track):
  *
  * Writes fan out to every eligible destination: each accepted subscription

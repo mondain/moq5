@@ -12,6 +12,21 @@
 #include <moq/publisher.h>
 
 #include <cstddef>
+#include <cstdint>
+#include <type_traits>
+
+/* Open kind sets remain fixed-width across C and C++ consumers. */
+static_assert(std::is_same<moq_media_packaging_t, uint32_t>::value,
+              "packaging is uint32_t");
+static_assert(std::is_same<moq_media_drop_reason_t, uint32_t>::value,
+              "drop reason is uint32_t");
+static_assert(std::is_same<moq_msf_ext_kind_t, uint32_t>::value,
+              "extension kind is uint32_t");
+static_assert(MOQ_MEDIA_PACKAGING_RAW == 1u && MOQ_MEDIA_PACKAGING_CMAF == 2u &&
+              MOQ_MEDIA_PACKAGING_MPEG2TS == 3u, "packaging values");
+static_assert(MOQ_MEDIA_DROP_MALFORMED_LOC == 1u &&
+              MOQ_MEDIA_DROP_KEYFRAME_WAIT == 7u &&
+              MOQ_MEDIA_DROP_MALFORMED_MPEG2TS == 8u, "drop reason values");
 
 static moq_tls_certificate_verdict_t consumerVerifyCertificate(
     void *ctx, moq_bytes_t serverName,
@@ -53,8 +68,44 @@ int main()
 
     moq_media_receiver_cfg_t rcfg;
     moq_media_receiver_cfg_init_live(&rcfg);
-    if (rcfg.struct_size != sizeof(moq_media_receiver_cfg_t))
+    if (rcfg.struct_size != MOQ_MEDIA_RECEIVER_CFG_V0_SIZE)
         return 2;
+    moq_media_receiver_cfg_init_live_sized(&rcfg, sizeof(rcfg));
+    if (rcfg.struct_size != sizeof(rcfg) ||
+        rcfg.overflow.policy != MOQ_MEDIA_OVERFLOW_DROP_TO_KEYFRAME)
+        return 2;
+    rcfg.mpeg2ts_reorder_slots = 32;
+    rcfg.mpeg2ts_reorder_window_us = 200000;
+    rcfg.mpeg2ts_strip_prefix = true;
+    rcfg.mpeg2ts_join_psi = true;
+    moq_media_receiver_cfg_init_sized(&rcfg, sizeof(rcfg));
+    moq_media_receiver_cfg_init_flow_control_sized(&rcfg, sizeof(rcfg));
+    if (rcfg.mpeg2ts_strip_prefix)
+        return 2;
+
+    moq_media_receiver_track_subscribe_cfg_t sub;
+    moq_media_receiver_track_subscribe_cfg_init(&sub);
+    if (sub.struct_size != MOQ_MEDIA_RECEIVER_TRACK_SUBSCRIBE_CFG_V0_SIZE)
+        return 12;
+    moq_media_receiver_track_subscribe_cfg_init_sized(&sub, sizeof(sub));
+    if (sub.struct_size != sizeof(sub) || sub.mpeg2ts_program_number != 0)
+        return 12;
+    sub.mpeg2ts_program_number = 1;
+
+    moq_media_track_desc_t desc = {};
+    if (moq_msf_ext_mpeg2ts(desc.extensions, desc.extension_count) != nullptr ||
+        desc.has_alt_group)
+        return 13;
+    moq_media_object_t obj = {};
+    if (obj.has_loss_report || obj.gap || obj.gap_tail_unknown ||
+        obj.gap_duration_known || obj.discontinuous ||
+        obj.gap_group != 0 || obj.gap_object != 0 ||
+        obj.gap_duration_27mhz != 0)
+        return 14;
+    moq_media_receiver_stats_t rst = {};
+    if (rst.gaps_reported != 0 || rst.gap_tails_unknown != 0 ||
+        rst.reorder_refused != 0)
+        return 15;
 
     /* Pointer-only sender preset: stamps the FROZEN v0 prefix (a non-zero
      * prefix of the current struct, never more). */
@@ -99,6 +150,39 @@ int main()
     moq_media_track_cfg_init(&tc);
     if (tc.struct_size != sizeof(moq_media_track_cfg_t))
         return 9;
+    moq_msf_mpeg2ts_t rec;
+    moq_msf_mpeg2ts_init(&rec);
+    rec.has_mode = true;
+    rec.mode = MOQ_MSF_MPEG2TS_MODE_UNMODIFIED_PROGRAM;
+    rec.has_packet_size = true;
+    rec.packet_size = 188;
+    moq_msf_track_ext_t ext = {};
+    ext.kind = MOQ_MSF_EXT_MPEG2TS;
+    ext.u.mpeg2ts = &rec;
+    tc.packaging = MOQ_MEDIA_PACKAGING_MPEG2TS;
+    tc.extensions = &ext;
+    tc.extension_count = 1;
+    tc.mpeg2ts_app_objects = false;
+    tc.mpeg2ts_object_packets = 7;
+    tc.mpeg2ts_min_group_ms = 0;
+    tc.mpeg2ts_forward_before_random_access = false;
+    if (moq_msf_ext_mpeg2ts(tc.extensions, tc.extension_count) != &rec)
+        return 9;
+
+    static const uint8_t pkt[188] = { 0x47 };
+    moq_media_send_mpeg2ts_t ts_in = {};
+    ts_in.struct_size = sizeof(ts_in);
+    ts_in.data.data = pkt;
+    ts_in.data.len = sizeof(pkt);
+    ts_in.end_object = true;
+    size_t consumed = 99;
+    if (moq_media_sender_write_mpeg2ts(nullptr, nullptr, &ts_in, &consumed) !=
+            MOQ_ERR_INVAL || consumed != 0)
+        return 16;
+    moq_media_sender_track_stats_t tst = {};
+    if (moq_media_sender_get_track_stats(nullptr, nullptr, &tst, sizeof(tst)) !=
+        MOQ_ERR_INVAL)
+        return 17;
 
     return 0;
 }

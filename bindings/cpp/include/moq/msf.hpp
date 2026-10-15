@@ -110,6 +110,12 @@ struct track_view {
     /// MSF-01 5.2.33/5.2.34 -- present only on a delta "clone" op track object.
     std::optional<std::string_view> parent_name;
     std::optional<std::string_view> parent_namespace;
+
+    /// draft-gregoire-moq-msfts record, read through moq_msf_track_mpeg2ts:
+    /// nullptr unless the track carries an mpeg2ts* key. Borrows from the
+    /// owning parsed_catalog. Every key is gated by its has_* flag. Check an
+    /// mpeg2ts track with parsed_catalog::mpeg2ts_check before using it.
+    const moq_msf_mpeg2ts_t *mpeg2ts = nullptr;
 };
 
 struct init_data_view {
@@ -229,6 +235,7 @@ inline track_view view_from(const moq_msf_track_t &t) {
     }
     if (t.has_parent_name)      v.parent_name      = sv(t.parent_name);
     if (t.has_parent_namespace) v.parent_namespace = sv(t.parent_namespace);
+    v.mpeg2ts = moq_msf_track_mpeg2ts(&t);
     return v;
 }
 
@@ -294,6 +301,15 @@ public:
 
     track_view track(size_t i) const {
         return detail::view_from(cat_.tracks[i]);
+    }
+
+    /// The subscriber's check of track i as an mpeg2ts track
+    /// (draft-gregoire-moq-msfts): MOQ_MSF_MPEG2TS_OK, or why the track must
+    /// be rejected. MOQ_MSF_MPEG2TS_ERR_NOT_MPEG2TS for another packaging.
+    moq_msf_mpeg2ts_error_t mpeg2ts_check(size_t i) const {
+        moq_msf_mpeg2ts_error_t why = MOQ_MSF_MPEG2TS_OK;
+        (void)moq_msf_track_mpeg2ts_check(&cat_.tracks[i], &why);
+        return why;
     }
 
     std::optional<track_view> find_role(std::string_view role) const {
@@ -470,6 +486,12 @@ struct track {
     bool       has_is_live        = false;
     bool       has_parent_name    = false;  bytes_view parent_name;
     bool       has_parent_namespace = false;  bytes_view parent_namespace;
+
+    // draft-gregoire-moq-msfts fields for an "mpeg2ts" track, handed to the
+    // C track as its MOQ_MSF_EXT_MPEG2TS extension (struct_size is stamped
+    // there). si_pids is borrowed and must outlive encode(); mode_name and
+    // timestamp_mode_name are ignored on encode for recognized values.
+    std::optional<moq_msf_mpeg2ts_t> mpeg2ts;
 };
 
 // MSF-01 5.1.7 root Initialization Data List entry (authoring; borrowed views).
@@ -589,6 +611,21 @@ inline void fill_c_track_(detail::encode_arena &arena, moq_msf_track_t &d,
     if (s.has_is_live)   d.has_is_live   = true;
     if (s.has_parent_name)      { d.has_parent_name = true;      d.parent_name = s.parent_name.raw(); }
     if (s.has_parent_namespace) { d.has_parent_namespace = true; d.parent_namespace = s.parent_namespace.raw(); }
+    if (s.mpeg2ts) {
+        // One extension entry and its record, owned by the encode arena. On
+        // allocation failure the arena latches failed(), which encode()
+        // checks before calling moq_msf_catalog_encode.
+        auto *rec = arena.calloc_n<moq_msf_mpeg2ts_t>(1);
+        auto *ext = arena.calloc_n<moq_msf_track_ext_t>(1);
+        if (rec && ext) {
+            *rec = *s.mpeg2ts;
+            rec->struct_size = sizeof(moq_msf_mpeg2ts_t);
+            ext->kind = MOQ_MSF_EXT_MPEG2TS;
+            ext->u.mpeg2ts = rec;
+            d.extensions = ext;
+            d.extension_count = 1;
+        }
+    }
     // Borrowed arrays -> arena-owned moq_bytes_t arrays. On allocation failure
     // dup_bytes_array leaves the field NULL/0 and latches arena.failed(), which
     // encode() checks before calling moq_msf_catalog_encode.

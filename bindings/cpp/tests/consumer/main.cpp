@@ -1,4 +1,7 @@
 #include <moq/moq.hpp>
+#if __has_include(<moq/mpeg2ts.h>)
+#include <moq/mpeg2ts.h>
+#endif
 
 #include <cstdint>
 #include <cstdio>
@@ -323,6 +326,34 @@ int main()
         CHECK(dflt.ok(), 87);
         CHECK(dflt->version() == MOQ_VERSION_DRAFT_16, 88);
     }
+
+#if __has_include(<moq/mpeg2ts.h>)
+    // -- MPEG-2 TS helpers through the installed C API: the caller-size
+    //    initializer macros and the sized outputs. ------------------------
+    {
+        moq_mpeg2ts_object_rules_t rules;
+        moq_mpeg2ts_object_rules_init(&rules);
+        CHECK(rules.struct_size == sizeof(rules), 90);
+        uint8_t pkt[188] = {};
+        pkt[0] = 0x47;
+        pkt[3] = 0x10;
+        moq_mpeg2ts_object_report_t rep;
+        CHECK(moq_mpeg2ts_validate_object(&rules, moq_bytes_t{pkt, 188}, &rep,
+                                          sizeof(rep)) == MOQ_OK, 91);
+        CHECK(rep.struct_size == sizeof(rep) && rep.reason == MOQ_MPEG2TS_OK, 92);
+        CHECK(moq_mpeg2ts_validate_object(
+                  &rules, moq_bytes_t{pkt, 188}, &rep,
+                  MOQ_MPEG2TS_OBJECT_REPORT_V0_SIZE - 1) == MOQ_ERR_INVAL, 93);
+        moq_mpeg2ts_receiver_cfg_t rc;
+        moq_mpeg2ts_receiver_cfg_init(&rc);
+        static moq_mpeg2ts_receiver_t rx;
+        CHECK(moq_mpeg2ts_receiver_init(&rx, sizeof(rx), &rc) == MOQ_OK, 94);
+        moq_mpeg2ts_receive_result_t res;
+        CHECK(moq_mpeg2ts_receiver_push(&rx, 0, 0, 0, moq_bytes_t{pkt, 188},
+                                        &res, sizeof(res)) == MOQ_OK, 95);
+        CHECK(res.struct_size == sizeof(res) && res.accepted, 96);
+    }
+#endif
 
     std::printf("PASS: moq_consumer_test\n");
     return 0;

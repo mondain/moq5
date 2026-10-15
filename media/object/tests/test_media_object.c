@@ -654,6 +654,18 @@ int main(void)
         moq_media_parsed_object_t po;
         CHECK(moq_media_object_parse(&ti, &oi, samples, 1, &po, NULL) == MOQ_ERR_BUFFER);
         CHECK(po.sample_count == 3);
+        /* Sized legacy parser preserves BUFFER's required-count contract. */
+        memset(&po, 0xA5, sizeof(po));
+        moq_media_drop_reason_t sized_why = 99;
+        CHECK(moq_media_object_parse_sized(&ti, &oi, NULL, samples, 1,
+              &po, MOQ_MEDIA_PARSED_OBJECT_V0_SIZE - 1, &sized_why) == MOQ_ERR_INVAL);
+        CHECK(sized_why == 99);
+        for (size_t j = 0; j < sizeof(po); j++)
+            CHECK(((const unsigned char *)&po)[j] == 0xA5);
+        CHECK(moq_media_object_parse_sized(&ti, &oi, NULL, samples, 1,
+              &po, sizeof(po), &sized_why) == MOQ_ERR_BUFFER);
+        CHECK(po.sample_count == 3 && po.struct_size == sizeof(po));
+        CHECK(sized_why == 0);
 
         moq_rcbuf_decref(payload);
     }

@@ -98,14 +98,21 @@ typedef struct moq_sub_cfg {
      * update. Uses callbacks.ctx. */
     void (*on_update_ok)(void *ctx, moq_sub_track_t *track,
                          const moq_sub_update_result_t *result);
+    /* Never read: protects the old tail padding on 32-bit ABIs with
+     * eight-byte uint64_t alignment. */
+    uint32_t _reserved_group_ends;
+    /* Appended after on_update_ok: queue a moq_sub_group_end_t for every
+     * subgroup that ends with a FIN and whose header carried END_OF_GROUP,
+     * for moq_sub_poll_group_end(). false (the default) queues none. */
+    bool surface_group_ends;
 } moq_sub_cfg_t;
 
 /* Pointer-only initializer. Clears and stamps ONLY the frozen v0 prefix (the
  * layout before the first appended field). It cannot know the caller's storage
  * size, so it must not write the full current sizeof -- that would overflow a
  * caller compiled against the original (smaller) struct. Appended fields
- * (on_goaway, on_subscribe_done, max_queued_object_bytes, on_update_ok)
- * default to disabled;
+ * (on_goaway, on_subscribe_done, max_queued_object_bytes, on_update_ok,
+ * surface_group_ends) default to disabled;
  * to set any of them, or to initialize the full current struct, use
  * moq_sub_cfg_init_sized(). */
 MOQ_API void moq_sub_cfg_init(moq_sub_cfg_t *cfg);
@@ -169,7 +176,10 @@ MOQ_API moq_result_t moq_sub_unsubscribe(
  * SUBSCRIBE_DONE / on_subscribe_done, or a subscribe error); a still-live
  * (PENDING/ACTIVE) track must be torn down with moq_sub_unsubscribe() first and
  * returns MOQ_ERR_WRONG_STATE here. The track handle MUST NOT be used after
- * release. No session message is sent (the subscription is already complete). */
+ * release. No session message is sent (the subscription is already complete).
+ * Release does not purge the queues: records already queued for the track
+ * (objects, chunks, Group ends) keep its handle, which a later subscribe may
+ * reuse, so poll them before releasing the track. */
 MOQ_API moq_result_t moq_sub_release_track(
     moq_subscriber_t *sub,
     moq_sub_track_t *track);
@@ -251,6 +261,38 @@ MOQ_API moq_result_t moq_sub_poll_object(
     moq_sub_object_t *out);
 
 MOQ_API void moq_sub_object_cleanup(moq_sub_object_t *obj);
+
+/* -- Group ends --------------------------------------------------- */
+
+/* The end of a Group on a subscription: a subgroup whose header carried the
+ * END_OF_GROUP bit ended with a FIN, so the last Object the subgroup carried
+ * is the Group's largest (drafts 16 and 18). A subgroup that is reset, or
+ * that ends with a FIN but without the bit, says nothing about where its
+ * Group ends and produces no record. Plain values; nothing to clean up. */
+typedef struct moq_sub_group_end {
+    moq_sub_track_t *track;
+    uint64_t         group_id;
+    uint64_t         subgroup_id;
+} moq_sub_group_end_t;
+
+/*
+ * Poll the next Group end. Group ends are queued only when
+ * moq_sub_cfg_t.surface_group_ends is set, and only for an active track.
+ *
+ * Ordering: a Group end is queued in session event order, behind the objects
+ * of its subgroup, and becomes pollable only once every object and chunk the
+ * facade queued before it has been returned by moq_sub_poll_object() or
+ * moq_sub_poll_chunk(). So when this returns a Group end, every object of
+ * that subgroup the facade received has already been handed to the caller.
+ * A caller that enables the option polls this queue too: like the object
+ * queue, a full Group-end queue holds moq_sub_tick() at MOQ_ERR_WOULD_BLOCK.
+ *
+ * Returns MOQ_OK and fills out, MOQ_DONE when no Group end is pollable, and
+ * MOQ_ERR_INVAL for a NULL argument.
+ */
+MOQ_API moq_result_t moq_sub_poll_group_end(
+    moq_subscriber_t *sub,
+    moq_sub_group_end_t *out);
 
 /* -- Stats ----------------------------------------------------------- */
 

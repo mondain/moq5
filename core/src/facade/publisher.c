@@ -441,6 +441,29 @@ static bool window_admits_group(const moq_resolved_window_t *w,
     return true;
 }
 
+/* Subgroup header admission for a new stream object operation. The
+ * END_OF_GROUP bit and the presence of object properties are fields of the
+ * subgroup header Type (drafts 16 and 18), fixed when the subgroup opens. A
+ * destination this operation would serve that already has the object's
+ * Group open must be able to carry the object under the header it sent;
+ * otherwise the operation is refused before it is committed, so nothing is
+ * left pending. */
+static bool track_header_admits(const moq_pub_track_t *t, uint64_t group_id,
+                                uint64_t object_id, bool need_ext,
+                                bool check_eog, bool want_eog)
+{
+    for (size_t i = 0; i < t->slot_cap; i++) {
+        const pub_sub_slot_t *sl = &t->slots[i];
+        if (!slot_eligible(t, sl) ||
+            !window_admits(&sl->window, group_id, object_id))
+            continue;
+        if (!sl->sg_open || sl->cur_group != group_id) continue;
+        if (need_ext && !sl->sg_has_extensions) return false;
+        if (check_eog && want_eog != sl->sg_end_of_group) return false;
+    }
+    return true;
+}
+
 /* Install (or clear) a slot's window from the session's resolved copy --
  * ALWAYS by value; the session entry is mutable and its pointer must not be
  * retained. A NULL accessor result (no filter negotiated / stale) means
@@ -2126,6 +2149,12 @@ moq_result_t moq_pub_write_object_ex(moq_publisher_t *pub,
             if (track->has_eog && obj->group_id <= track->eog_high)
                 return MOQ_ERR_WRONG_STATE;
         }
+        /* The object must fit the header of a subgroup already open for
+         * its Group. */
+        if (!obj->datagram &&
+            !track_header_admits(track, obj->group_id, obj->object_id,
+                                 obj->properties != NULL, true, want_eog))
+            return MOQ_ERR_WRONG_STATE;
     }
     /* Drain any Forward-0 retires (retryable). */
     {
@@ -2556,6 +2585,10 @@ static moq_result_t begin_object_impl(moq_publisher_t *pub,
             if (track->has_eog && cfg->group_id <= track->eog_high)
                 return MOQ_ERR_WRONG_STATE;
         }
+        /* Properties need a subgroup opened with them. */
+        if (!track_header_admits(track, cfg->group_id, cfg->object_id,
+                                 begin_props != NULL, false, false))
+            return MOQ_ERR_WRONG_STATE;
     }
     {
         moq_result_t rr = track_run_retires(pub, track, now_us);

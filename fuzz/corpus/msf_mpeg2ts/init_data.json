@@ -1,0 +1,28 @@
+{
+  "version": "draft-01",
+  "generatedAt": 1746104606044,
+  "tracks": [
+    {
+      "name": "program-1",
+      "namespace": "live.example.com/channel/1",
+      "packaging": "mpeg2ts",
+      "mpeg2tsMode": "per-program",
+      "isLive": true,
+      "targetLatency": 1000,
+      "role": "video",
+      "mimeType": "video/mp2t",
+      "bitrate": 6000000,
+      "initRef": "program-1-psi",
+      "mpeg2tsPacketSize": 188,
+      "mpeg2tsProgramNumber": 1,
+      "mpeg2tsPcrPid": 257
+    }
+  ],
+  "initDataList": [
+    {
+      "id": "program-1-psi",
+      "type": "inline",
+      "data": "R0AAEAAAsA0AAcEAAAAB4QDo+V59////..."
+    }
+  ]
+}

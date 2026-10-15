@@ -31,6 +31,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#include <time.h>
 
 static int failures = 0;
 
@@ -66,6 +67,16 @@ void moq_media_sender_test_pump(moq_media_sender_t *s,
                                 moq_session_t *session, uint64_t now_us);
 void moq_media_sender_test_free(moq_media_sender_t *s);
 uint32_t moq_media_sender_test_reset_attempts(const moq_media_sender_t *s);
+bool moq_media_sender_test_queue_entry(moq_media_sender_t *s, size_t i,
+                                       const moq_media_track_t **track,
+                                       const moq_rcbuf_t **payload,
+                                       uint64_t *group, bool *starts_group);
+bool moq_media_sender_test_emit_head(moq_media_sender_t *s,
+                                     moq_rcbuf_t **payload);
+void moq_media_sender_test_set_cond_wait_hook(
+    int (*fn)(const struct timespec *, void *), void *ctx);
+void moq_media_sender_test_drop_track_locked(moq_media_sender_t *s,
+                                             moq_media_track_t *t);
 
 /* -- Trace ------------------------------------------------------------- *
  * One record per object the PEER actually received, in arrival order, tagged
@@ -2901,9 +2912,10 @@ out:
 
 /* ===================================================================== *
  *  Distinct-group accounting is CUMULATIVE, not per drain pass.
- *  Two objects of the SAME still-open group, dropped in SEPARATE hooks, are
- *  two object discards but ONE dropped group. The group identity is asserted
- *  unchanged across the pass boundary.
+ *  Two objects of the SAME group, dropped in SEPARATE hooks, are two object
+ *  discards but ONE dropped group. Both are queued before the first hook; a
+ *  shared-capacity refusal on the demanded track stops that hook between
+ *  them, so the second is discarded only by the next hook.
  * ===================================================================== */
 static void test_drop_group_across_passes(void)
 {
@@ -2912,7 +2924,9 @@ static void test_drop_group_across_passes(void)
     moq_alloc_t alloc = test_allocator(&as);
     fix_t fix;
     uint64_t now = 1000;
-    if (!fix_init(&fix, &alloc, 0, true /* drop_without_demand */, now)) {
+    /* drop_without_demand, and the constrained action ring that lets one
+     * new-group emission out per hook. */
+    if (!fix_init(&fix, &alloc, 4, true /* drop_without_demand */, now)) {
         failures++; goto out;
     }
     /* Audio demanded so the pass has real work; video undemanded so its media
@@ -2921,16 +2935,21 @@ static void test_drop_group_across_passes(void)
     set_phase(&fix, PHASE_PACE);
     MOQ_TEST_CHECK(!moq_media_sender_track_has_subscriber(fix.s, fix.t[0]));
 
-    /* PASS 1: open video group 0 with a sync anchor and do NOT end it. */
-    MOQ_TEST_CHECK(write_obj(&fix, 0, 0x30, true, true, 1000) == MOQ_OK);
-    MOQ_TEST_CHECK(write_obj(&fix, 1, 0x31, true, true, 2000) == MOQ_OK);
-    const tr_exp_t audio1[1] = { { 1, 0, 0, 0x31, 1 } };
+    /* Queue order: audio g0, video g0 anchor, audio g1, video g0 delta. */
+    MOQ_TEST_CHECK(write_obj(&fix, 1, 0x30, true, true, 1000) == MOQ_OK);
+    MOQ_TEST_CHECK(write_obj(&fix, 0, 0x31, true, true, 1500) == MOQ_OK);
+    MOQ_TEST_CHECK(write_obj(&fix, 1, 0x32, true, true, 2000) == MOQ_OK);
+    MOQ_TEST_CHECK(write_obj(&fix, 0, 0x33, false, false, 2500) == MOQ_OK);
+
+    /* PASS 1: audio g0 leaves, the video anchor is discarded, audio g1 is
+     * refused by shared capacity, and the video delta stays queued. */
+    const tr_exp_t audio1[1] = { { 1, 0, 0, 0x30, 0 } };
     int from = fix.tr.n;
     int pass1 = fix.pass;
     drive(&fix, now);
     MOQ_TEST_CHECK_EQ_INT(fix.pass, pass1 + 1);
     expect_from(&fix, from, audio1, 1, "xpass-audio1");
-    expect_conserved(fix.s, 2, 1, 0, 1, 0, "xpass-stats1");
+    expect_conserved(fix.s, 4, 1, 2, 1, 2 * PAYLOAD_LEN, "xpass-stats1");
     {
         moq_media_sender_stats_t st; memset(&st, 0, sizeof(st));
         MOQ_TEST_CHECK(moq_media_sender_get_stats(fix.s, &st, sizeof(st)) == MOQ_OK);
@@ -2939,11 +2958,9 @@ static void test_drop_group_across_passes(void)
         MOQ_TEST_CHECK_EQ_U64(st.groups_dropped, 1);
     }
 
-    /* PASS 2, a SEPARATE hook: a second object of the SAME group (it never
-     * ended, and this write neither starts nor ends a group). */
-    MOQ_TEST_CHECK(write_obj(&fix, 0, 0x32, false, false, 3000) == MOQ_OK);
-    MOQ_TEST_CHECK(write_obj(&fix, 1, 0x33, true, true, 4000) == MOQ_OK);
-    const tr_exp_t audio2[1] = { { 1, 1, 0, 0x33, 3 } };
+    /* PASS 2, a SEPARATE hook: audio g1 leaves and the queued video delta of
+     * the SAME group 0 is discarded. */
+    const tr_exp_t audio2[1] = { { 1, 1, 0, 0x32, 2 } };
     int from2 = fix.tr.n;
     int pass2 = fix.pass;
     drive(&fix, now);
@@ -2966,9 +2983,6 @@ static void test_drop_group_across_passes(void)
         const term_exp_t terms[1] = { { 1, 0, 0, true, true } };
         expect_terminals(&fix, terms, 1, "xpass-terminals");
     }
-    /* The group identity really was unchanged: the second audio object opened
-     * audio group 1 while the video objects both belonged to video group 0,
-     * which the declared trace above pins. */
 
 out:
     fix_free(&fix);
@@ -3049,8 +3063,8 @@ out:
  *  whose sync anchor has already been EMITTED (so the group and its wire
  *  subgroup are open, and no anchor of that group is queued any more), then a
  *  delta of that same group queued and EVICTED by capacity pressure from the
- *  other track -- which also arms the service's pending_reset -- then a SECOND
- *  delta of the SAME still-open group queued for a later discard.
+ *  other track -- which also arms the service's pending_reset and closes the
+ *  group for writes, so a SECOND delta of it is refused.
  *
  *  Returns false and reports if any step of the geometry did not actually
  *  happen, so neither row can pass or fail vacuously.
@@ -3110,14 +3124,11 @@ static bool evict_geometry(fix_t *fix, uint64_t now)
     if (after_ev.dropped != 1) return false;
     expect_conserved(fix->s, 4, 1, 2, 1, 2 * PAYLOAD_LEN, "evx-after-eviction");
 
-    /* 4. Drain the audio pressure so step 5 needs no further eviction.
-     *    The two "open" facts are different and only one survives this drive:
-     *    the video APP-LEVEL group 0 is still open (no later group has been
-     *    written, so a further delta still belongs to it), while the WIRE
-     *    subgroup it was emitted on is driven through RESET by the post-pass
-     *    sweep -- the sender's general no-entry discharge, which needs no
-     *    queued video entry to hang off. The obligation is therefore
-     *    DISCHARGED here, not carried untouched into step 5. */
+    /* 4. Drain the audio pressure so step 5 needs no further eviction. The
+     *    WIRE subgroup video group 0 was emitted on is driven through RESET by
+     *    the post-pass sweep, which needs no queued video entry to hang off.
+     *    The obligation is therefore DISCHARGED here, not carried untouched
+     *    into step 5. */
     const tr_exp_t audio[2] = { { 1, 0, 0, 0x52, 2 }, { 1, 1, 0, 0x53, 3 } };
     int froma = fix->tr.n;
     drive(fix, now);
@@ -3125,10 +3136,11 @@ static bool evict_geometry(fix_t *fix, uint64_t now)
     expect_conserved(fix->s, 4, 3, 0, 1, 0, "evx-audio-stats");
     if (fix->tr.n - froma != 2) return false;
 
-    /* 5. A SECOND video delta in the SAME still-open group 0, for a later
-     *    discard through a different path. */
-    if (write_obj(fix, 0, 0x54, false, false, 5000) != MOQ_OK) return false;
-    expect_conserved(fix->s, 5, 3, 1, 1, PAYLOAD_LEN, "evx-delta2-queued");
+    /* 5. Group 0 lost queued media, so a SECOND video delta of it is
+     *    refused, taking nothing. */
+    if (write_obj(fix, 0, 0x54, false, false, 5000) != MOQ_ERR_WOULD_BLOCK)
+        return false;
+    expect_conserved(fix->s, 4, 3, 0, 1, 0, "evx-delta2-refused");
     return true;
 }
 
@@ -3179,8 +3191,18 @@ static bool evict_geometry_noflush(fix_t *fix, uint64_t now)
     return true;
 }
 
-/* Eviction: cross-path cumulative group identity. */
-static void test_evict_crosspath_group(void)
+/* ===================================================================== *
+ *  An open Group that lost queued media is closed for writes.
+ *
+ *  Video group 0's sync anchor is emitted, so the group and its wire subgroup
+ *  are open with no anchor of it left in the queue; a delta of it is then
+ *  evicted by pressure from the other track, and the wire subgroup is reset.
+ *  A further delta for that group can no longer be delivered as a
+ *  continuation of it: it is refused with WOULD_BLOCK and no ownership taken,
+ *  no Location of group 0 is emitted a second time, and the next sync point
+ *  opens group 1 at object 0.
+ * ===================================================================== */
+static void test_evicted_open_group_closed(void)
 {
     int before = failures;
     test_alloc_state_t as = {0};
@@ -3189,41 +3211,238 @@ static void test_evict_crosspath_group(void)
     uint64_t now = 1000;
     enum { QCAP = 2 };
     if (!fix_init_drop(&fix, &alloc, now, QCAP)) { failures++; goto out; }
-    if (!evict_geometry(&fix, now)) { failures++; goto out; }
+    if (!subscribe_track(&fix, 0, "v", now)) { failures++; goto out; }
+    if (!subscribe_track(&fix, 1, "a", now)) { failures++; goto out; }
+    set_phase(&fix, PHASE_PACE);
 
-    /* Discard the second delta through an INDEPENDENT public path. */
+    /* 1. The anchor of video group 0 is emitted; the group stays open. */
+    const tr_exp_t anchor[1] = { { 0, 0, 0, 0x80, 0 } };
+    int from = fix.tr.n;
+    MOQ_TEST_CHECK(write_obj(&fix, 0, 0x80, true, true, 1000) == MOQ_OK);
+    drive(&fix, now);
+    expect_from(&fix, from, anchor, 1, "evopen-anchor");
+
+    /* 2-3. A delta of that group, evicted by audio pressure. */
+    MOQ_TEST_CHECK(write_obj(&fix, 0, 0x81, false, false, 2000) == MOQ_OK);
+    MOQ_TEST_CHECK(write_obj(&fix, 1, 0x82, true, true, 3000) == MOQ_OK);
+    MOQ_TEST_CHECK(write_obj(&fix, 1, 0x83, true, true, 4000) == MOQ_OK);
+    {
+        drop_snap_t st; drop_snap(fix.s, &st);
+        MOQ_TEST_CHECK_EQ_U64(st.dropped, 1);
+        MOQ_TEST_CHECK_EQ_U64(st.keyframes, 0);
+    }
+
+    /* 4. Audio drains and the abandoned video subgroup is reset. */
+    const tr_exp_t audio[2] = { { 1, 0, 0, 0x82, 2 }, { 1, 1, 0, 0x83, 3 } };
+    int froma = fix.tr.n;
+    drive(&fix, now);
+    expect_from(&fix, froma, audio, 2, "evopen-audio");
+    MOQ_TEST_CHECK_EQ_INT(fix.reset_n, 1);
+
+    /* 5. Another delta for group 0 is refused, with no ownership taken. */
+    MOQ_TEST_CHECK(write_obj(&fix, 0, 0x84, false, false, 5000) ==
+                   MOQ_ERR_WOULD_BLOCK);
+    int fromd = fix.tr.n;
+    drive(&fix, now);
+    MOQ_TEST_CHECK_EQ_INT(fix.tr.n - fromd, 0);
+    MOQ_TEST_CHECK(!moq_media_sender_is_fatal(fix.s));
+
+    /* 6. The next sync point opens group 1 at object 0. */
+    const tr_exp_t next[1] = { { 0, 1, 0, 0x85, 4 } };
+    int fromn = fix.tr.n;
+    MOQ_TEST_CHECK(write_obj(&fix, 0, 0x85, true, false, 6000) == MOQ_OK);
+    drive(&fix, now);
+    expect_from(&fix, fromn, next, 1, "evopen-next-group");
+
+    /* No Location of video group 0 appeared twice. */
+    {
+        int g0 = 0;
+        for (int i = 0; i < fix.tr.n; i++)
+            if (fix.tr.recs[i].track == 0 && fix.tr.recs[i].group == 0) g0++;
+        MOQ_TEST_CHECK_EQ_INT(g0, 1);
+    }
+    expect_conserved(fix.s, 5, 4, 0, 1, 0, "evopen-final");
+    {
+        const reset_exp_t rexp[1] = {
+            { 0, 0, 0, 0x10, true, .sub_opaque = 0, .pub_opaque = 0 } };
+        expect_resets(&fix, rexp, 1, "evopen-reset");
+        const term_exp_t terms[1] = { { 1, 0, 0, true, true } };
+        expect_terminals(&fix, terms, 1, "evopen-terminals");
+    }
+
+out:
+    fix_free(&fix);
+    MOQ_TEST_CHECK(as.balance == 0);
+    report(&fix, "pacing_evicted_open_group_closed", before);
+}
+
+/* ===================================================================== *
+ *  A continuation never evicts the Group it continues.
+ *
+ *  Video group 0's anchor is emitted and a delta of it is queued; audio fills
+ *  the bound. A second delta of video group 0 needs room, but the only video
+ *  entry is the queued tail of the very Group it extends: evicting it would
+ *  leave the incoming delta joining a Group that lost media. The write is
+ *  refused with WOULD_BLOCK and nothing is evicted; the queued delta then
+ *  drains at its own Location.
+ * ===================================================================== */
+static void test_continuation_keeps_own_group(void)
+{
+    int before = failures;
+    test_alloc_state_t as = {0};
+    moq_alloc_t alloc = test_allocator(&as);
+    fix_t fix;
+    uint64_t now = 1000;
+    enum { QCAP = 2 };
+    if (!fix_init_drop(&fix, &alloc, now, QCAP)) { failures++; goto out; }
+    if (!subscribe_track(&fix, 0, "v", now)) { failures++; goto out; }
+    if (!subscribe_track(&fix, 1, "a", now)) { failures++; goto out; }
+    set_phase(&fix, PHASE_PACE);
+
+    const tr_exp_t anchor[1] = { { 0, 0, 0, 0x88, 0 } };
+    int from = fix.tr.n;
+    MOQ_TEST_CHECK(write_obj(&fix, 0, 0x88, true, true, 1000) == MOQ_OK);
+    drive(&fix, now);
+    expect_from(&fix, from, anchor, 1, "keep-anchor");
+
+    MOQ_TEST_CHECK(write_obj(&fix, 0, 0x89, false, false, 2000) == MOQ_OK);
+    MOQ_TEST_CHECK(write_obj(&fix, 1, 0x8a, true, true, 3000) == MOQ_OK);
+    MOQ_TEST_CHECK(write_obj(&fix, 0, 0x8b, false, false, 4000) ==
+                   MOQ_ERR_WOULD_BLOCK);
+    expect_conserved(fix.s, 3, 1, 2, 0, 2 * PAYLOAD_LEN, "keep-refused");
+
+    const tr_exp_t rest[2] = { { 0, 0, 1, 0x89, 1 }, { 1, 0, 0, 0x8a, 2 } };
+    int from2 = fix.tr.n;
+    drive(&fix, now);
+    expect_from(&fix, from2, rest, 2, "keep-drained");
+    expect_conserved(fix.s, 3, 3, 0, 0, 0, "keep-final");
+    MOQ_TEST_CHECK_EQ_INT(fix.reset_n, 0);
+
+out:
+    fix_free(&fix);
+    MOQ_TEST_CHECK(as.balance == 0);
+    report(&fix, "pacing_continuation_keeps_own_group", before);
+}
+
+/* Cross-path cumulative group identity: two discards of the same (video,
+ * group 0) by two different paths -- the no-demand drop in one hook, then
+ * lifecycle removal -- are two object discards but ONE group. A shared-capacity
+ * refusal on the demanded track stops the first hook between them. */
+static void test_evict_crosspath_group(void)
+{
+    int before = failures;
+    test_alloc_state_t as = {0};
+    moq_alloc_t alloc = test_allocator(&as);
+    fix_t fix;
+    uint64_t now = 1000;
+    if (!fix_init(&fix, &alloc, 4, true /* drop_without_demand */, now)) {
+        failures++; goto out;
+    }
+    if (!subscribe_track(&fix, 1, "a", now)) { failures++; goto out; }
+    set_phase(&fix, PHASE_PACE);
+
+    MOQ_TEST_CHECK(write_obj(&fix, 1, 0x90, true, true, 1000) == MOQ_OK);
+    MOQ_TEST_CHECK(write_obj(&fix, 0, 0x91, true, true, 1500) == MOQ_OK);
+    MOQ_TEST_CHECK(write_obj(&fix, 1, 0x92, true, true, 2000) == MOQ_OK);
+    MOQ_TEST_CHECK(write_obj(&fix, 0, 0x93, false, false, 2500) == MOQ_OK);
+
+    /* Hook 1: the video anchor is discarded for want of demand; the delta of
+     * the same group stays queued behind the refused audio object. */
+    drive(&fix, now);
+    {
+        drop_snap_t st; drop_snap(fix.s, &st);
+        MOQ_TEST_CHECK_EQ_U64(st.dropped, 1);
+        MOQ_TEST_CHECK_EQ_U64(st.groups, 1);
+    }
+    expect_conserved(fix.s, 4, 1, 2, 1, 2 * PAYLOAD_LEN, "evx-a-first");
+
+    /* Discard the delta through an INDEPENDENT public path. */
     MOQ_TEST_CHECK(moq_media_sender_remove_track(fix.s, fix.t[0]) == MOQ_OK);
     drive(&fix, now);
 
     drop_snap_t st; drop_snap(fix.s, &st);
-    /* TWO object discards of the same (video, group 0) -- one by capacity
-     * eviction, one by lifecycle removal -- but ONE group contribution. */
     MOQ_TEST_CHECK_EQ_U64(st.dropped, 2);
-    MOQ_TEST_CHECK_EQ_U64(st.keyframes, 0);
+    MOQ_TEST_CHECK_EQ_U64(st.keyframes, 1);   /* the anchor */
     MOQ_TEST_CHECK_EQ_U64(st.groups, 1);
-    /* The other track was unaffected (asserted in the geometry) and the final
-     * accounting is exact. */
-    expect_conserved(fix.s, 5, 3, 0, 2, 0, "evx-a-final");
+    expect_conserved(fix.s, 4, 2, 0, 2, 0, "evx-a-final");
     {
-        const done_exp_t dexp[1] = {
-            { fix.sub[0]._opaque, MOQ_PUB_DONE_TRACK_ENDED } };
-        expect_done(&fix, dexp, 1, "evx-a-done");
-        /* The abandoned video subgroup RESETs; audio's first group FINs; the
-         * fresh terminal-only video subgroup FINs behind its status object. */
-        const reset_exp_t rexp[1] = {
-            { 0, 0, 0, 0x10, true, .sub_opaque = 0, .pub_opaque = 0 } };
-        expect_resets(&fix, rexp, 1, "evx-a-reset");
-        const term_exp_t terms[2] = { { 1, 0, 0, true, true },
-                                      { 0, 1, 0, false, false } };
-        expect_terminals(&fix, terms, 2, "evx-a-terminals");
-        const stat_exp_t sx[1] = { { 0, 1, 0, MOQ_OBJECT_END_OF_TRACK } };
-        expect_status(&fix, sx, 1, "evx-a-status");
+        const tr_exp_t audio[2] = { { 1, 0, 0, 0x90, 0 }, { 1, 1, 0, 0x92, 2 } };
+        expect_from(&fix, 0, audio, 2, "evx-a-audio");
+        const term_exp_t terms[1] = { { 1, 0, 0, true, true } };
+        expect_terminals(&fix, terms, 1, "evx-a-terminals");
+        /* The removed video track never had a subscriber and never opened a
+         * subgroup: its removal sends no SUBSCRIBE_DONE, no RESET and no
+         * END_OF_TRACK status object. */
+        expect_done(&fix, NULL, 0, "evx-a-done");
+        expect_resets(&fix, NULL, 0, "evx-a-reset");
+        expect_status(&fix, NULL, 0, "evx-a-status");
     }
 
 out:
     fix_free(&fix);
     MOQ_TEST_CHECK(as.balance == 0);
     report(&fix, "pacing_evict_crosspath_group", before);
+}
+
+/* A Group abandoned for want of demand stays abandoned when demand arrives
+ * before its queued tail drains: the video anchor is dropped with no
+ * subscriber, its delta waits behind a shared-capacity refusal, then video is
+ * subscribed. The delta is dropped, never emitted as Object 0 of its Group,
+ * and the next keyframe opens Group 1. */
+static void test_no_demand_suffix_dropped(void)
+{
+    int before = failures;
+    test_alloc_state_t as = {0};
+    moq_alloc_t alloc = test_allocator(&as);
+    fix_t fix;
+    uint64_t now = 1000;
+    if (!fix_init(&fix, &alloc, 4, true /* drop_without_demand */, now)) {
+        failures++; goto out;
+    }
+    if (!subscribe_track(&fix, 1, "a", now)) { failures++; goto out; }
+    set_phase(&fix, PHASE_PACE);
+
+    /* Audio Groups ahead of and behind the video Group, so every pass stops
+     * on shared capacity before the video delta. */
+    MOQ_TEST_CHECK(write_obj(&fix, 1, 0xa0, true, true, 1000) == MOQ_OK);
+    MOQ_TEST_CHECK(write_obj(&fix, 0, 0xa1, true, true, 1500) == MOQ_OK);
+    for (int i = 0; i < 6; i++)
+        MOQ_TEST_CHECK(write_obj(&fix, 1, (uint8_t)(0xb0 + i), true, true,
+                                 2000 + (uint64_t)i) == MOQ_OK);
+    MOQ_TEST_CHECK(write_obj(&fix, 0, 0xa3, false, false, 2500) == MOQ_OK);
+    drive(&fix, now);
+
+    /* Demand arrives between passes, while the delta is still queued. */
+    set_phase(&fix, PHASE_RELEASE);
+    if (!subscribe_track(&fix, 0, "v", now)) { failures++; goto out; }
+    for (int i = 0; i < 8; i++) drive(&fix, now);
+    /* The next video keyframe opens Group 1. */
+    MOQ_TEST_CHECK(write_obj(&fix, 0, 0xa4, true, true, 3000) == MOQ_OK);
+    drive(&fix, now);
+    {
+        tr_exp_t all[8];
+        for (int i = 0; i < 7; i++)
+            all[i] = (tr_exp_t){ 1, (uint64_t)i, 0,
+                                 (uint8_t)(i == 0 ? 0xa0 : 0xb0 + i - 1),
+                                 i == 0 ? 0 : i + 1 };
+        all[7] = (tr_exp_t){ 0, 1, 0, 0xa4, 9 };
+        expect_from(&fix, 0, all, 8, "nds-trace");
+        /* Each audio Group finished when the next opened; no video subgroup
+         * ever opened for Group 0, so nothing was reset. */
+        term_exp_t terms[6];
+        for (int i = 0; i < 6; i++)
+            terms[i] = (term_exp_t){ 1, (uint64_t)i, 0, true, true };
+        expect_terminals(&fix, terms, 6, "nds-terminals");
+        expect_resets(&fix, NULL, 0, "nds-reset");
+    }
+    drop_snap_t st; drop_snap(fix.s, &st);
+    MOQ_TEST_CHECK_EQ_U64(st.dropped, 2);     /* the anchor, then its delta */
+    MOQ_TEST_CHECK_EQ_U64(st.groups, 1);
+
+out:
+    fix_free(&fix);
+    MOQ_TEST_CHECK(as.balance == 0);
+    report(&fix, "pacing_no_demand_suffix_dropped", before);
 }
 
 /* Eviction: the armed RESET must survive removal ordering. */
@@ -3292,10 +3511,10 @@ static void test_evict_reset_survives_removal(void)
     }
     drop_snap_t st; drop_snap(fix.s, &st);
     MOQ_TEST_CHECK_EQ_U64(st.abandoned, 1);   /* exactly once */
-    MOQ_TEST_CHECK_EQ_U64(st.dropped, 2);
+    MOQ_TEST_CHECK_EQ_U64(st.dropped, 1);
     MOQ_TEST_CHECK_EQ_U64(st.groups, 1);
     /* The other demanded track was unaffected (asserted in the geometry). */
-    expect_conserved(fix.s, 5, 3, 0, 2, 0, "evx-b-final");
+    expect_conserved(fix.s, 4, 3, 0, 1, 0, "evx-b-final");
 
 out:
     fix_free(&fix);
@@ -3801,6 +4020,113 @@ out:
     report(&fix, "pacing_reset_partial_fanout", before);
 }
 
+/* ===================================================================== *
+ *  A write that waits for room re-checks its Group after the wait.
+ *
+ *  BLOCK_TIMEOUT releases the sender lock while it waits, so a drop can close
+ *  the Group the waiting object continues. The object is then refused with
+ *  WOULD_BLOCK, never queued into the closed Group. Driven white-box: the
+ *  cond-wait seam runs the drop where the wait would be.
+ * ===================================================================== */
+typedef struct closed_ctx {
+    moq_media_sender_t *s;
+    moq_media_track_t  *t;
+    int                 calls;
+} closed_ctx_t;
+
+static int close_group_during_wait(const struct timespec *abs, void *ctx)
+{
+    (void)abs;
+    closed_ctx_t *c = (closed_ctx_t *)ctx;
+    if (c->calls++ == 0)
+        moq_media_sender_test_drop_track_locked(c->s, c->t);
+    return 0;
+}
+
+static moq_media_track_t *wr_add_loc(moq_media_sender_t *s, const char *name)
+{
+    moq_media_track_cfg_t tc;
+    moq_media_track_cfg_init_sized(&tc, sizeof(tc));
+    tc.name = (moq_bytes_t){ (const uint8_t *)name, strlen(name) };
+    tc.media_type = MOQ_MEDIA_TYPE_VIDEO;
+    tc.packaging = MOQ_MEDIA_PACKAGING_RAW;
+    tc.codec = (moq_bytes_t){ (const uint8_t *)"av01", 4 };
+    tc.bitrate = 1000000;
+    moq_media_track_t *t = NULL;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_add_track(s, &tc, &t),
+                          (int)MOQ_OK);
+    return t;
+}
+
+static moq_result_t wr_write(moq_media_sender_t *s, moq_media_track_t *t,
+                             bool sync)
+{
+    uint8_t d[PAYLOAD_LEN];
+    memset(d, 0x5A, sizeof(d));
+    moq_rcbuf_t *b = NULL;
+    moq_rcbuf_create(moq_alloc_default(), d, sizeof(d), &b);
+    moq_media_send_object_t o; memset(&o, 0, sizeof(o));
+    o.struct_size = sizeof(o);
+    o.payload = b;
+    o.is_sync = sync;
+    o.starts_group = sync;
+    moq_result_t rc = moq_media_sender_write(s, t, &o);
+    if (rc != MOQ_OK) moq_rcbuf_decref(b);
+    return rc;
+}
+
+static void test_wait_recheck(void)
+{
+    int before = failures;
+    moq_media_sender_cfg_t cfg;
+    moq_media_sender_cfg_init_lossless_sized(&cfg, sizeof(cfg));
+    g_ns[0] = MOQ_BYTES_LITERAL("svc");
+    g_ns[1] = MOQ_BYTES_LITERAL("wait");
+    cfg.namespace_ = (moq_namespace_t){ g_ns, 2 };
+    cfg.pre_ready_max_objects = 2;
+    cfg.block_timeout_us = 200000;
+    moq_media_sender_t *s = moq_media_sender_test_new_cfg(&cfg);
+    MOQ_TEST_CHECK(s != NULL);
+    if (!s) return;
+    moq_media_track_t *a = wr_add_loc(s, "a");
+    moq_media_track_t *b = wr_add_loc(s, "b");
+    /* Group 0 of `a`: its anchor is sent, a delta of it stays queued. */
+    MOQ_TEST_CHECK_EQ_INT((int)wr_write(s, a, true), (int)MOQ_OK);
+    moq_rcbuf_t *p = NULL;
+    MOQ_TEST_CHECK(moq_media_sender_test_emit_head(s, &p));
+    if (p) moq_rcbuf_decref(p);
+    MOQ_TEST_CHECK_EQ_INT((int)wr_write(s, a, false), (int)MOQ_OK);
+    /* `b` fills the bound. */
+    MOQ_TEST_CHECK_EQ_INT((int)wr_write(s, b, true), (int)MOQ_OK);
+    /* Another delta of `a` waits; meanwhile `a`'s queued delta is dropped,
+     * which closes Group 0. */
+    closed_ctx_t c = { s, a, 0 };
+    moq_media_sender_test_set_cond_wait_hook(close_group_during_wait, &c);
+    moq_result_t rc = wr_write(s, a, false);
+    moq_media_sender_test_set_cond_wait_hook(NULL, NULL);
+    MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_ERR_WOULD_BLOCK);
+    MOQ_TEST_CHECK(c.calls >= 1);
+    const moq_media_track_t *qt = NULL;
+    for (size_t i = 0;
+         moq_media_sender_test_queue_entry(s, i, &qt, NULL, NULL, NULL); i++)
+        MOQ_TEST_CHECK(qt != a);
+    /* The next sync point opens Group 1. */
+    MOQ_TEST_CHECK_EQ_INT((int)wr_write(s, a, true), (int)MOQ_OK);
+    uint64_t grp = 0;
+    bool starts = false, seen = false;
+    for (size_t i = 0;
+         moq_media_sender_test_queue_entry(s, i, &qt, NULL, &grp, &starts); i++)
+        if (qt == a) {
+            MOQ_TEST_CHECK(grp == 1 && starts);
+            seen = true;
+        }
+    MOQ_TEST_CHECK(seen);
+    moq_media_sender_test_free(s);
+    int n = failures - before;
+    if (n == 0) printf("PASS: wait_recheck_closed_group\n");
+    else        printf("FAIL: wait_recheck_closed_group (%d diagnostics)\n", n);
+}
+
 int main(void)
 {
     test_one_at_a_time();
@@ -3825,7 +4151,11 @@ int main(void)
     test_removal_accounting(true);
     test_drop_group_across_passes();
     test_evict_accounting();
+    test_evicted_open_group_closed();
+    test_continuation_keeps_own_group();
+    test_wait_recheck();
     test_evict_crosspath_group();
+    test_no_demand_suffix_dropped();
     test_evict_reset_survives_removal();
     test_reset_retry_blocked();
     test_terminal_flushes_reset();

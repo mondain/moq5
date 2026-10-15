@@ -73,6 +73,144 @@ typedef struct moq_msf_media_timeline_record {
     uint64_t wallclock_ms;   /* 0 = VOD/unknown */
 } moq_msf_media_timeline_record_t;
 
+/*
+ * MPEG-2 Transport Stream track fields (draft-gregoire-moq-msfts, Catalog):
+ * the "mpeg2ts*" keys of a track whose packaging is "mpeg2ts". They form one
+ * record, moq_msf_mpeg2ts_t, carried in the track's extension list under
+ * MOQ_MSF_EXT_MPEG2TS (see moq_msf_track_ext_t). Each key has its own has_
+ * flag.
+ *
+ * The parser records every key it finds, on any track, without judging it
+ * (Catalog: a parser MUST ignore fields it does not understand, so one bad
+ * mpeg2ts track never fails the catalog). A key whose value has the wrong
+ * JSON type, or a number that is negative, not integral, or too large for
+ * its field, is recorded as present with its bit set in `malformed`. Any
+ * JSON spelling of an integral value is accepted (188, 188.0, 1.88e2).
+ * moq_msf_track_mpeg2ts_check() is the subscriber's verdict on the track;
+ * the encoder applies the same rules strictly.
+ */
+typedef enum moq_msf_mpeg2ts_mode {
+    MOQ_MSF_MPEG2TS_MODE_UNRECOGNIZED         = 0,
+    MOQ_MSF_MPEG2TS_MODE_UNMODIFIED_PROGRAM   = 1, /* "unmodified-program" */
+    MOQ_MSF_MPEG2TS_MODE_UNMODIFIED_MULTIPLEX = 2, /* "unmodified-multiplex" */
+    MOQ_MSF_MPEG2TS_MODE_PER_PROGRAM          = 3, /* "per-program" */
+    MOQ_MSF_MPEG2TS_MODE_ES_PACKETS           = 4, /* "es-packets" */
+} moq_msf_mpeg2ts_mode_t;
+
+typedef enum moq_msf_mpeg2ts_timestamp_mode {
+    MOQ_MSF_MPEG2TS_TIMESTAMP_UNRECOGNIZED = 0,
+    MOQ_MSF_MPEG2TS_TIMESTAMP_ARRIVAL_TIME = 1,   /* "arrival-time" */
+    MOQ_MSF_MPEG2TS_TIMESTAMP_OPAQUE       = 2,   /* "opaque" */
+} moq_msf_mpeg2ts_timestamp_mode_t;
+
+/* Bits of moq_msf_mpeg2ts_t.malformed, one per key. */
+#define MOQ_MSF_MPEG2TS_F_MODE           (1u << 0)
+#define MOQ_MSF_MPEG2TS_F_PACKET_SIZE    (1u << 1)
+#define MOQ_MSF_MPEG2TS_F_ES_PID         (1u << 2)
+#define MOQ_MSF_MPEG2TS_F_PROGRAM_NUMBER (1u << 3)
+#define MOQ_MSF_MPEG2TS_F_PCR_PID        (1u << 4)
+#define MOQ_MSF_MPEG2TS_F_MUX_RATE       (1u << 5)
+#define MOQ_MSF_MPEG2TS_F_SI_PIDS        (1u << 6)
+#define MOQ_MSF_MPEG2TS_F_RANDOM_ACCESS  (1u << 7)
+#define MOQ_MSF_MPEG2TS_F_TIMESTAMP_MODE (1u << 8)
+#define MOQ_MSF_MPEG2TS_F_SCTE35_PID     (1u << 9)
+
+typedef struct moq_msf_mpeg2ts {
+    /* Sized record: moq_msf_mpeg2ts_init() stamps it. A reader refuses a
+     * record smaller than MOQ_MSF_MPEG2TS_V0_SIZE and reads a later field
+     * only when struct_size covers it. */
+    uint32_t               struct_size;
+
+    /* mpeg2tsMode. On encode the enum is authoritative; mode_name is what a
+     * parse found, and is re-emitted only for an unrecognized value on the
+     * receive-path re-encode. */
+    bool                   has_mode;
+    moq_msf_mpeg2ts_mode_t mode;
+    moq_bytes_t            mode_name;          /* BORROWED */
+
+    bool        has_packet_size;     /* mpeg2tsPacketSize: 188 or 192 */
+    uint32_t    packet_size;
+    bool        has_es_pid;          /* mpeg2tsEsPid */
+    uint32_t    es_pid;
+    bool        has_program_number;  /* mpeg2tsProgramNumber */
+    uint32_t    program_number;
+    bool        has_pcr_pid;         /* mpeg2tsPcrPid */
+    uint32_t    pcr_pid;
+    bool        has_mux_rate;        /* mpeg2tsMuxRate, bit/s */
+    uint64_t    mux_rate;
+    /* mpeg2tsSiPids. A parsed array belongs to the catalog and is freed by
+     * cleanup with its record; on encode it is borrowed for the call. A
+     * malformed element is stored as 0 with the bit set. */
+    bool        has_si_pids;
+    uint32_t   *si_pids;
+    size_t      si_pid_count;
+    bool        has_random_access;   /* mpeg2tsRandomAccess */
+    bool        random_access;
+    bool                             has_timestamp_mode; /* mpeg2tsTimestampMode */
+    moq_msf_mpeg2ts_timestamp_mode_t timestamp_mode;
+    moq_bytes_t                      timestamp_mode_name; /* BORROWED */
+    bool        has_scte35_pid;      /* mpeg2tsScte35Pid */
+    uint32_t    scte35_pid;
+
+    uint32_t    malformed;           /* MOQ_MSF_MPEG2TS_F_* */
+} moq_msf_mpeg2ts_t;
+
+/* The first published size: the layout through `malformed`. */
+#define MOQ_MSF_MPEG2TS_V0_SIZE \
+    (offsetof(moq_msf_mpeg2ts_t, malformed) + sizeof(uint32_t))
+
+/* Zero and stamp min(m_size, this build's size); nothing is written when
+ * m_size cannot hold struct_size. The macro passes the caller's sizeof. */
+MOQ_API void moq_msf_mpeg2ts_init_sized(moq_msf_mpeg2ts_t *m, size_t m_size);
+#define moq_msf_mpeg2ts_init(m) moq_msf_mpeg2ts_init_sized((m), sizeof(*(m)))
+
+/* -- Packaging extensions ----------------------------------------------
+ * Where a packaging or extension draft's catalog fields go:
+ *   - a few independent scalar keys sit flat on moq_msf_track_t as has_X /
+ *     X pairs, like CMSF's maxGrpSapStartingType / maxObjSapStartingType;
+ *   - a cohesive record -- several keys validated together, with their own
+ *     enums, arrays, malformed bits and a _check function -- is a sized
+ *     struct of its own (leading struct_size, its own _init and _check)
+ *     carried in the track's extension list, at most one entry per kind.
+ *
+ * Parsed: the list and its records are catalog-owned and freed by cleanup;
+ * spans inside a record borrow from the DOM. Encode: the list and the
+ * records are borrowed for the call. A clone op inherits the parent's
+ * entries and merges, by kind, the ones it carries.
+ *
+ * The encoder refuses a list with a NULL array, an unknown kind, a kind
+ * listed twice, a NULL record, a record whose struct_size is below its first
+ * published size, or a kind on a track whose packaging it does not belong
+ * to (MOQ_MSF_EXT_MPEG2TS: packaging "mpeg2ts"). The parser records a kind
+ * on any track; the kind's own _check judges it. */
+/* Extension kind. Fixed-width uint32_t for ABI stability. Values are never
+ * renumbered. Unknown kinds must be ignored by a reader (the encoder
+ * refuses them). */
+typedef uint32_t moq_msf_ext_kind_t;
+
+#define MOQ_MSF_EXT_NONE    0u
+#define MOQ_MSF_EXT_MPEG2TS 1u   /* draft-gregoire-moq-msfts: u.mpeg2ts */
+
+typedef struct moq_msf_track_ext {
+    moq_msf_ext_kind_t kind;
+    union {                                 /* select by kind */
+        const moq_msf_mpeg2ts_t *mpeg2ts;
+    } u;
+} moq_msf_track_ext_t;
+
+/* The entry of `kind` in a list, or NULL. Works on any extension list. */
+MOQ_API const moq_msf_track_ext_t *moq_msf_ext_find(
+    const moq_msf_track_ext_t *list, size_t count, moq_msf_ext_kind_t kind);
+
+/* Typed lookups, one per kind: NULL when the list carries no such record. */
+static inline const moq_msf_mpeg2ts_t *moq_msf_ext_mpeg2ts(
+    const moq_msf_track_ext_t *list, size_t count)
+{
+    const moq_msf_track_ext_t *e =
+        moq_msf_ext_find(list, count, MOQ_MSF_EXT_MPEG2TS);
+    return e ? e->u.mpeg2ts : NULL;
+}
+
 typedef struct moq_msf_track {
     uint32_t    struct_size;
 
@@ -172,7 +310,15 @@ typedef struct moq_msf_track {
      * own. (template_ avoids the C++ keyword in extern "C" consumers.) */
     bool                     has_template;
     moq_msf_media_template_t template_;
+
+    /* Packaging-extension records (see moq_msf_track_ext_t). */
+    const moq_msf_track_ext_t *extensions;
+    size_t                     extension_count;
 } moq_msf_track_t;
+
+/* The draft-gregoire-moq-msfts record of a track, or NULL. */
+MOQ_API const moq_msf_mpeg2ts_t *moq_msf_track_mpeg2ts(
+    const moq_msf_track_t *track);
 
 /* MSF-01 delta update operation kind (5.1.6). */
 typedef enum moq_msf_delta_op_kind {
@@ -287,7 +433,10 @@ typedef struct moq_msf_catalog {
  * fractional pixel counts, out-of-range numbers) are silently treated
  * as absent rather than failing the parse. A present but malformed
  * STRUCTURED field is an exception: a "template" that is not a well-formed
- * 6-tuple (5.2.15 / §7.4) is a PROTO error, not silently dropped. Only
+ * 6-tuple (5.2.15 / §7.4) is a PROTO error, not silently dropped. The
+ * mpeg2ts* keys are recorded as present-but-malformed instead (see
+ * moq_msf_mpeg2ts_t), so that the track check can reject the track; a
+ * "remove" delta track carrying one is a PROTO error like any other field. Only
  * missing required fields (version, tracks, track name/packaging/isLive)
  * and structurally invalid JSON cause parse failure.
  *
@@ -403,6 +552,94 @@ MOQ_API const moq_cmsf_content_protection_t *moq_msf_catalog_find_content_protec
     const moq_msf_catalog_t *cat, moq_bytes_t ref_id);
 
 /*
+ * Why a track is not a valid mpeg2ts track (draft-gregoire-moq-msfts).
+ */
+typedef enum moq_msf_mpeg2ts_error {
+    MOQ_MSF_MPEG2TS_OK = 0,
+    MOQ_MSF_MPEG2TS_ERR_NOT_MPEG2TS = 1,             /* packaging is not "mpeg2ts" */
+    MOQ_MSF_MPEG2TS_ERR_MALFORMED_FIELD = 2,         /* wrong JSON type or range */
+    MOQ_MSF_MPEG2TS_ERR_MODE_MISSING = 3,            /* Mode: required */
+    MOQ_MSF_MPEG2TS_ERR_MODE_UNRECOGNIZED = 4,       /* Mode: MUST reject the track */
+    MOQ_MSF_MPEG2TS_ERR_PACKET_SIZE_MISSING = 5,     /* Packet Size: required */
+    MOQ_MSF_MPEG2TS_ERR_PACKET_SIZE = 6,             /* Packet Size: 188 or 192 */
+    MOQ_MSF_MPEG2TS_ERR_TIMESTAMP_MODE_188 = 7,      /* Timestamp Mode: not at 188 */
+    MOQ_MSF_MPEG2TS_ERR_ES_PID_MISSING = 8,          /* ES PID: required in es-packets */
+    MOQ_MSF_MPEG2TS_ERR_ES_PID_FORBIDDEN = 9,        /* ES PID: absent in other modes */
+    MOQ_MSF_MPEG2TS_ERR_PID_RANGE = 10,              /* a PID above 0x1FFF */
+    MOQ_MSF_MPEG2TS_ERR_PROGRAM_NUMBER_RANGE = 11,   /* not 1..65535 */
+    MOQ_MSF_MPEG2TS_ERR_MUX_RATE_RANGE = 12,         /* 0 bit/s */
+    MOQ_MSF_MPEG2TS_ERR_MUX_RATE_FORBIDDEN = 13,     /* Mux Rate: unmodified-multiplex */
+    MOQ_MSF_MPEG2TS_ERR_SI_PIDS_FORBIDDEN = 14,      /* SI PIDs: with ES PID / multiplex */
+    MOQ_MSF_MPEG2TS_ERR_SI_PIDS_DUPLICATE = 15,      /* SI PIDs: each PID listed once */
+    MOQ_MSF_MPEG2TS_ERR_SCTE35_PID_FORBIDDEN = 16,   /* SCTE-35 PID: same rule */
+    MOQ_MSF_MPEG2TS_ERR_RANDOM_ACCESS_FORBIDDEN = 17, /* multiplex, no reference */
+    MOQ_MSF_MPEG2TS_ERR_ALT_GROUP_FORBIDDEN = 18,    /* Switching: multiplex in altGroup */
+    MOQ_MSF_MPEG2TS_ERR_INIT_REF_UNRESOLVED = 19,    /* initRef names no entry */
+    MOQ_MSF_MPEG2TS_ERR_INIT_DATA_TYPE = 20,         /* entry type is not "inline" */
+    MOQ_MSF_MPEG2TS_ERR_INIT_DATA_BASE64 = 21,       /* data is not valid Base64 */
+    MOQ_MSF_MPEG2TS_ERR_INIT_DATA_PACKETS = 22,      /* not whole source packets */
+} moq_msf_mpeg2ts_error_t;
+
+/*
+ * The subscriber's check of one mpeg2ts track (its common fields and its
+ * mpeg2ts record; a track without the record has neither Mode nor Packet
+ * Size), against every catalog MUST of
+ * draft-gregoire-moq-msfts that one track can break:
+ *   - Mode and Packet Size are required; the mode is one of the four names,
+ *     and an unrecognized one rejects the track;
+ *   - the packet size is 188 or 192, and mpeg2tsTimestampMode is absent at
+ *     188;
+ *   - mpeg2tsEsPid is present in es-packets mode and absent otherwise;
+ *   - mpeg2tsMuxRate is absent in unmodified-multiplex;
+ *   - mpeg2tsSiPids and mpeg2tsScte35Pid are absent with mpeg2tsEsPid and in
+ *     unmodified-multiplex; SI PIDs are listed once each;
+ *   - mpeg2tsRandomAccess is absent in unmodified-multiplex when no
+ *     mpeg2tsProgramNumber names a reference program;
+ *   - an unmodified-multiplex track is not in an altGroup;
+ *   - every value is in range before use (Security Considerations): PIDs
+ *     0..0x1FFF, program numbers 1..65535, a mux rate above 0, and no
+ *     malformed value.
+ * An unrecognized mpeg2tsTimestampMode is not a rejection: a 192-octet
+ * subscriber then treats the prefix as opaque, as for an absent one.
+ *
+ * Returns MOQ_OK for a valid track, MOQ_ERR_PROTO with *reason set when the
+ * track must be rejected, MOQ_ERR_INVAL for a NULL track, a record whose
+ * struct_size is below its first published size, or packaging other than
+ * "mpeg2ts" (*reason MOQ_MSF_MPEG2TS_ERR_NOT_MPEG2TS). reason may be NULL.
+ */
+MOQ_API moq_result_t moq_msf_track_mpeg2ts_check(const moq_msf_track_t *track,
+                                                 moq_msf_mpeg2ts_error_t *reason);
+
+/*
+ * Resolve and check an mpeg2ts track's initialization data (Use of MSF
+ * Initialization Data): initRef names an initDataList entry whose type MUST
+ * be "inline", and whose Base64-decoded data MUST be whole source packets of
+ * mpeg2tsPacketSize octets (each with the sync byte at offset 0, or 4 for
+ * 192); an empty entry is refused as a local policy. The track must pass
+ * moq_msf_track_mpeg2ts_check(). Whether the tables are still current is
+ * the caller's to judge: the draft has the PSI in the Objects take
+ * precedence once its version_number changes.
+ *
+ * On MOQ_OK, *out_packets (when out_packets is non-NULL) owns the decoded
+ * packets; release it with moq_rcbuf_decref().
+ *
+ * Returns MOQ_OK, MOQ_ERR_PROTO with *reason set, MOQ_ERR_INVAL for NULL
+ * arguments, a track without initRef, or one that is not an mpeg2ts track,
+ * and MOQ_ERR_NOMEM.
+ */
+MOQ_API moq_result_t moq_msf_track_mpeg2ts_init_data(
+    const moq_alloc_t *alloc,
+    const moq_msf_catalog_t *cat,
+    const moq_msf_track_t *track,
+    moq_rcbuf_t **out_packets,
+    moq_msf_mpeg2ts_error_t *reason);
+
+/* Canonical JSON names of the enums ("" for UNRECOGNIZED). */
+MOQ_API const char *moq_msf_mpeg2ts_mode_name(moq_msf_mpeg2ts_mode_t mode);
+MOQ_API const char *moq_msf_mpeg2ts_timestamp_mode_name(
+    moq_msf_mpeg2ts_timestamp_mode_t mode);
+
+/*
  * Encode an MSF catalog to JSON.
  *
  * Produces a UTF-8 JSON string in an moq_rcbuf_t.
@@ -412,8 +649,24 @@ MOQ_API const moq_cmsf_content_protection_t *moq_msf_catalog_find_content_protec
  * Returns MOQ_OK on success with *out_json set.
  * Returns MOQ_ERR_INVAL if alloc, cat, or out_json is NULL, if
  *   version != MOQ_MSF_VERSION, or if a string field has data==NULL
- *   with len > 0.
+ *   with len > 0, or if an mpeg2ts rule below is broken.
  * Returns MOQ_ERR_NOMEM on allocation failure (*out_json is NULL).
+ *
+ * mpeg2ts tracks (draft-gregoire-moq-msfts) are authored strictly, from each
+ * track's MOQ_MSF_EXT_MPEG2TS record (the extension-list rules are under
+ * moq_msf_track_ext_t):
+ *   - an independent track with packaging "mpeg2ts" must pass
+ *     moq_msf_track_mpeg2ts_check(), carry a timestamp mode only of a
+ *     recognized value, and, when it has initRef, reference an "inline"
+ *     initDataList entry whose Base64 data decodes to whole source packets
+ *     (Use of MSF Initialization Data);
+ *   - a delta "add" track carrying mpeg2ts fields must have packaging
+ *     "mpeg2ts" and pass the same check;
+ *   - a delta "clone" track's mpeg2ts overrides must each be valid on their
+ *     own (in range, not malformed, a recognized mode, 188 or 192, and no
+ *     pair of overrides that the rules forbid together); the fields it
+ *     inherits are judged when the delta is applied;
+ *   - mpeg2ts fields on any other packaging are refused.
  */
 MOQ_API moq_result_t moq_msf_catalog_encode(const moq_alloc_t *alloc,
                                               const moq_msf_catalog_t *cat,

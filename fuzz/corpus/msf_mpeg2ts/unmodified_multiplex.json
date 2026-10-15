@@ -1,0 +1,17 @@
+{
+  "version": "draft-01",
+  "generatedAt": 1746104606044,
+  "tracks": [
+    {
+      "name": "mux-1",
+      "namespace": "live.example.com/mux/1",
+      "packaging": "mpeg2ts",
+      "mpeg2tsMode": "unmodified-multiplex",
+      "isLive": true,
+      "targetLatency": 1000,
+      "mimeType": "video/mp2t",
+      "bitrate": 20000000,
+      "mpeg2tsPacketSize": 188
+    }
+  ]
+}

@@ -197,7 +197,7 @@ surfaces differ in maturity and intended audience:
 | **Core session API** (lower-level protocol API) | `<moq/moq.h>`, `<moq/session.h>`, `types.h`, `rcbuf.h`, `version.h` | the protocol engine; for relays, conformance, and app specialists who need direct control; pre-1.0 |
 | **Core facade API** (lower-level conveniences, used under the service tier) | `publisher.h`, `subscriber.h`, `url.h` | publish/subscribe conveniences over the session; pre-1.0 |
 | **Relay SDK** (`moq::relay-core`, `moq::relay`) | `<moq/relay/relay.h>`, `<moq/relay/moqr_bind.h>`, `<moq/relay/moqr_shards.h>` | optional transport-independent routing and host-pumped runtime; [embedding guide](relay/README.md) and [network example](examples/relay/simple-relay/README.md); pre-1.0 |
-| **Media helpers** | `loc.h`, `cmaf.h`, `msf.h`, `media_object.h`, `playback.h` | pre-1.0 media parse/pipeline helpers |
+| **Media helpers** | `loc.h`, `cmaf.h`, `msf.h`, `media_object.h`, `playback.h`, `mpeg2ts.h` | pre-1.0 media parse/pipeline helpers (`mpeg2ts.h` with `MOQ_BUILD_MPEG2TS=ON`) |
 | **CMAF writer** (`moq::cmaf-packager`) | `cmaf_packager.h` | optional clear, single-track initialization/chunk writer; enable `MOQ_BUILD_CMAF_PACKAGER=ON`; [contract and limits](media/cmaf_packager/README.md); pre-1.0 |
 | **Simulation harness** (`moq::sim`) | `sim.h` | deterministic SimPair testing helper; installed only when built with `MOQ_BUILD_SIM=ON`; pre-1.0 |
 | **Wire codec / tooling** | `codec.h`, `control.h`, `wire.h`, `buf.h`, `kvp.h` | draft-specific tooling for adapters/tests/tools, **not** the application API; details change across drafts |
@@ -227,7 +227,7 @@ sim/            moq-sim: SimPair deterministic simulation + fault injection
 adapters/       picoquic, mvfst, pico_wt, proxygen (+ shared conformance)
 bindings/cpp/   moq-cpp: header-only C++20 binding
 bindings/python/ CPython endpoint foundation over the installed service SDK
-media/          loc, cmaf, msf catalog, media object, playback (parse helpers)
+media/          loc, cmaf, mpeg2ts, msf catalog, media object, playback (parse helpers)
 tests/          unit, scenario, simulation, and adapter conformance tests
 fuzz/           fuzz targets and corpus
 examples/       service/ (media apps), relay/ (embedding), plus core, picoquic,

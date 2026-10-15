@@ -62,6 +62,17 @@ if(MOQ_BUILD_TESTS)
         MOQ_MSF_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
     add_test(NAME msf COMMAND test_msf)
 
+    # draft-gregoire-moq-msfts catalog fields, against the draft's examples.
+    add_executable(test_msf_mpeg2ts tests/test_msf_mpeg2ts.c)
+    target_link_libraries(test_msf_mpeg2ts PRIVATE moq::msf)
+    target_compile_definitions(test_msf_mpeg2ts PRIVATE
+        MOQ_MSF_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_msf_mpeg2ts PRIVATE -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME msf_mpeg2ts COMMAND test_msf_mpeg2ts)
+
     # The sized-companion cases use LOC through moq::msf's PUBLIC
     # moq::media-object dependency; do not repeat that static archive here.
     if(TARGET moq::media-object AND TARGET moq::cmaf AND TARGET moq::loc)

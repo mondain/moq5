@@ -230,8 +230,9 @@ int main(void)
                               (uint64_t)MOQ_WT_PROFILE_BACKEND_DEFAULT);
 
         /* Full-size caller, BACKEND_DEFAULT explicitly: accepted on picoquic. */
-        moq_endpoint_cfg_t c = mkcfg("https://relay.example/moq");
-        c.struct_size = sizeof(c);
+        moq_endpoint_cfg_t c;
+        moq_endpoint_cfg_init_sized(&c, sizeof(c));   /* the whole tail too */
+        c.url = B("https://relay.example/moq");
         c.wt_profile = (uint32_t)MOQ_WT_PROFILE_BACKEND_DEFAULT;
         MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_U64(r.wt_profile,

@@ -3,6 +3,7 @@
 
 #include <moq/msf.h>
 #include <moq/rcbuf.h>
+#include "msf_internal.h"
 #include <errno.h>
 #include <float.h>
 #include <limits.h>
@@ -190,6 +191,43 @@ static moq_result_t get_string_array(const moq_alloc_t *alloc,
     return MOQ_OK;
 }
 
+/* A parsed track's extension list: one entry and its record, allocated
+ * together on the track's first mpeg2ts* key and freed with the track. */
+typedef struct msf_ext_block {
+    moq_msf_track_ext_t entry;
+    moq_msf_mpeg2ts_t   ts;
+} msf_ext_block_t;
+
+/* moq_msf_mpeg2ts_t as first published: through `malformed`. */
+#define MSF_TS_V0 (offsetof(moq_msf_mpeg2ts_t, malformed) + sizeof(uint32_t))
+
+_Static_assert(MOQ_MSF_MPEG2TS_V0_SIZE == MSF_TS_V0, "msf ts record floor");
+
+void moq_msf_mpeg2ts_init_sized(moq_msf_mpeg2ts_t *m, size_t m_size)
+{
+    if (!m || m_size < sizeof(uint32_t)) return;
+    size_t n = m_size < sizeof(*m) ? m_size : sizeof(*m);
+    memset(m, 0, n);
+    uint32_t stamp = (uint32_t)n;
+    memcpy(m, &stamp, sizeof(stamp));
+}
+
+const moq_msf_track_ext_t *moq_msf_ext_find(const moq_msf_track_ext_t *list,
+                                            size_t count,
+                                            moq_msf_ext_kind_t kind)
+{
+    if (!list) return NULL;
+    for (size_t i = 0; i < count; i++)
+        if (list[i].kind == kind) return &list[i];
+    return NULL;
+}
+
+const moq_msf_mpeg2ts_t *moq_msf_track_mpeg2ts(const moq_msf_track_t *track)
+{
+    return track ? moq_msf_ext_mpeg2ts(track->extensions, track->extension_count)
+                 : NULL;
+}
+
 static void free_track_allocs(const moq_alloc_t *alloc, moq_msf_track_t *t)
 {
     if (t->cp_ref_ids) {
@@ -204,6 +242,270 @@ static void free_track_allocs(const moq_alloc_t *alloc, moq_msf_track_t *t)
         t->depends = NULL;
         t->depends_count = 0;
     }
+    if (t->extensions) {
+        /* A parsed track's list is one parse block (msf_ext_block_t). */
+        msf_ext_block_t *b = (msf_ext_block_t *)(uintptr_t)t->extensions;
+        if (b->ts.si_pids)
+            alloc->free(b->ts.si_pids, b->ts.si_pid_count * sizeof(uint32_t),
+                        alloc->ctx);
+        alloc->free(b, sizeof(*b), alloc->ctx);
+        t->extensions = NULL;
+        t->extension_count = 0;
+    }
+}
+
+/* -- mpeg2ts track fields (draft-gregoire-moq-msfts) ------------------ */
+
+static const char *const MPEG2TS_MODE_NAMES[] = {
+    "", "unmodified-program", "unmodified-multiplex", "per-program",
+    "es-packets",
+};
+
+static const char *const MPEG2TS_TS_MODE_NAMES[] = {
+    "", "arrival-time", "opaque",
+};
+
+const char *moq_msf_mpeg2ts_mode_name(moq_msf_mpeg2ts_mode_t mode)
+{
+    if ((unsigned)mode >= sizeof(MPEG2TS_MODE_NAMES) / sizeof(MPEG2TS_MODE_NAMES[0]))
+        return "";
+    return MPEG2TS_MODE_NAMES[mode];
+}
+
+const char *moq_msf_mpeg2ts_timestamp_mode_name(moq_msf_mpeg2ts_timestamp_mode_t m)
+{
+    if ((unsigned)m >= sizeof(MPEG2TS_TS_MODE_NAMES) / sizeof(MPEG2TS_TS_MODE_NAMES[0]))
+        return "";
+    return MPEG2TS_TS_MODE_NAMES[m];
+}
+
+/* Mode names are matched exactly (case-sensitive). */
+static moq_msf_mpeg2ts_mode_t mpeg2ts_mode_from(moq_bytes_t name)
+{
+    for (unsigned i = 1; i < sizeof(MPEG2TS_MODE_NAMES) / sizeof(MPEG2TS_MODE_NAMES[0]); i++) {
+        size_t n = strlen(MPEG2TS_MODE_NAMES[i]);
+        if (name.len == n && memcmp(name.data, MPEG2TS_MODE_NAMES[i], n) == 0)
+            return (moq_msf_mpeg2ts_mode_t)i;
+    }
+    return MOQ_MSF_MPEG2TS_MODE_UNRECOGNIZED;
+}
+
+static moq_msf_mpeg2ts_timestamp_mode_t mpeg2ts_ts_mode_from(moq_bytes_t name)
+{
+    for (unsigned i = 1; i < sizeof(MPEG2TS_TS_MODE_NAMES) / sizeof(MPEG2TS_TS_MODE_NAMES[0]); i++) {
+        size_t n = strlen(MPEG2TS_TS_MODE_NAMES[i]);
+        if (name.len == n && memcmp(name.data, MPEG2TS_TS_MODE_NAMES[i], n) == 0)
+            return (moq_msf_mpeg2ts_timestamp_mode_t)i;
+    }
+    return MOQ_MSF_MPEG2TS_TIMESTAMP_UNRECOGNIZED;
+}
+
+/* The exact value of a JSON number token (RFC 8259 grammar: int, optional
+ * fraction, optional exponent) when it is a non-negative integer no larger
+ * than max, whatever its spelling: 188, 188.0, 1.88e2 and 18800e-2 are all
+ * 188. No floating point is involved, so no rounding can admit a value out
+ * of range or a fractional one. */
+static bool json_uint_exact(const char *s, size_t n, uint64_t max,
+                            uint64_t *out)
+{
+    size_t i = 0;
+    if (i >= n || s[i] < '0' || s[i] > '9') return false;     /* no sign */
+    /* Significant digits of int and fraction, and how many were fraction. */
+    const char *digits[2] = { NULL, NULL };
+    size_t dlen[2] = { 0, 0 };
+    digits[0] = s + i;
+    while (i < n && s[i] >= '0' && s[i] <= '9') { i++; dlen[0]++; }
+    if (i < n && s[i] == '.') {
+        i++;
+        digits[1] = s + i;
+        while (i < n && s[i] >= '0' && s[i] <= '9') { i++; dlen[1]++; }
+        if (dlen[1] == 0) return false;
+    }
+    long long exp10 = 0;
+    if (i < n && (s[i] == 'e' || s[i] == 'E')) {
+        i++;
+        bool neg = false;
+        if (i < n && (s[i] == '+' || s[i] == '-')) neg = s[i++] == '-';
+        if (i >= n || s[i] < '0' || s[i] > '9') return false;
+        while (i < n && s[i] >= '0' && s[i] <= '9') {
+            if (exp10 < 100000) exp10 = exp10 * 10 + (s[i] - '0');
+            i++;
+        }
+        if (neg) exp10 = -exp10;
+    }
+    if (i != n) return false;
+    /* value = D * 10^(exp10 - dlen[1]) with D the digit string int||frac. */
+    long long shift = exp10 - (long long)dlen[1];
+    size_t total = dlen[0] + dlen[1];
+    /* The digits that the shift moves behind the decimal point must be 0. */
+    size_t keep = total;
+    if (shift < 0) {
+        size_t drop = (size_t)(-shift) < total ? (size_t)(-shift) : total;
+        for (size_t k = total - drop; k < total; k++) {
+            char c = k < dlen[0] ? digits[0][k] : digits[1][k - dlen[0]];
+            if (c != '0') return false;
+        }
+        keep = total - drop;
+        shift = 0;
+    }
+    uint64_t v = 0;
+    for (size_t k = 0; k < keep; k++) {
+        char c = k < dlen[0] ? digits[0][k] : digits[1][k - dlen[0]];
+        uint64_t d = (uint64_t)(c - '0');
+        if (v > (max - d) / 10) return false;
+        v = v * 10 + d;
+    }
+    for (long long k = 0; k < shift && v != 0; k++) {
+        if (v > max / 10) return false;
+        v *= 10;
+    }
+    if (v > max) return false;
+    *out = v;
+    return true;
+}
+
+/* A JSON number holding a non-negative integer no larger than max. */
+static bool mpeg2ts_num(const json_value_t *v, uint64_t max, uint64_t *out)
+{
+    json_number_t *n = json_value_as_number((json_value_t *)v);
+    if (!n || n->number_size == 0) return false;
+    return json_uint_exact(n->number, n->number_size, max, out);
+}
+
+/* Record one "mpeg2ts*" key. Returns false for a key this document does not
+ * define (left for the caller to ignore), MOQ_ERR_NOMEM via *rc. */
+static bool parse_mpeg2ts_key(const moq_alloc_t *alloc,
+                              const json_object_element_t *e,
+                              moq_msf_mpeg2ts_t *m, moq_result_t *rc)
+{
+    const json_value_t *v = e->value;
+    uint64_t x = 0;
+    *rc = MOQ_OK;
+    if (str_eq(e->name, "mpeg2tsMode")) {
+        m->has_mode = true;
+        m->mode_name = (moq_bytes_t){ NULL, 0 };
+        m->mode = MOQ_MSF_MPEG2TS_MODE_UNRECOGNIZED;
+        m->malformed &= ~MOQ_MSF_MPEG2TS_F_MODE;
+        if (get_string(e, &m->mode_name)) m->mode = mpeg2ts_mode_from(m->mode_name);
+        else m->malformed |= MOQ_MSF_MPEG2TS_F_MODE;
+    } else if (str_eq(e->name, "mpeg2tsPacketSize")) {
+        m->has_packet_size = true;
+        m->malformed &= ~MOQ_MSF_MPEG2TS_F_PACKET_SIZE;
+        if (mpeg2ts_num(v, UINT32_MAX, &x)) m->packet_size = (uint32_t)x;
+        else m->malformed |= MOQ_MSF_MPEG2TS_F_PACKET_SIZE;
+    } else if (str_eq(e->name, "mpeg2tsEsPid")) {
+        m->has_es_pid = true;
+        m->malformed &= ~MOQ_MSF_MPEG2TS_F_ES_PID;
+        if (mpeg2ts_num(v, UINT32_MAX, &x)) m->es_pid = (uint32_t)x;
+        else m->malformed |= MOQ_MSF_MPEG2TS_F_ES_PID;
+    } else if (str_eq(e->name, "mpeg2tsProgramNumber")) {
+        m->has_program_number = true;
+        m->malformed &= ~MOQ_MSF_MPEG2TS_F_PROGRAM_NUMBER;
+        if (mpeg2ts_num(v, UINT32_MAX, &x)) m->program_number = (uint32_t)x;
+        else m->malformed |= MOQ_MSF_MPEG2TS_F_PROGRAM_NUMBER;
+    } else if (str_eq(e->name, "mpeg2tsPcrPid")) {
+        m->has_pcr_pid = true;
+        m->malformed &= ~MOQ_MSF_MPEG2TS_F_PCR_PID;
+        if (mpeg2ts_num(v, UINT32_MAX, &x)) m->pcr_pid = (uint32_t)x;
+        else m->malformed |= MOQ_MSF_MPEG2TS_F_PCR_PID;
+    } else if (str_eq(e->name, "mpeg2tsMuxRate")) {
+        m->has_mux_rate = true;
+        m->malformed &= ~MOQ_MSF_MPEG2TS_F_MUX_RATE;
+        if (mpeg2ts_num(v, UINT64_MAX, &x)) m->mux_rate = x;
+        else m->malformed |= MOQ_MSF_MPEG2TS_F_MUX_RATE;
+    } else if (str_eq(e->name, "mpeg2tsSiPids")) {
+        if (m->si_pids) {           /* duplicate key: the last one wins */
+            alloc->free(m->si_pids, m->si_pid_count * sizeof(uint32_t), alloc->ctx);
+            m->si_pids = NULL;
+        }
+        m->si_pid_count = 0;
+        m->has_si_pids = true;
+        m->malformed &= ~MOQ_MSF_MPEG2TS_F_SI_PIDS;
+        json_array_t *a = json_value_as_array((json_value_t *)v);
+        if (!a) {
+            m->malformed |= MOQ_MSF_MPEG2TS_F_SI_PIDS;
+            return true;
+        }
+        if (a->length == 0) return true;
+        size_t bytes;
+        if (!moq_msf_checked_array_bytes(a->length, sizeof(uint32_t), &bytes)) {
+            *rc = MOQ_ERR_NOMEM;
+            return true;
+        }
+        uint32_t *arr = (uint32_t *)alloc->alloc(bytes, alloc->ctx);
+        if (!arr) { *rc = MOQ_ERR_NOMEM; return true; }
+        size_t n = 0;
+        for (json_array_element_t *ae = a->start; ae && n < a->length; ae = ae->next) {
+            if (mpeg2ts_num(ae->value, UINT32_MAX, &x)) {
+                arr[n++] = (uint32_t)x;
+            } else {
+                arr[n++] = 0;
+                m->malformed |= MOQ_MSF_MPEG2TS_F_SI_PIDS;
+            }
+        }
+        m->si_pids = arr;
+        m->si_pid_count = n;
+    } else if (str_eq(e->name, "mpeg2tsRandomAccess")) {
+        m->has_random_access = true;
+        m->malformed &= ~MOQ_MSF_MPEG2TS_F_RANDOM_ACCESS;
+        if (!get_bool(e, &m->random_access))
+            m->malformed |= MOQ_MSF_MPEG2TS_F_RANDOM_ACCESS;
+    } else if (str_eq(e->name, "mpeg2tsTimestampMode")) {
+        m->has_timestamp_mode = true;
+        m->timestamp_mode_name = (moq_bytes_t){ NULL, 0 };
+        m->timestamp_mode = MOQ_MSF_MPEG2TS_TIMESTAMP_UNRECOGNIZED;
+        m->malformed &= ~MOQ_MSF_MPEG2TS_F_TIMESTAMP_MODE;
+        if (get_string(e, &m->timestamp_mode_name))
+            m->timestamp_mode = mpeg2ts_ts_mode_from(m->timestamp_mode_name);
+        else
+            m->malformed |= MOQ_MSF_MPEG2TS_F_TIMESTAMP_MODE;
+    } else if (str_eq(e->name, "mpeg2tsScte35Pid")) {
+        m->has_scte35_pid = true;
+        m->malformed &= ~MOQ_MSF_MPEG2TS_F_SCTE35_PID;
+        if (mpeg2ts_num(v, UINT32_MAX, &x)) m->scte35_pid = (uint32_t)x;
+        else m->malformed |= MOQ_MSF_MPEG2TS_F_SCTE35_PID;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+/* A track's mpeg2ts record, or NULL when it carries none. */
+static const moq_msf_mpeg2ts_t *track_ts(const moq_msf_track_t *t)
+{
+    return moq_msf_track_mpeg2ts(t);
+}
+
+/* Is this one of the "mpeg2ts*" keys the draft defines? */
+static bool mpeg2ts_key_known(const json_string_t *name)
+{
+    static const char *const keys[] = {
+        "mpeg2tsMode", "mpeg2tsPacketSize", "mpeg2tsEsPid",
+        "mpeg2tsProgramNumber", "mpeg2tsPcrPid", "mpeg2tsMuxRate",
+        "mpeg2tsSiPids", "mpeg2tsRandomAccess", "mpeg2tsTimestampMode",
+        "mpeg2tsScte35Pid",
+    };
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++)
+        if (str_eq(name, keys[i])) return true;
+    return false;
+}
+
+/* The mpeg2ts record of a track being parsed, allocated with its list entry
+ * on first use. NULL on allocation failure. */
+static moq_msf_mpeg2ts_t *parse_ts_rec(const moq_alloc_t *alloc,
+                                       moq_msf_track_t *t)
+{
+    if (t->extensions)
+        return &((msf_ext_block_t *)(uintptr_t)t->extensions)->ts;
+    msf_ext_block_t *b = (msf_ext_block_t *)alloc->alloc(sizeof(*b), alloc->ctx);
+    if (!b) return NULL;
+    memset(b, 0, sizeof(*b));
+    moq_msf_mpeg2ts_init(&b->ts);
+    b->entry.kind = MOQ_MSF_EXT_MPEG2TS;
+    b->entry.u.mpeg2ts = &b->ts;
+    t->extensions = &b->entry;
+    t->extension_count = 1;
+    return &b->ts;
 }
 
 static void free_cp_allocs(const moq_alloc_t *alloc,
@@ -326,7 +628,8 @@ static bool track_is_name_namespace_only(const moq_msf_track_t *t)
            t->cp_ref_id_count == 0 && !t->has_max_grp_sap &&
            !t->has_max_obj_sap && !t->has_parent_name &&
            !t->has_parent_namespace && !t->has_packaging && !t->has_is_live &&
-           !t->has_template && !t->has_track_duration;
+           !t->has_template && !t->has_track_duration &&
+           t->extension_count == 0;
 }
 
 /* Parse a JSON number value as a non-negative integer uint64. Rejects a sign,
@@ -479,6 +782,17 @@ static moq_result_t parse_track(const moq_alloc_t *alloc,
             moq_result_t rc = parse_template(e->value, &t->template_);
             if (rc < 0) return rc;
             t->has_template = true;
+        } else if (e->name->string_size > 7 &&
+                   memcmp(e->name->string, "mpeg2ts", 7) == 0) {
+            /* draft-gregoire-moq-msfts track fields; any other mpeg2ts* key
+             * is not understood and ignored. */
+            if (mpeg2ts_key_known(e->name)) {
+                moq_msf_mpeg2ts_t *m = parse_ts_rec(alloc, t);
+                if (!m) return MOQ_ERR_NOMEM;  /* caller frees the track */
+                moq_result_t mrc;
+                parse_mpeg2ts_key(alloc, e, m, &mrc);
+                if (mrc < 0) return mrc;
+            }
         } else if (str_eq(e->name, "parentName")) {
             t->has_parent_name = get_string(e, &t->parent_name);
         } else if (str_eq(e->name, "parentNamespace")) {
@@ -916,6 +1230,36 @@ static bool track_identity_ok(const moq_msf_track_t *t)
 
 /* Build an effective track from a clone parent plus the clone op's overrides.
  * eff begins as a copy of the parent; spans are borrowed (no allocation). */
+/* mpeg2ts fields of a clone: each key the clone carries overrides the
+ * inherited one, value and malformed bit together. Spans and arrays stay
+ * borrowed from the catalogs they came from. */
+static void ts_merge_clone(moq_msf_mpeg2ts_t *em, const moq_msf_mpeg2ts_t *cm)
+{
+#define MPEG2TS_OVERRIDE(has, bit, assign) \
+    if (cm->has) { em->has = true; assign; \
+                   em->malformed = (em->malformed & ~(bit)) | (cm->malformed & (bit)); }
+    MPEG2TS_OVERRIDE(has_mode, MOQ_MSF_MPEG2TS_F_MODE,
+                     (em->mode = cm->mode, em->mode_name = cm->mode_name))
+    MPEG2TS_OVERRIDE(has_packet_size, MOQ_MSF_MPEG2TS_F_PACKET_SIZE,
+                     em->packet_size = cm->packet_size)
+    MPEG2TS_OVERRIDE(has_es_pid, MOQ_MSF_MPEG2TS_F_ES_PID, em->es_pid = cm->es_pid)
+    MPEG2TS_OVERRIDE(has_program_number, MOQ_MSF_MPEG2TS_F_PROGRAM_NUMBER,
+                     em->program_number = cm->program_number)
+    MPEG2TS_OVERRIDE(has_pcr_pid, MOQ_MSF_MPEG2TS_F_PCR_PID, em->pcr_pid = cm->pcr_pid)
+    MPEG2TS_OVERRIDE(has_mux_rate, MOQ_MSF_MPEG2TS_F_MUX_RATE,
+                     em->mux_rate = cm->mux_rate)
+    MPEG2TS_OVERRIDE(has_si_pids, MOQ_MSF_MPEG2TS_F_SI_PIDS,
+                     (em->si_pids = cm->si_pids, em->si_pid_count = cm->si_pid_count))
+    MPEG2TS_OVERRIDE(has_random_access, MOQ_MSF_MPEG2TS_F_RANDOM_ACCESS,
+                     em->random_access = cm->random_access)
+    MPEG2TS_OVERRIDE(has_timestamp_mode, MOQ_MSF_MPEG2TS_F_TIMESTAMP_MODE,
+                     (em->timestamp_mode = cm->timestamp_mode,
+                      em->timestamp_mode_name = cm->timestamp_mode_name))
+    MPEG2TS_OVERRIDE(has_scte35_pid, MOQ_MSF_MPEG2TS_F_SCTE35_PID,
+                     em->scte35_pid = cm->scte35_pid)
+#undef MPEG2TS_OVERRIDE
+}
+
 static void apply_clone_overrides(moq_msf_track_t *eff,
                                   const moq_msf_track_t *c)
 {
@@ -959,6 +1303,74 @@ static void apply_clone_overrides(moq_msf_track_t *eff,
     /* eff began as a copy of the parent, so it already inherits the parent's
      * template; a clone carrying its own template overrides it (5.2.15). */
     if (c->has_template)       { eff->has_template = true; eff->template_ = c->template_; }
+}
+
+/* One temporary allocation, with its size for the free. */
+typedef struct msf_tmp_block {
+    void  *p;
+    size_t n;
+} msf_tmp_block_t;
+
+/* A clone's extension list: the parent's entries, with each kind the clone
+ * carries merged into a fresh record (for mpeg2ts, key by key) or appended.
+ * The merged list and record live in one allocation that the caller keeps
+ * until the effective catalog is encoded (*block, *block_size). */
+static moq_result_t clone_merge_ext(const moq_alloc_t *alloc,
+                                    moq_msf_track_t *eff,
+                                    const moq_msf_track_t *c,
+                                    void **block, size_t *block_size)
+{
+    *block = NULL;
+    *block_size = 0;
+    size_t pn = eff->extension_count, cn = c->extension_count;
+    if (cn == 0) return MOQ_OK;
+    if (!c->extensions || (pn && !eff->extensions)) return MOQ_ERR_INVAL;
+    for (size_t i = 0; i < cn; i++)
+        for (size_t j = i + 1; j < cn; j++)
+            if (c->extensions[i].kind == c->extensions[j].kind)
+                return MOQ_ERR_INVAL;
+    if (pn > SIZE_MAX / 2 || cn > SIZE_MAX / 2) return MOQ_ERR_NOMEM;
+    size_t list_bytes;
+    if (!moq_msf_checked_array_bytes(pn + cn, sizeof(moq_msf_track_ext_t),
+                                     &list_bytes))
+        return MOQ_ERR_NOMEM;
+    size_t off = (list_bytes + _Alignof(moq_msf_mpeg2ts_t) - 1) /
+                 _Alignof(moq_msf_mpeg2ts_t) * _Alignof(moq_msf_mpeg2ts_t);
+    if (off > SIZE_MAX - sizeof(moq_msf_mpeg2ts_t)) return MOQ_ERR_NOMEM;
+    size_t bytes = off + sizeof(moq_msf_mpeg2ts_t);
+    uint8_t *mem = (uint8_t *)alloc->alloc(bytes, alloc->ctx);
+    if (!mem) return MOQ_ERR_NOMEM;
+    moq_msf_track_ext_t *list = (moq_msf_track_ext_t *)(void *)mem;
+    moq_msf_mpeg2ts_t *rec = (moq_msf_mpeg2ts_t *)(void *)(mem + off);
+    size_t k = 0;
+    for (size_t i = 0; i < pn; i++) list[k++] = eff->extensions[i];
+    for (size_t j = 0; j < cn; j++) {
+        const moq_msf_track_ext_t *ce = &c->extensions[j];
+        size_t at = k;
+        for (size_t i = 0; i < k; i++)
+            if (list[i].kind == ce->kind) { at = i; break; }
+        moq_msf_track_ext_t ne = *ce;
+        if (ce->kind == MOQ_MSF_EXT_MPEG2TS && ce->u.mpeg2ts &&
+            ce->u.mpeg2ts->struct_size >= MSF_TS_V0) {
+            moq_msf_mpeg2ts_init(rec);
+            const moq_msf_mpeg2ts_t *pm = at < k ? list[at].u.mpeg2ts : NULL;
+            if (pm && pm->struct_size >= MSF_TS_V0) {
+                size_t n = pm->struct_size < sizeof(*rec) ? pm->struct_size
+                                                          : sizeof(*rec);
+                memcpy(rec, pm, n);
+                rec->struct_size = sizeof(*rec);
+            }
+            ts_merge_clone(rec, ce->u.mpeg2ts);
+            ne.u.mpeg2ts = rec;
+        }
+        list[at] = ne;
+        if (at == k) k++;
+    }
+    eff->extensions = list;
+    eff->extension_count = k;
+    *block = mem;
+    *block_size = bytes;
+    return MOQ_OK;
 }
 
 /* Internal encode: strict_cp=true enforces CMSF §4 contentProtection authoring
@@ -1207,10 +1619,11 @@ moq_result_t moq_msf_catalog_apply_delta_ex(const moq_alloc_t *alloc,
      * Guard the running sum against size_t wrap, then the byte size against
      * wrap, so a crafted base/delta cannot under-allocate eff and overflow it
      * during the copy/apply loop below. */
-    size_t cap = base->track_count;
+    size_t cap = base->track_count, clones = 0;
     for (size_t i = 0; i < delta->delta_update_count; i++) {
         const moq_msf_delta_op_t *op = &delta->delta_update[i];
         if (op->track_count > 0 && !op->tracks) return MOQ_ERR_INVAL;
+        if (op->op == MOQ_MSF_DELTA_OP_CLONE) clones += op->track_count;
         /* Per-op-track identity spans are validated in the apply loop below --
          * after the overflow guards, so a lying (huge) track_count is rejected
          * as NOMEM before anything iterates it. */
@@ -1226,26 +1639,31 @@ moq_result_t moq_msf_catalog_apply_delta_ex(const moq_alloc_t *alloc,
     moq_msf_track_t *eff = NULL;
     uint8_t         *removed = NULL;
     size_t eff_bytes = 0, rem_bytes = 0;
+    /* Merged extension lists of clone tracks, kept until the encode. */
+    msf_tmp_block_t *merged = NULL;
+    size_t merged_bytes = 0, merged_n = 0;
+    if (clones > 0) {
+        if (!moq_msf_checked_array_bytes(clones, sizeof(msf_tmp_block_t),
+                                         &merged_bytes))
+            return MOQ_ERR_NOMEM;
+        merged = (msf_tmp_block_t *)alloc->alloc(merged_bytes, alloc->ctx);
+        if (!merged) return MOQ_ERR_NOMEM;
+    }
     ns_index_t ix = { NULL, 0, 0 };
     if (cap > 0) {
+        moq_result_t arc = MOQ_ERR_NOMEM;
         if (!moq_msf_checked_array_bytes(cap, sizeof(moq_msf_track_t),
-                                         &eff_bytes))
-            return MOQ_ERR_NOMEM;
-        eff = (moq_msf_track_t *)alloc->alloc(eff_bytes, alloc->ctx);
-        if (!eff) return MOQ_ERR_NOMEM;
-        if (!moq_msf_checked_array_bytes(cap, sizeof(uint8_t), &rem_bytes)) {
-            alloc->free(eff, eff_bytes, alloc->ctx);
-            return MOQ_ERR_NOMEM;
+                                         &eff_bytes) ||
+            !(eff = (moq_msf_track_t *)alloc->alloc(eff_bytes, alloc->ctx)) ||
+            !moq_msf_checked_array_bytes(cap, sizeof(uint8_t), &rem_bytes) ||
+            !(removed = (uint8_t *)alloc->alloc(rem_bytes, alloc->ctx)) ||
+            (arc = ns_index_init(&ix, cap, alloc)) < 0) {
+            if (removed) alloc->free(removed, rem_bytes, alloc->ctx);
+            if (eff) alloc->free(eff, eff_bytes, alloc->ctx);
+            if (merged) alloc->free(merged, merged_bytes, alloc->ctx);
+            return arc;
         }
-        removed = (uint8_t *)alloc->alloc(rem_bytes, alloc->ctx);
-        if (!removed) { alloc->free(eff, eff_bytes, alloc->ctx); return MOQ_ERR_NOMEM; }
         memset(removed, 0, rem_bytes);
-        moq_result_t irc = ns_index_init(&ix, cap, alloc);
-        if (irc < 0) {
-            alloc->free(removed, rem_bytes, alloc->ctx);
-            alloc->free(eff, eff_bytes, alloc->ctx);
-            return irc;
-        }
     }
 
     size_t n = 0;
@@ -1290,6 +1708,10 @@ moq_result_t moq_msf_catalog_apply_delta_ex(const moq_alloc_t *alloc,
                 if (idx < 0) { rc = MOQ_ERR_PROTO; break; }  /* parent absent */
                 moq_msf_track_t e = eff[(size_t)idx];
                 apply_clone_overrides(&e, ot);
+                msf_tmp_block_t *mb = &merged[merged_n];
+                rc = clone_merge_ext(alloc, &e, ot, &mb->p, &mb->n);
+                if (rc < 0) break;
+                if (mb->p) merged_n++;
                 /* The cloned tuple MUST be new. */
                 if (ns_index_find(&ix, eff, e.has_namespace,
                                   e.namespace_, e.name) >= 0) {
@@ -1334,6 +1756,9 @@ moq_result_t moq_msf_catalog_apply_delta_ex(const moq_alloc_t *alloc,
         rc = catalog_encode_impl(alloc, &mid, &json, /*strict_cp=*/false);
     }
 
+    for (size_t i = 0; i < merged_n; i++)
+        alloc->free(merged[i].p, merged[i].n, alloc->ctx);
+    if (merged) alloc->free(merged, merged_bytes, alloc->ctx);
     if (eff) alloc->free(eff, eff_bytes, alloc->ctx);
     if (rc < 0) return rc;
 
@@ -1656,6 +2081,168 @@ static bool cp_is_uuid(moq_bytes_t v)
     return true;
 }
 
+static moq_result_t mpeg2ts_fail(moq_msf_mpeg2ts_error_t *reason,
+                                 moq_msf_mpeg2ts_error_t why)
+{
+    if (reason) *reason = why;
+    return MOQ_ERR_PROTO;
+}
+
+/* The subscriber's check of one mpeg2ts track (see the header). */
+static moq_result_t ts_check(const moq_msf_track_t *t,
+                             const moq_msf_mpeg2ts_t *m,
+                             moq_msf_mpeg2ts_error_t *reason)
+{
+    /* Security Considerations: values are checked before use. */
+    if (m->malformed) return mpeg2ts_fail(reason, MOQ_MSF_MPEG2TS_ERR_MALFORMED_FIELD);
+
+    /* Mode: required; one of the four names; MUST reject an unknown one. */
+    if (!m->has_mode) return mpeg2ts_fail(reason, MOQ_MSF_MPEG2TS_ERR_MODE_MISSING);
+    if (m->mode < MOQ_MSF_MPEG2TS_MODE_UNMODIFIED_PROGRAM ||
+        m->mode > MOQ_MSF_MPEG2TS_MODE_ES_PACKETS)
+        return mpeg2ts_fail(reason, MOQ_MSF_MPEG2TS_ERR_MODE_UNRECOGNIZED);
+    bool multiplex = m->mode == MOQ_MSF_MPEG2TS_MODE_UNMODIFIED_MULTIPLEX;
+
+    /* Packet Size: required; 188 or 192. */
+    if (!m->has_packet_size)
+        return mpeg2ts_fail(reason, MOQ_MSF_MPEG2TS_ERR_PACKET_SIZE_MISSING);
+    if (m->packet_size != 188 && m->packet_size != 192)
+        return mpeg2ts_fail(reason, MOQ_MSF_MPEG2TS_ERR_PACKET_SIZE);
+
+    /* Timestamp Mode: MUST NOT be present when the packet size is 188. */
+    if (m->has_timestamp_mode && m->packet_size == 188)
+        return mpeg2ts_fail(reason, MOQ_MSF_MPEG2TS_ERR_TIMESTAMP_MODE_188);
+
+    /* ES PID: MUST be present in es-packets and absent otherwise. */
+    if (m->mode == MOQ_MSF_MPEG2TS_MODE_ES_PACKETS) {
+        if (!m->has_es_pid) return mpeg2ts_fail(reason, MOQ_MSF_MPEG2TS_ERR_ES_PID_MISSING);
+    } else if (m->has_es_pid) {
+        return mpeg2ts_fail(reason, MOQ_MSF_MPEG2TS_ERR_ES_PID_FORBIDDEN);
+    }
+
+    /* Ranges: 13-bit PIDs, 16-bit program numbers (0 names the network PID
+     * in a PAT, never a program), a positive rate. */
+    if ((m->has_es_pid && m->es_pid > 0x1FFFu) ||
+        (m->has_pcr_pid && m->pcr_pid > 0x1FFFu) ||
+        (m->has_scte35_pid && m->scte35_pid > 0x1FFFu))
+        return mpeg2ts_fail(reason, MOQ_MSF_MPEG2TS_ERR_PID_RANGE);
+    for (size_t i = 0; m->has_si_pids && i < m->si_pid_count; i++)
+        if (!m->si_pids || m->si_pids[i] > 0x1FFFu)
+            return mpeg2ts_fail(reason, MOQ_MSF_MPEG2TS_ERR_PID_RANGE);
+    if (m->has_program_number &&
+        (m->program_number == 0 || m->program_number > 0xFFFFu))
+        return mpeg2ts_fail(reason, MOQ_MSF_MPEG2TS_ERR_PROGRAM_NUMBER_RANGE);
+    if (m->has_mux_rate && m->mux_rate == 0)
+        return mpeg2ts_fail(reason, MOQ_MSF_MPEG2TS_ERR_MUX_RATE_RANGE);
+
+    /* Mux Rate: MUST be absent in unmodified-multiplex. */
+    if (multiplex && m->has_mux_rate)
+        return mpeg2ts_fail(reason, MOQ_MSF_MPEG2TS_ERR_MUX_RATE_FORBIDDEN);
+
+    /* SI PIDs: MUST be absent with an ES PID and in unmodified-multiplex;
+     * each PID listed once. */
+    if (m->has_si_pids && (m->has_es_pid || multiplex))
+        return mpeg2ts_fail(reason, MOQ_MSF_MPEG2TS_ERR_SI_PIDS_FORBIDDEN);
+    for (size_t i = 0; m->has_si_pids && i < m->si_pid_count; i++)
+        for (size_t j = i + 1; j < m->si_pid_count; j++)
+            if (m->si_pids[i] == m->si_pids[j])
+                return mpeg2ts_fail(reason, MOQ_MSF_MPEG2TS_ERR_SI_PIDS_DUPLICATE);
+
+    /* SCTE-35 PID: same presence rule. */
+    if (m->has_scte35_pid && (m->has_es_pid || multiplex))
+        return mpeg2ts_fail(reason, MOQ_MSF_MPEG2TS_ERR_SCTE35_PID_FORBIDDEN);
+
+    /* Random Access: in unmodified-multiplex it refers to the reference
+     * program and MUST be absent when the catalog names none (a reference
+     * program is named by mpeg2tsProgramNumber; a PCR PID alone names
+     * none). */
+    if (multiplex && m->has_random_access && !m->has_program_number)
+        return mpeg2ts_fail(reason, MOQ_MSF_MPEG2TS_ERR_RANDOM_ACCESS_FORBIDDEN);
+
+    /* Switching: an unmodified-multiplex track MUST NOT be in an altGroup. */
+    if (multiplex && t->has_alt_group)
+        return mpeg2ts_fail(reason, MOQ_MSF_MPEG2TS_ERR_ALT_GROUP_FORBIDDEN);
+
+    return MOQ_OK;
+}
+
+moq_result_t moq_msf_track_mpeg2ts_check(const moq_msf_track_t *t,
+                                         moq_msf_mpeg2ts_error_t *reason)
+{
+    if (reason) *reason = MOQ_MSF_MPEG2TS_OK;
+    if (!t) return MOQ_ERR_INVAL;
+    if (!bytes_eq_lit(t->packaging, "mpeg2ts")) {
+        if (reason) *reason = MOQ_MSF_MPEG2TS_ERR_NOT_MPEG2TS;
+        return MOQ_ERR_INVAL;
+    }
+    /* Without the record the track has none of its required fields. */
+    static const moq_msf_mpeg2ts_t none;
+    const moq_msf_mpeg2ts_t *m = track_ts(t);
+    if (m && m->struct_size < MSF_TS_V0) return MOQ_ERR_INVAL;
+    return ts_check(t, m ? m : &none, reason);
+}
+
+/* Resolve initRef and check the entry: "inline", Base64, whole packets of
+ * packet_size each with its sync byte. On MOQ_OK *out (when non-NULL) owns
+ * the decoded packets. */
+bool moq_msf_ts_whole_packets(const uint8_t *data, size_t len,
+                              uint32_t packet_size)
+{
+    if (packet_size == 0 || len == 0 || len % packet_size != 0) return false;
+    size_t sync = packet_size == 192u ? 4u : 0u;
+    for (size_t off = 0; off < len; off += packet_size)
+        if (data[off + sync] != 0x47u) return false;
+    return true;
+}
+
+static moq_result_t ts_init_check(const moq_alloc_t *alloc,
+                                  const moq_msf_catalog_t *cat,
+                                  const moq_msf_track_t *track,
+                                  uint32_t packet_size,
+                                  moq_rcbuf_t **out,
+                                  moq_msf_mpeg2ts_error_t *reason)
+{
+    const moq_msf_init_data_entry_t *e =
+        moq_msf_catalog_find_init_data(cat, track->init_ref);
+    if (!e) return mpeg2ts_fail(reason, MOQ_MSF_MPEG2TS_ERR_INIT_REF_UNRESOLVED);
+    /* Use of MSF Initialization Data: the entry's type MUST be "inline". */
+    if (!bytes_eq_lit(e->type, "inline"))
+        return mpeg2ts_fail(reason, MOQ_MSF_MPEG2TS_ERR_INIT_DATA_TYPE);
+
+    moq_rcbuf_t *raw = NULL;
+    moq_result_t rc = moq_msf_decode_init_data(alloc, e->data, &raw);
+    if (rc == MOQ_ERR_PROTO || rc == MOQ_ERR_INVAL)
+        return mpeg2ts_fail(reason, MOQ_MSF_MPEG2TS_ERR_INIT_DATA_BASE64);
+    if (rc != MOQ_OK) return rc;
+
+    /* ... and its decoded value MUST be whole source packets of the declared
+     * size, each starting with the sync byte. */
+    if (!moq_msf_ts_whole_packets(moq_rcbuf_data(raw), moq_rcbuf_len(raw),
+                                  packet_size)) {
+        moq_rcbuf_decref(raw);
+        return mpeg2ts_fail(reason, MOQ_MSF_MPEG2TS_ERR_INIT_DATA_PACKETS);
+    }
+    if (out) *out = raw;
+    else moq_rcbuf_decref(raw);
+    return MOQ_OK;
+}
+
+moq_result_t moq_msf_track_mpeg2ts_init_data(const moq_alloc_t *alloc,
+                                             const moq_msf_catalog_t *cat,
+                                             const moq_msf_track_t *track,
+                                             moq_rcbuf_t **out_packets,
+                                             moq_msf_mpeg2ts_error_t *reason)
+{
+    if (out_packets) *out_packets = NULL;
+    if (reason) *reason = MOQ_MSF_MPEG2TS_OK;
+    if (!alloc || !cat || !track) return MOQ_ERR_INVAL;
+    moq_result_t rc = moq_msf_track_mpeg2ts_check(track, reason);
+    if (rc != MOQ_OK) return rc;
+    if (!track->has_init_ref) return MOQ_ERR_INVAL;
+    return ts_init_check(alloc, cat, track, track_ts(track)->packet_size,
+                         out_packets, reason);
+}
+
 /* Validate the optional (has_*-gated) track spans and arrays. Shared by full
  * track validation and clone-op track validation. */
 static moq_result_t validate_track_optionals(const moq_msf_track_t *t)
@@ -1686,16 +2273,96 @@ static moq_result_t validate_track_optionals(const moq_msf_track_t *t)
         if (!validate_bytes(t->cp_ref_ids[i]) || t->cp_ref_ids[i].len == 0)
             return MOQ_ERR_INVAL;
 
+    /* The extension list: a known kind at most once, with a sized record. */
+    if (t->extension_count > 0 && !t->extensions) return MOQ_ERR_INVAL;
+    for (size_t i = 0; i < t->extension_count; i++) {
+        const moq_msf_track_ext_t *e = &t->extensions[i];
+        if (e->kind != MOQ_MSF_EXT_MPEG2TS) return MOQ_ERR_INVAL;
+        if (!e->u.mpeg2ts || e->u.mpeg2ts->struct_size < MSF_TS_V0)
+            return MOQ_ERR_INVAL;
+        for (size_t j = i + 1; j < t->extension_count; j++)
+            if (t->extensions[j].kind == e->kind) return MOQ_ERR_INVAL;
+    }
+    const moq_msf_mpeg2ts_t *m = track_ts(t);
+    if (m) {
+        if (m->has_si_pids && m->si_pid_count > 0 && !m->si_pids)
+            return MOQ_ERR_INVAL;
+        if (m->has_mode && !validate_bytes(m->mode_name)) return MOQ_ERR_INVAL;
+        if (m->has_timestamp_mode && !validate_bytes(m->timestamp_mode_name))
+            return MOQ_ERR_INVAL;
+    }
+
     return MOQ_OK;
 }
 
-static moq_result_t validate_track(const moq_msf_track_t *t)
+/* Authoring: a timestamp mode, when present, is one of the two values the
+ * draft defines (an unrecognized string is tolerated on receive only). */
+static bool ts_mode_authorable(const moq_msf_mpeg2ts_t *m)
+{
+    return !m->has_timestamp_mode ||
+           m->timestamp_mode == MOQ_MSF_MPEG2TS_TIMESTAMP_ARRIVAL_TIME ||
+           m->timestamp_mode == MOQ_MSF_MPEG2TS_TIMESTAMP_OPAQUE;
+}
+
+/* Authoring check of the mpeg2ts overrides a clone carries, each judged on
+ * its own and in the pairs the rules forbid; the inherited fields are judged
+ * when the delta is applied. */
+static bool ts_overrides_ok(const moq_msf_track_t *t, const moq_msf_mpeg2ts_t *m)
+{
+    if (m->malformed || !ts_mode_authorable(m)) return false;
+    if (m->has_mode && (m->mode < MOQ_MSF_MPEG2TS_MODE_UNMODIFIED_PROGRAM ||
+                        m->mode > MOQ_MSF_MPEG2TS_MODE_ES_PACKETS))
+        return false;
+    if (m->has_packet_size && m->packet_size != 188 && m->packet_size != 192)
+        return false;
+    if (m->has_timestamp_mode && m->has_packet_size && m->packet_size == 188)
+        return false;
+    if ((m->has_es_pid && m->es_pid > 0x1FFFu) ||
+        (m->has_pcr_pid && m->pcr_pid > 0x1FFFu) ||
+        (m->has_scte35_pid && m->scte35_pid > 0x1FFFu))
+        return false;
+    for (size_t i = 0; m->has_si_pids && i < m->si_pid_count; i++) {
+        if (!m->si_pids || m->si_pids[i] > 0x1FFFu) return false;
+        for (size_t j = i + 1; j < m->si_pid_count; j++)
+            if (m->si_pids[i] == m->si_pids[j]) return false;
+    }
+    if (m->has_program_number &&
+        (m->program_number == 0 || m->program_number > 0xFFFFu))
+        return false;
+    if (m->has_mux_rate && m->mux_rate == 0) return false;
+    if (m->has_mode) {
+        bool multiplex = m->mode == MOQ_MSF_MPEG2TS_MODE_UNMODIFIED_MULTIPLEX;
+        if (m->mode != MOQ_MSF_MPEG2TS_MODE_ES_PACKETS && m->has_es_pid)
+            return false;
+        if (multiplex && (m->has_mux_rate || m->has_si_pids ||
+                          m->has_scte35_pid || t->has_alt_group))
+            return false;
+    }
+    if (m->has_es_pid && (m->has_si_pids || m->has_scte35_pid)) return false;
+    return true;
+}
+
+static moq_result_t validate_track(const moq_msf_track_t *t, bool strict)
 {
     if (!validate_bytes(t->name) || t->name.len == 0) return MOQ_ERR_INVAL;
     if (!validate_bytes(t->packaging) || t->packaging.len == 0) return MOQ_ERR_INVAL;
 
     moq_result_t rc = validate_track_optionals(t);
     if (rc < 0) return rc;
+
+    /* draft-gregoire-moq-msfts: authoring applies the subscriber's track
+     * check, refuses an unrecognized timestamp mode, and keeps mpeg2ts keys
+     * off other packagings. The receive-path re-encode keeps what a peer
+     * sent. */
+    const moq_msf_mpeg2ts_t *m = track_ts(t);
+    if (strict) {
+        if (bytes_eq_lit(t->packaging, "mpeg2ts")) {
+            if (!m || ts_check(t, m, NULL) != MOQ_OK || !ts_mode_authorable(m))
+                return MOQ_ERR_INVAL;
+        } else if (m) {                  /* the kind belongs to "mpeg2ts" */
+            return MOQ_ERR_INVAL;
+        }
+    }
 
     /* MSF 5.2.35: trackDuration MUST NOT be present on a live track. */
     if (t->has_track_duration && t->is_live) return MOQ_ERR_INVAL;
@@ -1732,16 +2399,29 @@ static moq_result_t validate_track(const moq_msf_track_t *t)
  * track; a "remove" track carries only name (+optional namespace); a "clone"
  * track carries parentName + a new name + optional overrides. */
 static moq_result_t validate_delta_track(moq_msf_delta_op_kind_t op,
-                                         const moq_msf_track_t *t)
+                                         const moq_msf_track_t *t,
+                                         bool strict)
 {
     if (!validate_bytes(t->name) || t->name.len == 0) return MOQ_ERR_INVAL;
+    const moq_msf_mpeg2ts_t *m = track_ts(t);
+    bool has_ts = m != NULL;
     if (op == MOQ_MSF_DELTA_OP_ADD) {
         /* Lenient like the parser: packaging may be omitted in the example;
          * if present it must be non-empty. Optional spans must be coherent. */
         if (t->has_packaging &&
             (!validate_bytes(t->packaging) || t->packaging.len == 0))
             return MOQ_ERR_INVAL;
-        return validate_track_optionals(t);
+        moq_result_t rc = validate_track_optionals(t);
+        if (rc < 0) return rc;
+        /* Authoring: mpeg2ts fields make a whole mpeg2ts track. */
+        if (strict && has_ts &&
+            (!t->has_packaging || !bytes_eq_lit(t->packaging, "mpeg2ts") ||
+             ts_check(t, m, NULL) != MOQ_OK || !ts_mode_authorable(m)))
+            return MOQ_ERR_INVAL;
+        if (strict && t->has_packaging && bytes_eq_lit(t->packaging, "mpeg2ts") &&
+            !has_ts)
+            return MOQ_ERR_INVAL;            /* Mode and Packet Size missing */
+        return MOQ_OK;
     }
     if (op == MOQ_MSF_DELTA_OP_REMOVE) {
         /* MSF 5.1.6: name (+optional namespace) only. */
@@ -1757,7 +2437,13 @@ static moq_result_t validate_delta_track(moq_msf_delta_op_kind_t op,
     if (t->has_packaging &&
         (!validate_bytes(t->packaging) || t->packaging.len == 0))
         return MOQ_ERR_INVAL;
-    return validate_track_optionals(t);
+    moq_result_t rc = validate_track_optionals(t);
+    if (rc < 0) return rc;
+    if (strict && has_ts &&
+        ((t->has_packaging && !bytes_eq_lit(t->packaging, "mpeg2ts")) ||
+         !ts_overrides_ok(t, m)))
+        return MOQ_ERR_INVAL;
+    return MOQ_OK;
 }
 
 static moq_result_t validate_url(const moq_cmsf_url_t *u)
@@ -1818,6 +2504,78 @@ static moq_result_t validate_content_protection(
     }
     if (ds->has_robustness && !validate_bytes(ds->robustness)) return MOQ_ERR_INVAL;
     return MOQ_OK;
+}
+
+/* Emit the mpeg2ts keys in the order of the draft's field table. A malformed
+ * value is written as null and an unrecognized name as itself, so that the
+ * receive-path re-encode keeps a peer's invalid track invalid; authoring
+ * refuses both before getting here. */
+static void enc_track_mpeg2ts(enc_buf_t *b, const moq_msf_mpeg2ts_t *m, bool *f)
+{
+#define MPEG2TS_BAD(bit) ((m->malformed & (bit)) != 0)
+    if (m->has_mode) {
+        enc_comma(b, f);
+        enc_key(b, "mpeg2tsMode");
+        if (MPEG2TS_BAD(MOQ_MSF_MPEG2TS_F_MODE)) {
+            enc_lit(b, "null");
+        } else if (m->mode != MOQ_MSF_MPEG2TS_MODE_UNRECOGNIZED) {
+            const char *nm = moq_msf_mpeg2ts_mode_name(m->mode);
+            enc_json_string(b, (const uint8_t *)nm, strlen(nm));
+        } else {
+            enc_json_string(b, m->mode_name.data, m->mode_name.len);
+        }
+    }
+#define MPEG2TS_NUM(has, bit, key, val) \
+    if (m->has) { \
+        enc_comma(b, f); \
+        enc_key(b, key); \
+        if (MPEG2TS_BAD(bit)) enc_lit(b, "null"); else enc_u64_raw(b, (uint64_t)(val)); \
+    }
+    MPEG2TS_NUM(has_packet_size, MOQ_MSF_MPEG2TS_F_PACKET_SIZE,
+                "mpeg2tsPacketSize", m->packet_size)
+    MPEG2TS_NUM(has_es_pid, MOQ_MSF_MPEG2TS_F_ES_PID, "mpeg2tsEsPid", m->es_pid)
+    MPEG2TS_NUM(has_program_number, MOQ_MSF_MPEG2TS_F_PROGRAM_NUMBER,
+                "mpeg2tsProgramNumber", m->program_number)
+    MPEG2TS_NUM(has_pcr_pid, MOQ_MSF_MPEG2TS_F_PCR_PID, "mpeg2tsPcrPid", m->pcr_pid)
+    MPEG2TS_NUM(has_mux_rate, MOQ_MSF_MPEG2TS_F_MUX_RATE, "mpeg2tsMuxRate",
+                m->mux_rate)
+    if (m->has_si_pids) {
+        enc_comma(b, f);
+        enc_key(b, "mpeg2tsSiPids");
+        if (MPEG2TS_BAD(MOQ_MSF_MPEG2TS_F_SI_PIDS)) {
+            enc_lit(b, "null");
+        } else {
+            enc_char(b, '[');
+            for (size_t i = 0; i < m->si_pid_count; i++) {
+                if (i > 0) enc_char(b, ',');
+                enc_u64_raw(b, m->si_pids[i]);
+            }
+            enc_char(b, ']');
+        }
+    }
+    if (m->has_random_access) {
+        enc_comma(b, f);
+        enc_key(b, "mpeg2tsRandomAccess");
+        if (MPEG2TS_BAD(MOQ_MSF_MPEG2TS_F_RANDOM_ACCESS)) enc_lit(b, "null");
+        else enc_lit(b, m->random_access ? "true" : "false");
+    }
+    if (m->has_timestamp_mode) {
+        enc_comma(b, f);
+        enc_key(b, "mpeg2tsTimestampMode");
+        if (MPEG2TS_BAD(MOQ_MSF_MPEG2TS_F_TIMESTAMP_MODE)) {
+            enc_lit(b, "null");
+        } else if (m->timestamp_mode != MOQ_MSF_MPEG2TS_TIMESTAMP_UNRECOGNIZED) {
+            const char *nm = moq_msf_mpeg2ts_timestamp_mode_name(m->timestamp_mode);
+            enc_json_string(b, (const uint8_t *)nm, strlen(nm));
+        } else {
+            enc_json_string(b, m->timestamp_mode_name.data,
+                            m->timestamp_mode_name.len);
+        }
+    }
+    MPEG2TS_NUM(has_scte35_pid, MOQ_MSF_MPEG2TS_F_SCTE35_PID, "mpeg2tsScte35Pid",
+                m->scte35_pid)
+#undef MPEG2TS_NUM
+#undef MPEG2TS_BAD
 }
 
 /* Emit the optional (has_*-gated) track fields, managing the leading comma via
@@ -1886,6 +2644,8 @@ static void enc_track_optionals(enc_buf_t *b, const moq_msf_track_t *t, bool *f)
         }
         enc_char(b, ']');
     }
+    const moq_msf_mpeg2ts_t *m = track_ts(t);
+    if (m) enc_track_mpeg2ts(b, m, f);
 }
 
 static void enc_track(enc_buf_t *b, const moq_msf_track_t *t)
@@ -2117,7 +2877,8 @@ static moq_result_t catalog_encode_impl(const moq_alloc_t *alloc,
                 op->op != MOQ_MSF_DELTA_OP_CLONE) return MOQ_ERR_INVAL;
             if (op->track_count == 0 || !op->tracks) return MOQ_ERR_INVAL;
             for (size_t j = 0; j < op->track_count; j++) {
-                moq_result_t rc = validate_delta_track(op->op, &op->tracks[j]);
+                moq_result_t rc = validate_delta_track(op->op, &op->tracks[j],
+                                                       strict_cp);
                 if (rc < 0) return rc;
             }
         }
@@ -2136,7 +2897,7 @@ static moq_result_t catalog_encode_impl(const moq_alloc_t *alloc,
     if (cat->track_count > 0 && !cat->tracks) return MOQ_ERR_INVAL;
 
     for (size_t i = 0; i < cat->track_count; i++) {
-        moq_result_t rc = validate_track(&cat->tracks[i]);
+        moq_result_t rc = validate_track(&cat->tracks[i], strict_cp);
         if (rc < 0) return rc;
     }
     /* MSF §5.2.3: a track name is unique per namespace within the catalog.
@@ -2183,6 +2944,19 @@ static moq_result_t catalog_encode_impl(const moq_alloc_t *alloc,
                     memcmp(a.data, b.data, a.len) == 0)
                     return MOQ_ERR_INVAL;
             }
+
+    /* Use of MSF Initialization Data: an authored mpeg2ts track's initRef
+     * names an "inline" entry of whole source packets. */
+    if (strict_cp)
+        for (size_t i = 0; i < cat->track_count; i++) {
+            const moq_msf_track_t *t = &cat->tracks[i];
+            if (!t->has_init_ref || !bytes_eq_lit(t->packaging, "mpeg2ts"))
+                continue;
+            moq_result_t rc = ts_init_check(alloc, cat, t,
+                                            track_ts(t)->packet_size, NULL, NULL);
+            if (rc == MOQ_ERR_NOMEM) return rc;
+            if (rc != MOQ_OK) return MOQ_ERR_INVAL;
+        }
 
     /* Measure pass: buf=NULL, counts bytes needed. */
     size_t needed = enc_catalog_to(NULL, 0, cat);

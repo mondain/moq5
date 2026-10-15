@@ -1,0 +1,1 @@
+{"version":"1","tracks":[{"name":"a","packaging":"mpeg2ts","isLive":true,"mpeg2tsMode":"es-units","mpeg2tsEsPid":258,"mpeg2tsEsPayload":"pes"},{"name":"b","packaging":"mpeg2ts","isLive":true,"mpeg2tsMode":"per-program","mpeg2tsPacketSize":192,"mpeg2tsTimestampMode":"opaque","mpeg2tsSiPids":[16,17,17],"mpeg2tsPcrPid":null,"altGroup":2}]}

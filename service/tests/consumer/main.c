@@ -66,9 +66,13 @@ int main(void)
     if (ecs.handshake_timeout_us != 5000000ull)
         return 1;
 
-    /* Receiver cfg (live preset): forces an overflow policy, stamps struct_size. */
+    /* Receiver cfg (live preset): forces an overflow policy. The pointer-only
+     * form stamps the frozen v0 prefix, the sized form the full struct. */
     moq_media_receiver_cfg_t rcfg;
     moq_media_receiver_cfg_init_live(&rcfg);
+    if (rcfg.struct_size != MOQ_MEDIA_RECEIVER_CFG_V0_SIZE)
+        return 2;
+    moq_media_receiver_cfg_init_live_sized(&rcfg, sizeof(rcfg));
     if (rcfg.struct_size != sizeof(moq_media_receiver_cfg_t))
         return 2;
 
@@ -118,10 +122,13 @@ int main(void)
     /* Per-track subscribe cfg: the manual-subscription surface. */
     moq_media_receiver_track_subscribe_cfg_t tcfg;
     moq_media_receiver_track_subscribe_cfg_init(&tcfg);
-    if (tcfg.struct_size != sizeof(moq_media_receiver_track_subscribe_cfg_t))
+    if (tcfg.struct_size != MOQ_MEDIA_RECEIVER_TRACK_SUBSCRIBE_CFG_V0_SIZE)
         return 4;
     if (tcfg.start != MOQ_MEDIA_START_CURRENT)
         return 5;
+    moq_media_receiver_track_subscribe_cfg_init_sized(&tcfg, sizeof(tcfg));
+    if (tcfg.struct_size != sizeof(moq_media_receiver_track_subscribe_cfg_t))
+        return 4;
 
     /* Wake/wait contract surface: NULL-safe forms only (no network), so the
      * installed prefix proves both new public symbols link and behave. */

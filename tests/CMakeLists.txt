@@ -419,6 +419,10 @@ if(TARGET moq::sim)
     target_link_libraries(test_subscriber PRIVATE moq-core-test-internals moq::sim)
     add_test(NAME subscriber COMMAND test_subscriber)
 
+    add_executable(test_subscriber_group_end unit/test_subscriber_group_end.c)
+    target_link_libraries(test_subscriber_group_end PRIVATE moq-core-test-internals moq::sim)
+    add_test(NAME subscriber_group_end COMMAND test_subscriber_group_end)
+
     add_executable(test_d18_object unit/test_d18_object.c)
     target_link_libraries(test_d18_object PRIVATE moq-core-test-internals moq::sim)
     add_test(NAME d18_object COMMAND test_d18_object)

@@ -5,8 +5,8 @@
  * Stateless MoQ media object normalizer.
  *
  * Parses one MoQ media object into timing, keyframe, and payload
- * metadata. Handles RAW (LOC-01 properties) and CMAF (fragment
- * parsing) packaging. No state, no heap allocation, no retained
+ * metadata. Handles RAW (LOC-01 properties), CMAF (fragment
+ * parsing) and, in a build with moq::mpeg2ts, MPEG-2 TS packaging. No state, no heap allocation, no retained
  * refs — output spans borrow from input rcbufs.
  *
  * Usable standalone by downstream integrations without requiring
@@ -27,20 +27,30 @@ extern "C" {
 
 /* -- Enums ----------------------------------------------------------- */
 
-typedef enum moq_media_packaging {
-    MOQ_MEDIA_PACKAGING_RAW  = 1,
-    MOQ_MEDIA_PACKAGING_CMAF = 2,
-} moq_media_packaging_t;
+/* Packaging. Fixed-width uint32_t for ABI stability. Values are never
+ * renumbered. Unknown values must be ignored (a parse refuses them). */
+typedef uint32_t moq_media_packaging_t;
 
-typedef enum moq_media_drop_reason {
-    MOQ_MEDIA_DROP_MALFORMED_LOC            = 1,
-    MOQ_MEDIA_DROP_MALFORMED_CMAF           = 2,
-    MOQ_MEDIA_DROP_MISSING_TIMESTAMP        = 3,
-    MOQ_MEDIA_DROP_NON_MONOTONIC_DTS        = 4,
-    MOQ_MEDIA_DROP_UNSUPPORTED_MULTI_SAMPLE = 5,
-    MOQ_MEDIA_DROP_STALE                    = 6,
-    MOQ_MEDIA_DROP_KEYFRAME_WAIT            = 7,
-} moq_media_drop_reason_t;
+#define MOQ_MEDIA_PACKAGING_RAW     1u
+#define MOQ_MEDIA_PACKAGING_CMAF    2u
+/* MSF "mpeg2ts" packaging (draft-gregoire-moq-msfts): whole source packets
+ * of moq_media_object_parse_cfg_t.mpeg2ts_packet_size octets. Parsed only by a
+ * build that includes moq::mpeg2ts; any other build returns
+ * MOQ_ERR_UNSUPPORTED. */
+#define MOQ_MEDIA_PACKAGING_MPEG2TS 3u
+
+/* Why an object was dropped. Fixed-width uint32_t for ABI stability. Values
+ * are never renumbered. Unknown reasons must be ignored. */
+typedef uint32_t moq_media_drop_reason_t;
+
+#define MOQ_MEDIA_DROP_MALFORMED_LOC            1u
+#define MOQ_MEDIA_DROP_MALFORMED_CMAF           2u
+#define MOQ_MEDIA_DROP_MISSING_TIMESTAMP        3u
+#define MOQ_MEDIA_DROP_NON_MONOTONIC_DTS        4u
+#define MOQ_MEDIA_DROP_UNSUPPORTED_MULTI_SAMPLE 5u
+#define MOQ_MEDIA_DROP_STALE                    6u
+#define MOQ_MEDIA_DROP_KEYFRAME_WAIT            7u
+#define MOQ_MEDIA_DROP_MALFORMED_MPEG2TS        8u
 
 typedef enum moq_media_type {
     MOQ_MEDIA_TYPE_VIDEO = 1,
@@ -68,6 +78,9 @@ typedef struct moq_media_track_info {
     /* -- appended after v0 ------------------------------------------ */
     moq_version_t        transport_version;
 } moq_media_track_info_t;
+
+/* This complete type is embedded by value in service descriptors and must
+ * not grow. Additional parser context belongs in the separate sized config. */
 
 /* Size of the frozen v0 prefix: struct_size .. timescale inclusive. A
  * struct_size equal to this is an OLD caller that does not own
@@ -99,6 +112,7 @@ MOQ_API void moq_media_track_info_init(moq_media_track_info_t *info);
  * that covers transport_version, it is set to MOQ_VERSION_DRAFT_16, the
  * behaviour-preserving default for a caller that does not override it;
  * a caller on a draft-18 session MUST assign the negotiated version.
+ * MPEG2TS packet size belongs in the separate parser config, from the catalog.
  *
  * info_size below MOQ_MEDIA_TRACK_INFO_V0_SIZE writes nothing.
  */
@@ -155,9 +169,42 @@ typedef struct moq_media_parsed_object {
     moq_sap_type_t              sap_type;
     uint32_t                    chunk_count;  /* CMAF chunks in the object */
     uint32_t                    track_id;     /* tfhd.track_ID (0 if none) */
+
+    /* MPEG2TS: `payload` is the whole Object (its source
+     * packets); `fragment`, mdat and samples are empty. For a video track the
+     * program's video stream decides (its PID from a PMT in the Object, else
+     * a PES with a video stream_id, see MOQ_MPEG2TS_PID_AUTO): keyframe is
+     * true when the Object holds a random access point of that stream
+     * (random_access_indicator announcing a PES start), and timing is taken
+     * from its first PES with a PTS. For an audio track keyframe is always
+     * true and timing comes from the PES at the first random access point,
+     * else the first PES that carries a PTS. decode_time_us is the DTS (the
+     * PTS when there is none), presentation_time_us the PTS, both converted
+     * from the 90 kHz clock without unwrapping its 2^33 wrap. track_id is the
+     * PID of that PES, or 0 when there is none (PID 0 carries the PAT, never
+     * a PES), in which case the timing fields are 0. One Object of a
+     * multiplex can hold several streams and several frames: these fields
+     * describe the one PES chosen, not every frame. chunk_count is the number
+     * of source packets (saturating). sap_type is UNKNOWN:
+     * random_access_indicator does not give a SAP type. Continuity counters
+     * and the es-packets PID rules are not judged here; see <moq/mpeg2ts.h>. */
 } moq_media_parsed_object_t;
 
 MOQ_API void moq_media_parsed_object_init(moq_media_parsed_object_t *out);
+
+/* Original padded sizeof through track_id, independent of future tails. */
+#ifdef __cplusplus
+#define MOQ_MEDIA_PARSED_OBJECT_V0_ALIGNMENT \
+    (alignof(void *) > alignof(uint64_t) ? alignof(void *) : alignof(uint64_t))
+#else
+#define MOQ_MEDIA_PARSED_OBJECT_V0_ALIGNMENT \
+    (_Alignof(void *) > _Alignof(uint64_t) ? _Alignof(void *) : _Alignof(uint64_t))
+#endif
+#define MOQ_MEDIA_PARSED_OBJECT_V0_SIZE \
+    ((offsetof(moq_media_parsed_object_t, track_id) + \
+      sizeof(((moq_media_parsed_object_t *)0)->track_id) + \
+      MOQ_MEDIA_PARSED_OBJECT_V0_ALIGNMENT - 1) & \
+     ~(size_t)(MOQ_MEDIA_PARSED_OBJECT_V0_ALIGNMENT - 1))
 
 /* -- Parse ----------------------------------------------------------- */
 
@@ -181,6 +228,7 @@ MOQ_API void moq_media_parsed_object_init(moq_media_parsed_object_t *out);
  * silently given a codec.
  *
  * Returns MOQ_OK on success.
+ * MPEG2TS requires parse_sized below, with explicit packet-size context.
  * Returns MOQ_ERR_INVAL on bad struct_size, NULL required pointers,
  *   a covered-but-unsupported transport_version,
  *   invalid packaging/media_type, terminal with payload, normal
@@ -207,6 +255,50 @@ MOQ_API moq_result_t moq_media_object_parse(
     moq_cmaf_sample_t *samples,
     size_t sample_cap,
     moq_media_parsed_object_t *out,
+    moq_media_drop_reason_t *drop_reason);
+
+typedef uint32_t moq_media_companion_profile_t;
+#define MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01     UINT32_C(0)
+#define MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC UINT32_C(1)
+typedef struct moq_loc_metadata moq_loc_metadata_t;
+
+typedef struct moq_media_object_parse_cfg {
+    uint32_t struct_size;
+    uint32_t companion_profile;
+    const moq_loc_metadata_t *track_loc_metadata;
+    uint32_t mpeg2ts_packet_size;
+} moq_media_object_parse_cfg_t;
+
+#define MOQ_MEDIA_OBJECT_PARSE_CFG_V0_SIZE \
+    (offsetof(moq_media_object_parse_cfg_t, companion_profile) + \
+     sizeof(((moq_media_object_parse_cfg_t *)0)->companion_profile))
+#define MOQ_MEDIA_OBJECT_PARSE_CFG_INIT \
+    { (uint32_t)sizeof(moq_media_object_parse_cfg_t), \
+      MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01, NULL, 0 }
+
+/* NULL cfg selects legacy draft-16/18 without track context. Unknown profile
+ * or version and undersized cfg are INVAL. D22 and a covered non-NULL LOC
+ * metadata pointer are UNSUPPORTED in this build; the pointer is not read
+ * through. Each tail is read only when wholly covered. MPEG2TS requires a
+ * covered packet size of 188 or 192 (otherwise INVAL); other packaging ignores
+ * it. The unsized parser cannot supply TS context and returns INVAL for TS.
+ * Valid TS context in a build without moq::mpeg2ts returns UNSUPPORTED.
+ * Empty, partial or invalid-sync TS packets return PROTO with drop reason
+ * MOQ_MEDIA_DROP_MALFORMED_MPEG2TS.
+ *
+ * out_size must cover MOQ_MEDIA_PARSED_OBJECT_V0_SIZE. Validation of config
+ * and output size precedes output/drop-reason stores. Success copies/stamps
+ * min(out_size, library size). BUFFER also publishes the required sample_count;
+ * other failures leave out untouched. Samples remain caller-owned scratch,
+ * and all returned byte spans borrow input backing. No refs or ownership move. */
+MOQ_API moq_result_t moq_media_object_parse_sized(
+    const moq_media_track_info_t *track,
+    const moq_media_object_input_t *in,
+    const moq_media_object_parse_cfg_t *cfg,
+    moq_cmaf_sample_t *samples,
+    size_t sample_cap,
+    moq_media_parsed_object_t *out,
+    size_t out_size,
     moq_media_drop_reason_t *drop_reason);
 
 /* -- Subscriber input helper ----------------------------------------- */

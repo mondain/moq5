@@ -1,0 +1,38 @@
+{
+  "version": "draft-01",
+  "generatedAt": 1746104606044,
+  "tracks": [
+    {
+      "name": "video-high",
+      "namespace": "live.example.com/channel/1",
+      "packaging": "mpeg2ts",
+      "mpeg2tsMode": "unmodified-program",
+      "isLive": true,
+      "targetLatency": 1000,
+      "role": "video",
+      "mimeType": "video/mp2t",
+      "bitrate": 6000000,
+      "altGroup": 1,
+      "mpeg2tsPacketSize": 188,
+      "mpeg2tsProgramNumber": 1,
+      "mpeg2tsPcrPid": 257,
+      "mpeg2tsRandomAccess": true
+    },
+    {
+      "name": "video-low",
+      "namespace": "live.example.com/channel/1",
+      "packaging": "mpeg2ts",
+      "mpeg2tsMode": "unmodified-program",
+      "isLive": true,
+      "targetLatency": 1000,
+      "role": "video",
+      "mimeType": "video/mp2t",
+      "bitrate": 2000000,
+      "altGroup": 1,
+      "mpeg2tsPacketSize": 188,
+      "mpeg2tsProgramNumber": 1,
+      "mpeg2tsPcrPid": 513,
+      "mpeg2tsRandomAccess": true
+    }
+  ]
+}

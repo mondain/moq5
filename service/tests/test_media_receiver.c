@@ -2452,25 +2452,25 @@ int main(int argc, char **argv)
                 (int)moq_media_receiver_poll_object(r, &mo, sizeof(mo)),
                 (int)MOQ_DONE);
 
-            /* A non-SAP event timeline (scores), even explicitly subscribed and
-             * with an object delivered, never surfaces via poll_sap and never
-             * leaks into poll_object. A media timeline (history) likewise never
-             * surfaces via poll_sap/poll_object -- it is parsed and surfaced via
-             * poll_media_timeline instead (checked below). */
+            /* A non-SAP event timeline (scores) has no delivery path -- the
+             * receiver decodes no timeline of its kind -- so an explicit
+             * subscribe is refused and nothing is subscribed. A media timeline
+             * (history) never surfaces via poll_sap/poll_object -- it is
+             * parsed and surfaced via poll_media_timeline instead (checked
+             * below). */
             if (scores)
                 MOQ_TEST_CHECK_EQ_INT(
                     (int)moq_media_receiver_subscribe_track(r, scores, NULL),
-                    (int)MOQ_OK);
+                    (int)MOQ_ERR_UNSUPPORTED);
             if (history)
                 MOQ_TEST_CHECK_EQ_INT(
                     (int)moq_media_receiver_subscribe_track(r, history, NULL),
                     (int)MOQ_OK);
             for (int i = 0; i < 200 &&
-                 !(atomic_load(&g_sap.scores_published) &&
-                   atomic_load(&g_sap.history_published)); i++) {
+                 !atomic_load(&g_sap.history_published); i++) {
                 (void)moq_media_receiver_wait(r, 50000);
             }
-            MOQ_TEST_CHECK(atomic_load(&g_sap.scores_published));
+            MOQ_TEST_CHECK(!atomic_load(&g_sap.scores_published));
             MOQ_TEST_CHECK(atomic_load(&g_sap.history_published));
             /* Give the delivered objects time to be processed. */
             for (int i = 0; i < 10; i++)

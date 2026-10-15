@@ -227,7 +227,7 @@ public enum MediaObjectParser {
             repeating: moq_cmaf_sample_t(), count: maxSamples)
         var parsed = moq_media_parsed_object_t()
         moq_media_parsed_object_init(&parsed)
-        var dropReason = moq_media_drop_reason_t(rawValue: 0)
+        var dropReason: moq_media_drop_reason_t = 0
 
         let rc = moq_media_object_parse(
             &ti, &input, &samples, samples.count, &parsed, &dropReason)
@@ -249,7 +249,7 @@ public enum MediaObjectParser {
             case MOQ_MEDIA_DROP_UNSUPPORTED_MULTI_SAMPLE: reason = .unsupportedMultiSample
             case MOQ_MEDIA_DROP_STALE:                    reason = .stale
             case MOQ_MEDIA_DROP_KEYFRAME_WAIT:            reason = .keyframeWait
-            default: reason = .unknown(Int32(dropReason.rawValue))
+            default: reason = .unknown(Int32(bitPattern: dropReason))
             }
             throw MediaParseError.dropped(reason)
         }

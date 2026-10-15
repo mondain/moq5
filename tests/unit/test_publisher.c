@@ -7664,10 +7664,10 @@ static void test_publish_and_subscribe_coexist(void) {
 
 /* Coexist harness: one track, a subscription AND an accepted publication
  * (install order selectable). Returns via out params; caller destroys. */
-static void fanout_setup(test_alloc_state_t *as, moq_alloc_t *alloc,
-                         moq_simpair_t **sp, moq_publisher_t **pub_out,
-                         moq_pub_track_t **track_out, bool sub_first,
-                         uint32_t max_actions)
+static void fanout_setup_ver(test_alloc_state_t *as, moq_alloc_t *alloc,
+                             moq_simpair_t **sp, moq_publisher_t **pub_out,
+                             moq_pub_track_t **track_out, bool sub_first,
+                             uint32_t max_actions, uint64_t version)
 {
     *as = (test_alloc_state_t){0};
     *alloc = test_allocator(as);
@@ -7680,6 +7680,7 @@ static void fanout_setup(test_alloc_state_t *as, moq_alloc_t *alloc,
         cfg.client_initial_request_capacity = 16;
         cfg.server_send_request_capacity = true;
         cfg.server_initial_request_capacity = 16;
+        if (version) cfg.version = version;   /* 0: the default profile */
         cfg.max_actions = max_actions;   /* 0 = default; small forces
                                             mid-fan-out WOULD_BLOCK */
         moq_simpair_create(&cfg, sp);
@@ -7769,6 +7770,15 @@ static void fanout_setup(test_alloc_state_t *as, moq_alloc_t *alloc,
     MOQ_TEST_CHECK(moq_pub_track_is_published(pub, track));
     *pub_out = pub;
     *track_out = track;
+}
+
+static void fanout_setup(test_alloc_state_t *as, moq_alloc_t *alloc,
+                         moq_simpair_t **sp, moq_publisher_t **pub_out,
+                         moq_pub_track_t **track_out, bool sub_first,
+                         uint32_t max_actions)
+{
+    fanout_setup_ver(as, alloc, sp, pub_out, track_out, sub_first,
+                     max_actions, 0);
 }
 
 /* Count client OBJECT_RECEIVED events matching (group, object, bytes). */
@@ -14786,6 +14796,153 @@ static void test_nsterm_abi_canary(void)
     MOQ_TEST_PASS("nsterm_abi_canary");
 }
 
+/* The subgroup header is fixed when a subgroup opens: its END_OF_GROUP bit
+ * and whether its Objects carry properties (drafts 16 and 18, subgroup header
+ * Type). An Object that cannot be written under the header a destination
+ * already sent for its Group is refused at admission -- before the operation
+ * is committed -- so nothing is left pending and the track keeps working:
+ * the same Object written with the subgroup's header values goes through. */
+extern unsigned long moq_pub_test_commit_count;
+
+/* Received objects of groups 0..1, objects 0..5, per destination: [0] the
+ * client's subscription, [1] the publication it accepted. */
+typedef struct { unsigned n[2][6][2]; } recv_tally_t;
+
+static void tally_objects(moq_simpair_t *sp, recv_tally_t *t)
+{
+    moq_event_t evts[16]; size_t ne;
+    while ((ne = moq_session_poll_events(moq_simpair_client(sp), evts, 16)) > 0)
+        for (size_t i = 0; i < ne; i++) {
+            if (evts[i].kind == MOQ_EVENT_OBJECT_RECEIVED) {
+                const moq_object_received_event_t *o = &evts[i].u.object_received;
+                int dest = moq_publication_is_valid(o->pub) ? 1 : 0;
+                if (o->group_id < 2 && o->object_id < 6)
+                    t->n[o->group_id][o->object_id][dest]++;
+            }
+            moq_event_cleanup(&evts[i]);
+        }
+}
+
+static void subgroup_header_case(uint64_t version, const char *label)
+{
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *track;
+    fanout_setup_ver(&as, &alloc, &sp, &pub, &track, true, 0, version);
+    recv_tally_t t;
+    memset(&t, 0, sizeof(t));
+
+    uint8_t d[] = { 0x70, 0x61, 0x79 };
+    moq_rcbuf_t *pl = NULL;
+    moq_rcbuf_create(&alloc, d, sizeof(d), &pl);
+    uint8_t pd[] = { 0x02, 0x00 };          /* one even-type property */
+    moq_rcbuf_t *pr = NULL;
+    moq_rcbuf_create(&alloc, pd, sizeof(pd), &pr);
+
+    /* Object 0 opens Group 0's subgroup: no END_OF_GROUP, no properties. */
+    moq_pub_object_cfg_t obj;
+    moq_pub_object_cfg_init_sized(&obj, sizeof(obj));
+    obj.group_id = 0; obj.object_id = 0; obj.payload = pl;
+    MOQ_TEST_CHECK(moq_pub_write_object_ex(pub, track, &obj,
+        moq_simpair_now_us(sp)) == MOQ_OK);
+
+    /* Object 1 asking for END_OF_GROUP: refused, nothing committed. */
+    unsigned long commits = moq_pub_test_commit_count;
+    moq_pub_object_cfg_init_sized(&obj, sizeof(obj));
+    obj.group_id = 0; obj.object_id = 1; obj.payload = pl;
+    obj.end_of_group = true;
+    MOQ_TEST_CHECK(moq_pub_write_object_ex(pub, track, &obj,
+        moq_simpair_now_us(sp)) == MOQ_ERR_WRONG_STATE);
+    MOQ_TEST_CHECK_EQ_U64(moq_pub_test_commit_count, commits);
+    /* The track is not stuck. */
+    obj.end_of_group = false;
+    MOQ_TEST_CHECK(moq_pub_write_object_ex(pub, track, &obj,
+        moq_simpair_now_us(sp)) == MOQ_OK);
+
+    /* Object 2 with properties, into a subgroup opened without them. */
+    commits = moq_pub_test_commit_count;
+    moq_pub_object_cfg_init_sized(&obj, sizeof(obj));
+    obj.group_id = 0; obj.object_id = 2; obj.payload = pl;
+    obj.properties = pr;
+    MOQ_TEST_CHECK(moq_pub_write_object_ex(pub, track, &obj,
+        moq_simpair_now_us(sp)) == MOQ_ERR_WRONG_STATE);
+    MOQ_TEST_CHECK_EQ_U64(moq_pub_test_commit_count, commits);
+    obj.properties = NULL;
+    MOQ_TEST_CHECK(moq_pub_write_object_ex(pub, track, &obj,
+        moq_simpair_now_us(sp)) == MOQ_OK);
+
+    /* The streaming bracket follows the same rule. */
+    commits = moq_pub_test_commit_count;
+    moq_pub_begin_object_cfg_t bcfg;
+    moq_pub_begin_object_cfg_init_sized(&bcfg, sizeof(bcfg));
+    bcfg.group_id = 0; bcfg.object_id = 3; bcfg.payload_length = sizeof(d);
+    bcfg.properties = pr;
+    MOQ_TEST_CHECK(moq_pub_begin_object(pub, track, &bcfg,
+        moq_simpair_now_us(sp)) == MOQ_ERR_WRONG_STATE);
+    MOQ_TEST_CHECK_EQ_U64(moq_pub_test_commit_count, commits);
+    bcfg.properties = NULL;
+    MOQ_TEST_CHECK(moq_pub_begin_object(pub, track, &bcfg,
+        moq_simpair_now_us(sp)) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_pub_write_data(pub, track, pl,
+        moq_simpair_now_us(sp)) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_pub_end_object(pub, track,
+        moq_simpair_now_us(sp)) == MOQ_OK);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    tally_objects(sp, &t);
+
+    /* A new Group opens a new subgroup with the header its first Object
+     * asks for: END_OF_GROUP and properties. An object without properties
+     * fits that header too (written with an empty list), as does a streamed
+     * one. */
+    moq_pub_object_cfg_init_sized(&obj, sizeof(obj));
+    obj.group_id = 1; obj.object_id = 0; obj.payload = pl;
+    obj.end_of_group = true; obj.properties = pr;
+    MOQ_TEST_CHECK(moq_pub_write_object_ex(pub, track, &obj,
+        moq_simpair_now_us(sp)) == MOQ_OK);
+    moq_pub_object_cfg_init_sized(&obj, sizeof(obj));
+    obj.group_id = 1; obj.object_id = 1; obj.payload = pl;
+    obj.end_of_group = true; obj.properties = NULL;
+    MOQ_TEST_CHECK(moq_pub_write_object_ex(pub, track, &obj,
+        moq_simpair_now_us(sp)) == MOQ_OK);
+    moq_pub_begin_object_cfg_init_sized(&bcfg, sizeof(bcfg));
+    bcfg.group_id = 1; bcfg.object_id = 2; bcfg.payload_length = sizeof(d);
+    MOQ_TEST_CHECK(moq_pub_begin_object(pub, track, &bcfg,
+        moq_simpair_now_us(sp)) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_pub_write_data(pub, track, pl,
+        moq_simpair_now_us(sp)) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_pub_end_object(pub, track,
+        moq_simpair_now_us(sp)) == MOQ_OK);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    tally_objects(sp, &t);
+
+    /* Each destination received every written object exactly once, and
+     * nothing for the refused attempts. */
+    static const uint64_t want[][2] = { {0,0},{0,1},{0,2},{0,3},{1,0},{1,1},{1,2} };
+    for (size_t i = 0; i < sizeof(want) / sizeof(want[0]); i++)
+        for (int dest = 0; dest < 2; dest++)
+            MOQ_TEST_CHECK_EQ_U64(t.n[want[i][0]][want[i][1]][dest], 1);
+    for (int dest = 0; dest < 2; dest++) {
+        MOQ_TEST_CHECK_EQ_U64(t.n[0][4][dest], 0);
+        MOQ_TEST_CHECK_EQ_U64(t.n[1][3][dest], 0);
+    }
+    MOQ_TEST_CHECK(moq_pub_end_track(pub, track,
+        moq_simpair_now_us(sp)) == MOQ_OK);
+
+    moq_rcbuf_decref(pl);
+    moq_rcbuf_decref(pr);
+    moq_pub_destroy(pub);
+    drain_all(sp);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+    MOQ_TEST_PASS(label);
+}
+
+static void test_subgroup_header_mismatch_admission(void)
+{
+    subgroup_header_case(0, "subgroup header mismatch refused at admission");
+    subgroup_header_case(MOQ_VERSION_DRAFT_18,
+                         "subgroup header mismatch refused at admission d18");
+}
+
 int main(void) {
     test_create_destroy();
     test_pub_cfg_init_old_prefix_no_overflow();
@@ -15221,6 +15378,8 @@ int main(void) {
         MOQ_TEST_CHECK(as.balance == 0);
         MOQ_TEST_PASS("end_of_group mismatch false->true");
     }
+
+    test_subgroup_header_mismatch_admission();
 
     /* -- Retained catalog object answered via spec Joining FETCH -------- *
      * The origin advertises its retained object as the subscription's Largest

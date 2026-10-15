@@ -1,4 +1,5 @@
 #include <moq/msf_media.h>
+#include "msf_internal.h"
 #include <stddef.h>
 #include <string.h>
 
@@ -55,6 +56,78 @@ static bool role_is_non_media(moq_bytes_t role)
     return false;
 }
 
+/* Track roles of draft-gregoire-moq-msfts that name a PSI/SI table or the
+ * SCTE-35 stream of an es-packets track: not media. */
+static bool role_is_ts_table(moq_bytes_t role)
+{
+    static const char *const tables[] = {
+        "pat", "pmt", "nit", "sdt", "eit", "tdt", "scte35",
+    };
+    for (size_t i = 0; i < sizeof(tables) / sizeof(tables[0]); i++)
+        if (bytes_eq(role, tables[i]))
+            return true;
+    return false;
+}
+
+/* The "mpeg2ts" mapping (draft-gregoire-moq-msfts). out_info and out_init
+ * are already initialized by the caller. */
+static moq_result_t msf_mpeg2ts_to_media_info(
+    const moq_alloc_t *alloc,
+    const moq_msf_track_t *track,
+    moq_media_track_info_t *out_info,
+    bool want_version,
+    moq_rcbuf_t **out_init_buf)
+{
+    /* Keep the legacy mapping contract. Packet size remains in the typed
+     * catalog extension, not in the frozen embedded track info. */
+    if (!want_version)
+        return MOQ_ERR_INVAL;
+    /* Catalog: a subscriber MUST reject a track that breaks the rules. */
+    if (moq_msf_track_mpeg2ts_check(track, NULL) != MOQ_OK)
+        return MOQ_ERR_INVAL;
+    const moq_msf_mpeg2ts_t *ts = moq_msf_track_mpeg2ts(track);
+    if (!ts)
+        return MOQ_ERR_INVAL;
+
+    /* A TS track is a program (or one PID of it) whose random access is
+     * defined by its video stream; an audio role makes it audio. PSI/SI
+     * table roles and the reserved non-media roles are not media. */
+    if (track->has_role && bytes_eq(track->role, "audio"))
+        out_info->media_type = MOQ_MEDIA_TYPE_AUDIO;
+    else if (track->has_role &&
+             (role_is_ts_table(track->role) || role_is_non_media(track->role)))
+        return MOQ_ERR_INVAL;
+    else
+        out_info->media_type = MOQ_MEDIA_TYPE_VIDEO;
+
+    out_info->packaging = MOQ_MEDIA_PACKAGING_MPEG2TS;
+    if (track->has_timescale && track->timescale <= UINT32_MAX)
+        out_info->timescale = (uint32_t)track->timescale;
+
+    /* The initialization data is the PAT/PMT source packets (Use of MSF
+     * Initialization Data). It is not decoder extradata, so codec_config
+     * stays empty. Data that is not whole source packets is not surfaced;
+     * the track stays usable, since the PSI also travels in band. */
+    if (out_init_buf && track->has_init_data && track->init_data.len > 0) {
+        if (!alloc)
+            return MOQ_ERR_INVAL;
+        moq_rcbuf_t *decoded = NULL;
+        moq_result_t rc = moq_msf_decode_init_data(alloc, track->init_data,
+                                                   &decoded);
+        if (rc == MOQ_ERR_NOMEM)
+            return rc;
+        if (rc == MOQ_OK) {
+            if (moq_msf_ts_whole_packets(moq_rcbuf_data(decoded),
+                                         moq_rcbuf_len(decoded),
+                                         ts->packet_size))
+                *out_init_buf = decoded;
+            else
+                moq_rcbuf_decref(decoded);
+        }
+    }
+    return MOQ_OK;
+}
+
 /* struct_size at or above this covers transport_version. Spelled from
  * offsetof rather than assumed, so it tracks the struct. */
 #define MSF_TRACK_INFO_VERSION_SIZE \
@@ -108,6 +181,10 @@ static moq_result_t msf_track_to_media_info_impl(
         moq_cmaf_init_info_init(out_init);
     if (out_init_buf)
         *out_init_buf = NULL;
+
+    if (bytes_eq(track->packaging, "mpeg2ts"))
+        return msf_mpeg2ts_to_media_info(alloc, track, out_info,
+                                         want_version, out_init_buf);
 
     /* Map media type. role is OPTIONAL (MSF-01 §5.2.6) and custom roles are
      * allowed, so role alone cannot gate media classification:

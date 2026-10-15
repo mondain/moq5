@@ -54,6 +54,7 @@ foreach(_fuzz_lib
         moq-core
         moq-loc
         moq-cmaf
+        moq-mpeg2ts
         moq-cmaf-packager
         moq-codec-signaling
         moq-media-object
@@ -164,6 +165,32 @@ if(TARGET moq-msf)
     add_test(NAME fuzz_msf_corpus
              COMMAND fuzz_msf
              ${CMAKE_CURRENT_SOURCE_DIR}/corpus/msf -runs=0)
+    math(EXPR _fuzz_target_count "${_fuzz_target_count} + 1")
+    math(EXPR _fuzz_test_count "${_fuzz_test_count} + 2")
+endif()
+
+# MPEG-2 TS helpers and catalog extensions have independent feature gates.
+if(TARGET moq::mpeg2ts)
+    add_executable(fuzz_mpeg2ts fuzz_mpeg2ts.c)
+    target_link_libraries(fuzz_mpeg2ts PRIVATE moq::mpeg2ts)
+    target_compile_options(fuzz_mpeg2ts PRIVATE ${FUZZ_FLAGS})
+    target_link_options(fuzz_mpeg2ts PRIVATE ${FUZZ_FLAGS})
+    add_test(NAME fuzz_mpeg2ts_smoke
+             COMMAND fuzz_mpeg2ts -runs=1 -max_len=0)
+    add_test(NAME fuzz_mpeg2ts_corpus
+             COMMAND fuzz_mpeg2ts ${CMAKE_CURRENT_SOURCE_DIR}/corpus/mpeg2ts -runs=0)
+    math(EXPR _fuzz_target_count "${_fuzz_target_count} + 1")
+    math(EXPR _fuzz_test_count "${_fuzz_test_count} + 2")
+endif()
+if(TARGET moq::msf)
+    add_executable(fuzz_msf_mpeg2ts fuzz_msf_mpeg2ts.c)
+    target_link_libraries(fuzz_msf_mpeg2ts PRIVATE moq::msf)
+    target_compile_options(fuzz_msf_mpeg2ts PRIVATE ${FUZZ_FLAGS})
+    target_link_options(fuzz_msf_mpeg2ts PRIVATE ${FUZZ_FLAGS})
+    add_test(NAME fuzz_msf_mpeg2ts_smoke
+             COMMAND fuzz_msf_mpeg2ts -runs=1 -max_len=0)
+    add_test(NAME fuzz_msf_mpeg2ts_corpus
+             COMMAND fuzz_msf_mpeg2ts ${CMAKE_CURRENT_SOURCE_DIR}/corpus/msf_mpeg2ts -runs=0)
     math(EXPR _fuzz_target_count "${_fuzz_target_count} + 1")
     math(EXPR _fuzz_test_count "${_fuzz_test_count} + 2")
 endif()

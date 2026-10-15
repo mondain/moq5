@@ -1,0 +1,38 @@
+{
+  "version": "draft-01",
+  "generatedAt": 1746104606044,
+  "tracks": [
+    {
+      "name": "program-1",
+      "namespace": "live.example.com/mux/1",
+      "packaging": "mpeg2ts",
+      "mpeg2tsMode": "per-program",
+      "isLive": true,
+      "targetLatency": 1000,
+      "role": "video",
+      "mimeType": "video/mp2t",
+      "bitrate": 6000000,
+      "mpeg2tsPacketSize": 188,
+      "mpeg2tsProgramNumber": 1,
+      "mpeg2tsPcrPid": 257,
+      "mpeg2tsMuxRate": 6500000,
+      "mpeg2tsRandomAccess": true
+    },
+    {
+      "name": "program-2",
+      "namespace": "live.example.com/mux/1",
+      "packaging": "mpeg2ts",
+      "mpeg2tsMode": "per-program",
+      "isLive": true,
+      "targetLatency": 1000,
+      "role": "video",
+      "mimeType": "video/mp2t",
+      "bitrate": 4000000,
+      "mpeg2tsPacketSize": 188,
+      "mpeg2tsProgramNumber": 2,
+      "mpeg2tsPcrPid": 513,
+      "mpeg2tsMuxRate": 4500000,
+      "mpeg2tsRandomAccess": true
+    }
+  ]
+}

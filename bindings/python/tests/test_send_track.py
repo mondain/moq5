@@ -27,8 +27,9 @@ Native contracts pinned here, from the installed headers and source:
       INVAL NULL/foreign/generated handle; WRONG_STATE already removed;
       CLOSED terminal; INTERRUPTED latch. The handle stays VALID BUT INERT
       until the sender is destroyed.
-  moq_media_track_cfg_init      service/src/media_sender.c:2976-2982
-      zeroes the whole struct, stamps struct_size, sets is_live true.
+  moq_media_track_cfg_init      service/include/moq/media_sender.h
+      a macro over moq_media_track_cfg_init_sized(cfg, sizeof *cfg): zeroes
+      the whole struct, stamps struct_size, sets is_live true.
 
 MSF-01 rules these mirror, from /Users/jekyll/Projects/MoQ/Spec:
   5.2.18 codec required for audio and video (line 1110)

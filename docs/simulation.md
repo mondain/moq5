@@ -860,7 +860,7 @@ also fails. This holds for all scenario runner invariants
 
 ## Fuzz Targets
 
-Ten fuzz targets exercise `moq-core` and the media libraries (`moq-loc`,
+Eleven fuzz targets exercise `moq-core` and the media libraries (`moq-loc`,
 `moq-cmaf`, `moq-msf`) with arbitrary inputs under ASan and UBSan (plus
 `fuzz_relay_admin_http` when the relay tool tier is built):
 
@@ -876,6 +876,8 @@ Ten fuzz targets exercise `moq-core` and the media libraries (`moq-loc`,
 | `fuzz_loc` | LOC header extension parse/encode roundtrip (D16 QUIC-varint and D18 `vi64` KVP codecs) |
 | `fuzz_cmaf` | CMAF ISO BMFF init (`ftyp`+`moov`/CENC), fragment (`moof`+`mdat`), and object validation |
 | `fuzz_msf` | MSF-01 / CMSF-01 JSON catalog parse/encode, delta apply, media timeline, and Base64 `initData` |
+| `fuzz_msf_mpeg2ts` | MSF MPEG-TS catalog extensions: parse, validation, init data, encode roundtrip and delta apply (`MOQ_BUILD_MSF=ON`, including TS helpers OFF) |
+| `fuzz_mpeg2ts` | TS packet/PES/PSI parsing, object inspection, receiver/reorder, program filter, switcher and packetizer (additional target when `MOQ_BUILD_MPEG2TS=ON`) |
 | `fuzz_relay_admin_http` | Relay admin HTTP request parser (when `moqr-admin` is built) |
 
 Fuzz targets build only when `MOQ_BUILD_FUZZ=ON` and the compiler
@@ -927,11 +929,15 @@ CC=/opt/homebrew/opt/llvm/bin/clang \
 
 ### CTest smoke tests
 
-When fuzz targets build successfully with the `fuzz` preset, 17 CTest
-tests are registered: 10 empty-input startup smoke tests and 7 corpus
+When fuzz targets build successfully with the `fuzz` preset, 19 CTest
+tests are registered: 11 empty-input startup smoke tests and 8 corpus
 smoke tests (`control_d18`, `session_control`, `session_data`,
-`session_d18`, `loc`, `cmaf`, `msf`) that replay committed seed corpora
+`session_d18`, `loc`, `cmaf`, `msf`, `msf_mpeg2ts`) that replay committed seed corpora
 to prove the targets reach their parsers and satisfy all property checks.
+Enabling `MOQ_BUILD_MPEG2TS` adds one target and its smoke/corpus pair
+(12 targets, 21 tests with LOC/CMAF/MSF enabled). The optional relay admin
+target adds another smoke/corpus pair. The TS implementation library is
+instrumented along with the other in-tree fuzz dependencies.
 
 ### Running fuzz sessions
 
@@ -951,6 +957,11 @@ build/fuzz-check/fuzz/fuzz_cmaf \
   fuzz/corpus/cmaf -runs=0
 build/fuzz-check/fuzz/fuzz_msf \
   fuzz/corpus/msf -runs=0
+build/fuzz-check/fuzz/fuzz_msf_mpeg2ts \
+  fuzz/corpus/msf_mpeg2ts -runs=0
+# When configured with MOQ_BUILD_MPEG2TS=ON:
+build/fuzz-check/fuzz/fuzz_mpeg2ts \
+  fuzz/corpus/mpeg2ts -runs=0
 
 # Short fuzz session (10k iterations)
 build/fuzz-check/fuzz/fuzz_session_control -max_len=4096 -runs=10000

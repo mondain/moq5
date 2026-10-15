@@ -24,6 +24,11 @@ if(TARGET moq::cmaf)
     target_compile_definitions(moq_cpp INTERFACE MOQ_HAS_CMAF)
 endif()
 
+if(TARGET moq::mpeg2ts)
+    target_link_libraries(moq_cpp INTERFACE moq::mpeg2ts)
+    target_compile_definitions(moq_cpp INTERFACE MOQ_HAS_MPEG2TS)
+endif()
+
 set_target_properties(moq_cpp PROPERTIES EXPORT_NAME cpp)
 
 install(TARGETS moq_cpp
@@ -34,7 +39,8 @@ install(DIRECTORY include/moq
     FILES_MATCHING PATTERN "*.hpp"
     PATTERN "loc.hpp" EXCLUDE
     PATTERN "msf.hpp" EXCLUDE
-    PATTERN "cmaf.hpp" EXCLUDE)
+    PATTERN "cmaf.hpp" EXCLUDE
+    PATTERN "mpeg2ts.hpp" EXCLUDE)
 
 if(TARGET moq::loc)
     install(FILES include/moq/loc.hpp
@@ -48,6 +54,11 @@ endif()
 
 if(TARGET moq::cmaf)
     install(FILES include/moq/cmaf.hpp
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/moq)
+endif()
+
+if(TARGET moq::mpeg2ts)
+    install(FILES include/moq/mpeg2ts.hpp
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/moq)
 endif()
 
@@ -128,6 +139,12 @@ if(MOQ_BUILD_TESTS)
         add_executable(test_cpp_cmaf tests/test_cmaf.cpp)
         target_link_libraries(test_cpp_cmaf PRIVATE moq::cpp)
         add_test(NAME cpp_cmaf COMMAND test_cpp_cmaf)
+    endif()
+
+    if(TARGET moq::mpeg2ts)
+        add_executable(test_cpp_mpeg2ts tests/test_mpeg2ts.cpp)
+        target_link_libraries(test_cpp_mpeg2ts PRIVATE moq::cpp)
+        add_test(NAME cpp_mpeg2ts COMMAND test_cpp_mpeg2ts)
     endif()
 
     # Out-of-tree consumer smoke test
