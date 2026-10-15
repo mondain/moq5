@@ -198,11 +198,15 @@ jobs:
     # the dependency trees live in this job's own temporary directory.
     env:
       MOQ_MACOS_DEPLOYMENT_TARGET: "11.0"
-      MOQ_DEPS_DIR: ${{ runner.temp }}/picoquic-deps
-      MOQ_MACOS_OPENSSL_ROOT: ${{ runner.temp }}/macos-openssl
-      MOQ_LANE_LOGS: ${{ runner.temp }}/swift-service-logs
     steps:
       - uses: actions/checkout@v5
+
+      - name: Set job-local dependency paths
+        run: |
+          printf '%s\n' \
+            "MOQ_DEPS_DIR=$RUNNER_TEMP/picoquic-deps" \
+            "MOQ_MACOS_OPENSSL_ROOT=$RUNNER_TEMP/macos-openssl" \
+            "MOQ_LANE_LOGS=$RUNNER_TEMP/swift-service-logs" >> "$GITHUB_ENV"
 
       - name: Deployment diagnostic fake-command controls
         run: python3 scripts/tests/test_macos_deploy_diagnostics.py
