@@ -1,0 +1,22 @@
+name: Media ABI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  mpeg2ts-ilp32:
+    name: MPEG-TS layouts (ILP32)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - name: Check normal and short-enum layouts
+        run: bash scripts/check_mpeg2ts_ilp32_headers.sh
+        env:
+          CC_ILP32: clang

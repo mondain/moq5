@@ -118,9 +118,9 @@ typedef struct moq_media_receiver_cfg {
                                           Overflow is terminal (§6.3): losing
                                           a discovery event is unrecoverable
                                           miswiring, never a silent drop. */
-    /* Permanently reserved, never read: the four bytes of tail padding the
-     * struct had after max_track_events, so no appended field can be read
-     * from an older caller's uninitialized padding. */
+    /* Permanently reserved, never read: covers the tail padding the struct
+     * had after max_track_events on targets where it had any, so no appended
+     * field can be read from an older caller's uninitialized padding. */
     uint8_t  _reserved_cfg[4];
     /* Appended after max_track_events. MPEG2TS tracks only: each subscribed
      * TS track releases its Objects in Location order through a reorder
@@ -139,14 +139,17 @@ typedef struct moq_media_receiver_cfg {
     bool     mpeg2ts_join_psi;
 } moq_media_receiver_cfg_t;
 
-/* Frozen v0 sizeof includes tail padding. Its alignment is determined by
- * the original pointer and uint64_t members, not by future appended fields. */
+/* Frozen v0 sizeof includes tail padding. Use the original embedded
+ * aggregate's alignment: standalone uint64_t can be more strongly aligned
+ * than its containing struct on i686. Future tails must not change it. */
 #ifdef __cplusplus
 #define MOQ_MEDIA_RECEIVER_CFG_V0_ALIGNMENT \
-    (alignof(void *) > alignof(uint64_t) ? alignof(void *) : alignof(uint64_t))
+    (alignof(void *) > alignof(moq_media_overflow_cfg_t) \
+        ? alignof(void *) : alignof(moq_media_overflow_cfg_t))
 #else
 #define MOQ_MEDIA_RECEIVER_CFG_V0_ALIGNMENT \
-    (_Alignof(void *) > _Alignof(uint64_t) ? _Alignof(void *) : _Alignof(uint64_t))
+    (_Alignof(void *) > _Alignof(moq_media_overflow_cfg_t) \
+        ? _Alignof(void *) : _Alignof(moq_media_overflow_cfg_t))
 #endif
 /* The receiver
  * accepts any struct_size at or above it and reads an appended field only
