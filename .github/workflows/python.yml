@@ -29,6 +29,10 @@ jobs:
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
     steps:
+      - name: Select macOS qualification deployment target
+        if: runner.os == 'macOS'
+        run: echo 'MACOSX_DEPLOYMENT_TARGET=13.0' >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
@@ -52,7 +56,14 @@ jobs:
         env:
           SDK_SHARED: ${{ matrix.shared }}
         run: |
+          mkdir -p "$RUNNER_TEMP/python-logs"
+          cat > "$RUNNER_TEMP/python-logs/consumer-context.cmake" <<'CMAKE'
+          include("${PROJECT_SOURCE_DIR}/tests/cmake/ConsumerBuildContext.cmake")
+          moq_write_consumer_abi_context("${PROJECT_BINARY_DIR}/consumer-abi-context.cmake")
+          CMAKE
+          trap 'rc=$?; scripts/check_macos_deploy_lane.sh probe-logs build/python-sdk/CMakeFiles || rc=$?; exit "$rc"' EXIT
           cmake -S . -B build/python-sdk -G Ninja \
+            -DCMAKE_PROJECT_libmoq_INCLUDE="$RUNNER_TEMP/python-logs/consumer-context.cmake" \
             -Werror=dev -Werror=deprecated \
             -DCMAKE_BUILD_TYPE=Debug -DBUILD_SHARED_LIBS="$SDK_SHARED" \
             -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
@@ -73,10 +84,21 @@ jobs:
         run: |
           cmake --build build/python-sdk
           cmake --install build/python-sdk
+          if [[ "$RUNNER_OS" == macOS && "${{ matrix.shared }}" == ON ]]; then
+            shopt -s nullglob
+            dylibs=("$RUNNER_TEMP/python-sdk/lib/"*.dylib)
+            test "${#dylibs[@]}" -gt 0
+            audit=()
+            for dylib in "${dylibs[@]}"; do audit+=("$dylib=13.0"); done
+            python scripts/macho_deploy_audit.py binaries "${audit[@]}" \
+              | tee "$RUNNER_TEMP/python-logs/sdk-minos.log"
+          fi
 
       - name: Debug bridge tests (fake C provider, warnings as errors)
         run: |
+          trap 'rc=$?; scripts/check_macos_deploy_lane.sh probe-logs build/python-foundation/CMakeFiles || rc=$?; exit "$rc"' EXIT
           cmake -S bindings/python -B build/python-foundation -G Ninja \
+            -C "$GITHUB_WORKSPACE/build/python-sdk/consumer-abi-context.cmake" \
             -Werror=dev -Werror=deprecated \
             -DCMAKE_BUILD_TYPE=Debug \
             -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/python-sdk" \
@@ -89,8 +111,11 @@ jobs:
 
       - name: Build wheel, sdist, and source archive
         run: |
+          trap 'rc=$?; scripts/check_macos_deploy_lane.sh probe-logs "$RUNNER_TEMP/python-wheel-build/CMakeFiles" || rc=$?; exit "$rc"' EXIT
           python -m build --no-isolation --wheel --sdist \
             --outdir "$RUNNER_TEMP/python-artifacts" \
+            -C "build-dir=$RUNNER_TEMP/python-wheel-build" \
+            -C "cmake.args=-C;$GITHUB_WORKSPACE/build/python-sdk/consumer-abi-context.cmake" \
             -C cmake.build-type=Debug \
             -C "cmake.define.CMAKE_PREFIX_PATH=$RUNNER_TEMP/python-sdk" \
             -C cmake.define.MOQ_PYTHON_WARNINGS_AS_ERRORS=ON \
@@ -139,16 +164,59 @@ jobs:
                 --find-links="$RUNNER_TEMP/python-build-deps" \
                 'scikit-build-core>=0.11,<2' 'cmake>=3.26,<4' ninja
             fi
+            native_settings=()
+            if [[ "${labels[$index]}" != "wheel" ]]; then
+              native_build="$RUNNER_TEMP/python-${labels[$index]}-build"
+              native_settings=(-C "build-dir=$native_build"
+                -C "cmake.args=-C;$GITHUB_WORKSPACE/build/python-sdk/consumer-abi-context.cmake")
+              trap 'rc=$?; "$GITHUB_WORKSPACE/scripts/check_macos_deploy_lane.sh" probe-logs "$native_build/CMakeFiles" || rc=$?; exit "$rc"' EXIT
+            fi
             "$venv/bin/python" -m pip install --no-index --no-deps \
               --no-build-isolation --no-cache-dir \
+              "${native_settings[@]}" \
               -C cmake.build-type=Debug \
               -C "cmake.define.CMAKE_PREFIX_PATH=$RUNNER_TEMP/python-sdk" \
               -C cmake.define.MOQ_PYTHON_WARNINGS_AS_ERRORS=ON \
               -C cmake.define.MOQ_PYTHON_BUILD_TESTS=OFF \
               -C cmake.define.CMAKE_SKIP_INSTALL_RPATH=ON \
               "${artifacts[$index]}"
+            if [[ "${labels[$index]}" != "wheel" ]]; then
+              "$GITHUB_WORKSPACE/scripts/check_macos_deploy_lane.sh" probe-logs "$native_build/CMakeFiles"
+              trap - EXIT
+            fi
             "$venv/bin/python" -I -W error installed_smoke.py \
               --artifact "${artifacts[$index]}" \
               --expected-package-version "$package_version" \
               --expected-sdk-version "$sdk_version"
+            if [[ "$RUNNER_OS" == macOS ]]; then
+              module="$("$venv/bin/python" -I -c '
+          from importlib.metadata import distribution
+          dist = distribution("moq5")
+          matches = [p for p in (dist.files or ()) if str(p) == "moq5/_native.abi3.so"]
+          if len(matches) != 1:
+              raise SystemExit("expected exactly one recorded moq5/_native.abi3.so")
+          module = dist.locate_file(matches[0]).resolve(strict=True)
+          if not module.is_file():
+              raise SystemExit("recorded native module is not a file")
+          print(module)
+          ')"
+              "$venv/bin/python" "$GITHUB_WORKSPACE/scripts/macho_deploy_audit.py" \
+                binaries "$module=13.0" \
+                | tee "$RUNNER_TEMP/python-logs/${labels[$index]}-minos.log"
+            fi
           done
+
+      - name: Retain Python configure evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-configure-${{ matrix.os }}-${{ matrix.shared }}
+          if-no-files-found: error
+          path: |
+            build/python-sdk/consumer-abi-context.cmake*
+            build/python-sdk/CMakeFiles/CMakeConfigureLog.yaml
+            build/python-foundation/CMakeFiles/CMakeConfigureLog.yaml
+            ${{ runner.temp }}/python-logs/
+            ${{ runner.temp }}/python-wheel-build/CMakeFiles/CMakeConfigureLog.yaml
+            ${{ runner.temp }}/python-sdist-build/CMakeFiles/CMakeConfigureLog.yaml
+            ${{ runner.temp }}/python-source-build/CMakeFiles/CMakeConfigureLog.yaml
