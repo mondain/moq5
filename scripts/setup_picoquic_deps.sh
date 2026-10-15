@@ -88,6 +88,13 @@ build_picotls() {
     local config=${MOQ_PICOTLS_BUILD_CONFIG:-Release}
     local cmake_args=(-S "$source_dir" -B "$build_dir" "-DCMAKE_BUILD_TYPE=$config"
         "-DCMAKE_PROJECT_picotls_INCLUDE=$repo_root/cmake/MoqPicotlsBuildPolicy.cmake")
+    # Same Apple Clang ABI-probe correction as the LibMoQ root (see
+    # docs/cmake-abi-probes.md), registered before picotls enables C/C++.
+    # A toolchain selected through the CMAKE_TOOLCHAIN_FILE environment
+    # variable owns its rules hooks, so it is left alone.
+    if [ -z "${CMAKE_TOOLCHAIN_FILE:-}" ]; then
+        cmake_args+=("-DCMAKE_PROJECT_picotls_INCLUDE_BEFORE=$repo_root/cmake/MoqAppleAbiProbe.cmake")
+    fi
     if [ -n "${OPENSSL_ROOT_DIR:-}" ]; then
         cmake_args+=(-DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR")
     fi
