@@ -230,6 +230,16 @@ add_executable(test_session_publish unit/test_session_publish.c)
 target_link_libraries(test_session_publish PRIVATE moq-core-test-internals)
 add_test(NAME session_publish COMMAND test_session_publish)
 
+add_executable(test_issue44_rejected_update unit/test_issue44_rejected_update.c)
+target_link_libraries(test_issue44_rejected_update PRIVATE moq-core-test-internals)
+foreach(case publish-reject publish-ok subscribe-reject)
+    add_test(NAME issue44_rejected_update_${case}
+        COMMAND test_issue44_rejected_update ${case})
+endforeach()
+add_executable(test_issue44_rejected_update_pressure unit/test_issue44_rejected_update_pressure.c)
+target_link_libraries(test_issue44_rejected_update_pressure PRIVATE moq-core-test-internals)
+add_test(NAME issue44_rejected_update_pressure COMMAND test_issue44_rejected_update_pressure)
+
 add_executable(test_session_track_hist unit/test_session_track_hist.c)
 target_link_libraries(test_session_track_hist PRIVATE moq-core-test-internals)
 add_test(NAME session_track_hist COMMAND test_session_track_hist)

@@ -1594,7 +1594,7 @@ moq_result_t session_core_on_publish_done(moq_session_t *s,
 
 /* -- Inbound UNSUBSCRIBE for publisher-role publication ------------ */
 
-moq_result_t session_core_on_publish_unsubscribed(moq_session_t *s, int slot)
+static moq_result_t pub_reset_subgroups(moq_session_t *s, int slot)
 {
     moq_pub_entry_t *pe = &s->publishes[slot];
     moq_publication_t pub_handle = pe->handle;
@@ -1639,6 +1639,14 @@ moq_result_t session_core_on_publish_unsubscribed(moq_session_t *s, int slot)
         }
     }
     if (need_recompute) sg_recompute_deadline(s);
+    return MOQ_OK;
+}
+
+moq_result_t session_core_on_publish_unsubscribed(moq_session_t *s, int slot)
+{
+    moq_publication_t pub_handle = s->publishes[slot].handle;
+    moq_result_t rc = pub_reset_subgroups(s, slot);
+    if (rc < 0) return rc;
 
     if (event_queue_full(s))
         return MOQ_ERR_WOULD_BLOCK;
@@ -1649,7 +1657,7 @@ moq_result_t session_core_on_publish_unsubscribed(moq_session_t *s, int slot)
     ev.detail_size = (uint32_t)sizeof(moq_publish_unsubscribed_event_t);
     ev.borrow_epoch = s->borrow_epoch;
     ev.u.publish_unsubscribed.pub = pub_handle;
-    moq_result_t rc = push_event(s, &ev);
+    rc = push_event(s, &ev);
     if (rc < 0) return rc;
 
     pub_free_entry(s, slot);
@@ -1657,6 +1665,49 @@ moq_result_t session_core_on_publish_unsubscribed(moq_session_t *s, int slot)
 }
 
 /* -- Inbound REQUEST_UPDATE for publisher-role publication ----------- */
+
+static moq_result_t pub_reject_update_d16(moq_session_t *s,
+    const moq_decoded_request_update_t *d, uint64_t error_code)
+{
+    moq_pub_entry_t *pe = &s->publishes[d->target_slot];
+    uint8_t buf[256];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    moq_result_t rc = s->profile->encode_request_error(s, &w,
+        &(moq_request_error_encode_args_t){
+            .request_id = d->request_id, .error_code = error_code });
+    if (rc < 0) return rc;
+    size_t split = moq_buf_writer_offset(&w);
+    rc = s->profile->encode_publish_done(s, &w,
+        &(moq_finish_publish_encode_args_t){
+            .request_id = pe->request_id, .status_code = 0x8,
+            .stream_count = pe->subgroup_streams_opened });
+    if (rc < 0) return rc;
+    size_t total = moq_buf_writer_offset(&w);
+    size_t actions = s->action_cap == 1 ? 1 : 2;
+    /* Permanent BUFFER retains the input; draining cannot make it fit. */
+    if (total > s->send_cap) return MOQ_ERR_BUFFER;
+    if (total > s->send_cap - s->send_len || action_queue_avail(s) < actions)
+        return MOQ_ERR_WOULD_BLOCK;
+
+    /* From here WOULD_BLOCK retains teardown progress, not reply/ID/auth
+     * commits. Producers must not create new work between reset retries. */
+    pe->update_failed = true;
+    rc = pub_reset_subgroups(s, d->target_slot);
+    if (rc < 0) return rc;
+    if (action_queue_avail(s) < actions) return MOQ_ERR_WOULD_BLOCK;
+    if (actions == 1) {
+        rc = queue_send_control(s, buf, total);
+    } else {
+        rc = queue_send_control(s, buf, split);
+        if (rc < 0) return rc;
+        rc = queue_send_control(s, buf + split, total - split);
+    }
+    if (rc < 0) return rc;
+    s->profile->commit_inbound_request(s, &d->endpoint);
+    pub_free_entry(s, d->target_slot);
+    return MOQ_OK;
+}
 
 moq_result_t session_core_on_publish_request_update(
     moq_session_t *s, moq_decoded_request_update_t *d)
@@ -1684,14 +1735,20 @@ moq_result_t session_core_on_publish_request_update(
             "NEW_GROUP_REQUEST without dynamic-group support");
     }
 
-    /* An unsupported param or a message-level authorization-token reject
-     * answers REQUEST_ERROR; the publication continues (unlike subscription
-     * updates there is no terminal UPDATE_FAILED sequence here). A REGISTER
-     * carried alongside still commits its alias (the spec's
-     * register-even-on-reject rule), so the auth txn commits on this path. */
+    /* D16 failed subscription updates require ERROR then UPDATE_FAILED DONE.
+     * REGISTER aliases commit even on rejection, but only after output commits.
+     * Keep the stream-correlated path separate. */
     if (d->has_unsupported || d->auth_reject_code) {
         uint64_t err_code = d->auth_reject_code
             ? d->auth_reject_code : MOQ_REQUEST_ERROR_NOT_SUPPORTED;
+        if (!req_stream) {
+            result = pub_reject_update_d16(s, d, err_code);
+            if (result == MOQ_OK) {
+                auth_committed = true;
+                process_auth_tokens_commit_txn(s, &d->auth_txn);
+            }
+            goto cleanup_all;
+        }
         if (action_queue_full(s)) {
             result = MOQ_ERR_WOULD_BLOCK;
             goto cleanup_all;
@@ -2007,6 +2064,7 @@ moq_result_t moq_session_finish_publish(
         return MOQ_ERR_WRONG_STATE;
     if (s->publishes[slot].role != MOQ_PUB_ROLE_PUBLISHER)
         return MOQ_ERR_WRONG_STATE;
+    if (s->publishes[slot].update_failed) return MOQ_ERR_WRONG_STATE;
     /* Migrated by an outbound GOAWAY: no PUBLISH_DONE on the request bidi. Check
      * before capacity preflight so the contract is WRONG_STATE, not WOULD_BLOCK. */
     if (s->publishes[slot].goaway_sent) return MOQ_ERR_WRONG_STATE;
@@ -2104,6 +2162,7 @@ moq_result_t moq_session_open_pub_subgroup(
         return MOQ_ERR_WRONG_STATE;
     if (s->publishes[pub_slot].role != MOQ_PUB_ROLE_PUBLISHER)
         return MOQ_ERR_WRONG_STATE;
+    if (s->publishes[pub_slot].update_failed) return MOQ_ERR_WRONG_STATE;
     if (!s->publishes[pub_slot].send_allowed)
         return MOQ_ERR_WRONG_STATE;
 
@@ -2177,6 +2236,9 @@ moq_result_t moq_session_open_pub_subgroup(
     entry->has_extensions = has_ext;
     entry->delivery_deadline_us = UINT64_MAX;
     s->next_stream_ref++;
+
+    if (s->publishes[pub_slot].subgroup_streams_opened < MOQ_QUIC_VARINT_MAX)
+        s->publishes[pub_slot].subgroup_streams_opened++;
 
     *out_handle = sg_make_handle(s, (size_t)slot);
     return MOQ_OK;

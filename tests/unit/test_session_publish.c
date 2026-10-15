@@ -3034,10 +3034,16 @@ int main(void)
             moq_buf_writer_offset(&ew), 2000), (int)MOQ_OK);
         MOQ_TEST_CHECK(moq_session_state(sv) == MOQ_SESS_ESTABLISHED);
 
-        /* Second update should succeed. */
+        /* Failed subscription updates await UPDATE_FAILED, not another update. */
         ucfg.subscriber_priority = 100;
         MOQ_TEST_CHECK_EQ_INT((int)moq_session_update_publication(sv, sv_pub,
-            &ucfg, 3000), (int)MOQ_OK);
+            &ucfg, 3000), (int)MOQ_ERR_WRONG_STATE);
+        moq_buf_writer_init(&ew, errbuf, sizeof(errbuf));
+        MOQ_TEST_CHECK(moq_d16_encode_publish_done(&ew, 0, 0x8, 0, NULL, 0) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_on_control_bytes(sv, errbuf,
+            moq_buf_writer_offset(&ew), 4000) == MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_update_publication(sv, sv_pub,
+            &ucfg, 5000), (int)MOQ_ERR_STALE_HANDLE);
 
         moq_session_destroy(c);
         moq_session_destroy(sv);

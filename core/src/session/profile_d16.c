@@ -2987,9 +2987,11 @@ static moq_result_t d16_handle_control_message(moq_session_t *s,
                 s->publishes[ep.slot].update_pending &&
                 s->publishes[ep.slot].update_request_id == err.request_id) {
                 s->publishes[ep.slot].update_pending = false;
+                s->publishes[ep.slot].update_request_id = 0;
                 s->publishes[ep.slot].update_has_forward = false;
                 s->publishes[ep.slot].dt_upd_has_object = false;
                 s->publishes[ep.slot].dt_upd_has_subgroup = false;
+                s->publishes[ep.slot].update_failed = true;
             }
             request_registry_remove_by_id(s, err.request_id);
             return MOQ_OK;

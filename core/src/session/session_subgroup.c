@@ -19,10 +19,17 @@ static void sg_note_object_published(moq_session_t *s, const moq_sg_entry_t *e,
 
 /* Whether a subscription-owned subgroup belongs to a subscription the peer has
  * cancelled. Such a subgroup is owed the cancellation's reset: nothing else may
- * be written to it, a FIN included. A publication-owned subgroup never is. */
+ * be written to it, a FIN included. A publication's failed-update teardown
+ * likewise owes resets and must not be overtaken by producer output. */
 static bool sg_owner_cancelled(moq_session_t *s, const moq_sg_entry_t *sg)
 {
-    return moq_subscription_is_valid(sg->sub) && sub_cancel_pending(s, sg->sub);
+    if (moq_subscription_is_valid(sg->sub))
+        return sub_cancel_pending(s, sg->sub);
+    if (moq_publication_is_valid(sg->pub)) {
+        int slot = pub_resolve_handle(s, sg->pub);
+        return slot >= 0 && s->publishes[slot].update_failed;
+    }
+    return false;
 }
 
 static bool sg_send_allowed(moq_session_t *s, const moq_sg_entry_t *sg)
@@ -36,6 +43,7 @@ static bool sg_send_allowed(moq_session_t *s, const moq_sg_entry_t *sg)
     if (moq_publication_is_valid(sg->pub)) {
         int slot = pub_resolve_handle(s, sg->pub);
         if (slot < 0) return false;
+        if (s->publishes[slot].update_failed) return false;
         return s->publishes[slot].send_allowed;
     }
     return false;
@@ -1223,6 +1231,7 @@ moq_result_t moq_session_send_pub_object_datagram(
         return MOQ_ERR_WRONG_STATE;
     if (s->publishes[slot].role != MOQ_PUB_ROLE_PUBLISHER)
         return MOQ_ERR_WRONG_STATE;
+    if (s->publishes[slot].update_failed) return MOQ_ERR_WRONG_STATE;
     if (!s->publishes[slot].send_allowed)
         return MOQ_ERR_WRONG_STATE;
 
@@ -1266,6 +1275,7 @@ moq_result_t moq_session_send_pub_status_datagram(
         return MOQ_ERR_WRONG_STATE;
     if (s->publishes[slot].role != MOQ_PUB_ROLE_PUBLISHER)
         return MOQ_ERR_WRONG_STATE;
+    if (s->publishes[slot].update_failed) return MOQ_ERR_WRONG_STATE;
     if (!s->publishes[slot].send_allowed)
         return MOQ_ERR_WRONG_STATE;
 

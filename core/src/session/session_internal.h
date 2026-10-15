@@ -534,9 +534,12 @@ typedef struct moq_pub_entry {
      * current acknowledged Forward state); dropped on error/retirement. */
     bool               update_has_forward;
     bool               update_forward;
-    /* A REQUEST_UPDATE was rejected (REQUEST_ERROR): the publication must now be
-     * terminated by PUBLISH_DONE(UPDATE_FAILED); further updates are blocked. */
+    /* Subscriber: awaiting DONE after a rejected update. D16 publisher:
+     * automatic rejection teardown has begun; no new output may overtake it. */
     bool               update_failed;
+    /* Lifetime successful subgroup opens, saturated at the D16 unknown count.
+     * Used by the automatic D16 update-rejection terminal, not caller counts. */
+    uint64_t           subgroup_streams_opened;
     /* Co-allocated request-bidi receive buffer (stream-correlated profiles): the
      * PUBLISH bidi carries the peer's response/lifecycle messages here. On the
      * publisher (opener) side: PUBLISH_OK / REQUEST_ERROR / REQUEST_UPDATE; on
