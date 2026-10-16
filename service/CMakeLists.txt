@@ -619,7 +619,8 @@ if(MOQ_BUILD_TESTS)
             # This fixture includes the production receiver conversion, so link
             # endpoint-only support rather than a second receiver object.
             add_executable(test_media_receiver_companion
-                tests/test_media_receiver_companion.c)
+                tests/test_media_receiver_companion.c
+                tests/receiver_legacy_ts_caller.c)
             target_link_libraries(test_media_receiver_companion PRIVATE
                 moq-service-endpoint-test-internals moq::msf moq::sim)
             target_include_directories(test_media_receiver_companion PRIVATE
@@ -694,7 +695,8 @@ if(MOQ_BUILD_TESTS)
             set_tests_properties(media_receiver_metadata_copy PROPERTIES TIMEOUT 30)
 
             add_executable(test_media_receiver_origin
-                tests/test_media_receiver_origin.c)
+                tests/test_media_receiver_origin.c
+                tests/receiver_legacy_ts_caller.c)
             target_link_libraries(test_media_receiver_origin PRIVATE
                 moq-service-endpoint-test-internals moq::msf moq::sim)
             target_include_directories(test_media_receiver_origin PRIVATE
@@ -708,7 +710,8 @@ if(MOQ_BUILD_TESTS)
             set_tests_properties(media_receiver_origin PROPERTIES TIMEOUT 30)
 
             add_executable(test_media_receiver_fill_control
-                tests/test_media_receiver_fill_control.c)
+                tests/test_media_receiver_fill_control.c
+                tests/receiver_legacy_ts_caller.c)
             target_link_libraries(test_media_receiver_fill_control PRIVATE
                 moq-service-endpoint-test-internals moq::msf moq::sim)
             target_include_directories(test_media_receiver_fill_control PRIVATE

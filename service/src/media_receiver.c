@@ -5033,6 +5033,17 @@ void moq_media_receiver_cfg_init_flow_control_sized(
                                    MOQ_MEDIA_OVERFLOW_FLOW_CONTROL);
 }
 
+static moq_media_companion_profile_t receiver_cfg_companion(const void *cfg)
+{
+    uint32_t size;
+    memcpy(&size, cfg, sizeof(size));
+    moq_media_companion_profile_t profile = MOQ_MEDIA_COMPANION_AUTO;
+    const size_t offset = offsetof(moq_media_receiver_cfg_t, companion_profile);
+    if (size >= offset + sizeof(profile))
+        memcpy(&profile, (const uint8_t *)cfg + offset, sizeof(profile));
+    return profile;
+}
+
 /* Read a caller's cfg into a full current struct: the v0 prefix, then each
  * appended field only when struct_size covers all of it (half a field is
  * not a field). Fields left out keep their zero default, except
@@ -5041,21 +5052,21 @@ void moq_media_receiver_cfg_init_flow_control_sized(
 static void receiver_cfg_read(const moq_media_receiver_cfg_t *in,
                               moq_media_receiver_cfg_t *out)
 {
+    uint32_t size;
+    memcpy(&size, in, sizeof(size));
     memset(out, 0, sizeof(*out));
     memcpy(out, in, MOQ_MEDIA_RECEIVER_CFG_V0_SIZE);
-#define RCFG_HAS(f) \
-    (in->struct_size >= offsetof(moq_media_receiver_cfg_t, f) + sizeof(in->f))
-    if (RCFG_HAS(mpeg2ts_reorder_slots))
-        out->mpeg2ts_reorder_slots = in->mpeg2ts_reorder_slots;
-    if (RCFG_HAS(mpeg2ts_reorder_window_us))
-        out->mpeg2ts_reorder_window_us = in->mpeg2ts_reorder_window_us;
-    if (RCFG_HAS(mpeg2ts_strip_prefix))
-        out->mpeg2ts_strip_prefix = in->mpeg2ts_strip_prefix;
-    if (RCFG_HAS(mpeg2ts_join_psi))
-        out->mpeg2ts_join_psi = in->mpeg2ts_join_psi;
-    out->companion_profile = RCFG_HAS(companion_profile)
-        ? in->companion_profile : MOQ_MEDIA_COMPANION_AUTO;
-#undef RCFG_HAS
+#define RCFG_COPY(f) do { \
+    const size_t offset = offsetof(moq_media_receiver_cfg_t, f); \
+    if (size >= offset + sizeof(out->f)) \
+        memcpy(&out->f, (const uint8_t *)in + offset, sizeof(out->f)); \
+} while (0)
+    RCFG_COPY(mpeg2ts_reorder_slots);
+    RCFG_COPY(mpeg2ts_reorder_window_us);
+    RCFG_COPY(mpeg2ts_strip_prefix);
+    RCFG_COPY(mpeg2ts_join_psi);
+#undef RCFG_COPY
+    out->companion_profile = receiver_cfg_companion(in);
     out->struct_size = (uint32_t)sizeof(*out);
 }
 
@@ -5137,15 +5148,6 @@ void moq_media_receiver_test_set_parts_walk_hook(bool (*fn)(size_t, void *), voi
 #define CFG_PARTS_WALK_HOOK(count) ((void)0)
 #endif
 
-
-static moq_media_companion_profile_t receiver_cfg_companion(
-    const moq_media_receiver_cfg_t *cfg)
-{
-    if (cfg->struct_size >= offsetof(moq_media_receiver_cfg_t, companion_profile) +
-                            sizeof(cfg->companion_profile))
-        return cfg->companion_profile;
-    return MOQ_MEDIA_COMPANION_AUTO;
-}
 
 static moq_result_t receiver_validate_cfg(const moq_media_receiver_cfg_t *cfg)
 {
