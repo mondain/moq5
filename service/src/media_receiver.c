@@ -4983,7 +4983,14 @@ void moq_media_receiver_cfg_init_flow_control(moq_media_receiver_cfg_t *cfg)
 
 /* min(cfg_size, sizeof) cleared and stamped; the preset is applied only
  * when that prefix covers overflow.policy. Returns the stamped size, 0 when
- * nothing was written. */
+ * nothing was written. The caller's object may be an older, smaller record,
+ * so every store goes through its bytes at the field's offset, never
+ * through an lvalue of the current record type. */
+_Static_assert(sizeof(((moq_media_receiver_cfg_t *)0)->struct_size) == sizeof(uint32_t),
+               "struct_size is stored as a uint32_t");
+_Static_assert(sizeof(((moq_media_overflow_cfg_t *)0)->policy) ==
+               sizeof(moq_media_overflow_policy_t),
+               "overflow.policy is stored as the policy type");
 static size_t receiver_cfg_init_prefix(moq_media_receiver_cfg_t *cfg,
                                        size_t cfg_size,
                                        moq_media_overflow_policy_t policy)
@@ -4991,15 +4998,18 @@ static size_t receiver_cfg_init_prefix(moq_media_receiver_cfg_t *cfg,
     if (!cfg) return 0;
     size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
     if (n < sizeof(cfg->struct_size)) return 0;
-    memset(cfg, 0, n);
-    cfg->struct_size = (uint32_t)n;
-    if (n >= offsetof(moq_media_receiver_cfg_t, overflow) +
-             offsetof(moq_media_overflow_cfg_t, policy) +
-             sizeof(cfg->overflow.policy))
-        cfg->overflow.policy = policy;
-    if (n >= offsetof(moq_media_receiver_cfg_t, companion_profile) +
-             sizeof(cfg->companion_profile))
-        cfg->companion_profile = MOQ_MEDIA_COMPANION_AUTO;
+    unsigned char *bytes = (unsigned char *)cfg;
+    memset(bytes, 0, n);
+    const uint32_t stamp = (uint32_t)n;
+    memcpy(bytes + offsetof(moq_media_receiver_cfg_t, struct_size), &stamp, sizeof(stamp));
+    const size_t policy_at = offsetof(moq_media_receiver_cfg_t, overflow) +
+                             offsetof(moq_media_overflow_cfg_t, policy);
+    if (n >= policy_at + sizeof(policy))
+        memcpy(bytes + policy_at, &policy, sizeof(policy));
+    const moq_media_companion_profile_t companion = MOQ_MEDIA_COMPANION_AUTO;
+    const size_t companion_at = offsetof(moq_media_receiver_cfg_t, companion_profile);
+    if (n >= companion_at + sizeof(companion))
+        memcpy(bytes + companion_at, &companion, sizeof(companion));
     return n;
 }
 

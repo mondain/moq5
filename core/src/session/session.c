@@ -3933,12 +3933,19 @@ static size_t event_min_poll_size(uint32_t kind)
     }
 }
 
+/* An admission filter for the poll: `admit` decides each head event, and
+ * `discarded` reports that one was dropped. */
+typedef struct session_poll_admission {
+    session_event_admission_t (*admit)(void *, const moq_event_t *);
+    void *ctx;
+    bool discarded;
+} session_poll_admission_t;
+
 static moq_result_t session_poll_events_impl(moq_session_t *s,
                                          void *out, size_t cap,
                                          size_t element_size,
                                          size_t *out_count,
-    session_event_admission_t (*admit)(void *, const moq_event_t *),
-    void *admit_ctx, bool *discarded)
+                                         session_poll_admission_t *adm)
 {
     if (out_count) *out_count = 0;
     if (!s || !out || !out_count) return MOQ_ERR_INVAL;
@@ -3949,7 +3956,7 @@ static moq_result_t session_poll_events_impl(moq_session_t *s,
 
     const size_t lib_size = sizeof(moq_event_t);
     const size_t copy = lib_size < element_size ? lib_size : element_size;
-    if (!admit || s->event_head == s->event_tail) {
+    if (!adm || s->event_head == s->event_tail) {
         ts_retry_pending(s);
         ann_retry_pending(s);
         ns_sub_retry_pending(s);
@@ -3964,8 +3971,8 @@ static moq_result_t session_poll_events_impl(moq_session_t *s,
         if (element_size < event_min_poll_size(head->kind))
             break;
 
-        session_event_admission_t decision = admit
-            ? admit(admit_ctx, head) : SESSION_EVENT_TAKE;
+        session_event_admission_t decision = adm
+            ? adm->admit(adm->ctx, head) : SESSION_EVENT_TAKE;
         if (decision == SESSION_EVENT_LEAVE) {
             *out_count = n;
             return MOQ_ERR_WOULD_BLOCK;
@@ -4045,7 +4052,7 @@ static moq_result_t session_poll_events_impl(moq_session_t *s,
             event_location_retire(s, head->u.publish_state.location);
         if (decision == SESSION_EVENT_DISCARD) {
             moq_event_cleanup((moq_event_t *)out);
-            *discarded = true;
+            adm->discarded = true;
         }
         s->event_head++;
         /* Advance the progress token on event TRANSFER too (not only enqueue):
@@ -4101,8 +4108,7 @@ static moq_result_t session_poll_events_impl(moq_session_t *s,
 moq_result_t moq_session_poll_events_ex(moq_session_t *s,
     void *out, size_t cap, size_t element_size, size_t *out_count)
 {
-    return session_poll_events_impl(s, out, cap, element_size, out_count,
-                                    NULL, NULL, NULL);
+    return session_poll_events_impl(s, out, cap, element_size, out_count, NULL);
 }
 
 moq_result_t session_poll_event_admitted(moq_session_t *s, moq_event_t *out,
@@ -4110,11 +4116,10 @@ moq_result_t session_poll_event_admitted(moq_session_t *s, moq_event_t *out,
 {
     if (!admit) return MOQ_ERR_INVAL;
     size_t count = 0;
-    bool discarded = false;
-    moq_result_t rc = session_poll_events_impl(s, out, 1, sizeof(*out), &count,
-                                               admit, ctx, &discarded);
+    session_poll_admission_t adm = { .admit = admit, .ctx = ctx, .discarded = false };
+    moq_result_t rc = session_poll_events_impl(s, out, 1, sizeof(*out), &count, &adm);
     if (rc != MOQ_OK) return rc;
-    if (discarded) return MOQ_ERR_BUFFER;
+    if (adm.discarded) return MOQ_ERR_BUFFER;
     return count ? MOQ_OK : MOQ_DONE;
 }
 

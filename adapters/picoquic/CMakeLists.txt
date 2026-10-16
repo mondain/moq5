@@ -75,7 +75,9 @@ if(_moq_pq_verify_backend STREQUAL "openssl")
                 "-DMOQ_PICOQUIC_VERIFY_BACKEND=mbedtls with an mbedTLS "
                 "picoquic build.")
         endif()
-        set(MOQ_PTLS_OPENSSL_INCLUDE_DIR "${PTLS_INCLUDE_DIR}")
+        # The cache records the directory the verifier compiles against.
+        set(MOQ_PTLS_OPENSSL_INCLUDE_DIR "${PTLS_INCLUDE_DIR}" CACHE PATH
+            "Directory containing <picotls/openssl.h> for the cert verifier" FORCE)
     else()
         find_path(MOQ_PTLS_OPENSSL_INCLUDE_DIR
             NAMES picotls/openssl.h
