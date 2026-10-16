@@ -1624,11 +1624,15 @@ if(MOQ_BUILD_TESTS)
                 get_filename_component(_svc_wtqm_o "${OPENSSL_SSL_LIBRARY}" DIRECTORY)
                 get_filename_component(_svc_wtqm_ossl "${_svc_wtqm_o}" DIRECTORY)
             endif()
+            include("${PROJECT_SOURCE_DIR}/tests/cmake/ConsumerBuildContext.cmake")
+            set(_svc_wtqm_context "${CMAKE_CURRENT_BINARY_DIR}/wtquic-msquic-consumer-context.cmake")
+            moq_write_consumer_context("${_svc_wtqm_context}")
             add_test(NAME service_wtquic_msquic_install_consumer
                 COMMAND ${CMAKE_COMMAND}
                     -DBUILD=${PROJECT_BINARY_DIR}
                     -DSRC=${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer
                     -DWORK=${CMAKE_CURRENT_BINARY_DIR}/wtquic-msquic-consumer-work
+                    "-DCONSUMER_CONTEXT=${_svc_wtqm_context}"
                     "-DWTQUIC_PREFIX=${_svc_wtqm_prefix}"
                     "-DMSQUIC_DIR_HINT=${msquic_DIR}"
                     "-DPICOQUIC_SOURCE_DIR=${MOQ_PICOQUIC_SOURCE_DIR}"

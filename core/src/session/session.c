@@ -1,5 +1,6 @@
 #include <assert.h>
 #include "session_internal.h"
+#include "../bridge/transport_bridge_internal.h"
 #include "../internal/validate.h"
 #include "session_event_admission.h"
 
@@ -3735,7 +3736,10 @@ moq_result_t moq_session_on_bidi_stream_stop(moq_session_t *s,
     return handle_bidi_stream_stop(s, stream_ref, error_code);
 }
 
-bool moq_session_has_transport_stream(const moq_session_t *s, moq_stream_ref_t ref)
+/* Ownership other than a locally-ended request's drain identity. The public
+ * query includes that identity; local retirement must check without it. */
+static bool session_has_live_transport_owner(const moq_session_t *s,
+                                              moq_stream_ref_t ref)
 {
     if (!s) return false;
     if (moq_index_find(s->idx_rx_by_ref, s->idx_rx_mask, ref._v) >= 0)
@@ -3762,12 +3766,59 @@ bool moq_session_has_transport_stream(const moq_session_t *s, moq_stream_ref_t r
      * its retry rather than fatalize it. */
     if (noslot_carrier_find(s, ref) >= 0)
         return true;
-    /* A locally-terminated request bidi still in the drain ring: the owner is
-     * gone but the stream stays live until the peer's FIN/RESET, which the
-     * drain ring absorbs. */
-    if (drain_ref_contains(s, ref))
-        return true;
     return false;
+}
+
+bool moq_session_has_transport_stream(const moq_session_t *s, moq_stream_ref_t ref)
+{
+    /* A locally-terminated request bidi keeps its drain identity until a
+     * genuine terminal ends what it must absorb. Preserve the public query. */
+    return s && (session_has_live_transport_owner(s, ref) ||
+                 drain_ref_contains(s, ref));
+}
+
+static bool session_has_queued_bidi_action(const moq_session_t *s,
+                                           moq_stream_ref_t ref)
+{
+    for (size_t i = s->action_head; i < s->action_tail; ++i) {
+        const moq_action_t *a = &s->actions[i % s->action_cap];
+        moq_stream_ref_t r = { 0 };
+        switch (a->kind) {
+        case MOQ_ACTION_OPEN_BIDI_STREAM:  r = a->u.open_bidi_stream.stream_ref; break;
+        case MOQ_ACTION_SEND_BIDI_STREAM:  r = a->u.send_bidi_stream.stream_ref; break;
+        case MOQ_ACTION_CLOSE_BIDI_STREAM: r = a->u.close_bidi_stream.stream_ref; break;
+        case MOQ_ACTION_RESET_BIDI_STREAM: r = a->u.reset_bidi_stream.stream_ref; break;
+        case MOQ_ACTION_STOP_BIDI_STREAM:  r = a->u.stop_bidi_stream.stream_ref; break;
+        case MOQ_ACTION_ABORT_BIDI_STREAM: r = a->u.abort_bidi_stream.stream_ref; break;
+        default: continue;
+        }
+        if (r._v == ref._v) return true;
+    }
+    return false;
+}
+
+bool bridge_session_bidi_owner_ended(const moq_session_t *s, moq_stream_ref_t ref)
+{
+    return !moq_session_has_transport_stream(s, ref) &&
+           !session_has_queued_bidi_action(s, ref);
+}
+
+moq_result_t bridge_session_on_bidi_retired(moq_session_t *s,
+                                            moq_stream_ref_t ref,
+                                            uint64_t now_us)
+{
+    if (!s || ref._v == 0) return MOQ_ERR_INVAL;
+    moq_result_t arc = session_advance_entry(s, now_us);
+    if (arc != MOQ_OK) return arc;
+    /* A cancelled request identity can predate SETUP completion. Only the
+     * terminal session state forbids settling it; live owners still guard it. */
+    if (s->state == MOQ_SESS_CLOSED) return MOQ_ERR_CLOSED;
+    if (session_has_live_transport_owner(s, ref) ||
+        session_has_queued_bidi_action(s, ref))
+        return MOQ_ERR_WRONG_STATE;
+    /* The bridge proved local abort completion plus a genuine terminal.
+     * Release only its drain identity: no peer lifetime fact or event. */
+    return drain_ref_remove(s, ref) ? MOQ_OK : MOQ_ERR_STALE_HANDLE;
 }
 
 bool moq_session_can_admit_data_stream(const moq_session_t *s)

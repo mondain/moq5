@@ -365,6 +365,21 @@ add_test(NAME session_setup_tokens COMMAND test_session_setup_tokens)
 # Receive-capacity saturation through the real bridge over fake endpoints:
 # fill receive entries, retain later deliveries, and replay after capacity
 # returns. No request loses its response or receives a fabricated terminal.
+# Local receive retirement: a stopped peer data stream whose FIN or RESET the
+# transport never reports is released by the transport's terminal report, after
+# the STOP was accepted, with no FIN, reset or delivery claimed.
+add_executable(test_bridge_local_retire unit/test_bridge_local_retire.c)
+target_link_libraries(test_bridge_local_retire PRIVATE moq-core-test-internals)
+target_include_directories(test_bridge_local_retire PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME bridge_local_retire COMMAND test_bridge_local_retire)
+
+# A peer RESET of a request bidi ends only the peer's half: our send half keeps
+# its mapping until it is closed, or reset once in answer to a later STOP.
+add_executable(test_bridge_bidi_reset_half unit/test_bridge_bidi_reset_half.c)
+target_link_libraries(test_bridge_bidi_reset_half PRIVATE moq-core-test-internals)
+target_include_directories(test_bridge_bidi_reset_half PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME bridge_bidi_reset_half COMMAND test_bridge_bidi_reset_half)
+
 add_executable(test_bridge_rx_saturation unit/test_bridge_rx_saturation.c)
 target_link_libraries(test_bridge_rx_saturation PRIVATE moq-core-test-internals)
 target_include_directories(test_bridge_rx_saturation PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)

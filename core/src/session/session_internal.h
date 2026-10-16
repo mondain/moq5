@@ -3884,6 +3884,10 @@ void fill_rx_peer_reset(moq_session_t *s, const moq_rx_stream_t *rx, uint64_t er
 /* The session itself stopped the stream (budget or expiry): the child is
  * cancelled locally and its STOP recorded. */
 void fill_rx_local_stop(moq_session_t *s, const moq_rx_stream_t *rx);
+/* The stopped stream was retired by the transport with no peer FIN or RESET
+ * (local receive retirement): the child's stream is over, with the reason
+ * its cancellation recorded. */
+void fill_rx_local_retired(moq_session_t *s, const moq_rx_stream_t *rx);
 /* The identity a bound rx's fill events carry (zeroed when the child is gone). */
 void fill_rx_identity(const moq_session_t *s, const moq_rx_stream_t *rx,
                       moq_fill_t *fill, moq_subscription_t *sub,
