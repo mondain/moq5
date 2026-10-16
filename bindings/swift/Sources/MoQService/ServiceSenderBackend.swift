@@ -11,7 +11,8 @@ func withSenderCFG<T>(
 ) rethrows -> T {
     let arena = CBytesArena()
     var cfg = moq_media_sender_cfg_t()
-    moq_media_sender_cfg_init(&cfg)
+    moq_media_sender_cfg_init_sized(&cfg, MemoryLayout<moq_media_sender_cfg_t>.size)
+    cfg.companion_profile = cMediaCompanionProfile(configuration.companionProfile)
     cfg.namespace_ = arena.namespaceParts(configuration.namespace.parts)
     cfg.catalog_track = arena.bytes(configuration.catalogTrack)
     switch configuration.sendPolicy {
@@ -46,7 +47,9 @@ func withTrackCFG<T>(
 ) rethrows -> T {
     let arena = CBytesArena()
     var cfg = moq_media_track_cfg_t()
-    moq_media_track_cfg_init(&cfg)
+    // Sized: trackProperties/dynamicGroups are past the original layout,
+    // which is all the exported function name stamps.
+    moq_media_track_cfg_init_sized(&cfg, MemoryLayout<moq_media_track_cfg_t>.size)
     cfg.name = arena.bytes(configuration.name)
     cfg.media_type = configuration.mediaType == .audio
         ? MOQ_MEDIA_TYPE_AUDIO : MOQ_MEDIA_TYPE_VIDEO
@@ -64,6 +67,8 @@ func withTrackCFG<T>(
     cfg.samplerate = UInt32(clamping: configuration.samplerate ?? 0)
     cfg.channel_config = arena.bytes(configuration.channelConfig)
     cfg.bitrate = configuration.bitrate
+    cfg.track_properties = arena.bytes(configuration.trackProperties)
+    cfg.dynamic_groups = configuration.dynamicGroups
     return try withExtendedLifetime(arena) {
         try body(&cfg)
     }
@@ -75,6 +80,142 @@ func cSAPType(_ sapType: SAPType) -> moq_sap_type_t {
     case .type1: MOQ_SAP_TYPE_1
     case .type2: MOQ_SAP_TYPE_2
     case .type3: MOQ_SAP_TYPE_3
+    }
+}
+
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+private func validSenderMetadata(_ metadata: MediaLOCMetadata) -> Bool {
+    let fields: [(UInt32, Bool)] = [
+        (moq_swift_loc_metadata_has_timestamp(), metadata.timestamp != nil),
+        (moq_swift_loc_metadata_has_timescale(), metadata.timescale != nil),
+        (moq_swift_loc_metadata_has_marking(), metadata.marking != nil),
+        (moq_swift_loc_metadata_has_audio_level(), metadata.audioLevel != nil),
+        (moq_swift_loc_metadata_has_video_config(), metadata.videoConfig != nil),
+        (moq_swift_loc_metadata_has_audio_config(), metadata.audioConfig != nil),
+    ]
+    let known = fields.reduce(UInt32(0)) { $0 | $1.0 }
+    guard metadata.rawPresence & ~known == 0,
+          fields.allSatisfy({ (metadata.rawPresence & $0.0 != 0) == $0.1 }) else {
+        return false
+    }
+    return metadata.marking.map { (1...4).contains($0.count) } ?? true
+}
+
+/// Config spans and the nested record borrow only across the synchronous call.
+/// Clock/profile semantics remain native; derived output-only fields stay zero.
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+private func withSenderMetadata<T>(
+    _ input: MediaLOCMetadata?,
+    _ body: (UnsafePointer<moq_media_metadata_t>?) -> T
+) -> T {
+    guard let input else { return body(nil) }
+    var metadata = moq_media_metadata_t()
+    metadata.struct_size = UInt32(MemoryLayout<moq_media_metadata_t>.size)
+    metadata.loc.struct_size = UInt32(MemoryLayout<moq_loc_metadata_t>.size)
+    metadata.loc.present = input.rawPresence
+    metadata.loc.timestamp = input.timestamp ?? 0
+    metadata.loc.timescale = input.timescale ?? 0
+    metadata.loc.audio_level = input.audioLevel ?? 0
+    if let marking = input.marking {
+        metadata.loc.marking_len = UInt8(marking.count)
+        withUnsafeMutableBytes(of: &metadata.loc.marking) { destination in
+            marking.withUnsafeBytes { destination.copyMemory(from: $0) }
+        }
+    }
+    return (input.videoConfig ?? Data()).withUnsafeBytes { video in
+        (input.audioConfig ?? Data()).withUnsafeBytes { audio in
+            if input.videoConfig != nil {
+                metadata.loc.video_config = moq_bytes_t(
+                    data: video.bindMemory(to: UInt8.self).baseAddress,
+                    len: video.count)
+            }
+            if input.audioConfig != nil {
+                metadata.loc.audio_config = moq_bytes_t(
+                    data: audio.bindMemory(to: UInt8.self).baseAddress,
+                    len: audio.count)
+            }
+            return withUnsafePointer(to: metadata) { body($0) }
+        }
+    }
+}
+
+/// One synchronous service-thread attempt. Only OK transfers the freshly
+/// allocated references; no rcbuf escapes into an asynchronous Swift job.
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+func writeSenderObject(
+    _ object: OutgoingObject,
+    alloc: UnsafePointer<moq_alloc_t> = moq_alloc_default(),
+    write: (UnsafePointer<moq_media_send_object_t>) -> moq_result_t
+) -> SenderOperationResult {
+    if let metadata = object.locMetadata, !validSenderMetadata(metadata) {
+        return .invalidArgument
+    }
+    var payload: OpaquePointer?
+    let payloadRC = object.payload.withUnsafeBytes { raw in
+        moq_rcbuf_create(
+            alloc, raw.bindMemory(to: UInt8.self).baseAddress,
+            raw.count, &payload)
+    }
+    guard payloadRC == moq_result_t(MOQ_OK), let payload else {
+        return .outOfMemory
+    }
+
+    /* Optional CMAF property block; native RAW policy rejects extras. */
+    var properties: OpaquePointer?
+    if let propertyBytes = object.properties {
+        let propertiesRC = propertyBytes.withUnsafeBytes { raw in
+            moq_rcbuf_create(
+                alloc, raw.bindMemory(to: UInt8.self).baseAddress,
+                raw.count, &properties)
+        }
+        guard propertiesRC == moq_result_t(MOQ_OK) else {
+            moq_rcbuf_decref(payload)
+            return .outOfMemory
+        }
+    }
+
+    var send = moq_media_send_object_t()
+    send.struct_size = UInt32(MemoryLayout<moq_media_send_object_t>.size)
+    send.payload = payload
+    send.properties = properties
+    send.is_sync = object.isSync
+    send.starts_group = object.startsGroup
+    send.ends_group = object.endsGroup
+    send.presentation_time_us = object.presentationTime.wholeMicroseconds
+    send.decode_time_us = object.decodeTime?.wholeMicroseconds ?? 0
+    if let captureTime = object.captureTime {
+        send.has_capture_time = true
+        send.capture_time_us =
+            UInt64(max(0, captureTime.timeIntervalSince1970) * 1_000_000)
+    }
+    if let sapType = object.sapType {
+        send.has_sap_type = true
+        send.sap_type = cSAPType(sapType)
+    }
+
+    let rc = withSenderMetadata(object.locMetadata) { metadata in
+        send.metadata = metadata
+        return withUnsafePointer(to: send, write)
+    }
+    if rc == moq_result_t(MOQ_OK) {
+        return .ok
+    }
+    moq_rcbuf_decref(payload)
+    if let properties { moq_rcbuf_decref(properties) }
+    return senderOperationResult(rc)
+}
+
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+private func senderOperationResult(_ rc: moq_result_t) -> SenderOperationResult {
+    switch rc {
+    case moq_result_t(MOQ_OK): .ok
+    case moq_result_t(MOQ_ERR_WOULD_BLOCK): .wouldBlock
+    case moq_result_t(MOQ_ERR_WRONG_STATE): .wrongState
+    case moq_result_t(MOQ_ERR_INTERRUPTED): .interrupted
+    case moq_result_t(MOQ_ERR_CLOSED): .closed
+    case moq_result_t(MOQ_ERR_NOMEM): .outOfMemory
+    case moq_result_t(MOQ_ERR_UNSUPPORTED): .unsupported
+    default: .invalidArgument
     }
 }
 
@@ -125,69 +266,16 @@ final class ServiceSenderBackend: SenderBackend, @unchecked Sendable {
         guard let track = OpaquePointer(bitPattern: UInt(handleID)) else {
             return .invalidArgument
         }
-        let alloc = moq_alloc_default()
-
-        /* Payload rcbuf: created here, transferred on MOQ_OK only. */
-        var payload: OpaquePointer?
-        let payloadRC = object.payload.withUnsafeBytes { raw in
-            moq_rcbuf_create(
-                alloc, raw.bindMemory(to: UInt8.self).baseAddress,
-                raw.count, &payload)
-        }
-        guard payloadRC == moq_result_t(MOQ_OK), let payload else {
-            return .outOfMemory
-        }
-
-        /* Optional CMAF property block (must stay nil for RAW: the C
-         * service generates the LOC block itself and rejects extras). */
-        var properties: OpaquePointer?
-        if let propertyBytes = object.properties {
-            let propertiesRC = propertyBytes.withUnsafeBytes { raw in
-                moq_rcbuf_create(
-                    alloc, raw.bindMemory(to: UInt8.self).baseAddress,
-                    raw.count, &properties)
-            }
-            guard propertiesRC == moq_result_t(MOQ_OK) else {
-                moq_rcbuf_decref(payload)
-                return .outOfMemory
-            }
-        }
-
-        var send = moq_media_send_object_t()
-        send.struct_size = UInt32(MemoryLayout<moq_media_send_object_t>.size)
-        send.payload = payload
-        send.properties = properties
-        send.is_sync = object.isSync
-        send.starts_group = object.startsGroup
-        send.ends_group = object.endsGroup
-        send.presentation_time_us = object.presentationTime.wholeMicroseconds
-        send.decode_time_us = object.decodeTime?.wholeMicroseconds ?? 0
-        if let captureTime = object.captureTime {
-            send.has_capture_time = true
-            send.capture_time_us =
-                UInt64(max(0, captureTime.timeIntervalSince1970) * 1_000_000)
-        }
-        if let sapType = object.sapType {
-            send.has_sap_type = true
-            send.sap_type = cSAPType(sapType)
-        }
-
-        let rc = withUnsafePointer(to: send) {
+        return writeSenderObject(object) {
             moq_media_sender_write(sender, track, $0)
         }
-        if rc == moq_result_t(MOQ_OK) {
-            return .ok      /* refs transferred to the service */
-        }
-        moq_rcbuf_decref(payload)
-        if let properties { moq_rcbuf_decref(properties) }
-        return operationResult(rc)
     }
 
     func endTrack(handleID: UInt64) -> SenderOperationResult {
         guard let track = OpaquePointer(bitPattern: UInt(handleID)) else {
             return .invalidArgument
         }
-        return operationResult(moq_media_sender_end_track(sender, track))
+        return senderOperationResult(moq_media_sender_end_track(sender, track))
     }
 
     func wait(timeoutMicroseconds: UInt64) -> SenderWaitOutcome {
@@ -203,16 +291,11 @@ final class ServiceSenderBackend: SenderBackend, @unchecked Sendable {
         moq_media_sender_destroy(sender)
     }
 
-    private func operationResult(_ rc: moq_result_t) -> SenderOperationResult {
-        switch rc {
-        case moq_result_t(MOQ_OK): .ok
-        case moq_result_t(MOQ_ERR_WOULD_BLOCK): .wouldBlock
-        case moq_result_t(MOQ_ERR_WRONG_STATE): .wrongState
-        case moq_result_t(MOQ_ERR_INTERRUPTED): .interrupted
-        case moq_result_t(MOQ_ERR_CLOSED): .closed
-        case moq_result_t(MOQ_ERR_NOMEM): .outOfMemory
-        default: .invalidArgument
-        }
+    func takeNewGroupRequest(handleID: UInt64) -> UInt64? {
+        guard let track = OpaquePointer(bitPattern: UInt(handleID)) else { return nil }
+        var value: UInt64 = 0
+        return moq_media_sender_take_new_group_request(sender, track, &value) ==
+            moq_result_t(MOQ_OK) ? value : nil
     }
 }
 

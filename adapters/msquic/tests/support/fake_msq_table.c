@@ -39,6 +39,8 @@ static QUIC_STATUS QUIC_API f_stream_open(HQUIC conn,
 {
     fake_msq_t *f = (fake_msq_t *)conn;
 
+    if (f->closed_remotely)
+        return QUIC_STATUS_ABORTED;
     if (f->stream_count >= FAKE_MSQ_MAX_STREAMS)
         return QUIC_STATUS_OUT_OF_MEMORY;
     fake_msq_stream_t *st = &f->streams[f->stream_count++];
@@ -60,9 +62,11 @@ static QUIC_STATUS QUIC_API f_stream_start(HQUIC h,
     fake_msq_stream_t *st = stream_of(h);
     fake_msq_t *f = st->owner;
 
+    if (f->closed_remotely)
+        return QUIC_STATUS_ABORTED;
     if (f->stream_start_fails > 0) {
         f->stream_start_fails--;
-        return QUIC_STATUS_ABORTED; /* refused before any state moves */
+        return QUIC_STATUS_OUT_OF_MEMORY; /* refused before any state moves */
     }
     st->started = true;
     st->start_flags = flags;
@@ -92,9 +96,11 @@ static QUIC_STATUS QUIC_API f_stream_send(HQUIC h,
     fake_msq_stream_t *st = stream_of(h);
     fake_msq_t *f = st->owner;
 
+    if (f->closed_remotely)
+        return QUIC_STATUS_ABORTED;
     if (f->stream_send_fails > 0) {
         f->stream_send_fails--;
-        return QUIC_STATUS_ABORTED;
+        return QUIC_STATUS_OUT_OF_MEMORY;
     }
     if (f->send_count >= FAKE_MSQ_MAX_SENDS)
         return QUIC_STATUS_OUT_OF_MEMORY;
@@ -103,6 +109,7 @@ static QUIC_STATUS QUIC_API f_stream_send(HQUIC h,
     s->stream = st;
     s->flags = flags;
     s->client_ctx = client_ctx;
+    s->bufs = bufs;
     s->buf_count = count;
     if (count > 0) {
         s->data = bufs[0].Buffer;
@@ -136,7 +143,7 @@ static QUIC_STATUS QUIC_API f_stream_shutdown(
     } else {
         st->shutdown_log_overflow = true;
     }
-    return QUIC_STATUS_SUCCESS;
+    return st->owner->stream_shutdown_status;
 }
 
 static void QUIC_API f_stream_close(HQUIC h)
@@ -252,12 +259,38 @@ static QUIC_STATUS QUIC_API f_conn_set_configuration(HQUIC conn,
 static QUIC_STATUS QUIC_API f_get_param(HQUIC h, uint32_t param,
                                         uint32_t *len, void *buf)
 {
+    /* a connection with QUIC DATAGRAM negotiated both ways, as the real
+     * library reports it once the handshake has completed */
+    if ((param == QUIC_PARAM_CONN_DATAGRAM_RECEIVE_ENABLED ||
+         param == QUIC_PARAM_CONN_DATAGRAM_SEND_ENABLED) &&
+        *len >= sizeof(uint8_t)) {
+        *(uint8_t *)buf = 1;
+        *len = sizeof(uint8_t);
+        return QUIC_STATUS_SUCCESS;
+    }
     if (param == QUIC_PARAM_STREAM_ID && *len >= sizeof(uint64_t)) {
         *(uint64_t *)buf = stream_of(h)->id;
         *len = sizeof(uint64_t);
         return QUIC_STATUS_SUCCESS;
     }
     return QUIC_STATUS_NOT_SUPPORTED;
+}
+
+static QUIC_STATUS QUIC_API f_set_param(HQUIC h, uint32_t param,
+                                        uint32_t len, const void *buf)
+{
+    fake_msq_stream_t *st = stream_of(h);
+    fake_msq_t *f = st->owner;
+
+    f->stream_setparam_calls++;
+    if (f->stream_setparam_fails > 0) {
+        f->stream_setparam_fails--;
+        return QUIC_STATUS_INVALID_STATE;
+    }
+    f->last_stream_param = param;
+    if (len == sizeof(uint64_t))
+        memcpy(&f->last_stream_param_u64, buf, sizeof(uint64_t));
+    return QUIC_STATUS_SUCCESS;
 }
 
 void fake_msq_init(fake_msq_t *f, bool is_client)
@@ -281,6 +314,7 @@ void fake_msq_init(fake_msq_t *f, bool is_client)
     f->api.DatagramSend = f_datagram_send;
     f->api.SetCallbackHandler = f_set_callback_handler;
     f->api.GetParam = f_get_param;
+    f->api.SetParam = f_set_param;
 }
 
 const QUIC_API_TABLE *fake_msq_table(fake_msq_t *f)

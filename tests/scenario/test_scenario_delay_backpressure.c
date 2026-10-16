@@ -21,6 +21,7 @@
  * Each seed runs twice; combined trace hash must match.
  */
 #include <moq/sim.h>
+#include "scenario_pair_version.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -145,6 +146,7 @@ static moq_simpair_t *make_pair(uint64_t seed, moq_alloc_t *alloc,
                                  uint32_t max_evt, uint32_t fault_flags)
 {
     moq_simpair_cfg_t cfg = MOQ_SIMPAIR_CFG_INIT;
+    cfg.version = scenario_selected_version(MOQ_VERSION_DRAFT_16);
     cfg.alloc = alloc;
     cfg.seed = seed;
     cfg.initial_now_us = 1000;
@@ -329,6 +331,7 @@ static int stab_ns_sub(uint64_t seed, moq_alloc_t *alloc, trace_t *ts)
     drain_events(moq_simpair_client(sp));
     moq_subscribe_namespace_cfg_t snc;
     moq_subscribe_namespace_cfg_init(&snc);
+    snc.namespace_interest = MOQ_NAMESPACE_INTEREST_NAMESPACE_STATE;
     snc.track_namespace_prefix = (moq_namespace_t){ ns, 1 };
     moq_ns_sub_handle_t nsh;
     moq_session_subscribe_namespace(moq_simpair_client(sp), &snc,
@@ -366,6 +369,7 @@ typedef int (*sub_fn)(uint64_t, moq_alloc_t*, trace_t*);
 
 int main(void)
 {
+    if (scenario_selected_version(MOQ_VERSION_DRAFT_16) == 0) return 1;
     uint64_t seed_start = 0;
     uint64_t num_seeds = 100;
     const char *e;

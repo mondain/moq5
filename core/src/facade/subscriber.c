@@ -1,5 +1,8 @@
 #include <moq/subscriber.h>
 #include <moq/rcbuf.h>
+#include "fill_identity_internal.h"
+#include "migration_internal.h"
+#include "../session/session_event_admission.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -17,11 +20,30 @@ typedef enum {
     SUB_TRACK_DONE,
 } sub_track_state_t;
 
+typedef struct {
+    bool failed;
+    bool pending;
+    bool cancel_pending;
+    bool terminal_polled;
+} sub_delivery_failure_t;
+
+/* PUBLISH_DONE status GOING_AWAY (draft-22 §12.4, draft-18 and draft-16
+ * alike): the status a subscription migrated by a per-request GOAWAY ends
+ * with. */
+#define SUB_DONE_GOING_AWAY UINT64_C(0x4)
+
 struct moq_sub_track {
     sub_track_state_t     state;
     moq_subscription_t    handle;
     moq_subscriber_t     *sub;
     moq_request_error_t   error_code;
+    moq_sub_track_result_t initial_result;
+    moq_rcbuf_t          *initial_properties;
+    moq_result_t          initial_result_error;
+    sub_delivery_failure_t delivery_failure;
+    /* Where the subscription went when a REDIRECT or a per-request GOAWAY
+     * ended it. */
+    facade_migration_t    migration;
 };
 
 #define SUB_DEFAULT_MAX_STATUS 16
@@ -53,6 +75,62 @@ struct moq_sub_fetch_req {
     sub_fetch_state_t   state;
     moq_fetch_t         handle;
     moq_subscriber_t   *sub;
+    sub_delivery_failure_t delivery_failure;
+};
+
+#define SUB_DEFAULT_MAX_FILLS      16
+
+static sub_fill_identity_allocator_t fill_identities = SUB_FILL_IDENTITY_ALLOCATOR_INIT;
+
+typedef enum {
+    SUB_HISTORY_FREE = 0,
+    SUB_HISTORY_FETCH,
+    SUB_HISTORY_FILL,
+} sub_history_kind_t;
+
+typedef struct {
+    sub_history_kind_t kind;
+    size_t next;
+    union {
+        moq_sub_fetch_item_t fetch;
+        moq_sub_fill_item_t fill;
+    } u;
+} sub_history_slot_t;
+
+/* Only FIFO indices and logical credit; both families store items in the
+ * same tagged arena and return slots to its free list. */
+typedef struct {
+    size_t head, tail, count, cap;
+} sub_history_queue_t;
+
+/* A fill request slot. REQUESTED: the request was carried on a SUBSCRIBE or
+ * update and the session's FILL_CREATED (queued synchronously by that call, in
+ * request order) has not been consumed yet, so the slot has no session handle.
+ * ACTIVE: the handle is known. DONE: the terminal is queued; the slot frees
+ * when it is polled. `seq` orders slots so the oldest handle-less request on a
+ * track takes the next FILL_CREATED and the newest live one answers
+ * moq_sub_track_fill. */
+typedef enum {
+    SUB_FILL_FREE = 0,
+    SUB_FILL_REQUESTED,
+    SUB_FILL_ACTIVE,
+    SUB_FILL_DONE,
+} sub_fill_state_t;
+
+typedef struct moq_sub_fill_req moq_sub_fill_req_t;
+
+/* `seq` is also the request's public handle (moq_sub_fill_t): never zero or
+ * reused within this linked core instance, even after owner destruction.
+ * Ordering uses only comparisons, so gaps from other owners or refusals are OK. */
+struct moq_sub_fill_req {
+    sub_fill_state_t    state;
+    moq_fill_t          handle;
+    moq_sub_track_t    *track;
+    moq_subscriber_t   *sub;
+    uint64_t            seq;
+    bool                cancelled;   /* cancel accepted; terminal pending */
+    uint64_t            initiating_request_id;
+    sub_delivery_failure_t delivery_failure;
 };
 
 /* A queued Group end, with the object and chunk queue positions it waits
@@ -77,11 +155,12 @@ struct moq_subscriber {
 
     /* Byte budget for payload+properties rcbufs retained in the object and
      * fetch-object ring queues. Counts bytes currently in the rings only; the
-     * one-deep pending slots are tracked off-budget (see the byte-gate note in
-     * moq_sub_tick), so total retained is bounded by max_queued_bytes plus at
-     * most two maximum-size objects. */
+     * one-deep pending slots are outside this gauge. Legacy profiles admit at
+     * the high-water mark; D22's pre-dequeue gate includes all pending slots,
+     * chunks and retained ACK metadata in the exact configured byte bound. */
     size_t              max_queued_bytes;
     size_t              queued_bytes;
+    size_t              retained_ack_bytes; /* Not part of the queue gauge. */
 
     moq_sub_track_t    *tracks;
     size_t              track_cap;
@@ -97,7 +176,7 @@ struct moq_subscriber {
     moq_sub_status_req_t *status_reqs;
     size_t                status_cap;
 
-    moq_sub_status_result_t *status_results;
+    moq_sub_status_outcome_t *status_results;
     size_t                   sr_cap;
     size_t                   sr_head;
     size_t                   sr_tail;
@@ -105,13 +184,20 @@ struct moq_subscriber {
     moq_sub_fetch_req_t  *fetch_reqs;
     size_t                fetch_cap;
 
-    moq_sub_fetch_item_t *fetch_items;
-    size_t                fi_cap;
-    size_t                fi_head;
-    size_t                fi_tail;
+    sub_history_slot_t  *history;
+    size_t                history_cap;
+    size_t                history_free;
+    sub_history_queue_t   fetch_queue;
+    sub_history_queue_t   fill_queue;
 
     bool                  has_pending_fi;
     moq_sub_fetch_item_t  pending_fi;
+
+    moq_sub_fill_req_t   *fill_reqs;
+    size_t                fill_cap;
+
+    bool                  has_pending_fli;
+    moq_sub_fill_item_t   pending_fli;
 
     bool                streaming;
     moq_sub_chunk_t    *chunks;
@@ -156,6 +242,16 @@ static moq_sub_track_t *alloc_track(moq_subscriber_t *s)
     return NULL;
 }
 
+static void track_result_release(moq_subscriber_t *s, moq_sub_track_t *t)
+{
+    s->retained_ack_bytes -= moq_rcbuf_len(t->initial_properties);
+    moq_rcbuf_decref(t->initial_properties);
+    t->initial_properties = NULL;
+    memset(&t->initial_result, 0, sizeof(t->initial_result));
+    t->initial_result_error = MOQ_OK;
+    facade_migration_clear(&t->migration, &s->alloc);
+}
+
 static moq_sub_status_req_t *find_status_by_handle(moq_subscriber_t *s,
     moq_track_status_handle_t h)
 {
@@ -179,10 +275,12 @@ static bool sr_queue_full(const moq_subscriber_t *s)
     return (s->sr_tail - s->sr_head) >= s->sr_cap;
 }
 
-static moq_sub_status_result_t *sr_push(moq_subscriber_t *s)
+static moq_sub_status_outcome_t *sr_push(moq_subscriber_t *s)
 {
     if (sr_queue_full(s)) return NULL;
-    moq_sub_status_result_t *r = &s->status_results[s->sr_tail % s->sr_cap];
+    moq_sub_status_outcome_t *r = &s->status_results[s->sr_tail % s->sr_cap];
+    memset(r, 0, sizeof(*r));
+    r->struct_size = sizeof(*r);
     s->sr_tail++;
     return r;
 }
@@ -228,7 +326,8 @@ static void sub_bytes_sub(moq_subscriber_t *s, size_t n)
  * gate from deadlocking on an object larger than the cap. */
 static bool obj_bytes_over_budget(const moq_subscriber_t *s)
 {
-    return s->queued_bytes >= s->max_queued_bytes;
+    return s->retained_ack_bytes >= s->max_queued_bytes ||
+        s->queued_bytes >= s->max_queued_bytes - s->retained_ack_bytes;
 }
 
 static bool obj_queue_full(const moq_subscriber_t *s)
@@ -264,15 +363,44 @@ static moq_sub_fetch_req_t *alloc_fetch_req(moq_subscriber_t *s)
 
 static bool fi_queue_full(const moq_subscriber_t *s)
 {
-    return (s->fi_tail - s->fi_head) >= s->fi_cap;
+    return s->fetch_queue.count >= s->fetch_queue.cap;
+}
+
+static sub_history_slot_t *history_push(moq_subscriber_t *s,
+    sub_history_queue_t *q, sub_history_kind_t kind)
+{
+    if (q->count >= q->cap) return NULL;
+    /* Summed logical quotas guarantee a free slot whenever this family has
+     * credit. Pending items retain their existing, separate one-deep slot. */
+    size_t index = s->history_free;
+    sub_history_slot_t *slot = &s->history[index];
+    s->history_free = slot->next;
+    slot->kind = kind;
+    slot->next = SIZE_MAX;
+    if (q->count) s->history[q->tail].next = index;
+    else q->head = index;
+    q->tail = index;
+    q->count++;
+    return slot;
+}
+
+static void history_remove(moq_subscriber_t *s, sub_history_queue_t *q,
+    size_t index, size_t previous)
+{
+    sub_history_slot_t *slot = &s->history[index];
+    if (previous == SIZE_MAX) q->head = slot->next;
+    else s->history[previous].next = slot->next;
+    if (q->tail == index) q->tail = previous;
+    q->count--;
+    memset(slot, 0, sizeof(*slot));
+    slot->next = s->history_free;
+    s->history_free = index;
 }
 
 static moq_sub_fetch_item_t *fi_push(moq_subscriber_t *s)
 {
-    if (fi_queue_full(s)) return NULL;
-    moq_sub_fetch_item_t *f = &s->fetch_items[s->fi_tail % s->fi_cap];
-    s->fi_tail++;
-    return f;
+    sub_history_slot_t *slot = history_push(s, &s->fetch_queue, SUB_HISTORY_FETCH);
+    return slot ? &slot->u.fetch : NULL;
 }
 
 static void fetch_item_release_refs(moq_sub_fetch_item_t *item)
@@ -294,7 +422,7 @@ static void fetch_item_release_refs(moq_sub_fetch_item_t *item)
  * the application-visible correlation token, so stale items left behind would
  * be re-attributed to a later fetch that reuses the slot. Releases rcbuf refs
  * and returns retained bytes to the budget for removed queued objects; the
- * one-deep pending slot is tracked off-budget, so it only releases refs. Ring
+ * one-deep pending slot is tracked off-budget, so it only releases refs. FIFO
  * order of the surviving items is preserved. */
 static void purge_fetch_items_for(moq_subscriber_t *sub,
                                   const moq_sub_fetch_req_t *req)
@@ -305,24 +433,117 @@ static void purge_fetch_items_for(moq_subscriber_t *sub,
         sub->has_pending_fi = false;
     }
 
-    size_t write = sub->fi_head;
-    for (size_t read = sub->fi_head; read < sub->fi_tail; read++) {
-        moq_sub_fetch_item_t *src = &sub->fetch_items[read % sub->fi_cap];
+    size_t previous = SIZE_MAX;
+    size_t index = sub->fetch_queue.head;
+    while (index != SIZE_MAX) {
+        sub_history_slot_t *slot = &sub->history[index];
+        size_t next = slot->next;
+        moq_sub_fetch_item_t *src = &slot->u.fetch;
         if (src->request == req) {
             if (src->kind == MOQ_SUB_FETCH_OBJECT)
                 sub_bytes_sub(sub, rcbuf_pair_bytes(src->u.object.payload,
                                                     src->u.object.properties));
             fetch_item_release_refs(src);
-            memset(src, 0, sizeof(*src));
-            continue;
-        }
-        if (write != read) {
-            sub->fetch_items[write % sub->fi_cap] = *src;
-            memset(src, 0, sizeof(*src));
-        }
-        write++;
+            history_remove(sub, &sub->fetch_queue, index, previous);
+        } else previous = index;
+        index = next;
     }
-    sub->fi_tail = write;
+}
+
+static moq_sub_fill_req_t *find_fill_by_handle(moq_subscriber_t *s, moq_fill_t h)
+{
+    for (size_t i = 0; i < s->fill_cap; i++)
+        if (s->fill_reqs[i].state == SUB_FILL_ACTIVE &&
+            moq_fill_eq(s->fill_reqs[i].handle, h))
+            return &s->fill_reqs[i];
+    return NULL;
+}
+
+/* The oldest handle-less request on `t`: the one the next FILL_CREATED for
+ * that subscription belongs to (the session creates children in request
+ * order, within the requesting call). */
+static moq_sub_fill_req_t *find_fill_awaiting_handle(moq_subscriber_t *s,
+                                                     const moq_sub_track_t *t)
+{
+    moq_sub_fill_req_t *best = NULL;
+    for (size_t i = 0; i < s->fill_cap; i++) {
+        moq_sub_fill_req_t *r = &s->fill_reqs[i];
+        if (r->state == SUB_FILL_REQUESTED && r->track == t &&
+            (!best || r->seq < best->seq))
+            best = r;
+    }
+    return best;
+}
+
+static moq_result_t alloc_fill_req(moq_subscriber_t *s, moq_sub_track_t *t,
+                                   sub_fill_identity_allocator_t *ids,
+                                   moq_sub_fill_req_t **out)
+{
+    for (size_t i = 0; i < s->fill_cap; i++) {
+        moq_sub_fill_req_t *r = &s->fill_reqs[i];
+        if (r->state == SUB_FILL_FREE) {
+            uint64_t seq;
+            if (!sub_fill_identity_next(ids, &seq)) return MOQ_ERR_LIMIT;
+            r->state = SUB_FILL_REQUESTED;
+            r->track = t;
+            r->seq = seq;
+            r->cancelled = false;
+            r->initiating_request_id = 0;
+            memset(&r->delivery_failure, 0, sizeof(r->delivery_failure));
+            memset(&r->handle, 0, sizeof(r->handle));
+            *out = r;
+            return MOQ_OK;
+        }
+    }
+    return MOQ_ERR_WOULD_BLOCK;
+}
+
+static moq_sub_fill_t fill_handle_of(const moq_sub_fill_req_t *r)
+{
+    moq_sub_fill_t h = { r->seq };
+    return h;
+}
+
+/* The live request a handle names, or NULL once its terminal was polled. */
+static moq_sub_fill_req_t *fill_resolve(moq_subscriber_t *s, moq_sub_fill_t h)
+{
+    if (h._opaque == 0) return NULL;
+    for (size_t i = 0; i < s->fill_cap; i++)
+        if (s->fill_reqs[i].state != SUB_FILL_FREE && s->fill_reqs[i].seq == h._opaque)
+            return &s->fill_reqs[i];
+    return NULL;
+}
+
+static void free_fill_req(moq_sub_fill_req_t *r)
+{
+    r->state = SUB_FILL_FREE;
+    r->track = NULL;
+    memset(&r->handle, 0, sizeof(r->handle));
+}
+
+static bool fli_queue_full(const moq_subscriber_t *s)
+{
+    return s->fill_queue.count >= s->fill_queue.cap;
+}
+
+static moq_sub_fill_item_t *fli_push(moq_subscriber_t *s)
+{
+    sub_history_slot_t *slot = history_push(s, &s->fill_queue, SUB_HISTORY_FILL);
+    return slot ? &slot->u.fill : NULL;
+}
+
+static void fill_item_release_refs(moq_sub_fill_item_t *item)
+{
+    if (item->kind == MOQ_SUB_FILL_OBJECT) {
+        if (item->u.object.payload) {
+            moq_rcbuf_decref(item->u.object.payload);
+            item->u.object.payload = NULL;
+        }
+        if (item->u.object.properties) {
+            moq_rcbuf_decref(item->u.object.properties);
+            item->u.object.properties = NULL;
+        }
+    }
 }
 
 static bool chunk_queue_full(const moq_subscriber_t *s)
@@ -355,6 +576,93 @@ static void chunk_release_refs(moq_sub_chunk_t *c)
     if (c->properties) { moq_rcbuf_decref(c->properties); c->properties = NULL; }
 }
 
+static bool ack_charge(size_t *remaining, size_t bytes)
+{
+    if (bytes > *remaining) return false;
+    *remaining -= bytes;
+    return true;
+}
+
+static bool ack_charge_pair(size_t *remaining, const moq_rcbuf_t *a,
+                             const moq_rcbuf_t *b)
+{
+    return ack_charge(remaining, moq_rcbuf_len(a)) &&
+        ack_charge(remaining, moq_rcbuf_len(b));
+}
+
+/* Measure every owned reference by subtraction, including pending items and
+ * chunks. The legacy ring gauge alone cannot establish the D22 byte bound. */
+static bool retained_refs_fit(const moq_subscriber_t *s, size_t remaining)
+{
+    if (!ack_charge(&remaining, s->retained_ack_bytes)) return false;
+    for (size_t i = s->obj_head; i < s->obj_tail; i++) {
+        const moq_sub_object_t *o = &s->objects[i % s->obj_cap];
+        if (!ack_charge_pair(&remaining, o->payload, o->properties)) return false;
+    }
+    if (s->has_pending && !ack_charge_pair(&remaining,
+        s->pending.payload, s->pending.properties)) return false;
+    for (size_t i = 0; i < s->history_cap; i++) {
+        const sub_history_slot_t *slot = &s->history[i];
+        if (slot->kind == SUB_HISTORY_FETCH) {
+            const moq_sub_fetch_item_t *f = &slot->u.fetch;
+            if (f->kind == MOQ_SUB_FETCH_OBJECT && !ack_charge_pair(&remaining,
+                f->u.object.payload, f->u.object.properties)) return false;
+        } else if (slot->kind == SUB_HISTORY_FILL) {
+            const moq_sub_fill_item_t *f = &slot->u.fill;
+            if (f->kind == MOQ_SUB_FILL_OBJECT && !ack_charge_pair(&remaining,
+                f->u.object.payload, f->u.object.properties)) return false;
+        }
+    }
+    if (s->has_pending_fi && s->pending_fi.kind == MOQ_SUB_FETCH_OBJECT &&
+        !ack_charge_pair(&remaining, s->pending_fi.u.object.payload,
+                         s->pending_fi.u.object.properties)) return false;
+    if (s->has_pending_fli && s->pending_fli.kind == MOQ_SUB_FILL_OBJECT &&
+        !ack_charge_pair(&remaining, s->pending_fli.u.object.payload,
+                         s->pending_fli.u.object.properties)) return false;
+    for (size_t i = s->chunk_head; i < s->chunk_tail; i++) {
+        const moq_sub_chunk_t *c = &s->chunks[i % s->chunk_cap];
+        if (!ack_charge_pair(&remaining, c->chunk, c->properties)) return false;
+    }
+    return !s->has_pending_chunk || ack_charge_pair(&remaining,
+        s->pending_chunk.chunk, s->pending_chunk.properties);
+}
+
+static bool ack_bytes_fit(const moq_subscriber_t *s, size_t bytes)
+{
+    size_t remaining = s->max_queued_bytes;
+    return ack_charge(&remaining, bytes) && retained_refs_fit(s, remaining);
+}
+
+static moq_result_t track_result_capture(moq_subscriber_t *s,
+    moq_sub_track_t *t, const moq_subscribe_ok_event_t *ack)
+{
+    moq_sub_track_result_t *r = &t->initial_result;
+    r->flags = MOQ_SUB_TRACK_RESULT_RESPONSE_SEEN;
+    if (ack->has_largest) {
+        r->flags |= MOQ_SUB_TRACK_RESULT_HAS_LARGEST;
+        r->largest_group = ack->largest_group;
+        r->largest_object = ack->largest_object;
+    }
+    if (ack->has_expires) {
+        r->flags |= MOQ_SUB_TRACK_RESULT_HAS_EXPIRES;
+        r->expires_ms = ack->expires_ms;
+    }
+    size_t len = ack->track_properties.len;
+    if (len) {
+        size_t allocation_size;
+        if (!ack_bytes_fit(s, len) ||
+            moq_rcbuf_allocation_size(len, &allocation_size) != MOQ_OK)
+            return MOQ_ERR_BUFFER;
+        moq_result_t rc = moq_rcbuf_create(&s->alloc, ack->track_properties.data,
+                                          len, &t->initial_properties);
+        if (rc != MOQ_OK) return rc;
+        s->retained_ack_bytes += len; /* Checked by ack_bytes_fit. */
+        r->track_properties.data = moq_rcbuf_data(t->initial_properties);
+        r->track_properties.len = len;
+    }
+    return MOQ_OK;
+}
+
 static uint64_t sub_retained_bytes(const moq_subscriber_t *s)
 {
     uint64_t n = (uint64_t)s->queued_bytes;
@@ -366,6 +674,10 @@ static uint64_t sub_retained_bytes(const moq_subscriber_t *s)
         s->pending_fi.kind == MOQ_SUB_FETCH_OBJECT)
         n = u64_sat_add_size(n, rcbuf_pair_bytes(
             s->pending_fi.u.object.payload, s->pending_fi.u.object.properties));
+    if (s->has_pending_fli &&
+        s->pending_fli.kind == MOQ_SUB_FILL_OBJECT)
+        n = u64_sat_add_size(n, rcbuf_pair_bytes(
+            s->pending_fli.u.object.payload, s->pending_fli.u.object.properties));
     for (size_t i = s->chunk_head; i < s->chunk_tail; i++) {
         const moq_sub_chunk_t *c = &s->chunks[i % s->chunk_cap];
         n = u64_sat_add_size(n, rcbuf_pair_bytes(c->chunk, c->properties));
@@ -380,6 +692,195 @@ static moq_result_t sub_would_block(moq_subscriber_t *sub)
 {
     sub->stats.tick_would_blocks++;
     return MOQ_ERR_WOULD_BLOCK;
+}
+
+static bool history_has_fetch(const moq_subscriber_t *s,
+                               const moq_sub_fetch_req_t *req)
+{
+    if (s->has_pending_fi && s->pending_fi.request == req) return true;
+    for (size_t i = 0; i < s->history_cap; i++)
+        if (s->history[i].kind == SUB_HISTORY_FETCH &&
+            s->history[i].u.fetch.request == req) return true;
+    return false;
+}
+
+static bool history_has_fill(const moq_subscriber_t *s,
+                              const moq_sub_fill_req_t *req)
+{
+    moq_sub_fill_t token = fill_handle_of(req);
+    if (s->has_pending_fli &&
+        moq_sub_fill_eq(s->pending_fli.request, token)) return true;
+    for (size_t i = 0; i < s->history_cap; i++)
+        if (s->history[i].kind == SUB_HISTORY_FILL &&
+            moq_sub_fill_eq(s->history[i].u.fill.request, token)) return true;
+    return false;
+}
+
+static bool delivery_failure_settled(const sub_delivery_failure_t *failure)
+{
+    return failure->failed && !failure->pending &&
+        !failure->cancel_pending && failure->terminal_polled;
+}
+
+static void reap_failed_history(moq_subscriber_t *s)
+{
+    for (size_t i = 0; i < s->fetch_cap; i++) {
+        moq_sub_fetch_req_t *r = &s->fetch_reqs[i];
+        if (r->state != SUB_FETCH_FREE &&
+            delivery_failure_settled(&r->delivery_failure) &&
+            !history_has_fetch(s, r)) r->state = SUB_FETCH_FREE;
+    }
+    for (size_t i = 0; i < s->fill_cap; i++) {
+        moq_sub_fill_req_t *r = &s->fill_reqs[i];
+        if (r->state != SUB_FILL_FREE &&
+            delivery_failure_settled(&r->delivery_failure) &&
+            !history_has_fill(s, r)) free_fill_req(r);
+    }
+}
+
+static void retry_failed_deliveries(moq_subscriber_t *s, uint64_t now_us)
+{
+    bool closed = moq_session_state(s->session) == MOQ_SESS_CLOSED;
+    for (size_t i = 0; i < s->track_cap; i++) {
+        moq_sub_track_t *t = &s->tracks[i];
+        sub_delivery_failure_t *f = &t->delivery_failure;
+        if (t->state == SUB_TRACK_FREE || !f->cancel_pending) continue;
+        moq_result_t rc = closed ? MOQ_ERR_CLOSED :
+            moq_session_unsubscribe(s->session, t->handle, now_us);
+        if (rc == MOQ_OK || rc == MOQ_ERR_CLOSED || rc == MOQ_ERR_STALE_HANDLE)
+            f->cancel_pending = false;
+        /* STALE can mean the real terminal is still queued. Do not retire its
+         * facade identity until that event has also been observed. */
+        if (rc == MOQ_OK || rc == MOQ_ERR_CLOSED) f->terminal_polled = true;
+    }
+    for (size_t i = 0; i < s->fetch_cap; i++) {
+        moq_sub_fetch_req_t *r = &s->fetch_reqs[i];
+        sub_delivery_failure_t *f = &r->delivery_failure;
+        if (r->state == SUB_FETCH_FREE || !f->cancel_pending) continue;
+        moq_result_t rc = closed ? MOQ_ERR_CLOSED :
+            moq_session_fetch_cancel(s->session, r->handle, now_us);
+        if (rc == MOQ_OK || rc == MOQ_ERR_CLOSED || rc == MOQ_ERR_STALE_HANDLE)
+            f->cancel_pending = false;
+        if (rc == MOQ_OK || rc == MOQ_ERR_CLOSED) f->terminal_polled = true;
+    }
+    for (size_t i = 0; i < s->fill_cap; i++) {
+        moq_sub_fill_req_t *r = &s->fill_reqs[i];
+        sub_delivery_failure_t *f = &r->delivery_failure;
+        if (r->state == SUB_FILL_FREE || !f->cancel_pending) continue;
+        moq_result_t rc = closed ? MOQ_ERR_CLOSED :
+            moq_session_cancel_fill(s->session, r->handle, now_us);
+        if (rc == MOQ_OK || rc == MOQ_ERR_CLOSED || rc == MOQ_ERR_STALE_HANDLE)
+            f->cancel_pending = false;
+        if (rc == MOQ_OK) r->cancelled = true;
+        /* Fill cancellation has its own real terminal; success is not an
+         * invented terminal observation. A closed session purges that debt. */
+        if (rc == MOQ_ERR_CLOSED) f->terminal_polled = true;
+    }
+    reap_failed_history(s);
+}
+
+static session_event_admission_t admit_delivery(void *ctx, const moq_event_t *ev)
+{
+    moq_subscriber_t *s = ctx;
+    const moq_rcbuf_t *payload = NULL, *properties = NULL;
+    sub_delivery_failure_t *failure = NULL;
+    moq_sub_track_t *track = NULL;
+    moq_sub_fetch_req_t *fetch = NULL;
+    switch (ev->kind) {
+    case MOQ_EVENT_OBJECT_RECEIVED:
+        track = find_track_by_handle(s, ev->u.object_received.sub);
+        if (track && track->state == SUB_TRACK_ACTIVE) {
+            failure = &track->delivery_failure;
+            payload = ev->u.object_received.payload;
+            properties = ev->u.object_received.properties;
+        }
+        break;
+    case MOQ_EVENT_OBJECT_CHUNK:
+        track = find_track_by_handle(s, ev->u.object_chunk.sub);
+        if (s->streaming && track && track->state == SUB_TRACK_ACTIVE) {
+            failure = &track->delivery_failure;
+            payload = ev->u.object_chunk.chunk;
+            properties = ev->u.object_chunk.properties;
+        }
+        break;
+    case MOQ_EVENT_FETCH_OBJECT:
+        fetch = find_fetch_by_handle(s, ev->u.fetch_object.fetch);
+        if (fetch && (fetch->state == SUB_FETCH_PENDING ||
+                      fetch->state == SUB_FETCH_ACTIVE)) {
+            failure = &fetch->delivery_failure;
+            payload = ev->u.fetch_object.payload;
+            properties = ev->u.fetch_object.properties;
+        }
+        break;
+    case MOQ_EVENT_FILL_OBJECT: {
+        moq_sub_fill_req_t *fill = find_fill_by_handle(s, ev->u.fill_object.fill);
+        if (fill && !fill->delivery_failure.failed) {
+            failure = &fill->delivery_failure;
+            payload = ev->u.fill_object.payload;
+            properties = ev->u.fill_object.properties;
+        }
+        break;
+    }
+    default:
+        break;
+    }
+    if (!failure) return SESSION_EVENT_TAKE;
+    size_t remaining = s->max_queued_bytes;
+    if (!ack_charge(&remaining, s->retained_ack_bytes) ||
+        !ack_charge_pair(&remaining, payload, properties)) {
+        *failure = (sub_delivery_failure_t){
+            .failed = true, .pending = true, .cancel_pending = true };
+        if (track) track->state = SUB_TRACK_DONE;
+        if (fetch) fetch->state = SUB_FETCH_DONE;
+        return SESSION_EVENT_DISCARD;
+    }
+    remaining = s->max_queued_bytes;
+    if (!ack_charge_pair(&remaining, payload, properties) ||
+        !retained_refs_fit(s, remaining)) return SESSION_EVENT_LEAVE;
+    return SESSION_EVENT_TAKE;
+}
+
+moq_result_t moq_sub_poll_local_failure(moq_subscriber_t *sub,
+    moq_sub_local_failure_t *out, size_t out_size)
+{
+    if (!sub || !out || out_size < MOQ_SUB_LOCAL_FAILURE_V0_SIZE)
+        return MOQ_ERR_INVAL;
+    moq_sub_local_failure_t result = {0};
+    sub_delivery_failure_t *found = NULL;
+    for (size_t i = 0; i < sub->track_cap && !found; i++) {
+        moq_sub_track_t *t = &sub->tracks[i];
+        if (t->state != SUB_TRACK_FREE && t->delivery_failure.pending) {
+            found = &t->delivery_failure;
+            result.owner_kind = MOQ_SUB_LOCAL_FAILURE_TRACK;
+            result.track = t;
+        }
+    }
+    for (size_t i = 0; i < sub->fetch_cap && !found; i++) {
+        moq_sub_fetch_req_t *r = &sub->fetch_reqs[i];
+        if (r->state != SUB_FETCH_FREE && r->delivery_failure.pending) {
+            found = &r->delivery_failure;
+            result.owner_kind = MOQ_SUB_LOCAL_FAILURE_FETCH;
+            result.fetch = r;
+        }
+    }
+    for (size_t i = 0; i < sub->fill_cap && !found; i++) {
+        moq_sub_fill_req_t *r = &sub->fill_reqs[i];
+        if (r->state != SUB_FILL_FREE && r->delivery_failure.pending) {
+            found = &r->delivery_failure;
+            result.owner_kind = MOQ_SUB_LOCAL_FAILURE_FILL;
+            result.track = r->track;
+            result.fill = fill_handle_of(r);
+            result.initiating_request_id = r->initiating_request_id;
+        }
+    }
+    if (!found) return MOQ_DONE;
+    size_t written = out_size < sizeof(result) ? out_size : sizeof(result);
+    result.struct_size = (uint32_t)written;
+    result.local_result = MOQ_ERR_BUFFER;
+    memcpy(out, &result, written);
+    found->pending = false;
+    reap_failed_history(sub);
+    return MOQ_OK;
 }
 
 /* -- Public API ----------------------------------------------------- */
@@ -457,6 +958,13 @@ _Static_assert(offsetof(moq_sub_cfg_t, surface_group_ends) >=
 _Static_assert(offsetof(moq_sub_cfg_t, surface_group_ends) ==
                offsetof(moq_sub_cfg_t, _reserved_group_ends) + sizeof(uint32_t),
                "surface_group_ends must follow its reserved slot");
+/* The fill limits start past the complete sizeof of the layout that ends
+ * with surface_group_ends (its tail padding included), on every target. */
+_Static_assert(offsetof(moq_sub_cfg_t, max_fills) ==
+               ((offsetof(moq_sub_cfg_t, surface_group_ends) + sizeof(bool) +
+                 (_Alignof(moq_sub_cfg_t) - 1)) &
+                ~(size_t)(_Alignof(moq_sub_cfg_t) - 1)),
+               "max_fills must not reuse the group-end tail padding");
 
 #define SUB_CFG_HAS(field) \
     (cfg->struct_size >= offsetof(moq_sub_cfg_t, field) + sizeof(cfg->field))
@@ -472,6 +980,24 @@ _Static_assert(offsetof(moq_sub_cfg_t, surface_group_ends) ==
     bool streaming = SUB_CFG_HAS(streaming_objects) && cfg->streaming_objects;
     bool group_ends = SUB_CFG_HAS(surface_group_ends) &&
                       cfg->surface_group_ends;
+    size_t flc = SUB_CFG_HAS(max_fills) && cfg->max_fills
+        ? cfg->max_fills : SUB_DEFAULT_MAX_FILLS;
+    size_t flic = SUB_CFG_HAS(max_fill_items) && cfg->max_fill_items
+        ? cfg->max_fill_items : fic;
+    /* Legacy drafts reserve no fill slots or fill item credit. */
+    if (!moq_session_supports_fill(session)) {
+        flc = 0;
+        flic = 0;
+    }
+    if (fic > SIZE_MAX - flic) return MOQ_ERR_NOMEM;
+    size_t hc = fic + flic;
+    if (tc > SIZE_MAX / sizeof(moq_sub_track_t) ||
+        oc > SIZE_MAX / sizeof(moq_sub_object_t) ||
+        fc > SIZE_MAX / sizeof(moq_sub_fetch_req_t) ||
+        cc > SIZE_MAX / sizeof(moq_sub_chunk_t) ||
+        flc > SIZE_MAX / sizeof(moq_sub_fill_req_t) ||
+        hc > SIZE_MAX / sizeof(sub_history_slot_t))
+        return MOQ_ERR_NOMEM;
     size_t qbytes = SUB_DEFAULT_MAX_QUEUED_BYTES;
     if (SUB_CFG_HAS(max_queued_object_bytes) && cfg->max_queued_object_bytes) {
         /* Clamp (not truncate) a configured value that cannot fit in size_t. */
@@ -515,8 +1041,8 @@ _Static_assert(offsetof(moq_sub_cfg_t, surface_group_ends) ==
     }
     memset(s->status_reqs, 0, sc * sizeof(moq_sub_status_req_t));
 
-    s->status_results = (moq_sub_status_result_t *)alloc->alloc(
-        sc * sizeof(moq_sub_status_result_t), alloc->ctx);
+    s->status_results = (moq_sub_status_outcome_t *)alloc->alloc(
+        sc * sizeof(moq_sub_status_outcome_t), alloc->ctx);
     if (!s->status_results) {
         alloc->free(s->status_reqs, sc * sizeof(moq_sub_status_req_t), alloc->ctx);
         alloc->free(s->objects, oc * sizeof(moq_sub_object_t), alloc->ctx);
@@ -524,13 +1050,13 @@ _Static_assert(offsetof(moq_sub_cfg_t, surface_group_ends) ==
         alloc->free(s, sizeof(moq_subscriber_t), alloc->ctx);
         return MOQ_ERR_NOMEM;
     }
-    memset(s->status_results, 0, sc * sizeof(moq_sub_status_result_t));
+    memset(s->status_results, 0, sc * sizeof(moq_sub_status_outcome_t));
 
     s->fetch_reqs = (moq_sub_fetch_req_t *)alloc->alloc(
         fc * sizeof(moq_sub_fetch_req_t), alloc->ctx);
     if (!s->fetch_reqs) {
         alloc->free(s->status_results,
-            sc * sizeof(moq_sub_status_result_t), alloc->ctx);
+            sc * sizeof(moq_sub_status_outcome_t), alloc->ctx);
         alloc->free(s->status_reqs,
             sc * sizeof(moq_sub_status_req_t), alloc->ctx);
         alloc->free(s->objects, oc * sizeof(moq_sub_object_t), alloc->ctx);
@@ -540,13 +1066,13 @@ _Static_assert(offsetof(moq_sub_cfg_t, surface_group_ends) ==
     }
     memset(s->fetch_reqs, 0, fc * sizeof(moq_sub_fetch_req_t));
 
-    s->fetch_items = (moq_sub_fetch_item_t *)alloc->alloc(
-        fic * sizeof(moq_sub_fetch_item_t), alloc->ctx);
-    if (!s->fetch_items) {
+    s->history = (sub_history_slot_t *)alloc->alloc(
+        hc * sizeof(sub_history_slot_t), alloc->ctx);
+    if (!s->history) {
         alloc->free(s->fetch_reqs,
             fc * sizeof(moq_sub_fetch_req_t), alloc->ctx);
         alloc->free(s->status_results,
-            sc * sizeof(moq_sub_status_result_t), alloc->ctx);
+            sc * sizeof(moq_sub_status_outcome_t), alloc->ctx);
         alloc->free(s->status_reqs,
             sc * sizeof(moq_sub_status_req_t), alloc->ctx);
         alloc->free(s->objects, oc * sizeof(moq_sub_object_t), alloc->ctx);
@@ -554,17 +1080,23 @@ _Static_assert(offsetof(moq_sub_cfg_t, surface_group_ends) ==
         alloc->free(s, sizeof(moq_subscriber_t), alloc->ctx);
         return MOQ_ERR_NOMEM;
     }
-    memset(s->fetch_items, 0, fic * sizeof(moq_sub_fetch_item_t));
+    memset(s->history, 0, hc * sizeof(sub_history_slot_t));
+    for (size_t i = 0; i < hc; i++)
+        s->history[i].next = i + 1 < hc ? i + 1 : SIZE_MAX;
+    s->history_cap = hc;
+    s->history_free = 0;
+    s->fetch_queue.head = s->fetch_queue.tail = SIZE_MAX;
+    s->fill_queue.head = s->fill_queue.tail = SIZE_MAX;
 
     s->chunks = (moq_sub_chunk_t *)alloc->alloc(
         cc * sizeof(moq_sub_chunk_t), alloc->ctx);
     if (!s->chunks) {
-        alloc->free(s->fetch_items,
-            fic * sizeof(moq_sub_fetch_item_t), alloc->ctx);
+        alloc->free(s->history,
+            hc * sizeof(sub_history_slot_t), alloc->ctx);
         alloc->free(s->fetch_reqs,
             fc * sizeof(moq_sub_fetch_req_t), alloc->ctx);
         alloc->free(s->status_results,
-            sc * sizeof(moq_sub_status_result_t), alloc->ctx);
+            sc * sizeof(moq_sub_status_outcome_t), alloc->ctx);
         alloc->free(s->status_reqs,
             sc * sizeof(moq_sub_status_req_t), alloc->ctx);
         alloc->free(s->objects, oc * sizeof(moq_sub_object_t), alloc->ctx);
@@ -581,12 +1113,12 @@ _Static_assert(offsetof(moq_sub_cfg_t, surface_group_ends) ==
             oc * sizeof(sub_group_end_entry_t), alloc->ctx);
         if (!s->group_ends) {
             alloc->free(s->chunks, cc * sizeof(moq_sub_chunk_t), alloc->ctx);
-            alloc->free(s->fetch_items,
-                fic * sizeof(moq_sub_fetch_item_t), alloc->ctx);
+            alloc->free(s->history,
+                hc * sizeof(sub_history_slot_t), alloc->ctx);
             alloc->free(s->fetch_reqs,
                 fc * sizeof(moq_sub_fetch_req_t), alloc->ctx);
             alloc->free(s->status_results,
-                sc * sizeof(moq_sub_status_result_t), alloc->ctx);
+                sc * sizeof(moq_sub_status_outcome_t), alloc->ctx);
             alloc->free(s->status_reqs,
                 sc * sizeof(moq_sub_status_req_t), alloc->ctx);
             alloc->free(s->objects, oc * sizeof(moq_sub_object_t), alloc->ctx);
@@ -599,13 +1131,39 @@ _Static_assert(offsetof(moq_sub_cfg_t, surface_group_ends) ==
         s->surface_group_ends = true;
     }
 
+    if (flc > 0) {
+        s->fill_reqs = (moq_sub_fill_req_t *)alloc->alloc(
+            flc * sizeof(moq_sub_fill_req_t), alloc->ctx);
+        if (!s->fill_reqs) {
+            if (s->group_ends)
+                alloc->free(s->group_ends,
+                    oc * sizeof(sub_group_end_entry_t), alloc->ctx);
+            alloc->free(s->chunks, cc * sizeof(moq_sub_chunk_t), alloc->ctx);
+            alloc->free(s->history,
+                hc * sizeof(sub_history_slot_t), alloc->ctx);
+            alloc->free(s->fetch_reqs,
+                fc * sizeof(moq_sub_fetch_req_t), alloc->ctx);
+            alloc->free(s->status_results,
+                sc * sizeof(moq_sub_status_outcome_t), alloc->ctx);
+            alloc->free(s->status_reqs,
+                sc * sizeof(moq_sub_status_req_t), alloc->ctx);
+            alloc->free(s->objects, oc * sizeof(moq_sub_object_t), alloc->ctx);
+            alloc->free(s->tracks, tc * sizeof(moq_sub_track_t), alloc->ctx);
+            alloc->free(s, sizeof(moq_subscriber_t), alloc->ctx);
+            return MOQ_ERR_NOMEM;
+        }
+        memset(s->fill_reqs, 0, flc * sizeof(moq_sub_fill_req_t));
+    }
+
     s->callbacks = cfg->callbacks;
+    s->fill_cap = flc;
+    s->fill_queue.cap = flic;
     s->track_cap = tc;
     s->obj_cap = oc;
     s->status_cap = sc;
     s->sr_cap = sc;
     s->fetch_cap = fc;
-    s->fi_cap = fic;
+    s->fetch_queue.cap = fic;
     s->chunk_cap = cc;
     s->streaming = streaming;
     s->max_queued_bytes = qbytes;
@@ -624,6 +1182,8 @@ _Static_assert(offsetof(moq_sub_cfg_t, surface_group_ends) ==
         s->status_reqs[i].sub = s;
     for (size_t i = 0; i < fc; i++)
         s->fetch_reqs[i].sub = s;
+    for (size_t i = 0; i < flc; i++)
+        s->fill_reqs[i].sub = s;
 
     *out = s;
     return MOQ_OK;
@@ -632,6 +1192,9 @@ _Static_assert(offsetof(moq_sub_cfg_t, surface_group_ends) ==
 void moq_sub_destroy(moq_subscriber_t *sub)
 {
     if (!sub) return;
+
+    for (size_t i = 0; i < sub->track_cap; i++)
+        track_result_release(sub, &sub->tracks[i]);
 
     /* Release pending and queued object refs. */
     if (sub->has_pending) {
@@ -647,10 +1210,14 @@ void moq_sub_destroy(moq_subscriber_t *sub)
 
     if (sub->has_pending_fi)
         fetch_item_release_refs(&sub->pending_fi);
-    while (sub->fi_head < sub->fi_tail) {
-        moq_sub_fetch_item_t *f = &sub->fetch_items[sub->fi_head % sub->fi_cap];
-        fetch_item_release_refs(f);
-        sub->fi_head++;
+    if (sub->has_pending_fli)
+        fill_item_release_refs(&sub->pending_fli);
+    for (size_t i = 0; i < sub->history_cap; i++) {
+        sub_history_slot_t *slot = &sub->history[i];
+        if (slot->kind == SUB_HISTORY_FETCH)
+            fetch_item_release_refs(&slot->u.fetch);
+        else if (slot->kind == SUB_HISTORY_FILL)
+            fill_item_release_refs(&slot->u.fill);
     }
 
     if (sub->has_pending_chunk)
@@ -665,14 +1232,17 @@ void moq_sub_destroy(moq_subscriber_t *sub)
     if (sub->group_ends)
         alloc.free(sub->group_ends,
             sub->ge_cap * sizeof(sub_group_end_entry_t), alloc.ctx);
+    if (sub->fill_reqs)
+        alloc.free(sub->fill_reqs,
+            sub->fill_cap * sizeof(moq_sub_fill_req_t), alloc.ctx);
     alloc.free(sub->chunks,
         sub->chunk_cap * sizeof(moq_sub_chunk_t), alloc.ctx);
-    alloc.free(sub->fetch_items,
-        sub->fi_cap * sizeof(moq_sub_fetch_item_t), alloc.ctx);
+    alloc.free(sub->history,
+        sub->history_cap * sizeof(sub_history_slot_t), alloc.ctx);
     alloc.free(sub->fetch_reqs,
         sub->fetch_cap * sizeof(moq_sub_fetch_req_t), alloc.ctx);
     alloc.free(sub->status_results,
-        sub->sr_cap * sizeof(moq_sub_status_result_t), alloc.ctx);
+        sub->sr_cap * sizeof(moq_sub_status_outcome_t), alloc.ctx);
     alloc.free(sub->status_reqs,
         sub->status_cap * sizeof(moq_sub_status_req_t), alloc.ctx);
     alloc.free(sub->objects,
@@ -682,12 +1252,29 @@ void moq_sub_destroy(moq_subscriber_t *sub)
     alloc.free(sub, sizeof(moq_subscriber_t), alloc.ctx);
 }
 
-void moq_sub_track_cfg_init(moq_sub_track_cfg_t *cfg)
+/* The sizeof of the layout through auth_token_count: what a caller built
+ * before `location` was appended allocates and passes. */
+#define MOQ_SUB_TRACK_CFG_SIZE_THROUGH_AUTH_TOKEN_COUNT \
+    ((offsetof(moq_sub_track_cfg_t, auth_token_count) + \
+      sizeof(((moq_sub_track_cfg_t *)0)->auth_token_count) + \
+      (_Alignof(moq_sub_track_cfg_t) - 1)) & \
+     ~(_Alignof(moq_sub_track_cfg_t) - 1))
+
+/* Parenthesized: defines the symbol, not the header's sized macro. */
+void (moq_sub_track_cfg_init)(moq_sub_track_cfg_t *cfg)
+{
+    moq_sub_track_cfg_init_sized(cfg, MOQ_SUB_TRACK_CFG_SIZE_THROUGH_AUTH_TOKEN_COUNT);
+}
+
+void moq_sub_track_cfg_init_sized(moq_sub_track_cfg_t *cfg, size_t cfg_size)
 {
     if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(*cfg);
-    cfg->filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    if (n < sizeof(cfg->struct_size)) return;   /* too small to even stamp */
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
+    if (n >= offsetof(moq_sub_track_cfg_t, filter) + sizeof(cfg->filter))
+        cfg->filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
 }
 
 moq_result_t moq_sub_subscribe(moq_subscriber_t *sub,
@@ -703,8 +1290,23 @@ moq_result_t moq_sub_subscribe(moq_subscriber_t *sub,
     (cfg->struct_size >= offsetof(moq_sub_track_cfg_t, f) + sizeof(cfg->f))
     if (sub->closed) return MOQ_ERR_CLOSED;
 
+    const moq_fill_cfg_t *fill = STCFG_HAS(fill) ? cfg->fill : NULL;
+    /* Refused before anything is allocated or sent, as the session does. */
+    if (fill && !moq_session_supports_fill(sub->session))
+        return MOQ_ERR_UNSUPPORTED;
+    /* The session refuses a selection its draft cannot carry
+     * (MOQ_ERR_UNSUPPORTED) before anything is sent or kept here. */
+    const uint64_t *rendezvous = STCFG_HAS(rendezvous_timeout_ms)
+        ? cfg->rendezvous_timeout_ms : NULL;
+
     moq_sub_track_t *t = alloc_track(sub);
     if (!t) return MOQ_ERR_WOULD_BLOCK;
+
+    moq_sub_fill_req_t *fr = NULL;
+    if (fill) {
+        moq_result_t rc = alloc_fill_req(sub, t, &fill_identities, &fr);
+        if (rc != MOQ_OK) return rc;
+    }
 
     moq_subscribe_cfg_t scfg;
     moq_subscribe_cfg_init(&scfg);
@@ -719,15 +1321,32 @@ moq_result_t moq_sub_subscribe(moq_subscriber_t *sub,
         scfg.auth_tokens = cfg->auth_tokens;
         scfg.auth_token_count = cfg->auth_token_count;
     }
+    if (STCFG_HAS(location) && cfg->location)
+        scfg.location = cfg->location;
+    scfg.fill = fill;
+    scfg.has_rendezvous_timeout = rendezvous != NULL;
+    scfg.rendezvous_timeout_ms = rendezvous ? *rendezvous : 0;
+    if (STCFG_HAS(object_delivery_timeout_ms) && cfg->object_delivery_timeout_ms) {
+        scfg.delivery_timeout_flags |= MOQ_SUBSCRIBE_OBJECT_DELIVERY_TIMEOUT;
+        scfg.object_delivery_timeout_ms = *cfg->object_delivery_timeout_ms;
+    }
+    if (STCFG_HAS(subgroup_delivery_timeout_ms) && cfg->subgroup_delivery_timeout_ms) {
+        scfg.delivery_timeout_flags |= MOQ_SUBSCRIBE_SUBGROUP_DELIVERY_TIMEOUT;
+        scfg.subgroup_delivery_timeout_ms = *cfg->subgroup_delivery_timeout_ms;
+    }
 #undef STCFG_HAS
 #undef STCFG_MIN
 
     moq_subscription_t h;
     moq_result_t rc = moq_session_subscribe(sub->session, &scfg, now_us, &h);
-    if (rc < 0) return rc;
+    if (rc < 0) {
+        if (fr) free_fill_req(fr);
+        return rc;
+    }
 
     t->state = SUB_TRACK_PENDING;
     t->handle = h;
+    memset(&t->delivery_failure, 0, sizeof(t->delivery_failure));
     *out = t;
     return MOQ_OK;
 }
@@ -750,6 +1369,38 @@ moq_result_t moq_sub_unsubscribe(moq_subscriber_t *sub,
     return MOQ_OK;
 }
 
+static bool track_has_facade_refs(const moq_subscriber_t *s,
+    const moq_sub_track_t *track)
+{
+    for (size_t i = 0; i < s->fill_cap; i++)
+        if (s->fill_reqs[i].state != SUB_FILL_FREE &&
+            s->fill_reqs[i].track == track)
+            return true;
+    if ((s->has_pending && s->pending.track == track) ||
+        (s->has_pending_fli && s->pending_fli.track == track) ||
+        (s->has_pending_chunk && s->pending_chunk.track == track))
+        return true;
+    for (size_t n = 0; n < s->obj_tail - s->obj_head; n++)
+        if (s->objects[(s->obj_head + n) % s->obj_cap].track == track)
+            return true;
+    for (size_t n = 0; n < s->chunk_tail - s->chunk_head; n++)
+        if (s->chunks[(s->chunk_head + n) % s->chunk_cap].track == track)
+            return true;
+    /* Queued Group ends name the track too. Holding the slot for them is a
+     * D22 strengthening of the documented "poll them before releasing" rule:
+     * a released slot can be reused, and a record naming it would then name
+     * the new subscription. */
+    if (s->has_pending_ge && s->pending_ge.end.track == track) return true;
+    for (size_t n = 0; n < s->ge_tail - s->ge_head; n++)
+        if (s->group_ends[(s->ge_head + n) % s->ge_cap].end.track == track)
+            return true;
+    for (size_t i = 0; i < s->history_cap; i++)
+        if (s->history[i].kind == SUB_HISTORY_FILL &&
+            s->history[i].u.fill.track == track)
+            return true;
+    return false;
+}
+
 moq_result_t moq_sub_release_track(moq_subscriber_t *sub,
                                    moq_sub_track_t *track)
 {
@@ -760,9 +1411,51 @@ moq_result_t moq_sub_release_track(moq_subscriber_t *sub,
      * complete here, so no session message is needed -- just free the slot. */
     if (track->state != SUB_TRACK_DONE && track->state != SUB_TRACK_ERROR)
         return MOQ_ERR_WRONG_STATE;
+    if (track->delivery_failure.failed &&
+        !delivery_failure_settled(&track->delivery_failure))
+        return MOQ_ERR_WRONG_STATE;
+    if (moq_session_supports_fill(sub->session) &&
+        track_has_facade_refs(sub, track))
+        return MOQ_ERR_WRONG_STATE;
+    track_result_release(sub, track);
     track->state = SUB_TRACK_FREE;
     track->error_code = 0;
     return MOQ_OK;
+}
+
+moq_result_t moq_sub_get_track_migration(const moq_subscriber_t *sub,
+    const moq_sub_track_t *track, moq_request_migration_t *out, size_t out_size)
+{
+    if (!sub || !track) return MOQ_ERR_INVAL;
+    /* Compare identities before dereferencing a possibly foreign pointer. */
+    for (size_t i = 0; i < sub->track_cap; i++) {
+        const moq_sub_track_t *t = &sub->tracks[i];
+        if (t != track) continue;
+        if (t->state == SUB_TRACK_FREE) return MOQ_ERR_INVAL;
+        return facade_migration_get(&t->migration, out, out_size);
+    }
+    return MOQ_ERR_INVAL;
+}
+
+moq_result_t moq_sub_get_track_result(const moq_subscriber_t *sub,
+    const moq_sub_track_t *track, moq_sub_track_result_t *out, size_t out_size)
+{
+    if (!sub || !track || !out || out_size < MOQ_SUB_TRACK_RESULT_V0_SIZE)
+        return MOQ_ERR_INVAL;
+    /* Compare identities before dereferencing a possibly foreign pointer. */
+    for (size_t i = 0; i < sub->track_cap; i++) {
+        const moq_sub_track_t *t = &sub->tracks[i];
+        if (t != track) continue;
+        if (t->state == SUB_TRACK_FREE) return MOQ_ERR_INVAL;
+        if (t->initial_result_error != MOQ_OK) return t->initial_result_error;
+        moq_sub_track_result_t result = t->initial_result;
+        size_t n = out_size < sizeof(result) ? out_size : sizeof(result);
+        result.struct_size = (uint32_t)n;
+        result.state = (uint32_t)moq_sub_track_get_state(t);
+        memcpy(out, &result, n);
+        return MOQ_OK;
+    }
+    return MOQ_ERR_INVAL;
 }
 
 /* Frozen v0 prefix: struct_size .. delivery_timeout_us -- the layout before
@@ -831,8 +1524,35 @@ moq_result_t moq_sub_update_subscription(moq_subscriber_t *sub,
         ucfg.end_group = cfg->end_group;
     }
 
-    return moq_session_update_subscription(sub->session, track->handle,
-                                            &ucfg, now_us);
+    if (cfg->struct_size >= offsetof(moq_sub_update_cfg_t, location) +
+                                sizeof(cfg->location))
+        ucfg.location = cfg->location;
+    if (cfg->struct_size >= offsetof(moq_sub_update_cfg_t,
+                                     subgroup_delivery_timeout_ms) +
+                                sizeof(cfg->subgroup_delivery_timeout_ms)) {
+        ucfg.delivery_timeout_flags = cfg->delivery_timeout_flags;
+        ucfg.reserved = cfg->reserved;
+        ucfg.object_delivery_timeout_ms = cfg->object_delivery_timeout_ms;
+        ucfg.subgroup_delivery_timeout_ms = cfg->subgroup_delivery_timeout_ms;
+    }
+
+    const moq_fill_cfg_t *fill = NULL;
+    if (cfg->struct_size >= offsetof(moq_sub_update_cfg_t, fill) +
+                                sizeof(cfg->fill))
+        fill = cfg->fill;
+    if (fill && !moq_session_supports_fill(sub->session))
+        return MOQ_ERR_UNSUPPORTED;
+    moq_sub_fill_req_t *fr = NULL;
+    if (fill) {
+        moq_result_t reserve_rc = alloc_fill_req(sub, track, &fill_identities, &fr);
+        if (reserve_rc != MOQ_OK) return reserve_rc;
+        ucfg.fill = fill;
+    }
+
+    moq_result_t rc = moq_session_update_subscription(sub->session,
+        track->handle, &ucfg, now_us);
+    if (rc < 0 && fr) free_fill_req(fr);
+    return rc;
 }
 
 static void fill_sub_object(moq_sub_object_t *o, moq_sub_track_t *t,
@@ -853,10 +1573,11 @@ static void fill_sub_object(moq_sub_object_t *o, moq_sub_track_t *t,
 moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
 {
     if (!sub) return MOQ_ERR_INVAL;
-    (void)now_us;
+    bool exact_bytes = moq_session_supports_fill(sub->session);
+    if (exact_bytes) retry_failed_deliveries(sub, now_us);
 
     if (sub->has_pending) {
-        if (obj_queue_full(sub) || obj_bytes_over_budget(sub))
+        if (obj_queue_full(sub) || (!exact_bytes && obj_bytes_over_budget(sub)))
             return sub_would_block(sub);
         moq_sub_object_t *o = obj_push(sub);
         *o = sub->pending;
@@ -868,7 +1589,7 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
     if (sub->has_pending_fi) {
         bool fi_is_object = sub->pending_fi.kind == MOQ_SUB_FETCH_OBJECT;
         if (fi_queue_full(sub) ||
-            (fi_is_object && obj_bytes_over_budget(sub)))
+            (fi_is_object && !exact_bytes && obj_bytes_over_budget(sub)))
             return sub_would_block(sub);
         moq_sub_fetch_item_t *f = fi_push(sub);
         *f = sub->pending_fi;
@@ -894,16 +1615,48 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
         sub->has_pending_ge = false;
     }
 
+    if (sub->has_pending_fli) {
+        bool is_object = sub->pending_fli.kind == MOQ_SUB_FILL_OBJECT;
+        if (fli_queue_full(sub) ||
+            (is_object && !exact_bytes && obj_bytes_over_budget(sub)))
+            return sub_would_block(sub);
+        moq_sub_fill_item_t *f = fli_push(sub);
+        *f = sub->pending_fli;
+        if (is_object)
+            sub_bytes_add(sub, rcbuf_pair_bytes(f->u.object.payload,
+                                                f->u.object.properties));
+        memset(&sub->pending_fli, 0, sizeof(sub->pending_fli));
+        sub->has_pending_fli = false;
+    }
+
     moq_event_t ev;
-    while (moq_session_poll_events(sub->session, &ev, 1) == 1) {
+    for (;;) {
+        moq_result_t polled = exact_bytes
+            ? session_poll_event_admitted(sub->session, &ev, admit_delivery, sub)
+            : (moq_session_poll_events(sub->session, &ev, 1) == 1 ? MOQ_OK : MOQ_DONE);
+        if (polled == MOQ_ERR_WOULD_BLOCK) return sub_would_block(sub);
+        if (polled == MOQ_DONE) break;
+        if (polled != MOQ_OK) return polled;
         switch (ev.kind) {
         case MOQ_EVENT_SUBSCRIBE_OK: {
             moq_sub_track_t *t = find_track_by_handle(sub,
                 ev.u.subscribe_ok.sub);
-            if (t && t->state == SUB_TRACK_PENDING) {
-                t->state = SUB_TRACK_ACTIVE;
-                sub->stats.subscribe_ok++;
-                if (sub->callbacks.on_subscribed)
+            if (t && !(t->initial_result.flags &
+                       MOQ_SUB_TRACK_RESULT_RESPONSE_SEEN)) {
+                bool pending = t->state == SUB_TRACK_PENDING;
+                t->initial_result_error = track_result_capture(sub, t,
+                    &ev.u.subscribe_ok);
+                /* The core has already accepted this subscription. Preserve
+                 * that lifetime even when the local snapshot cannot be kept. */
+                if (pending) {
+                    t->state = SUB_TRACK_ACTIVE;
+                    sub->stats.subscribe_ok++;
+                }
+                if (t->initial_result_error != MOQ_OK) {
+                    moq_event_cleanup(&ev);
+                    return t->initial_result_error;
+                }
+                if (pending && sub->callbacks.on_subscribed)
                     sub->callbacks.on_subscribed(sub->callbacks.ctx, t);
             }
             break;
@@ -930,7 +1683,7 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
             moq_sub_track_t *t = find_track_by_handle(sub, obj->sub);
             if (t && t->state == SUB_TRACK_ACTIVE) {
                 sub->stats.objects_received++;
-                if (obj_queue_full(sub) || obj_bytes_over_budget(sub)) {
+                if (obj_queue_full(sub) || (!exact_bytes && obj_bytes_over_budget(sub))) {
                     fill_sub_object(&sub->pending, t, obj);
                     sub->has_pending = true;
                     ev.u.object_received.payload = NULL;
@@ -996,19 +1749,23 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
         case MOQ_EVENT_TRACK_STATUS_OK: {
             moq_sub_status_req_t *r = find_status_by_handle(sub,
                 ev.u.track_status_ok.handle);
-            if (r) {
+            if (r && r->state == SUB_STATUS_PENDING) {
                 if (sr_queue_full(sub)) {
                     moq_event_cleanup(&ev);
                     return MOQ_ERR_INTERNAL;
                 }
-                moq_sub_status_result_t *sr = sr_push(sub);
-                sr->kind = MOQ_SUB_STATUS_OK;
+                moq_sub_status_outcome_t *sr = sr_push(sub);
+                sr->kind = MOQ_SUB_STATUS_OUTCOME_OK;
                 sr->request = r;
-                sr->has_largest = ev.u.track_status_ok.has_largest;
-                sr->largest_group = ev.u.track_status_ok.largest_group;
-                sr->largest_object = ev.u.track_status_ok.largest_object;
-                sr->has_expires = ev.u.track_status_ok.has_expires;
-                sr->expires_ms = ev.u.track_status_ok.expires_ms;
+                if (ev.u.track_status_ok.has_largest) {
+                    sr->flags |= MOQ_SUB_STATUS_OUTCOME_HAS_LARGEST;
+                    sr->largest_group = ev.u.track_status_ok.largest_group;
+                    sr->largest_object = ev.u.track_status_ok.largest_object;
+                }
+                if (ev.u.track_status_ok.has_expires) {
+                    sr->flags |= MOQ_SUB_STATUS_OUTCOME_HAS_EXPIRES;
+                    sr->expires_ms = ev.u.track_status_ok.expires_ms;
+                }
                 r->state = SUB_STATUS_DONE;
             }
             break;
@@ -1017,17 +1774,38 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
         case MOQ_EVENT_TRACK_STATUS_ERROR: {
             moq_sub_status_req_t *r = find_status_by_handle(sub,
                 ev.u.track_status_error.handle);
-            if (r) {
+            if (r && r->state == SUB_STATUS_PENDING) {
                 if (sr_queue_full(sub)) {
                     moq_event_cleanup(&ev);
                     return MOQ_ERR_INTERNAL;
                 }
-                moq_sub_status_result_t *sr = sr_push(sub);
-                sr->kind = MOQ_SUB_STATUS_ERROR;
+                moq_sub_status_outcome_t *sr = sr_push(sub);
+                sr->kind = MOQ_SUB_STATUS_OUTCOME_ERROR;
                 sr->request = r;
                 sr->error_code = ev.u.track_status_error.error_code;
-                sr->can_retry = ev.u.track_status_error.can_retry;
-                sr->retry_after_ms = ev.u.track_status_error.retry_after_ms;
+                if (ev.u.track_status_error.can_retry) {
+                    sr->flags |= MOQ_SUB_STATUS_OUTCOME_CAN_RETRY;
+                    sr->retry_after_ms = ev.u.track_status_error.retry_after_ms;
+                }
+                r->state = SUB_STATUS_DONE;
+            }
+            break;
+        }
+
+        case MOQ_EVENT_TRACK_STATUS_TERMINATED: {
+            moq_sub_status_req_t *r = find_status_by_handle(sub,
+                ev.u.track_status_terminated.handle);
+            if (r && r->state == SUB_STATUS_PENDING) {
+                if (sr_queue_full(sub)) {
+                    moq_event_cleanup(&ev);
+                    return MOQ_ERR_INTERNAL;
+                }
+                moq_sub_status_outcome_t *sr = sr_push(sub);
+                sr->kind = MOQ_SUB_STATUS_OUTCOME_TERMINATED;
+                sr->request = r;
+                sr->cause = ev.u.track_status_terminated.cause;
+                sr->local_role = ev.u.track_status_terminated.local_role;
+                sr->stream_error_code = ev.u.track_status_terminated.stream_error_code;
                 r->state = SUB_STATUS_DONE;
             }
             break;
@@ -1064,6 +1842,7 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
             moq_sub_fetch_req_t *r = find_fetch_by_handle(sub,
                 ev.u.fetch_error.fetch);
             if (r) {
+                r->delivery_failure.cancel_pending = false;
                 sub->stats.fetch_errors++;
                 if (fi_queue_full(sub)) {
                     sub->pending_fi.kind = MOQ_SUB_FETCH_ERROR;
@@ -1098,7 +1877,7 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
             if (r && (r->state == SUB_FETCH_PENDING ||
                       r->state == SUB_FETCH_ACTIVE)) {
                 sub->stats.fetch_objects++;
-                if (fi_queue_full(sub) || obj_bytes_over_budget(sub)) {
+                if (fi_queue_full(sub) || (!exact_bytes && obj_bytes_over_budget(sub))) {
                     sub->pending_fi.kind = MOQ_SUB_FETCH_OBJECT;
                     sub->pending_fi.request = r;
                     sub->pending_fi.u.object.group_id = ev.u.fetch_object.group_id;
@@ -1164,6 +1943,7 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
             moq_sub_fetch_req_t *r = find_fetch_by_handle(sub,
                 ev.u.fetch_reset.fetch);
             if (r) {
+                r->delivery_failure.cancel_pending = false;
                 if (fi_queue_full(sub)) {
                     sub->pending_fi.kind = MOQ_SUB_FETCH_RESET;
                     sub->pending_fi.request = r;
@@ -1189,7 +1969,8 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
         case MOQ_EVENT_FETCH_COMPLETE: {
             moq_sub_fetch_req_t *r = find_fetch_by_handle(sub,
                 ev.u.fetch_complete.fetch);
-            if (r && r->state == SUB_FETCH_ACTIVE) {
+            if (r && (r->state == SUB_FETCH_ACTIVE || r->delivery_failure.failed)) {
+                r->delivery_failure.cancel_pending = false;
                 sub->stats.fetch_complete++;
                 if (fi_queue_full(sub)) {
                     sub->pending_fi.kind = MOQ_SUB_FETCH_COMPLETE;
@@ -1209,6 +1990,130 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
 
         case MOQ_EVENT_FETCH_CANCELLED:
             break;
+
+        case MOQ_EVENT_FILL_CREATED: {
+            /* The child this side requested now has its session handle;
+             * bind it to the oldest request on that track still awaiting
+             * one (children are created in request order). */
+            moq_sub_track_t *t = find_track_by_handle(sub, ev.u.fill_created.sub);
+            moq_sub_fill_req_t *r = t ? find_fill_awaiting_handle(sub, t) : NULL;
+            if (r) {
+                r->handle = ev.u.fill_created.fill;
+                r->state = SUB_FILL_ACTIVE;
+                r->initiating_request_id = ev.u.fill_created.initiating_request_id;
+                moq_sub_fill_item_t it;
+                memset(&it, 0, sizeof(it));
+                it.struct_size = (uint32_t)sizeof(it);
+                it.kind = MOQ_SUB_FILL_CREATED;
+                it.request = fill_handle_of(r);
+                it.track = r->track;
+                it.initiating_request_id = ev.u.fill_created.initiating_request_id;
+                if (fli_queue_full(sub)) {
+                    sub->pending_fli = it;
+                    sub->has_pending_fli = true;
+                    moq_event_cleanup(&ev);
+                    return sub_would_block(sub);
+                }
+                *fli_push(sub) = it;
+            }
+            break;
+        }
+
+        case MOQ_EVENT_FILL_OBJECT: {
+            moq_sub_fill_req_t *r = find_fill_by_handle(sub, ev.u.fill_object.fill);
+            if (r && !r->delivery_failure.failed) {
+                sub->stats.fill_objects++;
+                moq_sub_fill_item_t it;
+                memset(&it, 0, sizeof(it));
+                it.struct_size = (uint32_t)sizeof(it);
+                it.kind = MOQ_SUB_FILL_OBJECT;
+                it.request = fill_handle_of(r);
+                it.track = r->track;
+                it.initiating_request_id = ev.u.fill_object.initiating_request_id;
+                it.u.object.group_id = ev.u.fill_object.group_id;
+                it.u.object.subgroup_id = ev.u.fill_object.subgroup_id;
+                it.u.object.object_id = ev.u.fill_object.object_id;
+                it.u.object.publisher_priority = ev.u.fill_object.publisher_priority;
+                it.u.object.datagram = ev.u.fill_object.datagram;
+                it.u.object.payload = ev.u.fill_object.payload;
+                it.u.object.properties = ev.u.fill_object.properties;
+                ev.u.fill_object.payload = NULL;
+                ev.u.fill_object.properties = NULL;
+                if (fli_queue_full(sub) || (!exact_bytes && obj_bytes_over_budget(sub))) {
+                    sub->pending_fli = it;
+                    sub->has_pending_fli = true;
+                    moq_event_cleanup(&ev);
+                    return sub_would_block(sub);
+                }
+                moq_sub_fill_item_t *f = fli_push(sub);
+                *f = it;
+                sub_bytes_add(sub, rcbuf_pair_bytes(f->u.object.payload,
+                                                    f->u.object.properties));
+            }
+            break;
+        }
+
+        case MOQ_EVENT_FILL_GAP: {
+            moq_sub_fill_req_t *r = find_fill_by_handle(sub, ev.u.fill_gap.fill);
+            if (r && !r->delivery_failure.failed) {
+                sub->stats.fill_gaps++;
+                moq_sub_fill_item_t it;
+                memset(&it, 0, sizeof(it));
+                it.struct_size = (uint32_t)sizeof(it);
+                it.kind = MOQ_SUB_FILL_GAP;
+                it.request = fill_handle_of(r);
+                it.track = r->track;
+                it.initiating_request_id = ev.u.fill_gap.initiating_request_id;
+                it.u.gap.range_kind = ev.u.fill_gap.kind;
+                it.u.gap.group_id = ev.u.fill_gap.group_id;
+                it.u.gap.object_id = ev.u.fill_gap.object_id;
+                if (fli_queue_full(sub)) {
+                    sub->pending_fli = it;
+                    sub->has_pending_fli = true;
+                    moq_event_cleanup(&ev);
+                    return sub_would_block(sub);
+                }
+                *fli_push(sub) = it;
+            }
+            break;
+        }
+
+        case MOQ_EVENT_FILL_TERMINAL: {
+            /* Exactly once per fill; the slot is held until the item is
+             * polled so queued objects keep their correlation token. A
+             * terminal for a child that never got its handle (the session
+             * ended it inside the requesting call's own event batch) still
+             * resolves through the awaiting-handle lookup. */
+            moq_sub_fill_req_t *r = find_fill_by_handle(sub, ev.u.fill_terminal.fill);
+            if (!r) {
+                moq_sub_track_t *t = find_track_by_handle(sub, ev.u.fill_terminal.sub);
+                r = t ? find_fill_awaiting_handle(sub, t) : NULL;
+                if (r) r->handle = ev.u.fill_terminal.fill;
+            }
+            if (r) {
+                sub->stats.fill_terminals++;
+                moq_sub_fill_item_t it;
+                memset(&it, 0, sizeof(it));
+                it.struct_size = (uint32_t)sizeof(it);
+                it.kind = MOQ_SUB_FILL_TERMINAL;
+                it.request = fill_handle_of(r);
+                it.track = r->track;
+                it.initiating_request_id = ev.u.fill_terminal.initiating_request_id;
+                it.u.terminal.reason = ev.u.fill_terminal.reason;
+                it.u.terminal.error_domain = ev.u.fill_terminal.error_domain;
+                it.u.terminal.error_code = ev.u.fill_terminal.error_code;
+                r->state = SUB_FILL_DONE;
+                r->delivery_failure.cancel_pending = false;
+                if (fli_queue_full(sub)) {
+                    sub->pending_fli = it;
+                    sub->has_pending_fli = true;
+                    moq_event_cleanup(&ev);
+                    return sub_would_block(sub);
+                }
+                *fli_push(sub) = it;
+            }
+            break;
+        }
 
         case MOQ_EVENT_SUBSCRIPTION_UPDATE_OK: {
             /* success-only acknowledgment of our outbound update. The
@@ -1240,7 +2145,22 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
                 ev.u.unsubscribed.sub);
             if (t) {
                 t->state = SUB_TRACK_DONE;
+                t->delivery_failure.cancel_pending = false;
+                t->delivery_failure.terminal_polled = true;
                 sub->stats.unsubscribed++;
+                /* The session cancelled it because its Track is malformed:
+                 * the application learns through the same terminal callback
+                 * a publisher's done uses, with MALFORMED_TRACK as status. */
+                bool malformed = ev.detail_size >=
+                        offsetof(moq_unsubscribed_event_t, cause) +
+                        sizeof(ev.u.unsubscribed.cause) &&
+                    ev.u.unsubscribed.cause == MOQ_REQUEST_TERMINAL_MALFORMED_TRACK;
+                if (malformed) {
+                    sub->stats.malformed_tracks++;
+                    if (sub->on_subscribe_done)
+                        sub->on_subscribe_done(sub->callbacks.ctx, t,
+                                               MOQ_STREAM_ERROR_MALFORMED_TRACK);
+                }
             }
             break;
         }
@@ -1250,6 +2170,8 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
                 ev.u.subscribe_done.sub);
             if (t) {
                 t->state = SUB_TRACK_DONE;
+                t->delivery_failure.cancel_pending = false;
+                t->delivery_failure.terminal_polled = true;
                 sub->stats.subscribe_done++;
                 if (sub->on_subscribe_done)
                     sub->on_subscribe_done(sub->callbacks.ctx, t,
@@ -1296,6 +2218,127 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
             break;
         }
 
+        case MOQ_EVENT_REQUEST_REDIRECT: {
+            /* The peer refused the request with REDIRECT: the request ended
+             * as its error would, and the facade keeps where it went. */
+            const moq_request_redirect_event_t *rd = &ev.u.request_redirect;
+            if (rd->family == MOQ_REQUEST_FAMILY_SUBSCRIBE) {
+                moq_sub_track_t *t = find_track_by_handle(sub, rd->handle.subscription);
+                if (t && t->state == SUB_TRACK_PENDING) {
+                    facade_migration_set(&t->migration, &sub->alloc, true,
+                        rd->can_retry, rd->retry_after_ms, 0, rd->connect_uri,
+                        &rd->track_namespace, rd->track_name);
+                    t->state = SUB_TRACK_ERROR;
+                    t->error_code = rd->error_code;
+                    sub->stats.subscribe_errors++;
+                    if (sub->callbacks.on_subscribe_error)
+                        sub->callbacks.on_subscribe_error(sub->callbacks.ctx, t,
+                            rd->error_code, rd->reason);
+                }
+            } else if (rd->family == MOQ_REQUEST_FAMILY_FETCH) {
+                moq_sub_fetch_req_t *r = find_fetch_by_handle(sub, rd->handle.fetch);
+                if (r && r->state == SUB_FETCH_PENDING) {
+                    r->delivery_failure.cancel_pending = false;
+                    sub->stats.fetch_errors++;
+                    moq_sub_fetch_item_t it;
+                    memset(&it, 0, sizeof(it));
+                    it.kind = MOQ_SUB_FETCH_ERROR;
+                    it.request = r;
+                    it.u.error.error_code = rd->error_code;
+                    it.u.error.can_retry = rd->can_retry;
+                    it.u.error.retry_after_ms = rd->retry_after_ms;
+                    r->state = SUB_FETCH_DONE;
+                    if (fi_queue_full(sub)) {
+                        sub->pending_fi = it;
+                        sub->has_pending_fi = true;
+                        moq_event_cleanup(&ev);
+                        return sub_would_block(sub);
+                    }
+                    *fi_push(sub) = it;
+                }
+            } else if (rd->family == MOQ_REQUEST_FAMILY_TRACK_STATUS) {
+                moq_sub_status_req_t *r = find_status_by_handle(sub,
+                    rd->handle.track_status);
+                if (r && r->state == SUB_STATUS_PENDING) {
+                    if (sr_queue_full(sub)) {
+                        moq_event_cleanup(&ev);
+                        return MOQ_ERR_INTERNAL;
+                    }
+                    moq_sub_status_outcome_t *sr = sr_push(sub);
+                    sr->kind = MOQ_SUB_STATUS_OUTCOME_ERROR;
+                    sr->request = r;
+                    sr->error_code = rd->error_code;
+                    if (rd->can_retry) {
+                        sr->flags |= MOQ_SUB_STATUS_OUTCOME_CAN_RETRY;
+                        sr->retry_after_ms = rd->retry_after_ms;
+                    }
+                    r->state = SUB_STATUS_DONE;
+                }
+            }
+            break;
+        }
+
+        case MOQ_EVENT_REQUEST_GOAWAY: {
+            /* The peer migrated one request (draft-22 §9.2): it ends here, to
+             * be re-issued at the new session, and the facade keeps where. A
+             * subscription ends through on_subscribe_done with GOING_AWAY
+             * ("The subscriber or publisher issued a GOAWAY", §12.4); a fetch
+             * through its error item with the GOING_AWAY request error. */
+            const moq_request_goaway_event_t *ga = &ev.u.request_goaway;
+            if (ga->family == MOQ_REQUEST_FAMILY_TRACK_STATUS) {
+                /* A status request ends with its GOING_AWAY error outcome;
+                 * polling it frees the slot. The ring holds one outcome per
+                 * slot, so a pending request always finds room. */
+                moq_sub_status_req_t *r = find_status_by_handle(sub,
+                    ga->handle.track_status);
+                if (r && r->state == SUB_STATUS_PENDING) {
+                    if (sr_queue_full(sub)) {
+                        moq_event_cleanup(&ev);
+                        return MOQ_ERR_INTERNAL;
+                    }
+                    moq_sub_status_outcome_t *sr = sr_push(sub);
+                    sr->kind = MOQ_SUB_STATUS_OUTCOME_ERROR;
+                    sr->request = r;
+                    sr->error_code = MOQ_REQUEST_ERROR_GOING_AWAY;
+                    r->state = SUB_STATUS_DONE;
+                }
+            } else if (ga->family == MOQ_REQUEST_FAMILY_SUBSCRIBE) {
+                moq_sub_track_t *t = find_track_by_handle(sub, ga->handle.subscription);
+                if (t && (t->state == SUB_TRACK_ACTIVE || t->state == SUB_TRACK_PENDING)) {
+                    facade_migration_set(&t->migration, &sub->alloc, false,
+                        false, 0, ga->timeout_ms, ga->new_session_uri, NULL,
+                        (moq_bytes_t){ NULL, 0 });
+                    t->state = SUB_TRACK_DONE;
+                    t->delivery_failure.cancel_pending = false;
+                    t->delivery_failure.terminal_polled = true;
+                    sub->stats.subscribe_done++;
+                    if (sub->on_subscribe_done)
+                        sub->on_subscribe_done(sub->callbacks.ctx, t,
+                                               SUB_DONE_GOING_AWAY);
+                }
+            } else if (ga->family == MOQ_REQUEST_FAMILY_FETCH) {
+                moq_sub_fetch_req_t *r = find_fetch_by_handle(sub, ga->handle.fetch);
+                if (r && (r->state == SUB_FETCH_PENDING || r->state == SUB_FETCH_ACTIVE)) {
+                    r->delivery_failure.cancel_pending = false;
+                    sub->stats.fetch_errors++;
+                    moq_sub_fetch_item_t it;
+                    memset(&it, 0, sizeof(it));
+                    it.kind = MOQ_SUB_FETCH_ERROR;
+                    it.request = r;
+                    it.u.error.error_code = MOQ_REQUEST_ERROR_GOING_AWAY;
+                    r->state = SUB_FETCH_DONE;
+                    if (fi_queue_full(sub)) {
+                        sub->pending_fi = it;
+                        sub->has_pending_fi = true;
+                        moq_event_cleanup(&ev);
+                        return sub_would_block(sub);
+                    }
+                    *fi_push(sub) = it;
+                }
+            }
+            break;
+        }
+
         case MOQ_EVENT_GOAWAY:
             sub->draining = true;
             if (sub->on_goaway) {
@@ -1308,17 +2351,42 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
 
         case MOQ_EVENT_SESSION_CLOSED:
             sub->closed = true;
-            for (size_t i = 0; i < sub->track_cap; i++)
+            for (size_t i = 0; i < sub->track_cap; i++) {
+                sub->tracks[i].delivery_failure.cancel_pending = false;
+                sub->tracks[i].delivery_failure.terminal_polled = true;
                 if (sub->tracks[i].state == SUB_TRACK_ACTIVE ||
                     sub->tracks[i].state == SUB_TRACK_PENDING)
                     sub->tracks[i].state = SUB_TRACK_DONE;
+            }
             for (size_t i = 0; i < sub->status_cap; i++)
                 if (sub->status_reqs[i].state == SUB_STATUS_PENDING)
                     sub->status_reqs[i].state = SUB_STATUS_DONE;
-            for (size_t i = 0; i < sub->fetch_cap; i++)
+            for (size_t i = 0; i < sub->fetch_cap; i++) {
+                sub->fetch_reqs[i].delivery_failure.cancel_pending = false;
+                sub->fetch_reqs[i].delivery_failure.terminal_polled = true;
                 if (sub->fetch_reqs[i].state == SUB_FETCH_PENDING ||
                     sub->fetch_reqs[i].state == SUB_FETCH_ACTIVE)
                     sub->fetch_reqs[i].state = SUB_FETCH_DONE;
+            }
+            for (size_t i = 0; i < sub->fill_cap; i++) {
+                if (sub->fill_reqs[i].delivery_failure.failed) {
+                    sub->fill_reqs[i].delivery_failure.cancel_pending = false;
+                    sub->fill_reqs[i].delivery_failure.terminal_polled = true;
+                }
+                if (sub->fill_reqs[i].state == SUB_FILL_REQUESTED ||
+                    sub->fill_reqs[i].state == SUB_FILL_ACTIVE) {
+                    /* Close has no per-child terminal fanout. Retire only
+                     * children without a queued terminal; owned items still
+                     * pin their track independently until polled. */
+                    if (sub->fill_reqs[i].delivery_failure.failed) {
+                        sub->fill_reqs[i].state = SUB_FILL_DONE;
+                        sub->fill_reqs[i].delivery_failure.cancel_pending = false;
+                        sub->fill_reqs[i].delivery_failure.terminal_polled = true;
+                    } else {
+                        free_fill_req(&sub->fill_reqs[i]);
+                    }
+                }
+            }
             if (sub->callbacks.on_closed)
                 sub->callbacks.on_closed(sub->callbacks.ctx,
                     ev.u.closed.code);
@@ -1330,6 +2398,15 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
 
         moq_event_cleanup(&ev);
     }
+
+    if (exact_bytes) retry_failed_deliveries(sub, now_us);
+
+    /* Retention failure stays observable without preventing the terminal
+     * events that make the failed track releasable, or other track progress. */
+    for (size_t i = 0; i < sub->track_cap; i++)
+        if (sub->tracks[i].state == SUB_TRACK_ACTIVE &&
+            sub->tracks[i].initial_result_error != MOQ_OK)
+            return sub->tracks[i].initial_result_error;
 
     return MOQ_OK;
 }
@@ -1418,8 +2495,40 @@ moq_result_t moq_sub_poll_status(moq_subscriber_t *sub,
 {
     if (!sub || !out) return MOQ_ERR_INVAL;
     if (sub->sr_head >= sub->sr_tail) return MOQ_DONE;
-    *out = sub->status_results[sub->sr_head % sub->sr_cap];
-    if (out->request) out->request->state = SUB_STATUS_FREE;
+    const moq_sub_status_outcome_t *sr = &sub->status_results[sub->sr_head % sub->sr_cap];
+    if (sr->kind != MOQ_SUB_STATUS_OUTCOME_OK &&
+        sr->kind != MOQ_SUB_STATUS_OUTCOME_ERROR)
+        return MOQ_ERR_UNSUPPORTED;
+    moq_sub_status_result_t result;
+    memset(&result, 0, sizeof(result));
+    result.kind = sr->kind == MOQ_SUB_STATUS_OUTCOME_OK ? MOQ_SUB_STATUS_OK : MOQ_SUB_STATUS_ERROR;
+    result.request = sr->request;
+    result.has_largest = (sr->flags & MOQ_SUB_STATUS_OUTCOME_HAS_LARGEST) != 0;
+    result.largest_group = sr->largest_group;
+    result.largest_object = sr->largest_object;
+    result.has_expires = (sr->flags & MOQ_SUB_STATUS_OUTCOME_HAS_EXPIRES) != 0;
+    result.expires_ms = sr->expires_ms;
+    result.error_code = sr->error_code;
+    result.can_retry = (sr->flags & MOQ_SUB_STATUS_OUTCOME_CAN_RETRY) != 0;
+    result.retry_after_ms = sr->retry_after_ms;
+    *out = result;
+    if (sr->request) sr->request->state = SUB_STATUS_FREE;
+    sub->sr_head++;
+    return MOQ_OK;
+}
+
+moq_result_t moq_sub_poll_status_outcome(moq_subscriber_t *sub,
+                                        moq_sub_status_outcome_t *out,
+                                        size_t out_size)
+{
+    if (!sub || !out || out_size < MOQ_SUB_STATUS_OUTCOME_V0_SIZE)
+        return MOQ_ERR_INVAL;
+    if (sub->sr_head >= sub->sr_tail) return MOQ_DONE;
+    moq_sub_status_outcome_t result = sub->status_results[sub->sr_head % sub->sr_cap];
+    size_t n = out_size < sizeof(result) ? out_size : sizeof(result);
+    result.struct_size = (uint32_t)n;
+    memcpy(out, &result, n);
+    if (result.request) result.request->state = SUB_STATUS_FREE;
     sub->sr_head++;
     return MOQ_OK;
 }
@@ -1441,8 +2550,11 @@ moq_result_t moq_sub_get_stats(const moq_subscriber_t *sub,
         (uint64_t)(sub->chunk_tail - sub->chunk_head +
                    (sub->has_pending_chunk ? 1u : 0u));
     snap.fetch_items_queued =
-        (uint64_t)(sub->fi_tail - sub->fi_head +
+        (uint64_t)(sub->fetch_queue.count +
                    (sub->has_pending_fi ? 1u : 0u));
+    snap.fill_items_queued =
+        (uint64_t)(sub->fill_queue.count +
+                   (sub->has_pending_fli ? 1u : 0u));
     snap.bytes_queued = sub_retained_bytes(sub);
     snap.draining = sub->draining;
     snap.closed = sub->closed;
@@ -1534,6 +2646,7 @@ moq_result_t moq_sub_fetch(moq_subscriber_t *sub,
 
     r->state = SUB_FETCH_PENDING;
     r->handle = h;
+    memset(&r->delivery_failure, 0, sizeof(r->delivery_failure));
     *out = r;
     return MOQ_OK;
 }
@@ -1580,6 +2693,7 @@ moq_result_t moq_sub_joining_fetch(moq_subscriber_t *sub,
 
     r->state = SUB_FETCH_PENDING;
     r->handle = h;
+    memset(&r->delivery_failure, 0, sizeof(r->delivery_failure));
     *out = r;
     return MOQ_OK;
 }
@@ -1610,12 +2724,11 @@ moq_result_t moq_sub_poll_fetch(moq_subscriber_t *sub,
                                   moq_sub_fetch_item_t *out)
 {
     if (!sub || !out) return MOQ_ERR_INVAL;
-    if (sub->fi_head >= sub->fi_tail) return MOQ_DONE;
+    if (!sub->fetch_queue.count) return MOQ_DONE;
 
-    *out = sub->fetch_items[sub->fi_head % sub->fi_cap];
-    memset(&sub->fetch_items[sub->fi_head % sub->fi_cap], 0,
-        sizeof(moq_sub_fetch_item_t));
-    sub->fi_head++;
+    size_t index = sub->fetch_queue.head;
+    *out = sub->history[index].u.fetch;
+    history_remove(sub, &sub->fetch_queue, index, SIZE_MAX);
     if (out->kind == MOQ_SUB_FETCH_OBJECT)
         sub_bytes_sub(sub, rcbuf_pair_bytes(out->u.object.payload,
                                             out->u.object.properties));
@@ -1624,8 +2737,15 @@ moq_result_t moq_sub_poll_fetch(moq_subscriber_t *sub,
     if (out->request &&
         (out->kind == MOQ_SUB_FETCH_ERROR ||
          out->kind == MOQ_SUB_FETCH_COMPLETE ||
-         out->kind == MOQ_SUB_FETCH_RESET))
-        out->request->state = SUB_FETCH_FREE;
+         out->kind == MOQ_SUB_FETCH_RESET)) {
+        if (out->request->delivery_failure.failed) {
+            out->request->delivery_failure.terminal_polled = true;
+            out->request->delivery_failure.cancel_pending = false;
+        } else {
+            out->request->state = SUB_FETCH_FREE;
+        }
+    }
+    reap_failed_history(sub);
 
     return MOQ_OK;
 }
@@ -1634,6 +2754,89 @@ void moq_sub_fetch_item_cleanup(moq_sub_fetch_item_t *item)
 {
     if (!item) return;
     fetch_item_release_refs(item);
+}
+
+/* -- Fills ---------------------------------------------------------- */
+
+moq_sub_fill_t moq_sub_track_fill(const moq_sub_track_t *track)
+{
+    moq_sub_fill_t none = { 0 };
+    if (!track || !track->sub) return none;
+    const moq_subscriber_t *s = track->sub;
+    const moq_sub_fill_req_t *best = NULL;
+    for (size_t i = 0; i < s->fill_cap; i++) {
+        const moq_sub_fill_req_t *r = &s->fill_reqs[i];
+        if (r->state != SUB_FILL_FREE && r->track == track &&
+            (!best || r->seq > best->seq))
+            best = r;
+    }
+    return best ? fill_handle_of(best) : none;
+}
+
+moq_result_t moq_sub_cancel_fill(moq_subscriber_t *sub,
+                                 moq_sub_fill_t fill,
+                                 uint64_t now_us)
+{
+    if (!sub) return MOQ_ERR_INVAL;
+    moq_sub_fill_req_t *req = fill_resolve(sub, fill);
+    if (!req) return MOQ_ERR_STALE_HANDLE;
+    if (req->state != SUB_FILL_ACTIVE || req->cancelled)
+        return MOQ_ERR_WRONG_STATE;
+    /* The slot stays until the LOCAL_CANCELLED terminal is polled. */
+    moq_result_t rc = moq_session_cancel_fill(sub->session, req->handle, now_us);
+    if (rc == MOQ_OK) req->cancelled = true;
+    return rc;
+}
+
+moq_result_t moq_sub_poll_fill(moq_subscriber_t *sub,
+                               moq_sub_fill_item_t *out,
+                               size_t out_size)
+{
+    if (!sub || !out || out_size < MOQ_SUB_FILL_ITEM_V0_SIZE)
+        return MOQ_ERR_INVAL;
+    if (!sub->fill_queue.count) return MOQ_DONE;
+
+    size_t index = sub->fill_queue.head;
+    moq_sub_fill_item_t item = sub->history[index].u.fill;
+    size_t written = out_size < sizeof(item) ? out_size : sizeof(item);
+    item.struct_size = (uint32_t)written;
+    memcpy(out, &item, written);
+    history_remove(sub, &sub->fill_queue, index, SIZE_MAX);
+    if (item.kind == MOQ_SUB_FILL_OBJECT)
+        sub_bytes_sub(sub, rcbuf_pair_bytes(item.u.object.payload,
+                                            item.u.object.properties));
+    sub->stats.fill_items_polled++;
+
+    if (item.kind == MOQ_SUB_FILL_TERMINAL) {
+        moq_sub_fill_req_t *r = fill_resolve(sub, item.request);
+        if (r && r->delivery_failure.failed) {
+            r->delivery_failure.terminal_polled = true;
+            r->delivery_failure.cancel_pending = false;
+        } else if (r) {
+            free_fill_req(r);
+        }
+    }
+    reap_failed_history(sub);
+
+    return MOQ_OK;
+}
+
+void moq_sub_fill_item_cleanup(moq_sub_fill_item_t *item)
+{
+    if (!item) return;
+    size_t size = item->struct_size;
+    if (size < offsetof(moq_sub_fill_item_t, kind) + sizeof(item->kind) ||
+        item->kind != MOQ_SUB_FILL_OBJECT) return;
+    if (size >= offsetof(moq_sub_fill_item_t, u.object.payload) +
+                sizeof(item->u.object.payload) && item->u.object.payload) {
+        moq_rcbuf_decref(item->u.object.payload);
+        item->u.object.payload = NULL;
+    }
+    if (size >= offsetof(moq_sub_fill_item_t, u.object.properties) +
+                sizeof(item->u.object.properties) && item->u.object.properties) {
+        moq_rcbuf_decref(item->u.object.properties);
+        item->u.object.properties = NULL;
+    }
 }
 
 /* -- Chunk poll ----------------------------------------------------- */

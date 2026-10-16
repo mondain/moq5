@@ -2,7 +2,7 @@
 #
 # moq_wtquic_* symbols split into two groups, both deliberate:
 #   - the installed public API (moq/wtquic.h), and
-#   - ONE private, non-installed lockstep SPI (wtquic_adapter_internal.h) the
+#   - private, non-installed lockstep SPI (wtquic_adapter_internal.h) the
 #     managed facades link across their separate DSO boundary.
 # This test pins the EXACT set: every listed symbol must be exported and NO
 # OTHER moq_wtquic_* symbol may be. It fails on a missing symbol (visibility
@@ -42,11 +42,12 @@ set(BASE_SYMBOLS
     moq_wtquic_conn_is_fatal
     moq_wtquic_conn_is_closed
 )
-# The single private lockstep SPI (wtquic_adapter_internal.h, NOT installed):
-# the managed facades read the session's event-progress token + pending-event
-# bit through it. Any addition here is a deliberate adapter-SPI change.
+# Private lockstep SPI (wtquic_adapter_internal.h, NOT installed): managed
+# facades observe event progress, terminal facts and reliable output without
+# exposing the attach layout. Additions require an intentional SPI decision.
 list(APPEND BASE_SYMBOLS moq_wtquic_conn_event_progress)
 list(APPEND BASE_SYMBOLS moq_wtquic_conn_terminal_facts)
+list(APPEND BASE_SYMBOLS moq_wtquic_conn_poll_flush)
 
 set(EXPECTED_SYMBOLS "")
 foreach(base IN LISTS BASE_SYMBOLS)

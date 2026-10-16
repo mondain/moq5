@@ -381,9 +381,10 @@ static void drain_datagrams(pq_sim_t *s, dg_rx_t *rx)
     }
 }
 
-/* Send an object datagram (object_id `oid`) carrying `len` bytes of `fill`. */
+/* Send an object datagram (group 0, object_id `oid`) carrying `len` bytes of
+ * `fill`; `end_of_group` marks it the last object of group 0. */
 static int send_dg(pq_sim_t *s, moq_subscription_t ss, uint64_t oid,
-                   size_t len, uint8_t fill)
+                   size_t len, uint8_t fill, bool end_of_group)
 {
     uint8_t *p = (uint8_t *)malloc(len);
     memset(p, fill, len);
@@ -391,7 +392,7 @@ static int send_dg(pq_sim_t *s, moq_subscription_t ss, uint64_t oid,
     int rc = -1;
     if (moq_rcbuf_create(moq_alloc_default(), p, len, &buf) >= 0) {
         rc = (int)moq_session_send_object_datagram(s->server_session, ss, 0, oid,
-            200, true, buf, NULL, 0, s->now);
+            200, end_of_group, buf, NULL, 0, s->now);
         moq_rcbuf_decref(buf);
     }
     free(p);
@@ -411,7 +412,7 @@ static void run_datagram(uint8_t cid_byte, uint32_t datagram_max)
     moq_subscription_t ss = {0};
     failures += sim_subscribe_accept(&s, &ss);
 
-    CHECK(send_dg(&s, ss, 0, 2, 0xD0) >= 0);
+    CHECK(send_dg(&s, ss, 0, 2, 0xD0, true) >= 0);
     sim_pump(&s, 200);
 
     dg_rx_t rx = {0};
@@ -446,9 +447,12 @@ static void run_datagram_gate(uint8_t cid_byte)
     moq_subscription_t ss = {0};
     failures += sim_subscribe_accept(&s, &ss);
 
-    CHECK(send_dg(&s, ss, 0, 2, 0xA0) >= 0);   /* fits the negotiated 64 */
-    (void)send_dg(&s, ss, 1, 300, 0x5A);        /* > 64, < cautious -> gated */
-    CHECK(send_dg(&s, ss, 2, 2, 0xC0) >= 0);   /* fits the negotiated 64 */
+    /* One group: only its last object ends it. An object after the end of
+     * its group would make the Track malformed (§2.4.2), and nothing more of
+     * it would be delivered. */
+    CHECK(send_dg(&s, ss, 0, 2, 0xA0, false) >= 0);  /* fits the negotiated 64 */
+    (void)send_dg(&s, ss, 1, 300, 0x5A, false);      /* > 64, < cautious -> gated */
+    CHECK(send_dg(&s, ss, 2, 2, 0xC0, true) >= 0);   /* fits the negotiated 64 */
     sim_pump(&s, 200);
 
     dg_rx_t rx = {0};
@@ -464,6 +468,35 @@ static void run_datagram_gate(uint8_t cid_byte)
     CHECK(!moq_pq_conn_is_fatal(s.server_conn));
     CHECK(moq_session_state(s.client_session) == MOQ_SESS_ESTABLISHED);
     CHECK(moq_session_state(s.server_session) == MOQ_SESS_ESTABLISHED);
+    sim_cleanup(&s);
+}
+
+/* A datagram after one that ended its group is an object past the end of the
+ * group: the Track is malformed (draft-16 §2.4.2), so that object is never
+ * delivered and the subscription is cancelled; the connection stays up. */
+static void run_datagram_after_end_of_group(uint8_t cid_byte)
+{
+    scenario = "datagram-after-end-of-group";
+    pq_sim_t s;
+    CHECK(sim_setup(&s, cid_byte, MOQ_VERSION_DRAFT_16, 64) == 0);
+    if (!(s.test_ctx && s.client_conn && s.server_conn)) { sim_cleanup(&s); return; }
+    CHECK(sim_handshake(&s) == 0);
+
+    moq_subscription_t ss = {0};
+    failures += sim_subscribe_accept(&s, &ss);
+
+    CHECK(send_dg(&s, ss, 0, 2, 0xA0, true) >= 0);   /* ends group 0 */
+    CHECK(send_dg(&s, ss, 2, 2, 0xC0, true) >= 0);   /* past that end */
+    sim_pump(&s, 200);
+
+    dg_rx_t rx = {0};
+    drain_datagrams(&s, &rx);
+    CHECK(rx.got_obj[0]);
+    CHECK(!rx.got_obj[2]);
+    CHECK(rx.count == 1);
+    CHECK(!moq_pq_conn_is_fatal(s.client_conn));
+    CHECK(!moq_pq_conn_is_fatal(s.server_conn));
+    CHECK(moq_session_state(s.client_session) == MOQ_SESS_ESTABLISHED);
     sim_cleanup(&s);
 }
 
@@ -505,6 +538,9 @@ int main(void)
     /* F. the adapter's explicit max-size gate drops an oversized datagram
      * (below picoquic's own cautious-length threshold) without faulting. */
     run_datagram_gate(0x4C);
+
+    /* G. an object datagram past the end of its group is never delivered. */
+    run_datagram_after_end_of_group(0x4D);
 
     if (failures == 0)
         printf("PASS: pq_sim_establish\n");

@@ -787,7 +787,7 @@ int main(void)
         /* Deliver on the established publish bidi of the CLIENT publisher:
          * find its ref via the entry. */
         (void)pref;
-        moq_stream_ref_t ref = cl->publishes[0].request_stream_ref;
+        moq_stream_ref_t ref = cl->publishes[0].rs.ref;
         MOQ_TEST_CHECK_EQ_INT(
             (int)moq_session_on_bidi_stream_bytes(cl, ref, upd,
                 moq_buf_writer_offset(&w), false,
@@ -1568,8 +1568,9 @@ int main(void)
     }
 
     /* reject after an early SUBGROUP object: the bound data stream must not keep
-     * emitting against the freed publication handle. A further object on the same
-     * stream is dropped (STOP_SENDING), not surfaced. */
+     * emitting against the freed publication handle. The reject abandons the
+     * stream with STOP_SENDING (§10.10), and a further object on it is
+     * consumed, not surfaced, with no second STOP. */
     {
         moq_session_t *s = make_session(MOQ_PERSPECTIVE_SERVER);
         moq_publication_t h = feed_publish(s, moq_stream_ref_from_u64(7),
@@ -1582,7 +1583,7 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT((int)moq_session_reject_publish(s, h, &rj, 1),
                               (int)MOQ_OK);
         { moq_event_t e; while (moq_session_poll_events(s,&e,1)>0) moq_event_cleanup(&e); }
-        { moq_action_t a; while (moq_session_poll_actions(s,&a,1)>0) moq_action_cleanup(&a); }
+        MOQ_TEST_CHECK(saw_stop_data(s, dref));             /* stream stopped */
         /* A further object on the same (now stale-bound) subgroup stream. */
         uint8_t obj2[8];
         moq_buf_writer_t w; moq_buf_writer_init(&w, obj2, sizeof(obj2));
@@ -1591,7 +1592,7 @@ int main(void)
         moq_buf_write_raw(&w, (const uint8_t *)"y", 1);
         moq_session_on_data_bytes(s, dref, obj2, moq_buf_writer_offset(&w), false, 1);
         MOQ_TEST_CHECK_EQ_INT(count_objects(s), 0);         /* not emitted */
-        MOQ_TEST_CHECK(saw_stop_data(s, dref));             /* stream stopped */
+        MOQ_TEST_CHECK(!saw_stop_data(s, dref));            /* stopped once */
         MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
         moq_session_destroy(s);
     }

@@ -2,6 +2,7 @@
 #include <moq/sim.h>
 #include <moq/wire.h>   /* MOQ_QUIC_VARINT_MAX */
 #include "test_session_support.h"
+#include "publisher_track_old_layout.h"
 #include <stddef.h>
 #include <stdio.h>
 #include <moq/control.h>
@@ -1224,10 +1225,15 @@ static void test_end_group(void) {
     MOQ_TEST_CHECK(rc == MOQ_OK);
     moq_simpair_run_until_quiescent(sp, 8, NULL);
 
-    /* Writing in same group should open a new subgroup. */
+    /* end_group sealed group 0: a later Object there is refused before any
+     * effect (the payload stays the caller's), while the next group opens
+     * normally. */
     moq_rcbuf_t *p2 = NULL;
     moq_rcbuf_create(&alloc, d, 1, &p2);
     rc = moq_pub_write_object(pub, track, 0, 1, p2, moq_simpair_now_us(sp));
+    MOQ_TEST_CHECK(rc == MOQ_ERR_WRONG_STATE);
+    MOQ_TEST_CHECK(moq_rcbuf_refcount(p2) == 1);
+    rc = moq_pub_write_object(pub, track, 1, 0, p2, moq_simpair_now_us(sp));
     MOQ_TEST_CHECK(rc == MOQ_OK);
     moq_rcbuf_decref(p2);
 
@@ -4052,21 +4058,9 @@ static void test_publisher_priority_old_struct(void) {
     moq_publisher_t *pub = NULL;
     moq_pub_create(moq_simpair_server(sp), &alloc, &cfg, &pub);
 
-    /* Simulate the original struct layout (before has_publisher_priority
-     * was appended). pad_after_prio covers offsets 42..47 — the original
-     * trailing padding, exactly where the mis-placed has_publisher_priority
-     * once lived. Setting pad_after_prio[0] nonzero models an old caller
-     * whose uninitialised padding happens to be set: the appended presence
-     * bit now lives beyond this struct, so add_track must NOT read this
-     * byte as "has explicit priority". */
-    struct {
-        uint32_t        struct_size;
-        moq_namespace_t track_namespace;
-        moq_bytes_t     track_name;
-        bool            advertise_namespace;
-        uint8_t         publisher_priority;
-        uint8_t         pad_after_prio[6];
-    } old_tcfg;
+    /* Exact original layout: 48 bytes on LP64, 24 on ILP32. Poison its
+     * real trailing padding without adding LP64-only explicit members. */
+    test_pub_track_original_t old_tcfg;
     memset(&old_tcfg, 0, sizeof(old_tcfg));
     /* The presence bit must be appended past the original layout, else this
      * discriminator can't work. */
@@ -4078,7 +4072,8 @@ static void test_publisher_priority_old_struct(void) {
     old_tcfg.track_namespace.count = 1;
     old_tcfg.track_name = MOQ_BYTES_LITERAL("t");
     old_tcfg.publisher_priority = 0;
-    old_tcfg.pad_after_prio[0] = 0xFF;  /* old has_publisher_priority slot */
+    const size_t padding = offsetof(test_pub_track_original_t, publisher_priority) + 1;
+    memset((unsigned char *)&old_tcfg + padding, 0xFF, sizeof(old_tcfg) - padding);
 
     moq_pub_track_t *track = NULL;
     moq_result_t rc = moq_pub_add_track(pub,
@@ -8915,7 +8910,7 @@ static void publish_restart_case(bool d18, const char *label)
             const moq_pub_entry_t *e = &server->publishes[i];
             if (e->state != MOQ_PUB_FREE &&
                 e->role == MOQ_PUB_ROLE_PUBLISHER) {
-                ref = e->request_stream_ref;
+                ref = e->rs.ref;
                 found++;
             }
         }
@@ -10752,8 +10747,8 @@ static void windows_inject_sub_filter(moq_simpair_t *sp, moq_version_t ver,
         for (size_t i = 0; i < sv->sub_cap; i++)
             if (sv->subs[i].state != MOQ_SUB_FREE &&
                 sv->subs[i].role == MOQ_SUB_ROLE_PUBLISHER &&
-                sv->subs[i].request_stream_ref._v != 0)
-                ref = sv->subs[i].request_stream_ref;
+                sv->subs[i].rs.ref._v != 0)
+                ref = sv->subs[i].rs.ref;
         MOQ_TEST_CHECK(ref._v != 0);
         MOQ_TEST_CHECK(moq_session_on_bidi_stream_bytes(
             sv, ref, buf, moq_buf_writer_offset(&w), false,
@@ -11355,7 +11350,7 @@ static void windows_inject_pub_filter(moq_simpair_t *sp, moq_version_t ver,
         mp.filter_end_group = eg;
         MOQ_TEST_CHECK(moq_d18_encode_request_update(
             &w, new_req_id, &mp) == MOQ_OK);
-        moq_stream_ref_t ref = sv->publishes[slot].request_stream_ref;
+        moq_stream_ref_t ref = sv->publishes[slot].rs.ref;
         MOQ_TEST_CHECK(ref._v != 0);
         MOQ_TEST_CHECK(moq_session_on_bidi_stream_bytes(
             sv, ref, buf, moq_buf_writer_offset(&w), false,
@@ -11483,10 +11478,12 @@ static void test_window_end_track(moq_version_t ver, bool excluded)
       } }
     MOQ_TEST_CHECK_EQ_INT(nstatus, excluded ? 0 : 1);
     if (excluded) {
-        /* Deterministic terminal signal: exactly ONE done, status 0x3
-         * (SUBSCRIPTION_ENDED, both drafts). */
+        /* Deterministic terminal signal: exactly ONE done. Drafts 16 and 18
+         * report SUBSCRIPTION_ENDED (0x3); draft-22 has no such status
+         * (§16.11.3), and the track ended: TRACK_ENDED (0x2). */
         MOQ_TEST_CHECK_EQ_INT(ndone, 1);
-        MOQ_TEST_CHECK_EQ_U64(done_status, 0x3);
+        MOQ_TEST_CHECK_EQ_U64(done_status,
+                              ver == MOQ_VERSION_DRAFT_22 ? 0x2 : 0x3);
         MOQ_TEST_CHECK_EQ_SIZE(moq_pub_active_subscriptions(pub, track), 0);
     }
     MOQ_TEST_CHECK(moq_session_state(moq_simpair_server(sp))
@@ -13870,7 +13867,33 @@ static void test_mono_eog_open_vs_fin(moq_version_t ver)
         "mono_eog_open_vs_fin_d18" : "mono_eog_open_vs_fin_d16");
 }
 
-static void test_mono_reset_clears(moq_version_t ver)
+/* Subgroup ID of the client's OBJECT_RECEIVED for {g,o}, or UINT64_MAX when
+ * none arrived; every other event is dropped. */
+static uint64_t mono_received_subgroup(moq_simpair_t *sp, uint64_t g, uint64_t o)
+{
+    uint64_t sg = UINT64_MAX;
+    moq_event_t ev;
+    while (moq_session_poll_events(moq_simpair_client(sp), &ev, 1) == 1) {
+        if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED &&
+            ev.u.object_received.group_id == g &&
+            ev.u.object_received.object_id == o)
+            sg = ev.u.object_received.subgroup_id;
+        moq_event_cleanup(&ev);
+    }
+    return sg;
+}
+
+/* Armed EOG on group 2, then moq_pub_reset_group: the candidate dies (both
+ * drafts void the EOG inference for reset streams) and the group's Objects
+ * keep their assignments. `tail` selects what follows the reset:
+ *   0  end_group at once: promotes nothing, and seals group 2, so a later
+ *      Object there is refused before any effect;
+ *   1  a non-EOG Object 1 opens a fresh subgroup (Subgroup ID 1); a clean
+ *      close of it still promotes nothing;
+ *   2  a REPLACEMENT EOG Object 1 in the fresh subgroup plus a clean close
+ *      promotes, with the exact stream count (the reset stream and the
+ *      fresh one). */
+static void mono_reset_case(moq_version_t ver, int tail)
 {
     test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
     moq_publisher_t *pub; moq_pub_track_t *track;
@@ -13879,45 +13902,53 @@ static void test_mono_reset_clears(moq_version_t ver)
     windows_subscribe(sp, pub, MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE, 0, 0, 2);
     drain_all(sp);
 
-    /* Armed EOG on group 2, then a track-wide RESET: the candidate dies
-     * (both drafts void the EOG inference for reset streams). A later
-     * clean close WITHOUT a replacement EOG write promotes nothing. */
     MOQ_TEST_CHECK(mono_write_stream_eog(pub, track, &alloc, sp, 2, 0, true,
                                          0x9A) == MOQ_OK);
     MOQ_TEST_CHECK(moq_pub_reset_group(pub, track, 0x10, now) == MOQ_OK);
     moq_simpair_run_until_quiescent(sp, 8, NULL);
-    /* An end_group DIRECTLY after the reset must promote NOTHING: a stale
-     * arm surviving the reset would complete end=2 right here. */
-    MOQ_TEST_CHECK(moq_pub_end_group(pub, track, now) == MOQ_OK);
-    MOQ_TEST_CHECK(moq_pub_flush(pub, now) == MOQ_OK);
-    moq_simpair_run_until_quiescent(sp, 8, NULL);
-    MOQ_TEST_CHECK_EQ_INT(declare_client_dones(sp, NULL, NULL), 0);
-    /* Same-group continuation stays legal; a clean close of a NON-eog
-     * final write still promotes nothing. */
-    MOQ_TEST_CHECK(mono_write_stream_eog(pub, track, &alloc, sp, 2, 1, false,
-                                         0x9B) == MOQ_OK);   /* same group OK */
-    MOQ_TEST_CHECK(moq_pub_end_group(pub, track, now) == MOQ_OK);
-    MOQ_TEST_CHECK(moq_pub_flush(pub, now) == MOQ_OK);
-    moq_simpair_run_until_quiescent(sp, 8, NULL);
-    MOQ_TEST_CHECK_EQ_INT(declare_client_dones(sp, NULL, NULL), 0);
+    (void)mono_received_subgroup(sp, 2, 0);
 
-    /* A REPLACEMENT completed EOG write + clean close promotes. */
-    MOQ_TEST_CHECK(mono_write_stream_eog(pub, track, &alloc, sp, 2, 2, true,
-                                         0x9C) == MOQ_OK);
-    MOQ_TEST_CHECK(moq_pub_end_group(pub, track, now) == MOQ_OK);
-    MOQ_TEST_CHECK(moq_pub_flush(pub, now) == MOQ_OK);
-    moq_simpair_run_until_quiescent(sp, 8, NULL);
-    {
+    if (tail == 0) {
+        /* A stale arm surviving the reset would complete end=2 here. */
+        MOQ_TEST_CHECK(moq_pub_end_group(pub, track, now) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_pub_flush(pub, now) == MOQ_OK);
+        moq_simpair_run_until_quiescent(sp, 8, NULL);
+        MOQ_TEST_CHECK_EQ_INT(declare_client_dones(sp, NULL, NULL), 0);
+        MOQ_TEST_CHECK_EQ_INT((int)mono_write_stream_eog(pub, track, &alloc,
+                                  sp, 2, 1, true, 0x9B),
+                              (int)MOQ_ERR_WRONG_STATE);
+        MOQ_TEST_CHECK(moq_pub_flush(pub, now) == MOQ_OK);
+        moq_simpair_run_until_quiescent(sp, 8, NULL);
+        MOQ_TEST_CHECK_EQ_INT(declare_client_dones(sp, NULL, NULL), 0);
+    } else {
+        MOQ_TEST_CHECK(mono_write_stream_eog(pub, track, &alloc, sp, 2, 1,
+                                             tail == 2, 0x9B) == MOQ_OK);
+        moq_simpair_run_until_quiescent(sp, 8, NULL);
+        MOQ_TEST_CHECK_EQ_U64(mono_received_subgroup(sp, 2, 1), 1);
+        MOQ_TEST_CHECK(moq_pub_end_group(pub, track, now) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_pub_flush(pub, now) == MOQ_OK);
+        moq_simpair_run_until_quiescent(sp, 8, NULL);
         uint64_t st = ~0ull, sc = ~0ull;
-        MOQ_TEST_CHECK_EQ_INT(declare_client_dones(sp, &st, &sc), 1);
-        MOQ_TEST_CHECK_EQ_U64(st, 0x3);
-        MOQ_TEST_CHECK_EQ_U64(sc, 3);   /* three opened subgroups, exact */
+        if (tail == 1) {
+            MOQ_TEST_CHECK_EQ_INT(declare_client_dones(sp, NULL, NULL), 0);
+        } else {
+            MOQ_TEST_CHECK_EQ_INT(declare_client_dones(sp, &st, &sc), 1);
+            MOQ_TEST_CHECK_EQ_U64(st, 0x3);
+            MOQ_TEST_CHECK_EQ_U64(sc, 2);
+        }
     }
 
     moq_pub_destroy(pub);
     drain_all(sp);
     moq_simpair_destroy(sp);
     MOQ_TEST_CHECK(as.balance == 0);
+}
+
+static void test_mono_reset_clears(moq_version_t ver)
+{
+    mono_reset_case(ver, 0);
+    mono_reset_case(ver, 1);
+    mono_reset_case(ver, 2);
     MOQ_TEST_PASS(ver == MOQ_VERSION_DRAFT_18 ?
         "mono_reset_clears_d18" : "mono_reset_clears_d16");
 }
@@ -14272,19 +14303,16 @@ static void test_mono_abi_canary(moq_version_t ver)
     windows_setup(&as, &alloc, &sp, ver, &pub, &track_full);
     uint64_t now = moq_simpair_now_us(sp);
 
-    /* Exact v0-sized heap cfg. The old sizeof is derived INDEPENDENTLY
-     * of the appended field -- the align-rounded end of the old struct's
-     * last member -- so the canary keeps modeling a REAL 64-byte caller
-     * even if monotonic_groups ever drifted. Every byte poisoned 0xAA
+    /* Exact historical heap cfg, independent of the current type:
+     * 64 bytes on LP64, 36 on i686, 40 on ARM ILP32.
+     * Every byte poisoned 0xAA
      * first, real fields memcpy'd at their offsets, the old TRAILING
      * PADDING left poisoned; add_track must not read monotonic_groups (it
      * lies past the allocation). */
-    const size_t old_size =
-        (offsetof(moq_pub_track_cfg_t, has_publisher_priority) +
-         sizeof(bool) + (_Alignof(moq_pub_track_cfg_t) - 1)) &
-        ~(size_t)(_Alignof(moq_pub_track_cfg_t) - 1);
-    MOQ_TEST_CHECK_EQ_SIZE(old_size,
-                           offsetof(moq_pub_track_cfg_t, monotonic_groups));
+    const size_t old_size = sizeof(test_pub_track_pre_monotonic_t);
+    MOQ_TEST_CHECK(offsetof(moq_pub_track_cfg_t, monotonic_groups) >= old_size);
+    MOQ_TEST_CHECK_EQ_SIZE(offsetof(moq_pub_track_cfg_t, monotonic_groups),
+                          PUB_TRACK_DIM(64, 40, 40));
     uint8_t *raw = (uint8_t *)malloc(old_size);
     MOQ_TEST_CHECK(raw != NULL);
     memset(raw, 0xAA, old_size);
@@ -14296,19 +14324,19 @@ static void test_mono_abi_canary(moq_version_t ver)
         bool bfalse = false;
         uint8_t prio = 128;
         uint64_t zero64 = 0;
-        memcpy(raw + offsetof(moq_pub_track_cfg_t, struct_size),
+        memcpy(raw + offsetof(test_pub_track_pre_monotonic_t, struct_size),
                &ss, sizeof(ss));
-        memcpy(raw + offsetof(moq_pub_track_cfg_t, track_namespace),
+        memcpy(raw + offsetof(test_pub_track_pre_monotonic_t, track_namespace),
                &ns, sizeof(ns));
-        memcpy(raw + offsetof(moq_pub_track_cfg_t, track_name),
+        memcpy(raw + offsetof(test_pub_track_pre_monotonic_t, track_name),
                &nm, sizeof(nm));
-        memcpy(raw + offsetof(moq_pub_track_cfg_t, advertise_namespace),
+        memcpy(raw + offsetof(test_pub_track_pre_monotonic_t, advertise_namespace),
                &bfalse, sizeof(bfalse));
-        memcpy(raw + offsetof(moq_pub_track_cfg_t, publisher_priority),
+        memcpy(raw + offsetof(test_pub_track_pre_monotonic_t, publisher_priority),
                &prio, sizeof(prio));
-        memcpy(raw + offsetof(moq_pub_track_cfg_t, max_retained_bytes),
+        memcpy(raw + offsetof(test_pub_track_pre_monotonic_t, max_retained_bytes),
                &zero64, sizeof(zero64));
-        memcpy(raw + offsetof(moq_pub_track_cfg_t, has_publisher_priority),
+        memcpy(raw + offsetof(test_pub_track_pre_monotonic_t, has_publisher_priority),
                &bfalse, sizeof(bfalse));
         /* Bytes between has_publisher_priority+1 and old_size stay 0xAA:
          * the poisoned v0 trailing padding. */
@@ -14943,6 +14971,1934 @@ static void test_subgroup_header_mismatch_admission(void)
                          "subgroup header mismatch refused at admission d18");
 }
 
+/* -- Finite filter end and the PUBLISH_DONE registry ------------------- *
+ * Drafts 16 and 18 end a subscription whose finite filter end is covered by
+ * the completion watermark, with PUBLISH_DONE SUBSCRIPTION_ENDED (0x3).
+ * Draft-22 has no such status (§16.11.3) and "A publisher does not end a
+ * subscription solely because the Largest Object advances past the end of
+ * the current Location Filter" (§3.3.1): the subscription stays established,
+ * nothing outside its window is sent, and the track's end finishes it with
+ * TRACK_ENDED (0x2). */
+static void collect_window_events(moq_simpair_t *sp, int *nobj, uint64_t g,
+                                  int *ndone, uint64_t *status)
+{
+    moq_event_t ev;
+    while (moq_session_poll_events(moq_simpair_client(sp), &ev, 1) == 1) {
+        if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED &&
+            ev.u.object_received.group_id == g &&
+            ev.u.object_received.status == MOQ_OBJECT_NORMAL)
+            (*nobj)++;
+        if (ev.kind == MOQ_EVENT_SUBSCRIBE_DONE) {
+            (*ndone)++;
+            *status = ev.u.subscribe_done.status_code;
+        }
+        moq_event_cleanup(&ev);
+    }
+}
+
+static void test_window_completion_status(moq_version_t ver)
+{
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *track;
+    windows_setup(&as, &alloc, &sp, ver, &pub, &track);
+    uint64_t now = moq_simpair_now_us(sp);
+    windows_subscribe(sp, pub, MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE, 0, 0, 0);
+
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 0, 0, 0xE0)
+                   == MOQ_OK);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    int nobj = 0, ndone = 0;
+    uint64_t status = UINT64_MAX;
+    collect_window_events(sp, &nobj, 0, &ndone, &status);
+    MOQ_TEST_CHECK_EQ_INT(nobj, 1);
+
+    MOQ_TEST_CHECK(moq_pub_declare_groups_complete_through(pub, track, 0, now)
+                   == MOQ_OK);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    collect_window_events(sp, &nobj, 0, &ndone, &status);
+    if (ver == MOQ_VERSION_DRAFT_22) {
+        MOQ_TEST_CHECK_EQ_INT(ndone, 0);
+        MOQ_TEST_CHECK_EQ_SIZE(moq_pub_active_subscriptions(pub, track), 1);
+        /* Group 1 lies outside the window: not sent. */
+        MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 1, 0, 0xE1)
+                       == MOQ_OK);
+        moq_simpair_run_until_quiescent(sp, 8, NULL);
+        nobj = 0;
+        collect_window_events(sp, &nobj, 1, &ndone, &status);
+        MOQ_TEST_CHECK_EQ_INT(nobj, 0);
+        MOQ_TEST_CHECK_EQ_INT(ndone, 0);
+        MOQ_TEST_CHECK(moq_pub_end_track(pub, track, moq_simpair_now_us(sp))
+                       == MOQ_OK);
+        moq_simpair_run_until_quiescent(sp, 8, NULL);
+        collect_window_events(sp, &nobj, 1, &ndone, &status);
+        MOQ_TEST_CHECK_EQ_INT(ndone, 1);
+        MOQ_TEST_CHECK_EQ_U64(status, 0x2);   /* TRACK_ENDED */
+    } else {
+        MOQ_TEST_CHECK_EQ_INT(ndone, 1);
+        MOQ_TEST_CHECK_EQ_U64(status, 0x3);   /* SUBSCRIPTION_ENDED */
+        MOQ_TEST_CHECK_EQ_SIZE(moq_pub_active_subscriptions(pub, track), 0);
+    }
+    MOQ_TEST_CHECK(moq_session_state(moq_simpair_server(sp))
+                   == MOQ_SESS_ESTABLISHED);
+    moq_pub_destroy(pub);
+    drain_all(sp);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+    MOQ_TEST_PASS(ver == MOQ_VERSION_DRAFT_22 ? "window_completion_status_d22"
+                  : ver == MOQ_VERSION_DRAFT_18 ? "window_completion_status_d18"
+                  : "window_completion_status_d16");
+}
+
+/* -- FIRST_OBJECT on facade-opened subgroups ----------------------------- *
+ * The facade is the Original Publisher: a destination stream that begins
+ * with the first object the track published in that group's subgroup
+ * carries FIRST_OBJECT (draft-18 and draft-22 §2.2); a stream that begins
+ * later -- a subscriber that arrived mid-group -- does not, and neither do
+ * the stream's later objects. Draft-16 has no such bit. */
+static void collect_first_flags(moq_simpair_t *sp, uint64_t g, bool *flags,
+                                int *n)
+{
+    moq_event_t ev;
+    while (moq_session_poll_events(moq_simpair_client(sp), &ev, 1) == 1) {
+        if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED &&
+            ev.u.object_received.group_id == g && *n < 4)
+            flags[(*n)++] = ev.u.object_received.first_object;
+        moq_event_cleanup(&ev);
+    }
+}
+
+/* Drive the pair and drain the client: how many times {g,o} arrived, with
+ * the FIRST_OBJECT flag and Subgroup ID of its last arrival, and every end
+ * of the subscription (a malformed track ends it at the subscriber). */
+static int fo_seen(moq_simpair_t *sp, uint64_t g, uint64_t o, bool *first,
+                   uint64_t *sgid, int *ended)
+{
+    int n = 0;
+    moq_event_t ev;
+    for (int round = 0; round < 4; round++) {
+        moq_simpair_run_until_quiescent(sp, 32, NULL);
+        while (moq_session_poll_events(moq_simpair_client(sp), &ev, 1) == 1) {
+            if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED &&
+                ev.u.object_received.group_id == g &&
+                ev.u.object_received.object_id == o) {
+                n++;
+                if (first) *first = ev.u.object_received.first_object;
+                if (sgid) *sgid = ev.u.object_received.subgroup_id;
+            }
+            if (ev.kind == MOQ_EVENT_UNSUBSCRIBED ||
+                ev.kind == MOQ_EVENT_SUBSCRIBE_DONE)
+                (*ended)++;
+            moq_event_cleanup(&ev);
+        }
+    }
+    return n;
+}
+
+static void test_facade_first_object(moq_version_t ver)
+{
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *track;
+    windows_setup(&as, &alloc, &sp, ver, &pub, &track);
+    const bool has_bit = ver != MOQ_VERSION_DRAFT_16;
+
+    /* Group 0 starts before anyone subscribes. */
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 0, 0, 0xF0)
+                   == MOQ_OK);
+    windows_subscribe(sp, pub, MOQ_SUBSCRIBE_FILTER_NONE, 0, 0, 0);
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 0, 1, 0xF1)
+                   == MOQ_OK);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    bool flags[4] = { true, true, true, true };
+    int n = 0;
+    collect_first_flags(sp, 0, flags, &n);
+    MOQ_TEST_CHECK_EQ_INT(n, 1);
+    MOQ_TEST_CHECK(!flags[0]);      /* joined mid-group: not the first */
+
+    /* Group 1 starts with the subscriber present. */
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 1, 0, 0xF2)
+                   == MOQ_OK);
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 1, 1, 0xF3)
+                   == MOQ_OK);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    n = 0;
+    collect_first_flags(sp, 1, flags, &n);
+    MOQ_TEST_CHECK_EQ_INT(n, 2);
+    MOQ_TEST_CHECK(flags[0] == has_bit);
+    MOQ_TEST_CHECK(!flags[1]);
+
+    /* Groups need not increase with time (draft-22 §2.3.1): group 3 starts,
+     * then group 2, which nothing published before, starts too. Each first
+     * object opens its subgroup with FIRST_OBJECT; a later object of group 2
+     * does not. */
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 3, 0, 0xF4) == MOQ_OK);
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 2, 0, 0xF5) == MOQ_OK);
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 2, 1, 0xF6) == MOQ_OK);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    bool f3[4] = { true, true, true, true }, f2[4] = { true, true, true, true };
+    int n3 = 0, n2 = 0;
+    {
+        moq_event_t ev;
+        while (moq_session_poll_events(moq_simpair_client(sp), &ev, 1) == 1) {
+            if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED) {
+                uint64_t g = ev.u.object_received.group_id;
+                if (g == 3 && n3 < 4) f3[n3++] = ev.u.object_received.first_object;
+                if (g == 2 && n2 < 4) f2[n2++] = ev.u.object_received.first_object;
+            }
+            moq_event_cleanup(&ev);
+        }
+    }
+    MOQ_TEST_CHECK_EQ_INT(n3, 1);
+    MOQ_TEST_CHECK(f3[0] == has_bit);
+    MOQ_TEST_CHECK_EQ_INT(n2, 2);
+    MOQ_TEST_CHECK(f2[0] == has_bit);
+    MOQ_TEST_CHECK(!f2[1]);
+
+    /* Group 50, below seventeen later group starts but never published,
+     * starts its subgroup and carries FIRST_OBJECT; so does the new group
+     * 117. */
+    for (uint64_t g = 100; g <= 116; g++)
+        MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, g, 0, 0xE0) == MOQ_OK);
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 50, 0, 0xE1) == MOQ_OK);
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 117, 0, 0xE2) == MOQ_OK);
+    {
+        int seen50 = 0, seen117 = 0, seen116 = 0;
+        moq_event_t ev;
+        for (int round = 0; round < 16; round++) {
+        moq_simpair_run_until_quiescent(sp, 32, NULL);
+        while (moq_session_poll_events(moq_simpair_client(sp), &ev, 1) == 1) {
+            if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED) {
+                uint64_t g = ev.u.object_received.group_id;
+                bool f = ev.u.object_received.first_object;
+                if (g == 50) { seen50++; MOQ_TEST_CHECK(f == has_bit); }
+                if (g == 116) { seen116++; MOQ_TEST_CHECK(f == has_bit); }
+                if (g == 117) { seen117++; MOQ_TEST_CHECK(f == has_bit); }
+            }
+            moq_event_cleanup(&ev);
+        }
+        }
+        MOQ_TEST_CHECK(seen50 == 1 && seen116 == 1 && seen117 == 1);
+    }
+
+    /* Records now hold groups 103..116, 50 and 117; groups 0..3 and
+     * 100..102 were displaced and sealed. Every group's subgroup ended when
+     * the track moved on, so a later Object in a group is a revisit. */
+    int ended = 0;
+    bool f = false;
+    uint64_t sgid = UINT64_MAX;
+
+    /* A displaced group takes nothing more. */
+    MOQ_TEST_CHECK_EQ_INT((int)declare_write_stream(pub, track, &alloc, sp,
+                              100, 1, 0xE3), (int)MOQ_ERR_WRONG_STATE);
+    MOQ_TEST_CHECK_EQ_INT(fo_seen(sp, 100, 1, NULL, NULL, &ended), 0);
+
+    /* A recorded group revisited opens the next subgroup, which the stream
+     * begins (FIRST_OBJECT on the drafts with the bit). */
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 116, 1, 0xE4)
+                   == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(fo_seen(sp, 116, 1, &f, &sgid, &ended), 1);
+    MOQ_TEST_CHECK(f == has_bit);
+    MOQ_TEST_CHECK_EQ_U64(sgid, 1);
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 50, 1, 0xE7)
+                   == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(fo_seen(sp, 50, 1, &f, &sgid, &ended), 1);
+    MOQ_TEST_CHECK(f == has_bit);
+    MOQ_TEST_CHECK_EQ_U64(sgid, 1);
+
+    /* A revisit must be above every Object already assigned in the group. */
+    MOQ_TEST_CHECK_EQ_INT((int)declare_write_stream(pub, track, &alloc, sp,
+                              116, 1, 0xE5), (int)MOQ_ERR_WRONG_STATE);
+    MOQ_TEST_CHECK_EQ_INT(fo_seen(sp, 116, 1, NULL, NULL, &ended), 0);
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 116, 2, 0xE6)
+                   == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(fo_seen(sp, 116, 2, &f, &sgid, &ended), 1);
+    MOQ_TEST_CHECK(f == has_bit);
+    MOQ_TEST_CHECK_EQ_U64(sgid, 2);
+
+    /* Seven revisits per group (Subgroup IDs 0..7): groups 117 and 50
+     * alternate, so each write leaves the other group. */
+    for (uint64_t k = 1; k <= 7; k++) {
+        if (k >= 2) {
+            MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 50, k,
+                                                0xE8) == MOQ_OK);
+            MOQ_TEST_CHECK_EQ_INT(fo_seen(sp, 50, k, &f, &sgid, &ended), 1);
+            MOQ_TEST_CHECK(f == has_bit);
+            MOQ_TEST_CHECK_EQ_U64(sgid, k);
+        }
+        MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 117, k,
+                                            0xE9) == MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT(fo_seen(sp, 117, k, &f, &sgid, &ended), 1);
+        MOQ_TEST_CHECK(f == has_bit);
+        MOQ_TEST_CHECK_EQ_U64(sgid, k);
+    }
+    /* An eighth revisit is refused, payload left to the caller. */
+    {
+        uint8_t d[2] = { 0xEA, 0x15 };
+        moq_rcbuf_t *pl = NULL;
+        moq_rcbuf_create(&alloc, d, sizeof(d), &pl);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_pub_write_object(pub, track, 50, 8, pl,
+                                  moq_simpair_now_us(sp)), (int)MOQ_ERR_NOMEM);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(pl), 1);
+        moq_rcbuf_decref(pl);
+        MOQ_TEST_CHECK_EQ_INT(fo_seen(sp, 50, 8, NULL, NULL, &ended), 0);
+    }
+
+    /* Groups 116, 50 and 117 are revisited. Twelve more (500..511) take the
+     * revisited count to fifteen; each new group and its filler (600..611)
+     * displace the least recently admitted group never revisited. */
+    for (uint64_t i = 0; i < 12; i++) {
+        MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 500 + i, 0,
+                                            0xEB) == MOQ_OK);
+        MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 600 + i, 0,
+                                            0xEC) == MOQ_OK);
+        MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 500 + i, 1,
+                                            0xED) == MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT(fo_seen(sp, 500 + i, 1, &f, &sgid, &ended), 1);
+        MOQ_TEST_CHECK(f == has_bit);
+        MOQ_TEST_CHECK_EQ_U64(sgid, 1);
+    }
+    /* A sixteenth revisited group is refused on every path, before any
+     * effect: nothing is sent and no object is left open. Group 520's own
+     * write displaced the last filler; the revisit of 116 needs no record. */
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 520, 0, 0xEE)
+                   == MOQ_OK);
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 116, 3, 0xEF)
+                   == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(fo_seen(sp, 116, 3, &f, &sgid, &ended), 1);
+    MOQ_TEST_CHECK_EQ_U64(sgid, 3);
+    MOQ_TEST_CHECK_EQ_INT((int)declare_write_stream(pub, track, &alloc, sp,
+                              520, 1, 0xF7), (int)MOQ_ERR_NOMEM);
+    {
+        moq_pub_begin_object_cfg_t bcfg;
+        moq_pub_begin_object_cfg_init_sized(&bcfg, sizeof(bcfg));
+        bcfg.group_id = 520; bcfg.object_id = 1; bcfg.payload_length = 2;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_pub_begin_object(pub, track, &bcfg,
+                                  moq_simpair_now_us(sp)), (int)MOQ_ERR_NOMEM);
+        moq_rcbuf_t *pd = NULL;
+        uint8_t two[2] = { 1, 2 };
+        moq_rcbuf_create(&alloc, two, sizeof(two), &pd);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_pub_write_data(pub, track, pd,
+                                  moq_simpair_now_us(sp)), (int)MOQ_ERR_WRONG_STATE);
+        moq_rcbuf_decref(pd);
+    }
+    MOQ_TEST_CHECK_EQ_INT(fo_seen(sp, 520, 1, NULL, NULL, &ended), 0);
+
+    /* A revisited group keeps its record however far the track moved on;
+     * a group displaced long ago is still sealed. */
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 500, 2, 0xF8)
+                   == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(fo_seen(sp, 500, 2, &f, &sgid, &ended), 1);
+    MOQ_TEST_CHECK(f == has_bit);
+    MOQ_TEST_CHECK_EQ_U64(sgid, 2);
+    MOQ_TEST_CHECK_EQ_INT((int)declare_write_stream(pub, track, &alloc, sp,
+                              103, 1, 0xF9), (int)MOQ_ERR_WRONG_STATE);
+    MOQ_TEST_CHECK_EQ_INT(fo_seen(sp, 103, 1, NULL, NULL, &ended), 0);
+
+    /* The subscriber never saw a malformed track: the subscription is still
+     * established. */
+    MOQ_TEST_CHECK_EQ_INT(ended, 0);
+
+    moq_pub_destroy(pub);
+    drain_all(sp);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+    MOQ_TEST_PASS(ver == MOQ_VERSION_DRAFT_22 ? "facade_first_object_d22"
+                  : ver == MOQ_VERSION_DRAFT_18 ? "facade_first_object_d18"
+                  : "facade_first_object_d16");
+}
+
+/* -- Group history: identity, finality and retained installs ------------ */
+
+/* Install a dense retained group 0..n-1 (n <= 16) and return the result. */
+/* Retained payload of Object `o` in these rows; a live write of the same
+ * Object uses the same bytes (declare_write_stream with this tag), since an
+ * Object's identity includes its payload. */
+#define HIST_TAG(o) ((uint8_t)(0xA0u + (o)))
+
+/* Install a dense retained group 0..n-1 (n <= 16); every payload buffer is
+ * checked. */
+static moq_result_t hist_install(moq_publisher_t *pub, moq_pub_track_t *t,
+                                 moq_alloc_t *alloc, uint64_t g, size_t n)
+{
+    moq_pub_retained_object_t objs[16];
+    moq_rcbuf_t *pl[16];
+    memset(objs, 0, sizeof(objs));
+    memset(pl, 0, sizeof(pl));
+    if (n > 16) n = 16;
+    moq_result_t rc = MOQ_OK;
+    for (size_t i = 0; i < n && rc == MOQ_OK; i++) {
+        uint8_t d[2] = { HIST_TAG(i), (uint8_t)(HIST_TAG(i) ^ 0xFFu) };
+        rc = moq_rcbuf_create(alloc, d, sizeof(d), &pl[i]);
+        MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
+        objs[i].object_id = i;
+        objs[i].payload = pl[i];
+    }
+    if (rc == MOQ_OK) {
+        moq_pub_retained_group_cfg_t gc;
+        moq_pub_retained_group_cfg_init(&gc);
+        gc.group_id = g;
+        gc.objects = objs;
+        gc.object_count = n;
+        rc = moq_pub_set_retained_group(pub, t, &gc);
+    }
+    for (size_t i = 0; i < 16; i++)
+        if (pl[i]) moq_rcbuf_decref(pl[i]);
+    return rc;
+}
+
+/* windows_setup with every prerequisite checked; every output starts NULL.
+ * Returns false, with whatever was created left for hist_rig_teardown, when
+ * any step fails. */
+static bool hist_rig_setup(moq_version_t ver, test_alloc_state_t *as,
+                           moq_alloc_t *alloc, moq_simpair_t **sp,
+                           moq_publisher_t **pub, moq_pub_track_t **track)
+{
+    *sp = NULL; *pub = NULL; *track = NULL;
+    *as = (test_alloc_state_t){0};
+    *alloc = test_allocator(as);
+    moq_simpair_cfg_t cfg = MOQ_SIMPAIR_CFG_INIT;
+    cfg.alloc = alloc;
+    cfg.seed = 42;
+    cfg.initial_now_us = 1000;
+    cfg.client_send_request_capacity = true;
+    cfg.client_initial_request_capacity = 16;
+    cfg.server_send_request_capacity = true;
+    cfg.server_initial_request_capacity = 16;
+    cfg.version = ver;
+    if (moq_simpair_create(&cfg, sp) != MOQ_OK || !*sp) return false;
+    if (moq_simpair_start(*sp) != MOQ_OK) return false;
+    moq_simpair_run_until_quiescent(*sp, 8, NULL);
+    drain_all(*sp);
+    moq_pub_cfg_t cfg2; moq_pub_cfg_init_sized(&cfg2, sizeof(cfg2));
+    cfg2.accept_mode = MOQ_PUB_ACCEPT_ALL;
+    if (moq_pub_create(moq_simpair_server(*sp), alloc, &cfg2, pub) != MOQ_OK ||
+        !*pub)
+        return false;
+    moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("live") };
+    moq_pub_track_cfg_t tcfg; moq_pub_track_cfg_init(&tcfg);
+    tcfg.track_namespace.parts = ns_parts;
+    tcfg.track_namespace.count = 1;
+    tcfg.track_name = MOQ_BYTES_LITERAL("video");
+    return moq_pub_add_track(*pub, &tcfg, moq_simpair_now_us(*sp), track) ==
+               MOQ_OK && *track;
+}
+
+static void hist_rig_teardown(test_alloc_state_t *as, moq_simpair_t *sp,
+                              moq_publisher_t *pub)
+{
+    if (pub) moq_pub_destroy(pub);
+    if (sp) {
+        drain_all(sp);
+        moq_simpair_destroy(sp);
+    }
+    MOQ_TEST_CHECK(as->balance == 0);
+}
+
+/* Checked setup inside a row: on failure, record it, release what exists and
+ * leave the row. */
+#define HIST_RIG_OR_RETURN(ver) do { \
+    if (!hist_rig_setup((ver), &as, &alloc, &sp, &pub, &track)) { \
+        MOQ_TEST_CHECK(false); \
+        hist_rig_teardown(&as, sp, pub); \
+        return; \
+    } \
+} while (0)
+
+/* A status datagram at {g,o}. */
+static moq_result_t hist_status(moq_publisher_t *pub, moq_pub_track_t *t,
+                                moq_simpair_t *sp, uint64_t g, uint64_t o,
+                                moq_object_status_t status)
+{
+    moq_pub_object_cfg_t oc;
+    moq_pub_object_cfg_init(&oc);
+    oc.group_id = g; oc.object_id = o; oc.datagram = true;
+    oc.has_status = true; oc.status = status;
+    moq_result_t rc = moq_pub_write_object_ex(pub, t, &oc,
+                                              moq_simpair_now_us(sp));
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    return rc;
+}
+
+/* Every Object keeps the (Group, Subgroup ID, delivery mode) it was assigned
+ * at admission (draft-22 sections 2.1 and 7.1; draft-18 2.1; draft-16 2.4),
+ * and nothing is assigned above a group's final Object (draft-22 section
+ * 12.1, draft-16 section 2.4.2). Each refusal is before any effect; the
+ * subscriber never sees a malformed track. 16 groups, so no record is
+ * displaced. */
+static void test_hist_identity_rules(moq_version_t ver)
+{
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *track;
+    HIST_RIG_OR_RETURN(ver);
+    const bool has_bit = ver != MOQ_VERSION_DRAFT_16;
+    uint64_t now = moq_simpair_now_us(sp);
+    windows_subscribe(sp, pub, MOQ_SUBSCRIBE_FILTER_NONE, 0, 0, 0);
+    drain_all(sp);
+    int ended = 0;
+    bool f = false;
+    uint64_t sgid = UINT64_MAX;
+
+    /* Delivery mode: a known Object never changes it. */
+    MOQ_TEST_CHECK(windows_write_dg(pub, track, &alloc, sp, 7, 0, 0xB0)
+                   == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)declare_write_stream(pub, track, &alloc, sp,
+                              7, 0, 0xB1), (int)MOQ_ERR_WRONG_STATE);
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 8, 0, 0xB2)
+                   == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)windows_write_dg(pub, track, &alloc, sp, 8, 0,
+                              0xB3), (int)MOQ_ERR_WRONG_STATE);
+    (void)fo_seen(sp, 8, 0, NULL, NULL, &ended);
+
+    /* An END_OF_GROUP status at B: nothing at or above B, either mode. */
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 9, 0, 0xB4)
+                   == MOQ_OK);
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 9, 1, 0xB5)
+                   == MOQ_OK);
+    MOQ_TEST_CHECK(hist_status(pub, track, sp, 9, 2, MOQ_OBJECT_END_OF_GROUP)
+                   == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)declare_write_stream(pub, track, &alloc, sp,
+                              9, 2, 0xB6), (int)MOQ_ERR_WRONG_STATE);
+    MOQ_TEST_CHECK_EQ_INT((int)declare_write_stream(pub, track, &alloc, sp,
+                              9, 5, 0xB7), (int)MOQ_ERR_WRONG_STATE);
+    MOQ_TEST_CHECK_EQ_INT((int)windows_write_dg(pub, track, &alloc, sp, 9, 3,
+                              0xB8), (int)MOQ_ERR_WRONG_STATE);
+    MOQ_TEST_CHECK_EQ_INT(fo_seen(sp, 9, 5, NULL, NULL, &ended), 0);
+
+    /* END_OF_GROUP header on several Objects, then a clean FIN when the
+     * track moves on: Object 1 is the group's final, so even a revisit
+     * above every assigned Object is refused. */
+    MOQ_TEST_CHECK(mono_write_stream_eog(pub, track, &alloc, sp, 10, 0, true,
+                                         0xB9) == MOQ_OK);
+    MOQ_TEST_CHECK(mono_write_stream_eog(pub, track, &alloc, sp, 10, 1, true,
+                                         0xBA) == MOQ_OK);
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 11, 0, 0xBB)
+                   == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)declare_write_stream(pub, track, &alloc, sp,
+                              10, 2, 0xBC), (int)MOQ_ERR_WRONG_STATE);
+    MOQ_TEST_CHECK_EQ_INT(fo_seen(sp, 10, 2, NULL, NULL, &ended), 0);
+    /* A RESET fixes no final: the group continues in a fresh subgroup. */
+    MOQ_TEST_CHECK(mono_write_stream_eog(pub, track, &alloc, sp, 12, 0, true,
+                                         0xBD) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_pub_reset_group(pub, track, 0x10, now) == MOQ_OK);
+    MOQ_TEST_CHECK(mono_write_stream_eog(pub, track, &alloc, sp, 12, 1, false,
+                                         0xBE) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(fo_seen(sp, 12, 1, &f, &sgid, &ended), 1);
+    MOQ_TEST_CHECK(f == has_bit);
+    MOQ_TEST_CHECK_EQ_U64(sgid, 1);
+
+    /* After a RESET the group's Objects keep their assignments: an
+     * admitted Object cannot be assigned again, a larger one opens the next
+     * subgroup. */
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 13, 0, 0xC0)
+                   == MOQ_OK);
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 13, 1, 0xC1)
+                   == MOQ_OK);
+    MOQ_TEST_CHECK(moq_pub_reset_group(pub, track, 0x10, now) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)declare_write_stream(pub, track, &alloc, sp,
+                              13, 1, 0xC2), (int)MOQ_ERR_WRONG_STATE);
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 13, 2, 0xC3)
+                   == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(fo_seen(sp, 13, 2, &f, &sgid, &ended), 1);
+    MOQ_TEST_CHECK(f == has_bit);
+    MOQ_TEST_CHECK_EQ_U64(sgid, 1);
+
+    /* end_group seals the group for every admission path. */
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 14, 0, 0xC4)
+                   == MOQ_OK);
+    MOQ_TEST_CHECK(moq_pub_end_group(pub, track, now) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)declare_write_stream(pub, track, &alloc, sp,
+                              14, 1, 0xC5), (int)MOQ_ERR_WRONG_STATE);
+    MOQ_TEST_CHECK_EQ_INT((int)windows_write_dg(pub, track, &alloc, sp, 14, 5,
+                              0xC6), (int)MOQ_ERR_WRONG_STATE);
+    MOQ_TEST_CHECK_EQ_INT((int)hist_install(pub, track, &alloc, 14, 1),
+                          (int)MOQ_ERR_WRONG_STATE);
+
+    /* Retained installs never create a new identity inside a group's
+     * history: a gap, a revisited group and a datagram group are refused. */
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 20, 0, 0xC7)
+                   == MOQ_OK);
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 20, 3, 0xC8)
+                   == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)hist_install(pub, track, &alloc, 20, 4),
+                          (int)MOQ_ERR_WRONG_STATE);
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 21, 0, 0xC9)
+                   == MOQ_OK);
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 22, 0, 0xCA)
+                   == MOQ_OK);
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 21, 1, 0xCB)
+                   == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)hist_install(pub, track, &alloc, 21, 2),
+                          (int)MOQ_ERR_WRONG_STATE);
+    MOQ_TEST_CHECK(windows_write_dg(pub, track, &alloc, sp, 23, 0, 0xCC)
+                   == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)hist_install(pub, track, &alloc, 23, 1),
+                          (int)MOQ_ERR_WRONG_STATE);
+
+    /* A subgroup that ended with a FIN when the track moved on takes no
+     * extension; replaying its unchanged prefix is allowed. */
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 24, 0, HIST_TAG(0))
+                   == MOQ_OK);
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 25, 0, 0xCE)
+                   == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)hist_install(pub, track, &alloc, 24, 2),
+                          (int)MOQ_ERR_WRONG_STATE);
+    MOQ_TEST_CHECK(hist_install(pub, track, &alloc, 24, 1) == MOQ_OK);
+    /* While no stream of the current subgroup has ended, an extension is
+     * allowed. */
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 27, 0, HIST_TAG(0))
+                   == MOQ_OK);
+    MOQ_TEST_CHECK(hist_install(pub, track, &alloc, 27, 2) == MOQ_OK);
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 26, 0, HIST_TAG(0))
+                   == MOQ_OK);
+    (void)fo_seen(sp, 26, 0, NULL, NULL, &ended);
+    MOQ_TEST_CHECK_EQ_INT(ended, 0);
+
+    /* One destination's clean FIN, with the track still in the group,
+     * fixes the subgroup's final for that receiver: no extension. */
+    MOQ_TEST_CHECK(moq_pub_finish_subscribers(pub, track,
+                       MOQ_PUB_DONE_TRACK_ENDED, now) == MOQ_OK);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    MOQ_TEST_CHECK_EQ_INT((int)hist_install(pub, track, &alloc, 26, 2),
+                          (int)MOQ_ERR_WRONG_STATE);
+    MOQ_TEST_CHECK(hist_install(pub, track, &alloc, 26, 1) == MOQ_OK);
+
+    moq_pub_destroy(pub);
+    drain_all(sp);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+    MOQ_TEST_PASS(ver == MOQ_VERSION_DRAFT_22 ? "hist_identity_rules_d22"
+                  : ver == MOQ_VERSION_DRAFT_18 ? "hist_identity_rules_d18"
+                  : "hist_identity_rules_d16");
+}
+
+/* A standalone FETCH on draft-16; counts the objects served (with the
+ * largest Subgroup ID seen) and the code of a refusal, if any: a
+ * REQUEST_ERROR on the wire, surfaced locally as MOQ_EVENT_FETCH_ERROR. */
+static void hist_d16_fetch(moq_simpair_t *sp, moq_publisher_t *pub,
+                           uint64_t g, uint64_t end_object, int *nobj,
+                           uint64_t *sg_max, bool *complete, uint64_t *err)
+{
+    moq_session_t *cl = moq_simpair_client(sp);
+    moq_session_t *sv = moq_simpair_server(sp);
+    uint64_t now = moq_simpair_now_us(sp);
+    moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("live") };
+    moq_fetch_cfg_t fcfg; moq_fetch_cfg_init(&fcfg);
+    fcfg.track_namespace.parts = ns_parts;
+    fcfg.track_namespace.count = 1;
+    fcfg.track_name = MOQ_BYTES_LITERAL("video");
+    fcfg.start_group = g; fcfg.start_object = 0;
+    fcfg.end_group = g; fcfg.end_object = end_object;
+    moq_fetch_t fh;
+    MOQ_TEST_CHECK(moq_session_fetch(cl, &fcfg, now, &fh) == MOQ_OK);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    manual_forward(pub, sv, now, 0, NULL, NULL);
+    MOQ_TEST_CHECK(moq_pub_tick(pub, now) == MOQ_OK);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    *nobj = 0; *sg_max = 0; *complete = false; *err = UINT64_MAX;
+    moq_event_t d[16]; size_t ne;
+    while ((ne = moq_session_poll_events(cl, d, 16)) > 0)
+        for (size_t i = 0; i < ne; i++) {
+            if (d[i].kind == MOQ_EVENT_FETCH_OBJECT) {
+                (*nobj)++;
+                if (d[i].u.fetch_object.subgroup_id > *sg_max)
+                    *sg_max = d[i].u.fetch_object.subgroup_id;
+            } else if (d[i].kind == MOQ_EVENT_FETCH_COMPLETE) {
+                *complete = true;
+            } else if (d[i].kind == MOQ_EVENT_FETCH_ERROR) {
+                *err = d[i].u.fetch_error.error_code;
+            }
+            moq_event_cleanup(&d[i]);
+        }
+}
+
+/* Draft-16: the last Object sent in a FETCH that requested the entire Group
+ * is the Group's final Object (draft-16 section 2.4.2, condition 7). Such a
+ * FETCH is answered from the retained Objects only when nothing above them
+ * was assigned -- otherwise with REQUEST_ERROR NOT_SUPPORTED (0x3), the
+ * session staying open -- and once staged it refuses later Objects above
+ * them; a FETCH for an exact range fixes nothing. */
+static void test_hist_d16_whole_group_fetch(void)
+{
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *track;
+    HIST_RIG_OR_RETURN(MOQ_VERSION_DRAFT_16);
+    int n = 0; uint64_t sgm = 0, err = 0; bool done = false;
+
+    MOQ_TEST_CHECK(hist_install(pub, track, &alloc, 0, 2) == MOQ_OK);
+    /* Exact range 0..1 (End Location {0, 2}): served, nothing fixed. */
+    hist_d16_fetch(sp, pub, 0, 2, &n, &sgm, &done, &err);
+    MOQ_TEST_CHECK_EQ_INT(n, 2);
+    MOQ_TEST_CHECK_EQ_U64(sgm, 0);
+    MOQ_TEST_CHECK(done);
+    /* Entire group 0: served, and Object 1 is now its final. */
+    hist_d16_fetch(sp, pub, 0, 0, &n, &sgm, &done, &err);
+    MOQ_TEST_CHECK_EQ_INT(n, 2);
+    MOQ_TEST_CHECK(done);
+    MOQ_TEST_CHECK_EQ_INT((int)declare_write_stream(pub, track, &alloc, sp,
+                              0, 2, 0xD1), (int)MOQ_ERR_WRONG_STATE);
+
+    /* Group 5: retained 0..1, then live Object 2 admitted. The entire group
+     * cannot be answered from the cache; the refusal leaves history as it
+     * was, so the group still continues. */
+    MOQ_TEST_CHECK(hist_install(pub, track, &alloc, 5, 2) == MOQ_OK);
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 5, 2, 0xD2)
+                   == MOQ_OK);
+    hist_d16_fetch(sp, pub, 5, 0, &n, &sgm, &done, &err);
+    MOQ_TEST_CHECK_EQ_INT(n, 0);
+    MOQ_TEST_CHECK(!done);
+    MOQ_TEST_CHECK_EQ_U64(err, MOQ_REQUEST_ERROR_NOT_SUPPORTED);
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 5, 3, 0xD3)
+                   == MOQ_OK);
+
+    moq_pub_destroy(pub);
+    drain_all(sp);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+    MOQ_TEST_PASS("hist_d16_whole_group_fetch");
+}
+
+/* Count the client's SUBGROUP_FINISHED and SUBGROUP_RESET for group g; every
+ * other event is dropped. */
+static void hist_stream_ends(moq_simpair_t *sp, uint64_t g, int *fins,
+                             int *resets)
+{
+    moq_event_t ev;
+    for (int round = 0; round < 4; round++) {
+        moq_simpair_run_until_quiescent(sp, 32, NULL);
+        while (moq_session_poll_events(moq_simpair_client(sp), &ev, 1) == 1) {
+            if (ev.kind == MOQ_EVENT_SUBGROUP_FINISHED &&
+                ev.u.subgroup_finished.group_id == g) (*fins)++;
+            if (ev.kind == MOQ_EVENT_SUBGROUP_RESET &&
+                ev.u.subgroup_reset.group_id == g) (*resets)++;
+            moq_event_cleanup(&ev);
+        }
+    }
+}
+
+/* A destination's stream ends with a FIN only when it carried every Object of
+ * its subgroup except those below its Start Location; otherwise it is RESET
+ * (draft-22 section 11.3.2; draft-18 and draft-16 the same).
+ *   case 0: retained 0..10 installed, then live Object 0 on a destination
+ *           whose window admits 0..10: the switch to another group RESETs
+ *           (Objects 1..10 are assigned to its subgroup but never sent).
+ *   case 1: complete delivery: the switch FINs.
+ *   case 2: Object 0 lies below the destination's Start Location {40, 1}:
+ *           it is exempt, so the stream that carried Object 1 FINs. */
+static void hist_close_case(moq_version_t ver, int c)
+{
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *track;
+    HIST_RIG_OR_RETURN(ver);
+    const bool has_bit = ver != MOQ_VERSION_DRAFT_16;
+    int ended = 0, fins = 0, resets = 0;
+    bool f = false;
+    uint64_t sgid = UINT64_MAX;
+
+    if (c == 0) {
+        MOQ_TEST_CHECK(hist_install(pub, track, &alloc, 30, 11) == MOQ_OK);
+        windows_subscribe(sp, pub, MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START,
+                          30, 0, 0);
+        drain_all(sp);
+        /* Object 0 of the retained-origin subgroup: this stream begins the
+         * subgroup, so it carries FIRST_OBJECT. */
+        MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 30, 0,
+                                            HIST_TAG(0)) == MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT(fo_seen(sp, 30, 0, &f, &sgid, &ended), 1);
+        MOQ_TEST_CHECK(f == has_bit);
+        MOQ_TEST_CHECK_EQ_U64(sgid, 0);
+        MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 31, 0,
+                                            0xD5) == MOQ_OK);
+        hist_stream_ends(sp, 30, &fins, &resets);
+        MOQ_TEST_CHECK_EQ_INT(fins, 0);
+        MOQ_TEST_CHECK_EQ_INT(resets, 1);
+    } else if (c == 1) {
+        windows_subscribe(sp, pub, MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START,
+                          30, 0, 0);
+        drain_all(sp);
+        MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 30, 0,
+                                            0xD6) == MOQ_OK);
+        MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 30, 1,
+                                            0xD7) == MOQ_OK);
+        MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 31, 0,
+                                            0xD8) == MOQ_OK);
+        hist_stream_ends(sp, 30, &fins, &resets);
+        MOQ_TEST_CHECK_EQ_INT(fins, 1);
+        MOQ_TEST_CHECK_EQ_INT(resets, 0);
+    } else {
+        windows_subscribe(sp, pub, MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START,
+                          40, 1, 0);
+        drain_all(sp);
+        MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 40, 0,
+                                            0xD9) == MOQ_OK);
+        MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 40, 1,
+                                            0xDA) == MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT(fo_seen(sp, 40, 1, &f, &sgid, &ended), 1);
+        MOQ_TEST_CHECK(!f);   /* starts mid-subgroup */
+        MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 41, 0,
+                                            0xDB) == MOQ_OK);
+        hist_stream_ends(sp, 40, &fins, &resets);
+        MOQ_TEST_CHECK_EQ_INT(fins, 1);
+        MOQ_TEST_CHECK_EQ_INT(resets, 0);
+    }
+    MOQ_TEST_CHECK_EQ_INT(ended, 0);
+
+    moq_pub_destroy(pub);
+    drain_all(sp);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+}
+
+static void test_hist_destination_close(moq_version_t ver)
+{
+    hist_close_case(ver, 0);
+    hist_close_case(ver, 1);
+    hist_close_case(ver, 2);
+    MOQ_TEST_PASS(ver == MOQ_VERSION_DRAFT_22 ? "hist_destination_close_d22"
+                  : ver == MOQ_VERSION_DRAFT_18 ? "hist_destination_close_d18"
+                  : "hist_destination_close_d16");
+}
+
+/* An admitted END_OF_TRACK status at {50, 3}: nothing at or beyond that
+ * Location is admitted afterwards, stream or datagram (draft-22 section
+ * 12.1, condition 5), on a plain track with no destinations. */
+static void test_hist_end_of_track_status(moq_version_t ver)
+{
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *track;
+    HIST_RIG_OR_RETURN(ver);
+
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 50, 0, 0xDC)
+                   == MOQ_OK);
+    MOQ_TEST_CHECK(hist_status(pub, track, sp, 50, 3, MOQ_OBJECT_END_OF_TRACK)
+                   == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)declare_write_stream(pub, track, &alloc, sp,
+                              50, 3, 0xDD), (int)MOQ_ERR_WRONG_STATE);
+    MOQ_TEST_CHECK_EQ_INT((int)declare_write_stream(pub, track, &alloc, sp,
+                              51, 0, 0xDE), (int)MOQ_ERR_WRONG_STATE);
+    MOQ_TEST_CHECK_EQ_INT((int)windows_write_dg(pub, track, &alloc, sp, 50, 4,
+                              0xDF), (int)MOQ_ERR_WRONG_STATE);
+    MOQ_TEST_CHECK_EQ_INT((int)windows_write_dg(pub, track, &alloc, sp, 60, 0,
+                              0xE0), (int)MOQ_ERR_WRONG_STATE);
+    {
+        moq_pub_begin_object_cfg_t bc;
+        moq_pub_begin_object_cfg_init_sized(&bc, sizeof(bc));
+        bc.group_id = 52; bc.object_id = 0; bc.payload_length = 2;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_pub_begin_object(pub, track, &bc,
+                                  moq_simpair_now_us(sp)),
+                              (int)MOQ_ERR_WRONG_STATE);
+    }
+    MOQ_TEST_CHECK_EQ_INT((int)hist_install(pub, track, &alloc, 53, 1),
+                          (int)MOQ_ERR_WRONG_STATE);
+
+    moq_pub_destroy(pub);
+    drain_all(sp);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+    MOQ_TEST_PASS(ver == MOQ_VERSION_DRAFT_22 ? "hist_end_of_track_status_d22"
+                  : ver == MOQ_VERSION_DRAFT_18 ? "hist_end_of_track_status_d18"
+                  : "hist_end_of_track_status_d16");
+}
+
+/* Boundary rows for the stream-record bounds, with no destinations (the
+ * bookkeeping is the same either way): 16 records (16 and 17 groups), at
+ * most 15 revisited groups (15 and 16), at most 7 revisits per group (8 and
+ * 9 subgroups), the rolling victim (including the group the track just
+ * left) and exact per-group maxima. Sealed-run capacity and datagram-only
+ * records are not covered here. Same on every draft. */
+static void test_hist_capacity_sweep(moq_version_t ver)
+{
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *track;
+    HIST_RIG_OR_RETURN(ver);
+#define HW(g, o) ((int)declare_write_stream(pub, track, &alloc, sp, (g), (o), 0x77))
+
+    /* Sixteen groups fill the records; the seventeenth displaces group 0. */
+    for (uint64_t g = 0; g < 16; g++)
+        MOQ_TEST_CHECK_EQ_INT(HW(g, 0), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(HW(16, 0), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(HW(0, 1), (int)MOQ_ERR_WRONG_STATE);
+    MOQ_TEST_CHECK_EQ_INT(HW(0, 0), (int)MOQ_ERR_WRONG_STATE);
+
+    /* Groups 1..15 revisited: fifteen revisited groups. */
+    for (uint64_t g = 1; g <= 15; g++)
+        MOQ_TEST_CHECK_EQ_INT(HW(g, 1), (int)MOQ_OK);
+    /* A sixteenth is refused, and changes nothing. */
+    MOQ_TEST_CHECK_EQ_INT(HW(16, 1), (int)MOQ_ERR_NOMEM);
+    MOQ_TEST_CHECK_EQ_INT(HW(16, 1), (int)MOQ_ERR_NOMEM);
+
+    /* One record rolls: a new group displaces 16, then the next new group
+     * displaces 17, the group the track just left. */
+    MOQ_TEST_CHECK_EQ_INT(HW(17, 0), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(HW(16, 1), (int)MOQ_ERR_WRONG_STATE);
+    MOQ_TEST_CHECK_EQ_INT(HW(18, 0), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(HW(17, 1), (int)MOQ_ERR_WRONG_STATE);
+
+    /* Seven revisits per group: groups 1 and 2 (each at Subgroup 1)
+     * alternate up to Subgroup 7; an eighth revisit of group 1 is refused. */
+    for (uint64_t k = 2; k <= 7; k++) {
+        MOQ_TEST_CHECK_EQ_INT(HW(1, k), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT(HW(2, k), (int)MOQ_OK);
+    }
+    MOQ_TEST_CHECK_EQ_INT(HW(1, 8), (int)MOQ_ERR_NOMEM);
+
+    /* Revisits stay exact per group: at or below the group's largest
+     * Object is refused, above it admitted, with no coupling to other
+     * groups. */
+    MOQ_TEST_CHECK_EQ_INT(HW(3, 1), (int)MOQ_ERR_WRONG_STATE);
+    MOQ_TEST_CHECK_EQ_INT(HW(3, 100), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(HW(4, 2), (int)MOQ_OK);
+#undef HW
+
+    moq_pub_destroy(pub);
+    drain_all(sp);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+    MOQ_TEST_PASS(ver == MOQ_VERSION_DRAFT_22 ? "hist_capacity_sweep_d22"
+                  : ver == MOQ_VERSION_DRAFT_18 ? "hist_capacity_sweep_d18"
+                  : "hist_capacity_sweep_d16");
+}
+
+/* Draft-22 subscription with an inclusive end Object, accepted by the
+ * facade. */
+static void hist_subscribe_object_end(moq_simpair_t *sp, moq_publisher_t *pub,
+                                      uint64_t sg, uint64_t so,
+                                      uint64_t eg, uint64_t eo)
+{
+    moq_session_t *cl = moq_simpair_client(sp);
+    moq_session_t *sv = moq_simpair_server(sp);
+    moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("live") };
+    moq_location_filter_cfg_t loc;
+    moq_location_filter_cfg_init_sized(&loc, sizeof(loc));
+    loc.kind = MOQ_LOCATION_FILTER_OBJECT_END;
+    loc.start_group = sg; loc.start_object = so;
+    loc.end_group = eg; loc.end_object = eo;
+    moq_subscribe_cfg_t scfg; moq_subscribe_cfg_init(&scfg);
+    scfg.track_namespace.parts = ns_parts;
+    scfg.track_namespace.count = 1;
+    scfg.track_name = MOQ_BYTES_LITERAL("video");
+    scfg.location = &loc;
+    moq_subscription_t h;
+    MOQ_TEST_CHECK(moq_session_subscribe(cl, &scfg, moq_simpair_now_us(sp), &h)
+                   == MOQ_OK);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    manual_forward(pub, sv, moq_simpair_now_us(sp), 0, NULL, NULL);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    drain_all(sp);
+}
+
+/* Subgroup completeness on draft-22 windows with an end Object. Only Objects
+ * below the Start Location are exempt from completeness (draft-22 section
+ * 11.3.2); an Object past the window's end is never delivered, and a stream
+ * that ends without it ends with a RESET.
+ *   case 0: window {30,0}..{30,1}; Objects 0..2 assigned; end_group: RESET.
+ *   case 1: window {30,0}..{30,2}; the same Objects all delivered: FIN.
+ *   case 2: window {30,1}..{30,5}; Object 0 is below Start: FIN.
+ *   case 3: as case 0, then seventeen later groups displace group 30's
+ *           record before the close: the omission recorded before the
+ *           displacement still gives RESET. */
+static void hist_end_window_case(int c)
+{
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *track;
+    HIST_RIG_OR_RETURN(MOQ_VERSION_DRAFT_22);
+    int ended = 0, fins = 0, resets = 0;
+    uint64_t now = moq_simpair_now_us(sp);
+
+    if (c == 1) hist_subscribe_object_end(sp, pub, 30, 0, 30, 2);
+    else if (c == 2) hist_subscribe_object_end(sp, pub, 30, 1, 30, 5);
+    else hist_subscribe_object_end(sp, pub, 30, 0, 30, 1);
+
+    for (uint64_t o = 0; o <= 2; o++)
+        MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 30, o,
+                                            (uint8_t)(0x60 + o)) == MOQ_OK);
+    /* Delivery stays window-bound. */
+    MOQ_TEST_CHECK_EQ_INT(fo_seen(sp, 30, 2, NULL, NULL, &ended),
+                          c == 1 || c == 2 ? 1 : 0);
+    if (c == 3)
+        for (uint64_t g = 31; g <= 47; g++)
+            MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, g, 0,
+                                                0x70) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_pub_end_group(pub, track, now) == MOQ_OK);
+    hist_stream_ends(sp, 30, &fins, &resets);
+    if (c == 1 || c == 2) {
+        MOQ_TEST_CHECK_EQ_INT(fins, 1);
+        MOQ_TEST_CHECK_EQ_INT(resets, 0);
+    } else {
+        MOQ_TEST_CHECK_EQ_INT(fins, 0);
+        MOQ_TEST_CHECK_EQ_INT(resets, 1);
+    }
+    MOQ_TEST_CHECK_EQ_INT(ended, 0);
+
+    moq_pub_destroy(pub);
+    drain_all(sp);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+}
+
+static void test_hist_end_window_completeness(void)
+{
+    for (int c = 0; c < 4; c++) hist_end_window_case(c);
+    MOQ_TEST_PASS("hist_end_window_completeness_d22");
+}
+
+/* FETCH staging boundaries. The allocator wrapper can, while armed, count
+ * the allocations made (mode 1) or fail the first of them (mode 2),
+ * recording the size of the first one either way, so a run shows exactly
+ * which allocation a staging made or lost. */
+static int    hist_alloc_mode;          /* 0 off, 1 count, 2 fail the first */
+static int    hist_stage_allocs;        /* allocations while armed */
+static size_t hist_stage_first_size;    /* size of the first of them */
+static int    hist_failed_allocs;       /* allocations failed while armed */
+static void *hist_failing_alloc(size_t n, void *ctx)
+{
+    if (hist_alloc_mode) {
+        if (hist_stage_allocs++ == 0) hist_stage_first_size = n;
+        if (hist_alloc_mode == 2 && hist_stage_allocs == 1) {
+            hist_failed_allocs++;
+            return NULL;
+        }
+    }
+    return test_alloc(n, ctx);
+}
+
+static void hist_alloc_arm(int mode)
+{
+    hist_alloc_mode = mode;
+    hist_stage_allocs = 0;
+    hist_stage_first_size = 0;
+    hist_failed_allocs = 0;
+}
+
+/* Pair, publisher and track on `ver`; every output starts NULL. Returns
+ * false, with whatever was created left in the outputs for
+ * hist_fetch_teardown, when any prerequisite fails. */
+static bool hist_fetch_setup(moq_version_t ver, test_alloc_state_t *as,
+                             moq_alloc_t *alloc, moq_simpair_t **sp,
+                             uint32_t max_actions, moq_publisher_t **pub,
+                             moq_pub_track_t **track)
+{
+    *sp = NULL; *pub = NULL; *track = NULL;
+    *as = (test_alloc_state_t){0};
+    *alloc = test_allocator(as);
+    alloc->alloc = hist_failing_alloc;
+    hist_alloc_arm(0);
+    moq_simpair_cfg_t cfg = MOQ_SIMPAIR_CFG_INIT;
+    cfg.alloc = alloc;
+    cfg.seed = 42;
+    cfg.initial_now_us = 1000;
+    cfg.max_actions = max_actions;
+    cfg.client_send_request_capacity = true;
+    cfg.client_initial_request_capacity = 16;
+    cfg.server_send_request_capacity = true;
+    cfg.server_initial_request_capacity = 16;
+    cfg.version = ver;
+    if (moq_simpair_create(&cfg, sp) != MOQ_OK || !*sp) return false;
+    if (moq_simpair_start(*sp) != MOQ_OK) return false;
+    moq_simpair_run_until_quiescent(*sp, 8, NULL);
+    drain_all(*sp);
+    moq_pub_cfg_t cfg2; moq_pub_cfg_init_sized(&cfg2, sizeof(cfg2));
+    cfg2.accept_mode = MOQ_PUB_ACCEPT_ALL;
+    if (moq_pub_create(moq_simpair_server(*sp), alloc, &cfg2, pub) != MOQ_OK ||
+        !*pub)
+        return false;
+    moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("live") };
+    moq_pub_track_cfg_t tcfg; moq_pub_track_cfg_init(&tcfg);
+    tcfg.track_namespace.parts = ns_parts;
+    tcfg.track_namespace.count = 1;
+    tcfg.track_name = MOQ_BYTES_LITERAL("video");
+    return moq_pub_add_track(*pub, &tcfg, moq_simpair_now_us(*sp), track) ==
+               MOQ_OK && *track;
+}
+
+static void hist_fetch_teardown(test_alloc_state_t *as, moq_simpair_t *sp,
+                                moq_publisher_t *pub)
+{
+    hist_alloc_arm(0);
+    if (pub) moq_pub_destroy(pub);
+    if (sp) {
+        drain_all(sp);
+        moq_simpair_destroy(sp);
+    }
+    MOQ_TEST_CHECK(as->balance == 0);
+}
+
+/* Client side of a standalone FETCH of group `g` from Object 0 to End
+ * Location {g, end_object} (0: the whole group); the request reaches the
+ * server, which has not handled it yet. */
+static bool hist_fetch_request(moq_simpair_t *sp, uint64_t g,
+                               uint64_t end_object, moq_fetch_t *fh)
+{
+    moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("live") };
+    moq_fetch_cfg_t fcfg; moq_fetch_cfg_init(&fcfg);
+    fcfg.track_namespace.parts = ns_parts;
+    fcfg.track_namespace.count = 1;
+    fcfg.track_name = MOQ_BYTES_LITERAL("video");
+    fcfg.start_group = g; fcfg.start_object = 0;
+    fcfg.end_group = g; fcfg.end_object = end_object;
+    moq_result_t rc = moq_session_fetch(moq_simpair_client(sp), &fcfg,
+                                        moq_simpair_now_us(sp), fh);
+    MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    return rc == MOQ_OK;
+}
+
+/* Hand the server's pending FETCH_REQUEST to the facade; its result. */
+static moq_result_t hist_fetch_stage(moq_simpair_t *sp, moq_publisher_t *pub)
+{
+    moq_session_t *sv = moq_simpair_server(sp);
+    moq_result_t rc = MOQ_ERR_INVAL;
+    moq_event_t ev;
+    while (moq_session_poll_events(sv, &ev, 1) == 1) {
+        if (ev.kind == MOQ_EVENT_FETCH_REQUEST) {
+            moq_pub_event_result_t res = MOQ_PUB_EVENT_IGNORED;
+            rc = moq_pub_handle_event(pub, &ev, moq_simpair_now_us(sp), &res);
+            MOQ_TEST_CHECK(res == MOQ_PUB_EVENT_CONSUMED);
+        }
+        moq_event_cleanup(&ev);
+    }
+    return rc;
+}
+
+/* What the client saw for FETCH `fh`: FETCH_OK, objects, completion, and a
+ * refusal -- a REQUEST_ERROR on the wire, the local event FETCH_ERROR --
+ * with its code. Events for other handles are counted as strays. */
+typedef struct {
+    int      oks, nobj, completes, errors, strays;
+    uint64_t err;
+} hist_fetch_seen_t;
+
+/* A bounded drive -- eight flush rounds, each running the pair to
+ * quiescence -- that collects the outcome. It injects no backpressure: a row
+ * that needs a blocked response arranges it itself. */
+static void hist_fetch_settle(moq_simpair_t *sp, moq_publisher_t *pub,
+                              moq_fetch_t fh, hist_fetch_seen_t *o)
+{
+    memset(o, 0, sizeof(*o));
+    o->err = UINT64_MAX;
+    for (int round = 0; round < 8; round++) {
+        (void)moq_pub_flush(pub, moq_simpair_now_us(sp));
+        moq_simpair_run_until_quiescent(sp, 8, NULL);
+        moq_event_t ev;
+        while (moq_session_poll_events(moq_simpair_client(sp), &ev, 1) == 1) {
+            moq_fetch_t h = MOQ_FETCH_INVALID;
+            if (ev.kind == MOQ_EVENT_FETCH_OK) h = ev.u.fetch_ok.fetch;
+            if (ev.kind == MOQ_EVENT_FETCH_OBJECT) h = ev.u.fetch_object.fetch;
+            if (ev.kind == MOQ_EVENT_FETCH_COMPLETE) h = ev.u.fetch_complete.fetch;
+            if (ev.kind == MOQ_EVENT_FETCH_ERROR) h = ev.u.fetch_error.fetch;
+            if (moq_fetch_is_valid(h)) {
+                if (!moq_fetch_eq(h, fh)) o->strays++;
+                else if (ev.kind == MOQ_EVENT_FETCH_OK) o->oks++;
+                else if (ev.kind == MOQ_EVENT_FETCH_OBJECT) o->nobj++;
+                else if (ev.kind == MOQ_EVENT_FETCH_COMPLETE) o->completes++;
+                else {
+                    o->errors++;
+                    o->err = ev.u.fetch_error.error_code;
+                }
+            }
+            MOQ_TEST_CHECK(ev.kind != MOQ_EVENT_SESSION_CLOSED);
+            moq_event_cleanup(&ev);
+        }
+    }
+}
+
+static bool hist_fetch_sessions_alive(moq_simpair_t *sp)
+{
+    return moq_session_state(moq_simpair_client(sp)) == MOQ_SESS_ESTABLISHED &&
+           moq_session_state(moq_simpair_server(sp)) == MOQ_SESS_ESTABLISHED;
+}
+
+/* A staging whose snapshot cannot be allocated refuses that exact request
+ * with REQUEST_ERROR INTERNAL_ERROR (code 0) and nothing else: no FETCH_OK,
+ * no Object, no completion, both sessions alive, every allocation balanced.
+ * The refusal is decided by the facade's refusal flag, never by the code,
+ * which is zero. The failed allocation is shown to be the snapshot: it has
+ * the size of the first allocation a successful staging of the same
+ * retained group makes. On draft-16 the request asked for the entire group,
+ * and the failed staging fixes no final Object: Object 2 is still admitted.
+ * Draft-22 is the control whose refusal decision did not change. */
+static void test_hist_fetch_snapshot_failure(moq_version_t ver)
+{
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *track;
+    if (!hist_fetch_setup(ver, &as, &alloc, &sp, 0, &pub, &track)) {
+        MOQ_TEST_CHECK(false);      /* setup prerequisite failed */
+        hist_fetch_teardown(&as, sp, pub);
+        return;
+    }
+    hist_fetch_seen_t seen;
+    moq_fetch_t fh;
+    MOQ_TEST_CHECK(hist_install(pub, track, &alloc, 0, 2) == MOQ_OK);
+
+    /* A successful staging of the exact range 0..1: its first allocation is
+     * the snapshot this group needs. */
+    size_t snapshot_size = 0;
+    if (hist_fetch_request(sp, 0, 2, &fh)) {
+        hist_alloc_arm(1);
+        MOQ_TEST_CHECK_EQ_INT((int)hist_fetch_stage(sp, pub), (int)MOQ_OK);
+        snapshot_size = hist_stage_first_size;
+        MOQ_TEST_CHECK(hist_stage_allocs >= 1);
+        hist_alloc_arm(0);
+        hist_fetch_settle(sp, pub, fh, &seen);
+        MOQ_TEST_CHECK(seen.oks == 1 && seen.nobj == 2 && seen.completes == 1 &&
+                       seen.errors == 0 && seen.strays == 0);
+    }
+
+    /* The same group again, with that allocation failing. */
+    if (hist_fetch_request(sp, 0, 0, &fh)) {
+        hist_alloc_arm(2);
+        moq_result_t st = hist_fetch_stage(sp, pub);
+        int consumed = hist_failed_allocs;
+        size_t failed_size = hist_stage_first_size;
+        hist_alloc_arm(0);
+        fprintf(stderr, "hist_fetch_snapshot_failure draft %u: failed %d "
+                "allocation(s), size %zu (snapshot %zu), stage result %d\n",
+                (unsigned)ver, consumed, failed_size, snapshot_size, (int)st);
+        MOQ_TEST_CHECK_EQ_INT(consumed, 1);
+        MOQ_TEST_CHECK(snapshot_size != 0 && failed_size == snapshot_size);
+        MOQ_TEST_CHECK_EQ_INT((int)st, (int)MOQ_OK);
+        hist_fetch_settle(sp, pub, fh, &seen);
+        MOQ_TEST_CHECK_EQ_INT(seen.oks, 0);
+        MOQ_TEST_CHECK_EQ_INT(seen.nobj, 0);
+        MOQ_TEST_CHECK_EQ_INT(seen.completes, 0);
+        MOQ_TEST_CHECK_EQ_INT(seen.errors, 1);
+        MOQ_TEST_CHECK_EQ_INT(seen.strays, 0);
+        MOQ_TEST_CHECK_EQ_U64(seen.err, MOQ_REQUEST_ERROR_INTERNAL_ERROR);
+        MOQ_TEST_CHECK(hist_fetch_sessions_alive(sp));
+    }
+    MOQ_TEST_CHECK_EQ_INT((int)declare_write_stream(pub, track, &alloc, sp,
+                              0, 2, 0x81), (int)MOQ_OK);
+
+    hist_fetch_teardown(&as, sp, pub);
+    MOQ_TEST_PASS(ver == MOQ_VERSION_DRAFT_22 ? "hist_fetch_snapshot_failure_d22"
+                  : ver == MOQ_VERSION_DRAFT_18 ? "hist_fetch_snapshot_failure_d18"
+                  : "hist_fetch_snapshot_failure_d16");
+}
+
+/* A retained group above the facade's conservative location guard (Group ID
+ * MOQ_QUIC_VARINT_MAX + 1, i.e. 2^62: the facade refuses to answer with a
+ * Location beyond the QUIC-varint range its data plane writes; it is not a
+ * draft-18/22 wire limit -- those encode Locations as vi64 -- and a draft-16
+ * request cannot name the group at all) is refused with REQUEST_ERROR
+ * INTERNAL_ERROR (code 0) WITHOUT staging: the facade makes no allocation at
+ * all while handling the request -- no snapshot is taken for a refused
+ * request -- and the client sees only that refusal. The guard itself is
+ * unchanged here. */
+static void test_hist_fetch_beyond_location_guard(moq_version_t ver)
+{
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *track;
+    if (!hist_fetch_setup(ver, &as, &alloc, &sp, 0, &pub, &track)) {
+        MOQ_TEST_CHECK(false);
+        hist_fetch_teardown(&as, sp, pub);
+        return;
+    }
+    const uint64_t g = MOQ_QUIC_VARINT_MAX + 1;
+    hist_fetch_seen_t seen;
+    moq_fetch_t fh;
+    MOQ_TEST_CHECK(hist_install(pub, track, &alloc, g, 2) == MOQ_OK);
+    if (hist_fetch_request(sp, g, 0, &fh)) {
+        hist_alloc_arm(1);
+        moq_result_t st = hist_fetch_stage(sp, pub);
+        int allocs = hist_stage_allocs;
+        hist_alloc_arm(0);
+        MOQ_TEST_CHECK_EQ_INT(allocs, 0);
+        MOQ_TEST_CHECK_EQ_INT((int)st, (int)MOQ_OK);
+        hist_fetch_settle(sp, pub, fh, &seen);
+        MOQ_TEST_CHECK_EQ_INT(seen.oks, 0);
+        MOQ_TEST_CHECK_EQ_INT(seen.nobj, 0);
+        MOQ_TEST_CHECK_EQ_INT(seen.completes, 0);
+        MOQ_TEST_CHECK_EQ_INT(seen.errors, 1);
+        MOQ_TEST_CHECK_EQ_U64(seen.err, MOQ_REQUEST_ERROR_INTERNAL_ERROR);
+        MOQ_TEST_CHECK(hist_fetch_sessions_alive(sp));
+    }
+    hist_fetch_teardown(&as, sp, pub);
+    MOQ_TEST_PASS(ver == MOQ_VERSION_DRAFT_22 ? "hist_fetch_beyond_location_guard_d22"
+                  : "hist_fetch_beyond_location_guard_d18");
+}
+
+/* A standalone FETCH for track `name` from {sg, so} to {eg, eo} (eo
+ * exclusive, 0: the whole end group), handed to the facade and settled. */
+static void fetch_range_outcome(moq_simpair_t *sp, moq_publisher_t *pub,
+                                const char *name, uint64_t sg, uint64_t so,
+                                uint64_t eg, uint64_t eo,
+                                hist_fetch_seen_t *seen)
+{
+    moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("live") };
+    moq_fetch_cfg_t fcfg; moq_fetch_cfg_init(&fcfg);
+    fcfg.track_namespace.parts = ns_parts;
+    fcfg.track_namespace.count = 1;
+    fcfg.track_name = (moq_bytes_t){ (const uint8_t *)name, strlen(name) };
+    fcfg.start_group = sg; fcfg.start_object = so;
+    fcfg.end_group = eg; fcfg.end_object = eo;
+    moq_fetch_t fh;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_fetch(moq_simpair_client(sp), &fcfg,
+                              moq_simpair_now_us(sp), &fh), (int)MOQ_OK);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    MOQ_TEST_CHECK_EQ_INT((int)hist_fetch_stage(sp, pub), (int)MOQ_OK);
+    hist_fetch_settle(sp, pub, fh, seen);
+    MOQ_TEST_CHECK(hist_fetch_sessions_alive(sp));
+}
+
+/* FETCH refusals by what the track has published: an unknown track is
+ * DOES_NOT_EXIST; a track that exists with nothing published, or a start
+ * past its Largest Object, is INVALID_RANGE (draft-22 §3.2, draft-18
+ * §10.12.3; draft-16 §9.16.3 for the start past Largest, the no-object
+ * standalone answer being library policy there); a start at or below the
+ * Largest is served. */
+static void test_fetch_range_published(moq_version_t ver)
+{
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *track;
+    if (!hist_fetch_setup(ver, &as, &alloc, &sp, 0, &pub, &track)) {
+        MOQ_TEST_CHECK(false);
+        hist_fetch_teardown(&as, sp, pub);
+        return;
+    }
+    hist_fetch_seen_t seen;
+    fetch_range_outcome(sp, pub, "video", 0, 0, 0, 1, &seen);
+    MOQ_TEST_CHECK_EQ_INT(seen.errors, 1);
+    MOQ_TEST_CHECK_EQ_U64(seen.err, MOQ_REQUEST_ERROR_INVALID_RANGE);
+    MOQ_TEST_CHECK_EQ_INT(seen.oks + seen.nobj + seen.completes, 0);
+
+    fetch_range_outcome(sp, pub, "nope", 0, 0, 0, 1, &seen);
+    MOQ_TEST_CHECK_EQ_INT(seen.errors, 1);
+    MOQ_TEST_CHECK_EQ_U64(seen.err, MOQ_REQUEST_ERROR_DOES_NOT_EXIST);
+
+    /* Largest Object {3, 1}. */
+    MOQ_TEST_CHECK(hist_install(pub, track, &alloc, 3, 2) == MOQ_OK);
+    fetch_range_outcome(sp, pub, "video", 4, 0, 5, 0, &seen);
+    MOQ_TEST_CHECK_EQ_INT(seen.errors, 1);
+    MOQ_TEST_CHECK_EQ_U64(seen.err, MOQ_REQUEST_ERROR_INVALID_RANGE);
+    fetch_range_outcome(sp, pub, "video", 3, 2, 3, 5, &seen);
+    MOQ_TEST_CHECK_EQ_INT(seen.errors, 1);
+    MOQ_TEST_CHECK_EQ_U64(seen.err, MOQ_REQUEST_ERROR_INVALID_RANGE);
+    fetch_range_outcome(sp, pub, "video", 3, 0, 3, 2, &seen);
+    MOQ_TEST_CHECK_EQ_INT(seen.errors, 0);
+    MOQ_TEST_CHECK_EQ_INT(seen.oks, 1);
+    MOQ_TEST_CHECK_EQ_INT(seen.nobj, 2);
+
+    /* Objects were published and the cache no longer holds them: the start
+     * is within the Largest, so the refusal is not INVALID_RANGE. */
+    MOQ_TEST_CHECK(moq_pub_clear_retained_group(pub, track) == MOQ_OK);
+    fetch_range_outcome(sp, pub, "video", 3, 0, 3, 2, &seen);
+    MOQ_TEST_CHECK_EQ_INT(seen.errors, 1);
+    MOQ_TEST_CHECK_EQ_U64(seen.err, MOQ_REQUEST_ERROR_DOES_NOT_EXIST);
+    fetch_range_outcome(sp, pub, "video", 3, 2, 3, 5, &seen);
+    MOQ_TEST_CHECK_EQ_INT(seen.errors, 1);
+    MOQ_TEST_CHECK_EQ_U64(seen.err, MOQ_REQUEST_ERROR_INVALID_RANGE);
+
+    hist_fetch_teardown(&as, sp, pub);
+    MOQ_TEST_PASS(ver == MOQ_VERSION_DRAFT_16 ? "fetch_range_published_d16"
+                  : ver == MOQ_VERSION_DRAFT_18 ? "fetch_range_published_d18"
+                  : "fetch_range_published_d22");
+}
+
+/* Draft-16: a whole-group snapshot staged while its response cannot be
+ * accepted yet (action queue full) fixes the group's final Object at once:
+ * Object 2 is refused while the response waits, and the response then
+ * serves Objects 0..1. */
+static void test_hist_d16_fetch_staging(void)
+{
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *track;
+    if (!hist_fetch_setup(MOQ_VERSION_DRAFT_16, &as, &alloc, &sp, 3u, &pub,
+                          &track)) {
+        MOQ_TEST_CHECK(false);
+        hist_fetch_teardown(&as, sp, pub);
+        return;
+    }
+    hist_fetch_seen_t seen;
+    moq_fetch_t fh;
+    MOQ_TEST_CHECK(hist_install(pub, track, &alloc, 0, 2) == MOQ_OK);
+    windows_subscribe(sp, pub, MOQ_SUBSCRIBE_FILTER_NONE, 0, 0, 0);
+    drain_all(sp);
+    if (hist_fetch_request(sp, 0, 0, &fh)) {
+        /* Fill the server's action queue with live delivery in another
+         * group, each write completing. */
+        moq_session_t *sv = moq_simpair_server(sp);
+        for (uint64_t o = 0; o < 3 && moq_session_action_capacity(sv) >= 2; o++)
+            MOQ_TEST_CHECK_EQ_INT((int)declare_write_stream(pub, track, &alloc,
+                                      sp, 5, o, 0x82), (int)MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_action_capacity(sv) < 2);
+        MOQ_TEST_CHECK_EQ_INT((int)hist_fetch_stage(sp, pub),
+                              (int)MOQ_ERR_WOULD_BLOCK);
+        MOQ_TEST_CHECK_EQ_INT((int)declare_write_stream(pub, track, &alloc,
+                                  sp, 0, 2, 0x83), (int)MOQ_ERR_WRONG_STATE);
+        hist_fetch_settle(sp, pub, fh, &seen);
+        MOQ_TEST_CHECK(seen.oks == 1 && seen.nobj == 2 && seen.completes == 1 &&
+                       seen.errors == 0);
+        MOQ_TEST_CHECK_EQ_INT((int)declare_write_stream(pub, track, &alloc,
+                                  sp, 0, 2, 0x84), (int)MOQ_ERR_WRONG_STATE);
+    }
+    hist_fetch_teardown(&as, sp, pub);
+    MOQ_TEST_PASS("hist_d16_fetch_staging");
+}
+
+/* Internal omissions: a destination's stream that skips an Object assigned
+ * to its subgroup -- one it owes, at or after its Start Location -- ends with
+ * a RESET even when it carried the subgroup's last Object (draft-22 section
+ * 11.3.2). Numbers never assigned are not omissions. Retained Objects 0..10
+ * of group 30 are assigned before the live writes.
+ *   case 0: Start {30,0}; live 0 then 10 (1..9 skipped)          -> RESET
+ *   case 1: Start {30,0}; live 0..10                             -> FIN
+ *   case 2: Start {30,5}; live 6..10 (5 skipped)                 -> RESET
+ *   case 3: Start {30,5}; live 5..10                             -> FIN
+ *   case 4: no retained Objects; Start {30,0}; live 0 then 5     -> FIN
+ *           (1..4 were never assigned) */
+static void hist_internal_omission_case(moq_version_t ver, int c)
+{
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *track;
+    HIST_RIG_OR_RETURN(ver);
+    int ended = 0, fins = 0, resets = 0;
+    if (c != 4)
+        MOQ_TEST_CHECK(hist_install(pub, track, &alloc, 30, 11) == MOQ_OK);
+    windows_subscribe(sp, pub, MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START,
+                      30, (c == 2 || c == 3) ? 5 : 0, 0);
+    drain_all(sp);
+
+    static const uint64_t live0[] = { 0, 10 };
+    static const uint64_t live2[] = { 6, 7, 8, 9, 10 };
+    static const uint64_t live3[] = { 5, 6, 7, 8, 9, 10 };
+    static const uint64_t live4[] = { 0, 5 };
+    uint64_t all[11];
+    for (uint64_t i = 0; i < 11; i++) all[i] = i;
+    const uint64_t *objs = c == 0 ? live0 : c == 1 ? all : c == 2 ? live2
+                         : c == 3 ? live3 : live4;
+    size_t n = c == 0 ? 2 : c == 1 ? 11 : c == 2 ? 5 : c == 3 ? 6 : 2;
+    for (size_t i = 0; i < n; i++)
+        MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 30, objs[i],
+                                            HIST_TAG(objs[i])) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(fo_seen(sp, 30, objs[n - 1], NULL, NULL, &ended), 1);
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 31, 0, 0x5F)
+                   == MOQ_OK);
+    hist_stream_ends(sp, 30, &fins, &resets);
+    bool reset = (c == 0 || c == 2);
+    MOQ_TEST_CHECK_EQ_INT(fins, reset ? 0 : 1);
+    MOQ_TEST_CHECK_EQ_INT(resets, reset ? 1 : 0);
+    MOQ_TEST_CHECK_EQ_INT(ended, 0);
+
+    moq_pub_destroy(pub);
+    drain_all(sp);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+}
+
+static void test_hist_internal_omission(moq_version_t ver)
+{
+    for (int c = 0; c < 5; c++) hist_internal_omission_case(ver, c);
+    MOQ_TEST_PASS(ver == MOQ_VERSION_DRAFT_22 ? "hist_internal_omission_d22"
+                  : ver == MOQ_VERSION_DRAFT_18 ? "hist_internal_omission_d18"
+                  : "hist_internal_omission_d16");
+}
+
+/* Evidence recorded when a group's record is displaced: retained Objects
+ * 0..10 of group 30 are assigned before a draft-22 destination with window
+ * {30,0}..{30,end} opens the subgroup; live Objects follow, then seventeen
+ * later groups displace group 30's record before end_group closes the
+ * stream.
+ *   end 1, live 0 only: Objects 1..10 owed and never sent, and no op after
+ *        the opening recorded it -- only the displacement can: RESET.
+ *   end 10, live 0..10: complete: FIN. */
+static void hist_retained_tail_case(bool complete)
+{
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *track;
+    HIST_RIG_OR_RETURN(MOQ_VERSION_DRAFT_22);
+    int ended = 0, fins = 0, resets = 0;
+    uint64_t now = moq_simpair_now_us(sp);
+    MOQ_TEST_CHECK(hist_install(pub, track, &alloc, 30, 11) == MOQ_OK);
+    hist_subscribe_object_end(sp, pub, 30, 0, 30, complete ? 10 : 1);
+    uint64_t last = complete ? 10 : 0;
+    for (uint64_t o = 0; o <= last; o++)
+        MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 30, o,
+                                            HIST_TAG(o)) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(fo_seen(sp, 30, last, NULL, NULL, &ended), 1);
+    for (uint64_t g = 31; g <= 47; g++)
+        MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, g, 0,
+                                            0x71) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_pub_end_group(pub, track, now) == MOQ_OK);
+    hist_stream_ends(sp, 30, &fins, &resets);
+    MOQ_TEST_CHECK_EQ_INT(fins, complete ? 1 : 0);
+    MOQ_TEST_CHECK_EQ_INT(resets, complete ? 0 : 1);
+    MOQ_TEST_CHECK_EQ_INT(ended, 0);
+
+    moq_pub_destroy(pub);
+    drain_all(sp);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+}
+
+static void test_hist_retained_tail_displaced(void)
+{
+    hist_retained_tail_case(false);
+    hist_retained_tail_case(true);
+    MOQ_TEST_PASS("hist_retained_tail_displaced_d22");
+}
+
+/* Generation identity holds on every write: Objects 0..4 of group 30 are
+ * admitted with no destination, the group is reset, Object 5 opens Subgroup
+ * 1; a fresh destination then subscribes from {30,0}. Object 1 (its original
+ * bytes) belongs to Subgroup 0, so writing it again is refused before any
+ * effect -- even though Subgroup 1 is open and this is not its first write
+ * -- and nothing reaches the destination; Object 6 continues Subgroup 1. */
+static void test_hist_generation_identity(moq_version_t ver)
+{
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *track;
+    HIST_RIG_OR_RETURN(ver);
+    int ended = 0;
+    uint64_t sgid = UINT64_MAX;
+    uint64_t now = moq_simpair_now_us(sp);
+    for (uint64_t o = 0; o <= 4; o++)
+        MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 30, o,
+                                            HIST_TAG(o)) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_pub_reset_group(pub, track, 0x10, now) == MOQ_OK);
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 30, 5,
+                                        HIST_TAG(5)) == MOQ_OK);
+    windows_subscribe(sp, pub, MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START, 30, 0, 0);
+    drain_all(sp);
+
+    MOQ_TEST_CHECK_EQ_INT((int)declare_write_stream(pub, track, &alloc, sp,
+                              30, 1, HIST_TAG(1)), (int)MOQ_ERR_WRONG_STATE);
+    MOQ_TEST_CHECK_EQ_INT(fo_seen(sp, 30, 1, NULL, NULL, &ended), 0);
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 30, 6,
+                                        HIST_TAG(6)) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(fo_seen(sp, 30, 6, NULL, &sgid, &ended), 1);
+    MOQ_TEST_CHECK_EQ_U64(sgid, 1);
+    MOQ_TEST_CHECK_EQ_INT(ended, 0);
+
+    hist_rig_teardown(&as, sp, pub);
+    MOQ_TEST_PASS(ver == MOQ_VERSION_DRAFT_22 ? "hist_generation_identity_d22"
+                  : ver == MOQ_VERSION_DRAFT_18 ? "hist_generation_identity_d18"
+                  : "hist_generation_identity_d16");
+}
+
+/* Sparse membership. Objects assigned with no destination open; a
+ * destination subscribing later from Start {30,5} must not see its stream
+ * end with a FIN when an assigned Object at or after 5 was never sent to it
+ * (draft-22 section 11.3.2), and must see a FIN when none exists.
+ *   case 0: live 0, 5, 10; then the replay of 10 -> RESET (5 omitted)
+ *   case 1: live 0, 10; then the replay of 10    -> FIN (5 never assigned)
+ *   case 2: retained 0..10, live 20; then 6..20  -> RESET (5 omitted)
+ *   case 3: retained 0..10, live 20; then 5..20  -> FIN
+ * Exact assignment membership in the group history decides them. */
+static void hist_sparse_membership_case(moq_version_t ver, int c)
+{
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *track;
+    HIST_RIG_OR_RETURN(ver);
+    int ended = 0, fins = 0, resets = 0;
+    uint64_t now = moq_simpair_now_us(sp);
+    if (c <= 1) {
+        MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 30, 0,
+                                            HIST_TAG(0)) == MOQ_OK);
+        if (c == 0)
+            MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 30, 5,
+                                                HIST_TAG(5)) == MOQ_OK);
+        MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 30, 10,
+                                            HIST_TAG(10)) == MOQ_OK);
+    } else {
+        MOQ_TEST_CHECK(hist_install(pub, track, &alloc, 30, 11) == MOQ_OK);
+        MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 30, 20,
+                                            HIST_TAG(20)) == MOQ_OK);
+    }
+    windows_subscribe(sp, pub, MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START, 30, 5, 0);
+    drain_all(sp);
+    if (c <= 1) {
+        MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 30, 10,
+                                            HIST_TAG(10)) == MOQ_OK);
+    } else {
+        for (uint64_t o = (c == 2 ? 6 : 5); o <= 20; o++)
+            MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 30, o,
+                                                HIST_TAG(o)) == MOQ_OK);
+    }
+    MOQ_TEST_CHECK(moq_pub_end_group(pub, track, now) == MOQ_OK);
+    hist_stream_ends(sp, 30, &fins, &resets);
+    bool reset = (c == 0 || c == 2);
+    MOQ_TEST_CHECK_EQ_INT(fins, reset ? 0 : 1);
+    MOQ_TEST_CHECK_EQ_INT(resets, reset ? 1 : 0);
+    MOQ_TEST_CHECK_EQ_INT(ended, 0);
+    hist_rig_teardown(&as, sp, pub);
+}
+
+/* Delivery-mode identity needs exact datagram membership: an Object sent as
+ * a datagram is never assigned to a subgroup (draft-22 section 2.1).
+ *   case 0: datagrams 0, 10, 5; stream Object 5 -> refused
+ *   case 1: datagrams 0, 10;    stream Object 5 -> admitted (never assigned)
+ *   case 2: datagrams 0, 10, 5; stream Object 10 -> refused */
+static void hist_datagram_identity_case(moq_version_t ver, int c)
+{
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *track;
+    HIST_RIG_OR_RETURN(ver);
+    MOQ_TEST_CHECK(windows_write_dg(pub, track, &alloc, sp, 30, 0, HIST_TAG(0))
+                   == MOQ_OK);
+    MOQ_TEST_CHECK(windows_write_dg(pub, track, &alloc, sp, 30, 10, HIST_TAG(10))
+                   == MOQ_OK);
+    if (c != 1)
+        MOQ_TEST_CHECK(windows_write_dg(pub, track, &alloc, sp, 30, 5,
+                                        HIST_TAG(5)) == MOQ_OK);
+    uint64_t o = c == 2 ? 10 : 5;
+    MOQ_TEST_CHECK_EQ_INT((int)declare_write_stream(pub, track, &alloc, sp, 30,
+                              o, HIST_TAG(o)),
+                          c == 1 ? (int)MOQ_OK : (int)MOQ_ERR_WRONG_STATE);
+    hist_rig_teardown(&as, sp, pub);
+}
+
+static void test_hist_sparse_membership(moq_version_t ver)
+{
+    for (int c = 0; c < 3; c++) hist_datagram_identity_case(ver, c);
+    for (int c = 0; c < 4; c++) hist_sparse_membership_case(ver, c);
+    MOQ_TEST_PASS(ver == MOQ_VERSION_DRAFT_22 ? "hist_sparse_membership_d22"
+                  : ver == MOQ_VERSION_DRAFT_18 ? "hist_sparse_membership_d18"
+                  : "hist_sparse_membership_d16");
+}
+
+/* Membership capacity: a group keeps at most 16 ranges of consecutive
+ * Objects of one owner (a subgroup, or the datagram mode). With no
+ * destination, stream Objects 0, 2, ..., 30 of group 30 fill the 16 ranges.
+ *   - Object 32 would need a 17th range: MOQ_ERR_NOMEM, and nothing is
+ *     assigned (32 is later taken as a datagram);
+ *   - Object 1 joins the ranges of 0 and 2 (15 ranges), so datagram 32 now
+ *     fits (16 ranges, a datagram range);
+ *   - at 16 ranges: stream Object 34 is refused (NOMEM); replaying stream
+ *     Object 4, extending stream range 30 with 31, and extending datagram
+ *     range 32 with datagram 33 are all admitted;
+ *   - ranges of different owners never merge: stream Object 33 is a
+ *     datagram's (WRONG_STATE), and datagram 28 is a stream Object's. */
+static void test_hist_membership_capacity(moq_version_t ver)
+{
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *track;
+    HIST_RIG_OR_RETURN(ver);
+#define HM(o) ((int)declare_write_stream(pub, track, &alloc, sp, 30, (o), HIST_TAG(o)))
+#define HD(o) ((int)windows_write_dg(pub, track, &alloc, sp, 30, (o), HIST_TAG(o)))
+    for (uint64_t o = 0; o <= 30; o += 2)
+        MOQ_TEST_CHECK_EQ_INT(HM(o), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(HM(32), (int)MOQ_ERR_NOMEM);
+    MOQ_TEST_CHECK_EQ_INT(HM(1), (int)MOQ_OK);           /* joins 0 and 2 */
+    MOQ_TEST_CHECK_EQ_INT(HD(32), (int)MOQ_OK);          /* 32 was free */
+    MOQ_TEST_CHECK_EQ_INT(HM(34), (int)MOQ_ERR_NOMEM);   /* 17th range */
+    MOQ_TEST_CHECK_EQ_INT(HM(4), (int)MOQ_OK);           /* replay */
+    MOQ_TEST_CHECK_EQ_INT(HM(31), (int)MOQ_OK);          /* extension */
+    MOQ_TEST_CHECK_EQ_INT(HD(33), (int)MOQ_OK);          /* datagram extension */
+    MOQ_TEST_CHECK_EQ_INT(HM(33), (int)MOQ_ERR_WRONG_STATE);
+    MOQ_TEST_CHECK_EQ_INT(HD(28), (int)MOQ_ERR_WRONG_STATE);
+#undef HM
+#undef HD
+    hist_rig_teardown(&as, sp, pub);
+    MOQ_TEST_PASS(ver == MOQ_VERSION_DRAFT_22 ? "hist_membership_capacity_d22"
+                  : ver == MOQ_VERSION_DRAFT_18 ? "hist_membership_capacity_d18"
+                  : "hist_membership_capacity_d16");
+}
+
+/* After a FIN, reinstalling Objects that are already the subgroup's is
+ * allowed (it assigns nothing new); extending the subgroup is not. Group 40:
+ * live 0..2, then the track moves to group 41 (the subgroup ends with a
+ * FIN). */
+static void test_hist_retained_subset_after_fin(moq_version_t ver)
+{
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *track;
+    HIST_RIG_OR_RETURN(ver);
+    for (uint64_t o = 0; o <= 2; o++)
+        MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 40, o,
+                                            HIST_TAG(o)) == MOQ_OK);
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 41, 0,
+                                        HIST_TAG(0)) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)hist_install(pub, track, &alloc, 40, 2), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)hist_install(pub, track, &alloc, 40, 3), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)hist_install(pub, track, &alloc, 40, 4),
+                          (int)MOQ_ERR_WRONG_STATE);
+    hist_rig_teardown(&as, sp, pub);
+    MOQ_TEST_PASS(ver == MOQ_VERSION_DRAFT_22 ? "hist_retained_subset_after_fin_d22"
+                  : ver == MOQ_VERSION_DRAFT_18 ? "hist_retained_subset_after_fin_d18"
+                  : "hist_retained_subset_after_fin_d16");
+}
+
+/* After one destination ends the open subgroup with a FIN (its final Object
+ * is fixed for that receiver, draft-22 section 12.1), the group goes on:
+ *   case 0: live 0, 1; FIN; a new destination; live 2 (above the group's
+ *           maximum) opens Subgroup 1, which the stream begins (FIRST_OBJECT
+ *           on drafts 18 and 22);
+ *   case 1: live 0, 2; FIN; live 1 (unassigned, below the maximum) would
+ *           extend the ended subgroup: refused before any effect;
+ *   case 2: live 0, 1 with END_OF_GROUP; FIN; live 2 would follow the
+ *           group's largest Object: refused. */
+static void hist_fin_rollover_case(moq_version_t ver, int c)
+{
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *track;
+    HIST_RIG_OR_RETURN(ver);
+    const bool has_bit = ver != MOQ_VERSION_DRAFT_16;
+    int ended = 0, fins = 0, resets = 0;
+    bool f = false;
+    uint64_t sgid = UINT64_MAX;
+    windows_subscribe(sp, pub, MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START, 30, 0, 0);
+    drain_all(sp);
+    uint64_t second = c == 1 ? 2 : 1;
+    MOQ_TEST_CHECK(mono_write_stream_eog(pub, track, &alloc, sp, 30, 0, c == 2,
+                                         HIST_TAG(0)) == MOQ_OK);
+    MOQ_TEST_CHECK(mono_write_stream_eog(pub, track, &alloc, sp, 30, second,
+                                         c == 2, HIST_TAG(second)) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_pub_finish_subscribers(pub, track,
+                       MOQ_PUB_DONE_TRACK_ENDED, moq_simpair_now_us(sp)) == MOQ_OK);
+    hist_stream_ends(sp, 30, &fins, &resets);
+    MOQ_TEST_CHECK_EQ_INT(fins, 1);
+    MOQ_TEST_CHECK_EQ_INT(resets, 0);
+    windows_subscribe(sp, pub, MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START, 30, 0, 0);
+    drain_all(sp);
+    if (c == 0) {
+        MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 30, 2,
+                                            HIST_TAG(2)) == MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT(fo_seen(sp, 30, 2, &f, &sgid, &ended), 1);
+        MOQ_TEST_CHECK_EQ_U64(sgid, 1);
+        MOQ_TEST_CHECK(f == has_bit);
+    } else {
+        uint64_t o = c == 1 ? 1 : 2;
+        MOQ_TEST_CHECK_EQ_INT((int)declare_write_stream(pub, track, &alloc, sp,
+                                  30, o, HIST_TAG(o)), (int)MOQ_ERR_WRONG_STATE);
+        MOQ_TEST_CHECK_EQ_INT(fo_seen(sp, 30, o, NULL, NULL, &ended), 0);
+    }
+    hist_rig_teardown(&as, sp, pub);
+}
+
+static void test_hist_fin_rollover(moq_version_t ver)
+{
+    for (int c = 0; c < 3; c++) hist_fin_rollover_case(ver, c);
+    MOQ_TEST_PASS(ver == MOQ_VERSION_DRAFT_22 ? "hist_fin_rollover_d22"
+                  : ver == MOQ_VERSION_DRAFT_18 ? "hist_fin_rollover_d18"
+                  : "hist_fin_rollover_d16");
+}
+
+/* Datagram pressure: groups 1..15 are revisited (15 pinned records) and the
+ * track then writes group 16, which holds the only other record. A datagram
+ * in new group 100 compacts group 16 into the sealed runs instead of being
+ * refused; the destination's open stream of group 16, complete, still ends
+ * with a FIN when the track next moves; group 16 then refuses Objects, and a
+ * new stream group displaces group 100's record as usual. */
+static void test_hist_datagram_compacts_current(moq_version_t ver)
+{
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *track;
+    HIST_RIG_OR_RETURN(ver);
+    int ended = 0, fins = 0, resets = 0;
+    windows_subscribe(sp, pub, MOQ_SUBSCRIBE_FILTER_NONE, 0, 0, 0);
+    drain_all(sp);
+    /* Each write is delivered before the next, so the pair's action and
+     * event queues never fill. */
+    for (int pass = 0; pass < 2; pass++)
+        for (uint64_t g = 1; g <= 15; g++) {
+            MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, g,
+                               (uint64_t)pass, HIST_TAG(pass)) == MOQ_OK);
+            moq_simpair_run_until_quiescent(sp, 32, NULL);
+            moq_event_t ev;
+            while (moq_session_poll_events(moq_simpair_client(sp), &ev, 1) == 1) {
+                MOQ_TEST_CHECK(ev.kind != MOQ_EVENT_UNSUBSCRIBED &&
+                               ev.kind != MOQ_EVENT_SUBSCRIBE_DONE);
+                moq_event_cleanup(&ev);
+            }
+        }
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 16, 0,
+                                        HIST_TAG(0)) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(fo_seen(sp, 16, 0, NULL, NULL, &ended), 1);
+    MOQ_TEST_CHECK_EQ_INT((int)windows_write_dg(pub, track, &alloc, sp, 100, 0,
+                              HIST_TAG(0)), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)declare_write_stream(pub, track, &alloc, sp, 16,
+                              1, HIST_TAG(1)), (int)MOQ_ERR_WRONG_STATE);
+    MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 17, 0,
+                                        HIST_TAG(0)) == MOQ_OK);
+    hist_stream_ends(sp, 16, &fins, &resets);
+    MOQ_TEST_CHECK_EQ_INT(fins, 1);
+    MOQ_TEST_CHECK_EQ_INT(resets, 0);
+    MOQ_TEST_CHECK_EQ_INT(ended, 0);
+    hist_rig_teardown(&as, sp, pub);
+    MOQ_TEST_PASS(ver == MOQ_VERSION_DRAFT_22 ? "hist_datagram_compacts_current_d22"
+                  : ver == MOQ_VERSION_DRAFT_18 ? "hist_datagram_compacts_current_d18"
+                  : "hist_datagram_compacts_current_d16");
+}
+
+/* Drive the pair to quiescence and drop the client's events, checking the
+ * subscription never ends. */
+static void hist_pump_discard(moq_simpair_t *sp)
+{
+    moq_simpair_run_until_quiescent(sp, 32, NULL);
+    moq_event_t ev;
+    while (moq_session_poll_events(moq_simpair_client(sp), &ev, 1) == 1) {
+        MOQ_TEST_CHECK(ev.kind != MOQ_EVENT_UNSUBSCRIBED &&
+                       ev.kind != MOQ_EVENT_SUBSCRIBE_DONE);
+        moq_event_cleanup(&ev);
+    }
+}
+
+/* What the client saw for group 16: Object 0 or 1 (count, Subgroup ID and
+ * whether its payload is exactly 11 22 33 44), and the stream terminals. */
+typedef struct {
+    int      objects, fins, resets, ended;
+    uint64_t sgid;
+    bool     exact;
+} hist_cs_seen_t;
+
+static void hist_cs_observe(moq_simpair_t *sp, hist_cs_seen_t *o)
+{
+    static const uint8_t want[4] = { 0x11, 0x22, 0x33, 0x44 };
+    for (int round = 0; round < 4; round++) {
+        moq_simpair_run_until_quiescent(sp, 32, NULL);
+        moq_event_t ev;
+        while (moq_session_poll_events(moq_simpair_client(sp), &ev, 1) == 1) {
+            if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED &&
+                ev.u.object_received.group_id == 16) {
+                o->objects++;
+                o->sgid = ev.u.object_received.subgroup_id;
+                moq_rcbuf_t *pl = ev.u.object_received.payload;
+                o->exact = pl && moq_rcbuf_len(pl) == sizeof(want) &&
+                           memcmp(moq_rcbuf_data(pl), want, sizeof(want)) == 0;
+            }
+            if (ev.kind == MOQ_EVENT_SUBGROUP_FINISHED &&
+                ev.u.subgroup_finished.group_id == 16) o->fins++;
+            if (ev.kind == MOQ_EVENT_SUBGROUP_RESET &&
+                ev.u.subgroup_reset.group_id == 16) o->resets++;
+            if (ev.kind == MOQ_EVENT_UNSUBSCRIBED ||
+                ev.kind == MOQ_EVENT_SUBSCRIBE_DONE) o->ended++;
+            moq_event_cleanup(&ev);
+        }
+    }
+}
+
+static moq_result_t hist_cs_chunk(moq_publisher_t *pub, moq_pub_track_t *t,
+                                  moq_alloc_t *alloc, moq_simpair_t *sp,
+                                  uint8_t a, uint8_t b)
+{
+    uint8_t d[2] = { a, b };
+    moq_rcbuf_t *c = NULL;
+    moq_result_t rc = moq_rcbuf_create(alloc, d, sizeof(d), &c);
+    MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
+    if (rc != MOQ_OK) return rc;
+    rc = moq_pub_write_data(pub, t, c, moq_simpair_now_us(sp));
+    moq_rcbuf_decref(c);
+    return rc;
+}
+
+/* A streaming Object in flight when its group is compacted. Groups 1..15 are
+ * revisited (15 pinned records) and group 16 holds the only other record.
+ * Object `obj` of group 16 is begun (4 bytes) and its first 2 bytes sent;
+ * a datagram in new group 100 then compacts group 16 into the sealed runs.
+ * The Object still finishes on the stream it began on -- same Subgroup ID,
+ * exact bytes -- with no terminal before moq_pub_end_group, which closes
+ * the stream although group 16 admits nothing more.
+ *   case 0: the destination carried every Object of the subgroup: one FIN.
+ *   case 1: the destination subscribed after Object 0 and owes it (its
+ *           window starts at {16,0}), so its stream omits an owed Object:
+ *           one RESET, decided before the record went away.
+ *   cases 2, 3: as 0 and 1, with the server's action queue full when
+ *           moq_pub_end_group runs: it returns WOULD_BLOCK (the record of
+ *           group 16 is already reused by group 100), and the retry after
+ *           the queue drains gives exactly one terminal, with the same
+ *           verdict. */
+static void hist_compact_stream_case(moq_version_t ver, int c)
+{
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *track;
+    const bool blocked = c >= 2;
+    const bool omitted = c == 1 || c == 3;
+    if (!hist_fetch_setup(ver, &as, &alloc, &sp, blocked ? 4u : 0u, &pub,
+                          &track)) {
+        MOQ_TEST_CHECK(false);
+        hist_fetch_teardown(&as, sp, pub);
+        return;
+    }
+    hist_cs_seen_t seen;
+    memset(&seen, 0, sizeof(seen));
+    uint64_t now = moq_simpair_now_us(sp);
+    if (!omitted) {
+        windows_subscribe(sp, pub, MOQ_SUBSCRIBE_FILTER_NONE, 0, 0, 0);
+        drain_all(sp);
+    }
+    for (int pass = 0; pass < 2; pass++)
+        for (uint64_t g = 1; g <= 15; g++) {
+            MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, g,
+                               (uint64_t)pass, HIST_TAG(pass)) == MOQ_OK);
+            hist_pump_discard(sp);
+        }
+    uint64_t obj = 0;
+    if (omitted) {
+        MOQ_TEST_CHECK(declare_write_stream(pub, track, &alloc, sp, 16, 0,
+                                            HIST_TAG(0)) == MOQ_OK);
+        windows_subscribe(sp, pub, MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START,
+                          16, 0, 0);
+        drain_all(sp);
+        obj = 1;
+    }
+    moq_pub_begin_object_cfg_t bc;
+    moq_pub_begin_object_cfg_init_sized(&bc, sizeof(bc));
+    bc.group_id = 16; bc.object_id = obj; bc.payload_length = 4;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_pub_begin_object(pub, track, &bc, now),
+                          (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)hist_cs_chunk(pub, track, &alloc, sp, 0x11, 0x22),
+                          (int)MOQ_OK);
+    moq_simpair_run_until_quiescent(sp, 32, NULL);
+
+    /* The compacting datagram (record pressure: 15 pinned + group 16). */
+    MOQ_TEST_CHECK_EQ_INT((int)windows_write_dg(pub, track, &alloc, sp, 100, 0,
+                              HIST_TAG(0)), (int)MOQ_OK);
+    /* The Object in flight finishes on its stream. */
+    MOQ_TEST_CHECK_EQ_INT((int)hist_cs_chunk(pub, track, &alloc, sp, 0x33, 0x44),
+                          (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_pub_end_object(pub, track, now), (int)MOQ_OK);
+    hist_cs_observe(sp, &seen);
+    MOQ_TEST_CHECK_EQ_INT(seen.objects, 1);
+    MOQ_TEST_CHECK(seen.exact);
+    MOQ_TEST_CHECK_EQ_U64(seen.sgid, 0);
+    MOQ_TEST_CHECK_EQ_INT(seen.fins + seen.resets, 0);   /* no terminal yet */
+
+    /* Group 16 admits nothing more, on any path. */
+    MOQ_TEST_CHECK_EQ_INT((int)declare_write_stream(pub, track, &alloc, sp, 16,
+                              5, HIST_TAG(5)), (int)MOQ_ERR_WRONG_STATE);
+    bc.object_id = 6;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_pub_begin_object(pub, track, &bc, now),
+                          (int)MOQ_ERR_WRONG_STATE);
+
+    if (blocked) {
+        /* Fill the server's action queue with completed datagrams of group
+         * 100, then close: the terminal cannot be queued yet. */
+        moq_session_t *sv = moq_simpair_server(sp);
+        for (uint64_t o = 1; o <= 8 && moq_session_action_capacity(sv) > 0; o++) {
+            moq_pub_object_cfg_t oc; moq_pub_object_cfg_init(&oc);
+            uint8_t d[2] = { HIST_TAG(o), (uint8_t)(HIST_TAG(o) ^ 0xFFu) };
+            moq_rcbuf_t *pl = NULL;
+            MOQ_TEST_CHECK(moq_rcbuf_create(&alloc, d, sizeof(d), &pl) == MOQ_OK);
+            oc.group_id = 100; oc.object_id = o; oc.payload = pl;
+            oc.datagram = true;
+            MOQ_TEST_CHECK_EQ_INT((int)moq_pub_write_object_ex(pub, track, &oc,
+                                      now), (int)MOQ_OK);
+            moq_rcbuf_decref(pl);
+        }
+        MOQ_TEST_CHECK_EQ_U64(moq_session_action_capacity(sv), 0);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_pub_end_group(pub, track, now),
+                              (int)MOQ_ERR_WOULD_BLOCK);
+        hist_cs_observe(sp, &seen);
+        MOQ_TEST_CHECK_EQ_INT(seen.fins + seen.resets, 0);
+    }
+    MOQ_TEST_CHECK_EQ_INT((int)moq_pub_end_group(pub, track, now), (int)MOQ_OK);
+    hist_cs_observe(sp, &seen);
+    MOQ_TEST_CHECK_EQ_INT(seen.fins, omitted ? 0 : 1);
+    MOQ_TEST_CHECK_EQ_INT(seen.resets, omitted ? 1 : 0);
+    MOQ_TEST_CHECK_EQ_INT(seen.ended, 0);
+    /* A second close changes nothing. */
+    MOQ_TEST_CHECK_EQ_INT((int)moq_pub_end_group(pub, track, now), (int)MOQ_OK);
+    hist_cs_observe(sp, &seen);
+    MOQ_TEST_CHECK_EQ_INT(seen.fins + seen.resets, 1);
+    hist_fetch_teardown(&as, sp, pub);
+}
+
+static void test_hist_compact_stream(moq_version_t ver)
+{
+    for (int c = 0; c < 4; c++) hist_compact_stream_case(ver, c);
+    MOQ_TEST_PASS(ver == MOQ_VERSION_DRAFT_22 ? "hist_compact_stream_d22"
+                  : ver == MOQ_VERSION_DRAFT_18 ? "hist_compact_stream_d18"
+                  : "hist_compact_stream_d16");
+}
+
 int main(void) {
     test_create_destroy();
     test_pub_cfg_init_old_prefix_no_overflow();
@@ -15046,6 +17002,54 @@ int main(void) {
     test_window_end_track(MOQ_VERSION_DRAFT_16, false);
     test_window_end_track(MOQ_VERSION_DRAFT_18, true);
     test_window_end_track(MOQ_VERSION_DRAFT_18, false);
+    test_window_end_track(MOQ_VERSION_DRAFT_22, true);
+    test_window_end_track(MOQ_VERSION_DRAFT_22, false);
+    test_window_completion_status(MOQ_VERSION_DRAFT_16);
+    test_window_completion_status(MOQ_VERSION_DRAFT_18);
+    test_window_completion_status(MOQ_VERSION_DRAFT_22);
+    test_facade_first_object(MOQ_VERSION_DRAFT_16);
+    test_facade_first_object(MOQ_VERSION_DRAFT_18);
+    test_facade_first_object(MOQ_VERSION_DRAFT_22);
+    test_hist_identity_rules(MOQ_VERSION_DRAFT_16);
+    test_hist_identity_rules(MOQ_VERSION_DRAFT_18);
+    test_hist_identity_rules(MOQ_VERSION_DRAFT_22);
+    test_hist_d16_whole_group_fetch();
+    test_hist_end_window_completeness();
+    test_hist_d16_fetch_staging();
+    test_hist_fetch_snapshot_failure(MOQ_VERSION_DRAFT_16);
+    test_hist_fetch_snapshot_failure(MOQ_VERSION_DRAFT_18);
+    test_hist_fetch_snapshot_failure(MOQ_VERSION_DRAFT_22);
+    test_hist_fetch_beyond_location_guard(MOQ_VERSION_DRAFT_18);
+    test_hist_fetch_beyond_location_guard(MOQ_VERSION_DRAFT_22);
+    test_fetch_range_published(MOQ_VERSION_DRAFT_16);
+    test_fetch_range_published(MOQ_VERSION_DRAFT_18);
+    test_fetch_range_published(MOQ_VERSION_DRAFT_22);
+    test_hist_internal_omission(MOQ_VERSION_DRAFT_16);
+    test_hist_internal_omission(MOQ_VERSION_DRAFT_18);
+    test_hist_internal_omission(MOQ_VERSION_DRAFT_22);
+    test_hist_retained_tail_displaced();
+    test_hist_generation_identity(MOQ_VERSION_DRAFT_16);
+    test_hist_generation_identity(MOQ_VERSION_DRAFT_18);
+    test_hist_generation_identity(MOQ_VERSION_DRAFT_22);
+    test_hist_sparse_membership(MOQ_VERSION_DRAFT_16);
+    test_hist_sparse_membership(MOQ_VERSION_DRAFT_18);
+    test_hist_sparse_membership(MOQ_VERSION_DRAFT_22);
+    for (int v = 0; v < 3; v++) {
+        moq_version_t mv = v == 0 ? MOQ_VERSION_DRAFT_16
+                         : v == 1 ? MOQ_VERSION_DRAFT_18 : MOQ_VERSION_DRAFT_22;
+        test_hist_membership_capacity(mv);
+        test_hist_retained_subset_after_fin(mv);
+        test_hist_fin_rollover(mv);
+        test_hist_datagram_compacts_current(mv);
+        test_hist_compact_stream(mv);
+    }
+    for (int v = 0; v < 3; v++) {
+        moq_version_t hv = v == 0 ? MOQ_VERSION_DRAFT_16
+                         : v == 1 ? MOQ_VERSION_DRAFT_18 : MOQ_VERSION_DRAFT_22;
+        test_hist_destination_close(hv);
+        test_hist_end_of_track_status(hv);
+        test_hist_capacity_sweep(hv);
+    }
     test_window_end_track_blocked(MOQ_VERSION_DRAFT_16, true);
     test_window_end_track_blocked(MOQ_VERSION_DRAFT_16, false);
     test_window_end_track_blocked(MOQ_VERSION_DRAFT_18, true);
@@ -15537,8 +17541,8 @@ int main(void) {
          * unknown-track rejections are evaluated against a live cache); phase 2
          * clears it first (the no-retained-group rejections). */
 
-        /* (a) Standalone FETCH whose range OMITS the retained group (object 0)
-         * -> NOT_SUPPORTED. [1,0)->[2,0) does not cover the group-0 object. */
+        /* (a) Standalone FETCH starting past the Largest Object {0, 0} ->
+         * INVALID_RANGE. [1,0)->[2,0) names nothing published. */
         moq_fetch_cfg_t f1; moq_fetch_cfg_init(&f1);
         f1.track_namespace.parts = ns_parts; f1.track_namespace.count = 1;
         f1.track_name = MOQ_BYTES_LITERAL("catalog");
@@ -15558,20 +17562,20 @@ int main(void) {
         MOQ_TEST_CHECK(moq_pub_tick(pub, now) == MOQ_OK);
         moq_simpair_run_until_quiescent(sp, 8, NULL);
 
-        bool got_not_supported = false, got_does_not_exist = false, got_object = false;
+        bool got_invalid_range = false, got_does_not_exist = false, got_object = false;
         { moq_event_t evts[16]; size_t ne;
           while ((ne = moq_session_poll_events(moq_simpair_client(sp), evts, 16)) > 0)
               for (size_t i = 0; i < ne; i++) {
                   if (evts[i].kind == MOQ_EVENT_FETCH_ERROR) {
                       moq_request_error_t ec = evts[i].u.fetch_error.error_code;
-                      if (ec == MOQ_REQUEST_ERROR_NOT_SUPPORTED) got_not_supported = true;
+                      if (ec == MOQ_REQUEST_ERROR_INVALID_RANGE) got_invalid_range = true;
                       if (ec == MOQ_REQUEST_ERROR_DOES_NOT_EXIST) got_does_not_exist = true;
                   } else if (evts[i].kind == MOQ_EVENT_FETCH_OBJECT) {
                       got_object = true;
                   }
                   moq_event_cleanup(&evts[i]);
               } }
-        MOQ_TEST_CHECK(got_not_supported);   /* (a) out-of-range standalone */
+        MOQ_TEST_CHECK(got_invalid_range);   /* (a) start past the Largest */
         MOQ_TEST_CHECK(got_does_not_exist);  /* (a2) unknown track */
         MOQ_TEST_CHECK(!got_object);         /* nothing served by the rejects */
 

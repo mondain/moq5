@@ -48,7 +48,8 @@ func withReceiverCFG<T>(
 ) rethrows -> T {
     let arena = CBytesArena()
     var cfg = moq_media_receiver_cfg_t()
-    moq_media_receiver_cfg_init(&cfg)
+    moq_media_receiver_cfg_init_sized(&cfg, MemoryLayout<moq_media_receiver_cfg_t>.size)
+    cfg.companion_profile = cMediaCompanionProfile(configuration.companionProfile)
     cfg.namespace_ = arena.namespaceParts(configuration.namespace.parts)
     cfg.catalog_track = arena.bytes(configuration.catalogTrack)
     cfg.auto_subscribe = configuration.autoSubscribe
@@ -145,6 +146,120 @@ func copyObjectPayload(_ object: moq_media_object_t) -> (media: Data, fragment: 
     return (optionalData(object.payload) ?? Data(), Data())
 }
 
+private func receivedFieldIsPresent<Root, Field>(
+    _ stamp: UInt32, _ field: KeyPath<Root, Field>
+) -> Bool {
+    Int(stamp) >= MemoryLayout<Root>.offset(of: field)! + MemoryLayout<Field>.size
+}
+
+/// Successful native outputs own valid spans. A present zero-length span is
+/// empty Data, not absence; no pointer is retained by the copy.
+private func copyReceivedSpan(_ bytes: moq_bytes_t) -> Data {
+    if bytes.len == 0 { return Data() }
+    return Data(bytes: bytes.data!, count: bytes.len)
+}
+
+private func copyReceivedProperties(_ ref: OpaquePointer?) -> Data {
+    copyReceivedSpan(moq_bytes_t(data: moq_rcbuf_data(ref), len: moq_rcbuf_len(ref)))
+}
+
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+private func copyReceivedLOC(_ loc: moq_loc_metadata_t) -> MediaLOCMetadata? {
+    guard receivedFieldIsPresent(loc.struct_size, \moq_loc_metadata_t.audio_config) else {
+        return nil
+    }
+    let marking: Data?
+    if loc.present & moq_swift_loc_metadata_has_marking() != 0 {
+        marking = withUnsafeBytes(of: loc.marking) {
+            Data($0[..<Int(loc.marking_len)])
+        }
+    } else {
+        marking = nil
+    }
+    return MediaLOCMetadata(
+        rawPresence: loc.present,
+        timestamp: loc.present & moq_swift_loc_metadata_has_timestamp() != 0
+            ? loc.timestamp : nil,
+        timescale: loc.present & moq_swift_loc_metadata_has_timescale() != 0
+            ? loc.timescale : nil,
+        marking: marking,
+        audioLevel: loc.present & moq_swift_loc_metadata_has_audio_level() != 0
+            ? loc.audio_level : nil,
+        videoConfig: loc.present & moq_swift_loc_metadata_has_video_config() != 0
+            ? copyReceivedSpan(loc.video_config) : nil,
+        audioConfig: loc.present & moq_swift_loc_metadata_has_audio_config() != 0
+            ? copyReceivedSpan(loc.audio_config) : nil)
+}
+
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+private func copyReceivedMetadata(_ metadata: moq_media_metadata_t) -> MediaObjectMetadata? {
+    guard receivedFieldIsPresent(metadata.struct_size, \moq_media_metadata_t.reserved) else {
+        return nil
+    }
+    let domain: MediaTimeDomain
+    switch metadata.time_domain {
+    case moq_swift_media_time_domain_none(): domain = .none
+    case moq_swift_media_time_domain_unix_us(): domain = .unixMicroseconds
+    case moq_swift_media_time_domain_application_media(): domain = .applicationMedia
+    default: domain = .unknown(metadata.time_domain)
+    }
+    return MediaObjectMetadata(
+        timeDomain: domain,
+        timeMicroseconds: metadata.has_time_us != 0 ? metadata.time_us : nil,
+        isIndependent: metadata.independence_known != 0 ? metadata.independent != 0 : nil,
+        loc: copyReceivedLOC(metadata.loc))
+}
+
+/// Consume one successful native poll on the service thread. Every owned span
+/// is copied before the single stamped cleanup; no C buffer reaches Sendable.
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+func takeReceivedObject(_ object: inout moq_media_object_t) -> ReceiverPolledObject {
+    defer { moq_media_object_cleanup(&object) }
+    let (media, fragment) = copyObjectPayload(object)
+    let identity = receivedFieldIsPresent(object.struct_size, \moq_media_object_t.has_subgroup)
+        ? MediaObjectIdentity(
+            groupID: object.group_id,
+            subgroupID: object.has_subgroup ? object.subgroup_id : nil,
+            objectID: object.object_id, publisherPriority: object.publisher_priority)
+        : nil
+    let metadata = receivedFieldIsPresent(object.struct_size, \moq_media_object_t.metadata)
+        ? copyReceivedMetadata(object.metadata) : nil
+    let trackProperties = receivedFieldIsPresent(
+        object.struct_size, \moq_media_object_t.track_properties_ref)
+        ? copyReceivedProperties(object.track_properties_ref) : nil
+    let delivery: MediaObjectDelivery?
+    if receivedFieldIsPresent(object.struct_size, \moq_media_object_t.initiating_request_id) {
+        switch object.delivery_origin {
+        case MOQ_MEDIA_DELIVERY_LIVE: delivery = .live
+        case MOQ_MEDIA_DELIVERY_FILL:
+            delivery = .fill(initiatingRequestID: object.initiating_request_id)
+        default:
+            delivery = .unknown(rawOrigin: object.delivery_origin,
+                                rawInitiatingRequestID: object.initiating_request_id)
+        }
+    } else {
+        delivery = nil
+    }
+    return ReceiverPolledObject(
+        handleID: UInt64(UInt(bitPattern: object.track)),
+        storage: CopiedObjectStorage(media: media, fragment: fragment),
+        isKeyframe: object.keyframe,
+        endsGroup: object.end_of_group,
+        isDatagram: object.datagram,
+        presentationTime: .microseconds(object.presentation_time_us),
+        decodeTime: .microseconds(object.decode_time_us),
+        compositionOffset: .microseconds(object.composition_offset_us),
+        captureTime: object.has_capture_time
+            ? Date(timeIntervalSince1970:
+                    Double(object.capture_time_us) / 1_000_000)
+            : nil,
+        wireIdentity: identity,
+        metadata: metadata,
+        objectProperties: copyReceivedProperties(object.properties_ref),
+        trackProperties: trackProperties,
+        delivery: delivery)
+}
+
 /* -- The real receiver backend ---------------------------------------------- */
 
 /// `ReceiverBackend` over an owned `moq_media_receiver_t`. Polls and detach
@@ -187,58 +302,7 @@ final class ServiceReceiverBackend: ReceiverBackend, @unchecked Sendable {
             default:
                 return .closed
             }
-            let handleID = UInt64(UInt(bitPattern: event.track))
-            switch event.kind {
-            case MOQ_MEDIA_CATALOG_READY:
-                return .event(ReceiverPolledEvent(
-                    kind: .catalogReady, handleID: 0, trackDescription: nil))
-            case MOQ_MEDIA_TRACK_ADDED:
-                /* Deep copy at poll time; nil = outside the v1 model
-                 * (timeline tracks) -- skip it and poll the next event.
-                 * Later events for a skipped handle drop harmlessly in the
-                 * core's unknown-handle guard. */
-                guard let description = event.desc.flatMap({
-                    copyTrackDescription($0.pointee)
-                }) else { continue }
-                return .event(ReceiverPolledEvent(
-                    kind: .added, handleID: handleID,
-                    trackDescription: description))
-            case MOQ_MEDIA_TRACK_UPDATED:
-                return .event(ReceiverPolledEvent(
-                    kind: .updated, handleID: handleID,
-                    trackDescription: event.desc.flatMap {
-                        copyTrackDescription($0.pointee)
-                    }))
-            case MOQ_MEDIA_TRACK_REMOVED:
-                return .event(ReceiverPolledEvent(
-                    kind: .removed, handleID: handleID, trackDescription: nil))
-            case MOQ_MEDIA_TRACK_ENDED:
-                return .event(ReceiverPolledEvent(
-                    kind: .ended, handleID: handleID, trackDescription: nil))
-            case MOQ_MEDIA_TRACK_PARSE_DROP:
-                let cls: ParseDropClass
-                switch event.parse_drop_class {
-                case MOQ_MEDIA_PARSE_DROP_MEDIA: cls = .media
-                case MOQ_MEDIA_PARSE_DROP_SAP: cls = .sap
-                case MOQ_MEDIA_PARSE_DROP_MEDIA_TIMELINE: cls = .mediaTimeline
-                default:
-                    /* Unknown/zero future class: the class is part of the
-                     * diagnostic, so skip rather than invent .media (and never
-                     * a false .ended). */
-                    continue
-                }
-                return .event(ReceiverPolledEvent(
-                    kind: .parseDrop, handleID: handleID, trackDescription: nil,
-                    parseDropClass: cls,
-                    parseDropTotal: event.parse_drops_total,
-                    parseDropDelta: event.parse_drops_delta))
-            default:
-                /* Unknown/future kind (or one with no polled representation,
-                 * e.g. MOQ_MEDIA_TRACK_UPDATE_OK): skip it, never surface a
-                 * false .ended. Skipping unknown future events is acceptable;
-                 * falsely ending a track is not. */
-                continue
-            }
+            if let copied = copyReceiverTrackEvent(event) { return .event(copied) }
         }
     }
 
@@ -256,64 +320,278 @@ final class ServiceReceiverBackend: ReceiverBackend, @unchecked Sendable {
         default:
             return .closed
         }
-        /* Ownership was transferred: copy out on THIS service thread, then
-         * clean the C object here too -- the rcbuf-backed buffers never
-         * cross the seam (non-atomic refcounts; copied-by-design v1). */
-        let (media, fragment) = copyObjectPayload(object)
-        let polled = ReceiverPolledObject(
-            handleID: UInt64(UInt(bitPattern: object.track)),
-            storage: CopiedObjectStorage(media: media, fragment: fragment),
-            isKeyframe: object.keyframe,
-            endsGroup: object.end_of_group,
-            isDatagram: object.datagram,
-            presentationTime: .microseconds(object.presentation_time_us),
-            decodeTime: .microseconds(object.decode_time_us),
-            compositionOffset: .microseconds(object.composition_offset_us),
-            captureTime: object.has_capture_time
-                ? Date(timeIntervalSince1970:
-                        Double(object.capture_time_us) / 1_000_000)
-                : nil)
-        moq_media_object_cleanup(&object)
-        return .object(polled)
+        return .object(takeReceivedObject(&object))
     }
 
     func subscribe(handleID: UInt64, start: StartMode,
-                   priority: UInt8?) -> ReceiverCommandResult {
+                   priority: UInt8?, options: MediaTrackSubscriptionOptions) -> ReceiverCommandResult {
         guard let track = OpaquePointer(bitPattern: UInt(handleID)) else {
             return .invalidArgument
         }
-        var cfg = moq_media_receiver_track_subscribe_cfg_t()
-        moq_media_receiver_track_subscribe_cfg_init(&cfg)
-        cfg.start = start == .nextGroup
-            ? MOQ_MEDIA_START_NEXT_GROUP : MOQ_MEDIA_START_CURRENT
-        if let priority {
-            cfg.has_priority = true
-            cfg.priority = priority
+        do {
+            return try withReceiverTrackSubscribeCFG(start: start, priority: priority, options: options) {
+                receiverCommandResult(moq_media_receiver_subscribe_track(receiver, track, &$0))
+            }
+        } catch {
+            // The nonthrowing body leaves only the marshaller's size refusal.
+            return .nativeFailure(Int32(MOQ_ERR_ABI_MISMATCH))
         }
-        return commandResult(
-            moq_media_receiver_subscribe_track(receiver, track, &cfg))
     }
 
     func unsubscribe(handleID: UInt64) -> ReceiverCommandResult {
         guard let track = OpaquePointer(bitPattern: UInt(handleID)) else {
             return .invalidArgument
         }
-        return commandResult(
+        return receiverCommandResult(
             moq_media_receiver_unsubscribe_track(receiver, track))
     }
 
-    private func commandResult(_ rc: moq_result_t) -> ReceiverCommandResult {
-        switch rc {
-        case moq_result_t(MOQ_OK): .ok
-        case moq_result_t(MOQ_ERR_WRONG_STATE): .wrongState
-        case moq_result_t(MOQ_ERR_CLOSED): .closed
-        case moq_result_t(MOQ_ERR_UNSUPPORTED): .unsupported
-        default: .invalidArgument
-        }
+    func cancelFill(handleID: UInt64, initiatingRequestID: UInt64) -> ReceiverCommandResult {
+        cancelReceiverFill(receiver: receiver, handleID: handleID,
+                           initiatingRequestID: initiatingRequestID)
+    }
+
+    func trackState(handleID: UInt64) -> Result<ExtendedTrackSubscriptionState, MoQServiceError> {
+        queryReceiverTrackState(receiver: receiver, handleID: handleID)
     }
 
     func detach() {
         moq_media_receiver_destroy(receiver)
+    }
+}
+
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+func copyReceiverTrackEvent(_ event: moq_media_track_event_t) -> ReceiverPolledEvent? {
+    let handleID = UInt64(UInt(bitPattern: event.track))
+    switch event.kind {
+    case MOQ_MEDIA_CATALOG_READY:
+        return ReceiverPolledEvent(kind: .catalogReady, handleID: 0, trackDescription: nil)
+    case MOQ_MEDIA_TRACK_ADDED:
+        // Timeline/unknown media tracks stay outside the legacy model.
+        guard let description = event.desc.flatMap({ copyTrackDescription($0.pointee) }) else {
+            return nil
+        }
+        return ReceiverPolledEvent(kind: .added, handleID: handleID, trackDescription: description)
+    case MOQ_MEDIA_TRACK_UPDATED:
+        return ReceiverPolledEvent(kind: .updated, handleID: handleID,
+                                   trackDescription: event.desc.flatMap { copyTrackDescription($0.pointee) })
+    case MOQ_MEDIA_TRACK_REMOVED:
+        return ReceiverPolledEvent(kind: .removed, handleID: handleID, trackDescription: nil)
+    case MOQ_MEDIA_TRACK_ENDED:
+        return ReceiverPolledEvent(kind: .ended, handleID: handleID, trackDescription: nil)
+    case MOQ_MEDIA_TRACK_PARSE_DROP:
+        let cls: ParseDropClass
+        switch event.parse_drop_class {
+        case MOQ_MEDIA_PARSE_DROP_MEDIA: cls = .media
+        case MOQ_MEDIA_PARSE_DROP_SAP: cls = .sap
+        case MOQ_MEDIA_PARSE_DROP_MEDIA_TIMELINE: cls = .mediaTimeline
+        default: return nil // Do not invent a class or a track end.
+        }
+        return ReceiverPolledEvent(
+            kind: .parseDrop, handleID: handleID, trackDescription: nil,
+            parseDropClass: cls, parseDropTotal: event.parse_drops_total,
+            parseDropDelta: event.parse_drops_delta)
+    case MOQ_MEDIA_TRACK_FILL_TERMINAL:
+        let terminal = MediaFillTerminal(
+            initiatingRequestID: receivedFieldIsPresent(event.struct_size, \moq_media_track_event_t.initiating_request_id)
+                ? event.initiating_request_id : nil,
+            reason: receivedFieldIsPresent(event.struct_size, \moq_media_track_event_t.fill_reason)
+                ? copyFillReason(event.fill_reason) : nil,
+            errorDomain: receivedFieldIsPresent(event.struct_size, \moq_media_track_event_t.fill_error_domain)
+                ? copyFillErrorDomain(event.fill_error_domain) : nil,
+            errorCode: receivedFieldIsPresent(event.struct_size, \moq_media_track_event_t.fill_error_code)
+                ? event.fill_error_code : nil)
+        return ReceiverPolledEvent(kind: .fillTerminal(terminal), handleID: handleID, trackDescription: nil)
+    case MOQ_MEDIA_TRACK_LOCAL_FAILURE:
+        let localResult = receivedFieldIsPresent(event.struct_size, \moq_media_track_event_t.local_result)
+            ? event.local_result : nil
+        return ReceiverPolledEvent(kind: .localFailure(localResult: localResult),
+                                   handleID: handleID, trackDescription: nil)
+    case MOQ_MEDIA_TRACK_DELIVERY_LOCAL_FAILURE:
+        let localResult = receivedFieldIsPresent(event.struct_size, \moq_media_track_event_t.local_result)
+            ? event.local_result : nil
+        let origin = receivedFieldIsPresent(event.struct_size, \moq_media_track_event_t.delivery_origin)
+            ? event.delivery_origin : nil
+        let initiatingID = origin == MOQ_MEDIA_DELIVERY_FILL && receivedFieldIsPresent(
+            event.struct_size, \moq_media_track_event_t.delivery_initiating_request_id)
+            ? event.delivery_initiating_request_id : nil
+        return ReceiverPolledEvent(kind: .deliveryLocalFailure(localResult: localResult,
+            origin: origin, initiatingRequestID: initiatingID), handleID: handleID, trackDescription: nil)
+    default:
+        // Unmodeled kinds are not false track ends.
+        return nil
+    }
+}
+
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+private func copyFillReason(_ raw: UInt32) -> MediaFillReason {
+    switch raw {
+    case MOQ_FILL_COMPLETE: .complete
+    case MOQ_FILL_NO_STREAM: .noStream
+    case MOQ_FILL_LOCAL_CANCELLED: .localCancelled
+    case MOQ_FILL_PEER_CANCELLED_OR_RESET: .peerCancelledOrReset
+    case MOQ_FILL_LOCAL_ABORTED: .localAborted
+    case MOQ_FILL_PARENT_REJECTED: .parentRejected
+    case MOQ_FILL_PARENT_TERMINATED: .parentTerminated
+    default: .unknown(raw)
+    }
+}
+
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+private func copyFillErrorDomain(_ raw: UInt32) -> MediaFillErrorDomain {
+    switch raw {
+    case MOQ_FILL_ERROR_NONE: .none
+    case MOQ_FILL_ERROR_STREAM: .stream
+    case MOQ_FILL_ERROR_PARENT_REQUEST: .parentRequest
+    case MOQ_FILL_ERROR_PARENT_DONE: .parentDone
+    default: .unknown(raw)
+    }
+}
+
+/// Every pointer below borrows a sized local only until the synchronous body
+/// returns. The service copies selected values before returning from subscribe.
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+func withReceiverTrackSubscribeCFG<T>(
+    start: StartMode, priority: UInt8?, options: MediaTrackSubscriptionOptions,
+    _ body: (inout moq_media_receiver_track_subscribe_cfg_t) -> T
+) throws -> T {
+    var cfg = moq_media_receiver_track_subscribe_cfg_t()
+    moq_media_receiver_track_subscribe_cfg_init_sized(&cfg, MemoryLayout.size(ofValue: cfg))
+    guard receivedFieldIsPresent(cfg.struct_size, \moq_media_receiver_track_subscribe_cfg_t.priority),
+          options.location == nil || receivedFieldIsPresent(cfg.struct_size, \moq_media_receiver_track_subscribe_cfg_t.location),
+          options.fill == nil || receivedFieldIsPresent(cfg.struct_size, \moq_media_receiver_track_subscribe_cfg_t.fill) else {
+        throw MoQServiceError.internalError(Int32(MOQ_ERR_ABI_MISMATCH))
+    }
+    cfg.start = start == .nextGroup ? MOQ_MEDIA_START_NEXT_GROUP : MOQ_MEDIA_START_CURRENT
+    if let priority {
+        cfg.has_priority = true
+        cfg.priority = priority
+    }
+    return try withReceiverLocation(options.location) { location in
+        try withReceiverFill(options.fill) { fill in
+            cfg.location = location
+            cfg.fill = fill
+            return body(&cfg)
+        }
+    }
+}
+
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+private func withReceiverLocation<T>(
+    _ location: MediaLocationFilter?,
+    _ body: (UnsafePointer<moq_location_filter_cfg_t>?) throws -> T
+) throws -> T {
+    guard let location else { return try body(nil) }
+    var cfg = moq_location_filter_cfg_t()
+    moq_location_filter_cfg_init_sized(&cfg, MemoryLayout.size(ofValue: cfg))
+    guard cfg.struct_size >= MOQ_LOCATION_FILTER_CFG_V0_SIZE else {
+        throw MoQServiceError.internalError(Int32(MOQ_ERR_ABI_MISMATCH))
+    }
+    switch location {
+    case .none: cfg.kind = MOQ_LOCATION_FILTER_NONE
+    case .nextObject: cfg.kind = MOQ_LOCATION_FILTER_NEXT_OBJECT
+    case .relativeGroup(let offset):
+        cfg.kind = MOQ_LOCATION_FILTER_RELATIVE_GROUP
+        cfg.relative_group_offset = offset
+    case .absoluteStart(let group, let object):
+        cfg.kind = MOQ_LOCATION_FILTER_ABSOLUTE_START
+        cfg.start_group = group
+        cfg.start_object = object
+    case .groupEnd(let startGroup, let startObject, let endGroup):
+        cfg.kind = MOQ_LOCATION_FILTER_GROUP_END
+        cfg.start_group = startGroup
+        cfg.start_object = startObject
+        cfg.end_group = endGroup
+    case .objectEnd(let startGroup, let startObject, let endGroup, let endObject):
+        cfg.kind = MOQ_LOCATION_FILTER_OBJECT_END
+        cfg.start_group = startGroup
+        cfg.start_object = startObject
+        cfg.end_group = endGroup
+        cfg.end_object = endObject
+    }
+    return try withUnsafePointer(to: &cfg) { try body($0) }
+}
+
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+private func withReceiverFill<T>(
+    _ fill: MediaFillOptions?, _ body: (UnsafePointer<moq_fill_cfg_t>?) throws -> T
+) throws -> T {
+    guard let fill else { return try body(nil) }
+    var cfg = moq_fill_cfg_t()
+    moq_fill_cfg_init_sized(&cfg, MemoryLayout.size(ofValue: cfg))
+    guard cfg.struct_size >= MOQ_FILL_CFG_V0_SIZE else {
+        throw MoQServiceError.internalError(Int32(MOQ_ERR_ABI_MISMATCH))
+    }
+    if let priority = fill.subscriberPriority {
+        cfg.has_subscriber_priority = true
+        cfg.subscriber_priority = priority
+    }
+    if let order = fill.groupOrder {
+        cfg.has_group_order = true
+        cfg.group_order = order == .ascending ? MOQ_GROUP_ORDER_ASCENDING : MOQ_GROUP_ORDER_DESCENDING
+    }
+    if let timeout = fill.timeoutMilliseconds {
+        cfg.has_fill_timeout = true
+        cfg.fill_timeout_ms = timeout
+    }
+    return try withReceiverLocation(fill.location) { location in
+        cfg.location = location
+        return try withUnsafePointer(to: &cfg) { try body($0) }
+    }
+}
+
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+func cancelReceiverFill(
+    receiver: OpaquePointer, handleID: UInt64, initiatingRequestID: UInt64,
+    call: (OpaquePointer?, OpaquePointer?, UInt64) -> moq_result_t = moq_media_receiver_cancel_fill
+) -> ReceiverCommandResult {
+    guard let track = OpaquePointer(bitPattern: UInt(handleID)) else { return .invalidArgument }
+    return receiverCommandResult(call(receiver, track, initiatingRequestID))
+}
+
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+func receiverCommandResult(_ rc: moq_result_t) -> ReceiverCommandResult {
+    switch rc {
+    case moq_result_t(MOQ_OK): .ok
+    case moq_result_t(MOQ_ERR_INVAL): .invalidArgument
+    case moq_result_t(MOQ_ERR_WRONG_STATE): .wrongState
+    case moq_result_t(MOQ_ERR_CLOSED): .closed
+    case moq_result_t(MOQ_ERR_UNSUPPORTED): .unsupported
+    default: .nativeFailure(rc)
+    }
+}
+
+/// Use the real getter for each call; neither delivery events nor descriptions
+/// provide an authoritative current state. The output is read on success only.
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+func queryReceiverTrackState(
+    receiver: OpaquePointer?, handleID: UInt64,
+    call: (OpaquePointer?, OpaquePointer?, UnsafeMutablePointer<moq_media_track_state_t>?) -> moq_result_t
+        = moq_media_receiver_track_state
+) -> Result<ExtendedTrackSubscriptionState, MoQServiceError> {
+    guard let track = OpaquePointer(bitPattern: UInt(handleID)) else {
+        return .failure(.invalidArgument("track state: invalid track"))
+    }
+    var state = MOQ_MEDIA_TRACK_STATE_DISCOVERED
+    switch receiverCommandResult(call(receiver, track, &state)) {
+    case .ok:
+        let copied: ExtendedTrackSubscriptionState
+        switch state {
+        case MOQ_MEDIA_TRACK_STATE_DISCOVERED: copied = .legacy(.discovered)
+        case MOQ_MEDIA_TRACK_STATE_PENDING: copied = .legacy(.pending)
+        case MOQ_MEDIA_TRACK_STATE_ACTIVE: copied = .legacy(.active)
+        case MOQ_MEDIA_TRACK_STATE_PAUSED_APP: copied = .legacy(.pausedByApp)
+        case MOQ_MEDIA_TRACK_STATE_PAUSED_FLOW: copied = .legacy(.pausedByFlowControl)
+        case MOQ_MEDIA_TRACK_STATE_ENDED: copied = .legacy(.ended)
+        case MOQ_MEDIA_TRACK_STATE_FAILED: copied = .failed
+        default: copied = .unknown(state.rawValue)
+        }
+        return .success(copied)
+    case .invalidArgument: return .failure(.invalidArgument("track state: invalid track"))
+    case .wrongState: return .failure(.wrongState)
+    case .closed: return .failure(.closed)
+    case .unsupported: return .failure(.unsupported)
+    case .nativeFailure(let code): return .failure(.internalError(code))
     }
 }
 

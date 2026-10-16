@@ -23,9 +23,9 @@ target_link_libraries(moq_pico_wt_client
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
     target_compile_options(moq_pico_wt_server PRIVATE
-        -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+        -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
     target_compile_options(moq_pico_wt_client PRIVATE
-        -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+        -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
 endif()
 
 # -- Localhost smoke -------------------------------------------------

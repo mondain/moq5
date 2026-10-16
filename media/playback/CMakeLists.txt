@@ -58,6 +58,7 @@ if(MOQ_BUILD_TESTS)
     target_compile_definitions(test_playback_api PRIVATE MOQ_PLAYBACK_TESTING)
     add_test(NAME playback_api COMMAND test_playback_api)
 
+    # Public-interface fixture exercises the real production library.
     add_executable(test_playback_oom tests/test_playback_oom.c)
     target_link_libraries(test_playback_oom PRIVATE moq::playback)
     add_test(NAME playback_oom COMMAND test_playback_oom)

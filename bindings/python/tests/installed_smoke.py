@@ -51,7 +51,7 @@ PUBLIC_NAMES = frozenset({
     "SendObject", "SendTrack", "SendTrackConfig", "Sender", "SenderConfig",
     "SenderTerminal", "StartMode",
     "Terminal", "TerminalReason", "TimeMode", "Track", "TrackDescription",
-    "TrackEvent", "TrackEventKind", "TrackNameBusy", "TrackState", "Version",
+    "TrackEvent", "TrackEventKind", "TrackNameBusy", "TrackState", "UriMode", "Version",
     "VodState", "WaitResult", "WriteOutcome", "WtProfile", "build_info",
 })
 
@@ -459,6 +459,45 @@ def expect_native_error(url: str, expected_code: int, versions: tuple[int, ...] 
         raise AssertionError(f"expected native connect refusal for {url}")
 
 
+def expect_native_connect_error(expected_code: int, *args: object) -> None:
+    """The private bridge passes the mode and preference fields through, so
+    the real C resolver's own rule is what answers here."""
+    from moq5 import _native
+
+    try:
+        handle = _native.connect(*args)
+    except _native.Error as error:
+        require(error.args[0] == expected_code, f"wrong native result: {error.args}")
+        require(error.args[1] == "connect", "failure did not come from connect")
+    else:
+        _native.close(handle)
+        raise AssertionError(f"expected native connect refusal for {args!r}")
+
+
+def check_endpoint_values() -> None:
+    """The draft-22 era endpoint values, from the compiled C constants."""
+    from moq5 import EndpointConfig, UriMode, Version
+
+    require({m.name: m.value for m in Version}
+            == {"DRAFT_16": 16, "DRAFT_18": 18, "DRAFT_22": 22},
+            "named wire versions changed")
+    require({m.name: m.value for m in UriMode} == {"STANDARD": 1, "LEGACY": 0},
+            "URI modes changed")
+    config = EndpointConfig(url="moqt://127.0.0.1:9")
+    require(config.uri_mode is UriMode.LEGACY, "LEGACY is not the default URI mode")
+    require(config.preferred_version is None, "a preferred version is set by default")
+    legacy = EndpointConfig(url="https://127.0.0.1:443/moq", wt_path="/moq")
+    require(legacy.wt_path == "/moq", "the default client path override changed")
+    for kwargs in ({"wt_path": "/moq", "uri_mode": UriMode.STANDARD},
+                   {"versions": (18,), "preferred_version": 22}):
+        try:
+            EndpointConfig(url="https://127.0.0.1:443/moq", **kwargs)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"configuration accepted: {kwargs!r}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifact", type=Path, required=True)
@@ -488,6 +527,7 @@ def main() -> None:
     check_public_origin()
     check_receiver_values()
     check_sender_values()
+    check_endpoint_values()
     check_loader_paths(native_file)
     info = moq5.build_info()
     require(
@@ -541,6 +581,15 @@ def main() -> None:
     # during resolution, BEFORE any backend is selected or a socket exists --
     # on every SDK, with or without adapters. The fixture cannot certify this.
     expect_native_error("moqt://127.0.0.1:9", -2, versions=(16,) * 9)
+    # The URI-mode and preference rules are the C resolver's, reached during
+    # resolution before any backend is selected, on every SDK: a wt_path
+    # under STANDARD, and a preferred version beside an explicit offer, are
+    # INVAL. (url, protocol, backend, versions, sni, ca_file, wt_path,
+    # wt_profile, handshake_timeout_us, uri_mode, preferred_version)
+    expect_native_connect_error(-2, b"https://127.0.0.1:443/moq", 0, 0, (), b"", b"",
+                                b"/moq", 0, 0, 1, 0)
+    expect_native_connect_error(-2, b"moqt://127.0.0.1:9", 0, 0, (18,), b"", b"",
+                                b"", 0, 0, 0, 22)
     if args.skip_backendless_checks:
         print("Backend-absence assertions omitted; no valid-URL connection attempted.")
     else:
@@ -549,6 +598,15 @@ def main() -> None:
         # Eight offers is the SDK's capacity: accepted by resolution, then
         # refused by backend absence. Adapter-free SDKs only; never dialled.
         expect_native_error("moqt://127.0.0.1:9", -14, versions=(16,) * 8)
+        # The same wt_path under LEGACY passes the INVAL checks, as do draft
+        # 22 offered or preferred; an adapter-free SDK then answers
+        # UNSUPPORTED, a code that does not by itself separate the absent
+        # backend from version support.
+        expect_native_connect_error(-14, b"https://127.0.0.1:443/moq", 0, 0, (), b"", b"",
+                                    b"/moq", 0, 0, 0, 0)
+        expect_native_error("moqt://127.0.0.1:9", -14, versions=(22,))
+        expect_native_connect_error(-14, b"moqt://127.0.0.1:9", 0, 0, (), b"", b"",
+                                    b"", 0, 0, 0, 22)
     print(
         f"Installed {artifact.name}: moq5={args.expected_package_version}, "
         f"LibMoQ VERSION={args.expected_sdk_version}, cp312-abi3; smoke passed."

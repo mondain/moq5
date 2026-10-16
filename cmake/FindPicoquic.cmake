@@ -75,8 +75,8 @@ endfunction()
 #
 #   PTLS_INCLUDE_DIR  -- dir with picotls.h / picotls/openssl.h. Needed by the
 #       cert-verifier helper (moq_picoquic_verify.c) and the managed edge tests.
-#       In source-tree mode picoquic's FindPTLS sets it; in CONFIG / already-
-#       available mode nothing does.
+#       In source-tree mode it is selected before picoquic is added; in
+#       CONFIG / already-available mode it is resolved here.
 #   MOQ_PTLS_LIB_DIR  -- dir with libpicotls-*.a. Needed so the generated .pc
 #       files can bake an absolute -L for the picotls libraries. This must NOT
 #       be derived from PTLS_OPENSSL_LIBRARY: picoquic's FindPTLS sets that to a
@@ -88,7 +88,16 @@ endfunction()
 # Both are cache vars (globally visible after find_package(Picoquic)). Absent a
 # usable MOQ_PICOTLS_PREFIX hint they stay unset and consumers fall back to
 # their own resolution / an actionable error.
+#
+# With FROM_PREFIX (installed CONFIG package or an existing picoquic target)
+# and a MOQ_PICOTLS_PREFIX, both follow that prefix under the same derived /
+# explicit rule as source-tree mode (see _moq_pq_ptls_select). In source-tree
+# mode they were already selected before picoquic was added.
 function(_moq_pq_resolve_ptls)
+    if("${ARGV0}" STREQUAL "FROM_PREFIX" AND MOQ_PICOTLS_PREFIX)
+        _moq_pq_ptls_dirs_from_prefix()
+        return()
+    endif()
     if(NOT PTLS_INCLUDE_DIR OR NOT EXISTS "${PTLS_INCLUDE_DIR}/picotls.h")
         find_path(PTLS_INCLUDE_DIR
             NAMES picotls.h
@@ -121,6 +130,209 @@ function(_moq_pq_resolve_ptls)
             endif()
         endif()
     endif()
+endfunction()
+
+# -- picotls from MOQ_PICOTLS_PREFIX (source-tree mode) -------------------
+#
+# picoquic's FindPTLS hints its headers at ${PTLS_PREFIX}/include/picotls, one
+# level below where picotls/minicrypto.h resolves, then falls back to picotls
+# checkouts beside the top-level source and build trees. It also keeps any
+# PTLS_* cache entry that is already set. Left to it, a build can pair this
+# prefix's libraries with another picotls's headers, and a reconfigure onto a
+# different prefix keeps the previous prefix's selections. So the selections
+# are made here, from the currently named prefix, before picoquic is added.
+#
+# Layout of MOQ_PICOTLS_PREFIX, checked in this order:
+#   installed prefix   <prefix>/include/picotls/minicrypto.h, libraries in
+#                      <prefix>/lib or <prefix>/lib64
+#   build directory    libpicotls-core directly in <prefix> and headers in
+#                      <prefix>/../include (a picotls checkout's build dir)
+# Anything else is refused.
+#
+# Each selected cache entry (PTLS_INCLUDE_DIR, PTLS_{CORE,MINICRYPTO,OPENSSL,
+# FUSION}_LIBRARY, MOQ_PTLS_LIB_DIR) is either derived or explicit:
+#   derived   chosen by this module (recorded in _MOQ_PQ_PTLS_SELECTED_<var>)
+#             or by a find module's default search; it is re-selected from
+#             the current prefix on every configure, and dropped when the
+#             prefix does not provide it.
+#   explicit  anything else the caller set (-D, -C, a changed value). It is
+#             kept only if it names what the prefix provides, or supplies
+#             something the prefix lacks; an explicit selection that differs
+#             from the prefix's own file stops the configure, so two picotls
+#             trees are never combined. Once seen, an entry stays explicit
+#             (recorded in _MOQ_PQ_PTLS_EXPLICIT_<var>) until the caller
+#             removes it (-U<var>): a find_path/find_library that meets an
+#             untyped -D entry retypes it and replaces its help string with
+#             the find default, which would otherwise read as derived on the
+#             next configure.
+set(_MOQ_PQ_PTLS_DERIVED_HELP
+    "Path to a file."
+    "Path to a library."
+    "picotls include directory (picotls.h)"
+    "picotls include directory (picotls/minicrypto.h)"
+    "picotls library directory (libpicotls-*.a)"
+    "picotls core library"
+    "picotls minicrypto library"
+    "picotls openssl library"
+    "picotls fusion library")
+
+function(_moq_pq_ptls_find_lib name dirs out_var)
+    unset(_MOQ_PQ_PTLS_PROBE)
+    unset(_MOQ_PQ_PTLS_PROBE CACHE)
+    find_library(_MOQ_PQ_PTLS_PROBE NAMES picotls-${name} PATHS ${dirs} NO_DEFAULT_PATH)
+    set(found "${_MOQ_PQ_PTLS_PROBE}")
+    unset(_MOQ_PQ_PTLS_PROBE CACHE)
+    if(found MATCHES "-NOTFOUND$")
+        set(found "")
+    endif()
+    set(${out_var} "${found}" PARENT_SCOPE)
+endfunction()
+
+# Selects cache entry `var` (of `type`) from `candidate`, the prefix's own
+# file or "" when the prefix lacks it. `what` names it in diagnostics.
+function(_moq_pq_ptls_select var type candidate required what doc)
+    set(record _MOQ_PQ_PTLS_SELECTED_${var})
+    set(explicit_record _MOQ_PQ_PTLS_EXPLICIT_${var})
+    set(current "${${var}}")
+    set(explicit FALSE)
+    if(current STREQUAL "" OR current MATCHES "-NOTFOUND$")
+        unset(${explicit_record} CACHE)
+    elseif(DEFINED CACHE{${explicit_record}})
+        set(explicit TRUE)
+    else()
+        if(DEFINED CACHE{${record}})
+            if(NOT current STREQUAL "$CACHE{${record}}")
+                set(explicit TRUE)
+            endif()
+        else()
+            get_property(help CACHE ${var} PROPERTY HELPSTRING)
+            if(NOT help IN_LIST _MOQ_PQ_PTLS_DERIVED_HELP)
+                set(explicit TRUE)
+            endif()
+        endif()
+    endif()
+
+    if(explicit)
+        if(candidate)
+            get_filename_component(chosen "${current}" REALPATH)
+            get_filename_component(provided "${candidate}" REALPATH)
+            if(NOT chosen STREQUAL provided)
+                message(FATAL_ERROR
+                    "${var}=${current} conflicts with "
+                    "MOQ_PICOTLS_PREFIX=${MOQ_PICOTLS_PREFIX}, whose ${what} is "
+                    "${candidate}. Name one picotls: drop the override "
+                    "(-U${var}) or point MOQ_PICOTLS_PREFIX at the tree it "
+                    "belongs to.")
+            endif()
+        elseif(NOT EXISTS "${current}")
+            message(FATAL_ERROR "${var}=${current} does not exist")
+        endif()
+        unset(${record} CACHE)
+        set(${explicit_record} "${current}" CACHE INTERNAL "")
+        return()
+    endif()
+
+    unset(${explicit_record} CACHE)
+    if(candidate)
+        set(${var} "${candidate}" CACHE ${type} "${doc}" FORCE)
+        set(${record} "${candidate}" CACHE INTERNAL "")
+    else()
+        unset(${var} CACHE)
+        unset(${record} CACHE)
+        if(required)
+            message(FATAL_ERROR
+                "MOQ_PICOTLS_PREFIX=${MOQ_PICOTLS_PREFIX} provides no ${what}; "
+                "pass -D${var}=<path> to name it explicitly.")
+        endif()
+    endif()
+endfunction()
+
+# Reads the layout of MOQ_PICOTLS_PREFIX into _moq_ptls_tree,
+# _moq_ptls_include_dir, _moq_ptls_lib_dirs and _moq_ptls_build_form, or
+# refuses a prefix that is neither layout.
+function(_moq_pq_ptls_layout)
+    set(prefix "${MOQ_PICOTLS_PREFIX}")
+    get_filename_component(parent "${prefix}/.." ABSOLUTE)
+    _moq_pq_ptls_find_lib(core "${prefix}" core_in_prefix)
+    if(EXISTS "${prefix}/include/picotls/minicrypto.h")
+        set(build_form FALSE)
+        set(tree "${prefix}")
+        set(include_dir "${prefix}/include")
+        set(lib_dirs "${prefix}/lib" "${prefix}/lib64")
+    elseif(core_in_prefix AND EXISTS "${parent}/include/picotls/minicrypto.h")
+        set(build_form TRUE)
+        set(tree "${parent}")
+        set(include_dir "${parent}/include")
+        set(lib_dirs "${prefix}")
+    else()
+        message(FATAL_ERROR
+            "MOQ_PICOTLS_PREFIX=${prefix} is not a picotls tree: expected an "
+            "installed prefix (include/picotls/minicrypto.h with lib/ or "
+            "lib64/) or a picotls build directory (libpicotls-core in it, "
+            "headers in ../include).")
+    endif()
+    set(_moq_ptls_tree "${tree}" PARENT_SCOPE)
+    set(_moq_ptls_include_dir "${include_dir}" PARENT_SCOPE)
+    set(_moq_ptls_lib_dirs "${lib_dirs}" PARENT_SCOPE)
+    set(_moq_ptls_build_form ${build_form} PARENT_SCOPE)
+endfunction()
+
+# Selects the two entries libmoq itself reads, PTLS_INCLUDE_DIR (verifier
+# helper, managed edge tests) and MOQ_PTLS_LIB_DIR (generated .pc files), from
+# MOQ_PICOTLS_PREFIX. Used where picoquic is already built (installed CONFIG
+# package or an existing target), so the PTLS_*_LIBRARY entries belong to
+# that picoquic and are left alone.
+function(_moq_pq_ptls_dirs_from_prefix)
+    _moq_pq_ptls_layout()
+    _moq_pq_ptls_select(PTLS_INCLUDE_DIR PATH "${_moq_ptls_include_dir}" TRUE
+        "headers (picotls/minicrypto.h)"
+        "picotls include directory (picotls/minicrypto.h)")
+    _moq_pq_ptls_find_lib(core "${_moq_ptls_lib_dirs}" core)
+    set(lib_dir "")
+    if(core)
+        get_filename_component(lib_dir "${core}" DIRECTORY)
+    endif()
+    _moq_pq_ptls_select(MOQ_PTLS_LIB_DIR PATH "${lib_dir}" TRUE
+        "library directory (libpicotls-core)"
+        "picotls library directory (libpicotls-*.a)")
+endfunction()
+
+# Sets PTLS_PREFIX and every selection above from MOQ_PICOTLS_PREFIX, for a
+# picoquic about to be built from source. Returns _moq_ptls_build_form (TRUE
+# for the build-directory layout).
+function(_moq_pq_ptls_from_prefix)
+    _moq_pq_ptls_layout()
+    set(build_form ${_moq_ptls_build_form})
+    set(include_dir "${_moq_ptls_include_dir}")
+    set(lib_dirs "${_moq_ptls_lib_dirs}")
+    set(PTLS_PREFIX "${_moq_ptls_tree}" CACHE PATH "" FORCE)
+
+    _moq_pq_ptls_select(PTLS_INCLUDE_DIR PATH "${include_dir}" TRUE
+        "headers (picotls/minicrypto.h)"
+        "picotls include directory (picotls/minicrypto.h)")
+
+    if(NOT DEFINED WITH_OPENSSL OR WITH_OPENSSL)
+        set(openssl_required TRUE)
+    else()
+        set(openssl_required FALSE)
+    endif()
+    foreach(lib core minicrypto openssl fusion)
+        string(TOUPPER "PTLS_${lib}_LIBRARY" var)
+        _moq_pq_ptls_find_lib(${lib} "${lib_dirs}" candidate)
+        set(required FALSE)
+        if(lib STREQUAL "core" OR lib STREQUAL "minicrypto" OR
+           (lib STREQUAL "openssl" AND openssl_required))
+            set(required TRUE)
+        endif()
+        _moq_pq_ptls_select(${var} FILEPATH "${candidate}" ${required}
+            "picotls-${lib} library" "picotls ${lib} library")
+    endforeach()
+
+    get_filename_component(lib_dir "${PTLS_CORE_LIBRARY}" DIRECTORY)
+    _moq_pq_ptls_select(MOQ_PTLS_LIB_DIR PATH "${lib_dir}" TRUE
+        "library directory" "picotls library directory (libpicotls-*.a)")
+
+    set(_moq_ptls_build_form ${build_form} PARENT_SCOPE)
 endfunction()
 
 # One OpenSSL link identity for source-tree picoquic and the adapter.
@@ -236,7 +448,7 @@ if(TARGET picoquic::picoquic-core OR TARGET picoquic-core)
         endif()
         _moq_pq_require_http("the already-available picoquic")
     endif()
-    _moq_pq_resolve_ptls()
+    _moq_pq_resolve_ptls(FROM_PREFIX)
     set(Picoquic_FOUND TRUE)
     return()
 endif()
@@ -259,7 +471,7 @@ else()
         if(_MOQ_PQ_NEED_HTTP)
             _moq_pq_require_http("the installed picoquic CONFIG package")
         endif()
-        _moq_pq_resolve_ptls()
+        _moq_pq_resolve_ptls(FROM_PREFIX)
         set(Picoquic_FOUND TRUE)
         return()
     endif()
@@ -286,16 +498,13 @@ if(MOQ_PICOQUIC_SOURCE_DIR)
         endif()
     endif()
 
-    # picoquic's FindPTLS searches PTLS_PREFIX/include for headers
-    # and PTLS_PREFIX/lib for libraries. picotls source builds put
-    # headers in source/include and libraries in build root.
-    get_filename_component(_ptls_src "${MOQ_PICOTLS_PREFIX}/.." ABSOLUTE)
-    if(EXISTS "${_ptls_src}/include/picotls/minicrypto.h")
-        set(PTLS_PREFIX "${_ptls_src}" CACHE PATH "" FORCE)
+    # MOQ_PICOTLS_PREFIX decides picotls for the source build; see
+    # _moq_pq_ptls_from_prefix. PTLS_PREFIX tells picoquic's FindPTLS the same.
+    _moq_pq_ptls_from_prefix()
+    if(_moq_ptls_build_form)
         list(APPEND CMAKE_LIBRARY_PATH "${MOQ_PICOTLS_PREFIX}")
-    else()
-        set(PTLS_PREFIX "${MOQ_PICOTLS_PREFIX}" CACHE PATH "" FORCE)
     endif()
+    unset(_moq_ptls_build_form)
 
     # Disable picoquic extras.
     set(BUILD_DEMO OFF CACHE BOOL "" FORCE)

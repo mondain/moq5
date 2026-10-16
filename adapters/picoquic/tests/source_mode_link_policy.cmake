@@ -42,6 +42,11 @@ endif()
 if(DEFINED CXX_COMPILER AND NOT CXX_COMPILER STREQUAL "")
     list(APPEND _common "-DCMAKE_CXX_COMPILER=${CXX_COMPILER}")
 endif()
+# The parent build's OpenSSL selection (ConsumerProviderContext.cmake), so
+# every driver configure resolves the provider the parent did.
+if(DEFINED OPENSSL_CONTEXT AND NOT OPENSSL_CONTEXT STREQUAL "")
+    list(APPEND _common -C "${OPENSSL_CONTEXT}")
+endif()
 set(_gen "")
 if(DEFINED GENERATOR AND NOT GENERATOR STREQUAL "")
     if(GENERATOR MATCHES "^(Xcode|Visual Studio|Ninja Multi-Config)")
@@ -274,6 +279,10 @@ function(_write_driver dir pre post)
     file(MAKE_DIRECTORY "${dir}/sibling")
     file(WRITE "${dir}/CMakeLists.txt"
         "cmake_minimum_required(VERSION 3.20)\n"
+        "# Toolchains select their own rules during project(); do not preempt that choice.\n"
+        "if(NOT CMAKE_TOOLCHAIN_FILE AND \"\$ENV{CMAKE_TOOLCHAIN_FILE}\" STREQUAL \"\")\n"
+        "    include(\"${SRC}/cmake/MoqAppleAbiProbe.cmake\")\n"
+        "endif()\n"
         "project(driver C CXX)\n"
         "list(APPEND CMAKE_MODULE_PATH \"${SRC}/cmake\" \"${_hooks}\")\n"
         "set(MOQ_BUILD_ADAPTER_PICO_WT ON)\n"

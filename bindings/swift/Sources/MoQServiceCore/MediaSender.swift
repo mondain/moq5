@@ -44,6 +44,9 @@ public final class MediaSender: @unchecked Sendable {
         public var namespace: MediaNamespace
         public var sendPolicy: SendPolicy
         public var queueLimits: QueueLimits?
+        /// Media profile. `.automatic` (the default) follows the negotiated
+        /// draft; an explicit profile refuses the other drafts.
+        public var companionProfile: MediaCompanionProfile
         /// Strict CMAF validation of written fragments (default true, like
         /// the C tier); disable only for known-good passthrough.
         public var validateCMAF: Bool
@@ -54,6 +57,7 @@ public final class MediaSender: @unchecked Sendable {
             self.namespace = namespace
             self.sendPolicy = sendPolicy
             self.queueLimits = nil
+            self.companionProfile = .automatic
             self.validateCMAF = true
             self.catalogTrack = nil
         }
@@ -252,6 +256,24 @@ public final class MediaSender: @unchecked Sendable {
         }
     }
 
+    /// Take the new-group request pending on a track added with
+    /// `dynamicGroups`: a subscriber asked for a new group (draft-22 section
+    /// 9.20.19) with a value that warrants one. The publisher "SHOULD end the
+    /// current Group and begin a new Group as soon as practical", so write
+    /// the next object as a group-starting keyframe. Returns the request's
+    /// value (0: the subscriber knows no group) and clears it, or nil when
+    /// none is pending; requests not yet taken coalesce into the latest.
+    public func takeNewGroupRequest(for track: MediaTrack) async throws -> UInt64? {
+        guard let handleID = attachment.handleID(for: track) else {
+            throw MoQServiceError.invalidArgument(
+                "takeNewGroupRequest: the track does not belong to this sender")
+        }
+        let attachment = self.attachment
+        return try await performGuarded { [attachment] in
+            attachment.backend.takeNewGroupRequest(handleID: handleID)
+        }
+    }
+
     /// End a finite track: returns once the reliable END_OF_TRACK marker is
     /// QUEUED (a momentarily full queue is retried internally, independent
     /// of the send policy); the service then drains it after the track's
@@ -291,6 +313,8 @@ public final class MediaSender: @unchecked Sendable {
                     throw attachment.terminalError()
                 case .outOfMemory:
                     throw MoQServiceError.outOfMemory
+                case .unsupported:
+                    throw MoQServiceError.unsupported
                 }
             }
             if queued { return }
@@ -336,6 +360,8 @@ public final class MediaSender: @unchecked Sendable {
                     throw attachment.terminalError()
                 case .outOfMemory:
                     throw MoQServiceError.outOfMemory
+                case .unsupported:
+                    throw MoQServiceError.unsupported
                 }
             }
             if delivered { return }
@@ -457,6 +483,8 @@ package final class SenderAttachment: @unchecked Sendable {
             throw terminalError()
         case .outOfMemory:
             throw MoQServiceError.outOfMemory
+        case .unsupported:
+            throw MoQServiceError.unsupported
         }
     }
 }

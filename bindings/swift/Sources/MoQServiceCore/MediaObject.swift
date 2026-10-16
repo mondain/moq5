@@ -24,6 +24,14 @@ public final class MediaObject: @unchecked Sendable {
     public let decodeTime: Duration
     public let compositionOffset: Duration
     public let captureTime: Date?
+    /// Nil means the native output did not contain the complete observation.
+    public let wireIdentity: MediaObjectIdentity?
+    public let metadata: MediaObjectMetadata?
+    /// Separate, unchanged Object and initial ACK Track Property blocks.
+    /// Nil means unobserved; an observed empty block is empty Data.
+    public let objectProperties: Data?
+    public let trackProperties: Data?
+    public let delivery: MediaObjectDelivery?
 
     package init(storage: any OwnedObjectStorage,
                  track: MediaTrack,
@@ -33,7 +41,12 @@ public final class MediaObject: @unchecked Sendable {
                  presentationTime: Duration = .zero,
                  decodeTime: Duration = .zero,
                  compositionOffset: Duration = .zero,
-                 captureTime: Date? = nil) {
+                 captureTime: Date? = nil,
+                 wireIdentity: MediaObjectIdentity? = nil,
+                 metadata: MediaObjectMetadata? = nil,
+                 objectProperties: Data? = nil,
+                 trackProperties: Data? = nil,
+                 delivery: MediaObjectDelivery? = nil) {
         self.storage = storage
         self.track = track
         self.isKeyframe = isKeyframe
@@ -43,6 +56,11 @@ public final class MediaObject: @unchecked Sendable {
         self.decodeTime = decodeTime
         self.compositionOffset = compositionOffset
         self.captureTime = captureTime
+        self.wireIdentity = wireIdentity
+        self.metadata = metadata
+        self.objectProperties = objectProperties
+        self.trackProperties = trackProperties
+        self.delivery = delivery
     }
 
     deinit {
@@ -95,6 +113,9 @@ public struct OutgoingObject: Sendable {
     public var decodeTime: Duration?
     public var captureTime: Date?
     public var sapType: SAPType?
+    /// Raw outbound LOC metadata. Native service profile and clock rules
+    /// apply; this does not derive values from the legacy time helpers.
+    public var locMetadata: MediaLOCMetadata?
 
     public init(payload: Data,
                 isSync: Bool = false,
@@ -114,5 +135,23 @@ public struct OutgoingObject: Sendable {
         self.decodeTime = decodeTime
         self.captureTime = captureTime
         self.sapType = sapType
+        self.locMetadata = nil
+    }
+
+    public init(payload: Data,
+                isSync: Bool = false,
+                startsGroup: Bool = false,
+                endsGroup: Bool = false,
+                presentationTime: Duration = .zero,
+                decodeTime: Duration? = nil,
+                captureTime: Date? = nil,
+                sapType: SAPType? = nil,
+                properties: Data? = nil,
+                locMetadata: MediaLOCMetadata?) {
+        self.init(payload: payload, isSync: isSync, startsGroup: startsGroup,
+                  endsGroup: endsGroup, presentationTime: presentationTime,
+                  decodeTime: decodeTime, captureTime: captureTime,
+                  sapType: sapType, properties: properties)
+        self.locMetadata = locMetadata
     }
 }

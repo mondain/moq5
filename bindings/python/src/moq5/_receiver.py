@@ -19,9 +19,19 @@ from ._values import (
     CmafInit,
     CmafSample,
     CodecKind,
+    DeliveryOrigin,
+    ExtendedTrackState,
     FatalOrigin,
+    FillConfig,
+    FillErrorDomain,
+    FillReason,
+    FillTerminal,
+    LocationFilter,
+    LocMetadata,
+    MediaMetadata,
     MediaObject,
     MediaTemplate,
+    MediaTimeDomain,
     MediaType,
     ObjectStatus,
     Packaging,
@@ -43,9 +53,27 @@ from ._values import (
     _bounded_integer,
     _integer,
     _known_or_int,
+    _UINT64_MAX,
 )
 
 _PRIORITY_MAX = 255
+
+
+def _location(value: LocationFilter | None) -> tuple | None:
+    if value is None:
+        return None
+    if not isinstance(value, LocationFilter):
+        raise TypeError("location must be LocationFilter or None")
+    return (int(value.kind), value.relative_group_offset, value.start_group,
+            value.start_object, value.end_group, value.end_object)
+
+
+def _metadata(value: dict | None) -> MediaMetadata | None:
+    if value is None:
+        return None
+    return MediaMetadata(
+        _known_or_int(MediaTimeDomain, value["time_domain"]), value["time_us"],
+        value["independent"], None if value["loc"] is None else LocMetadata(**value["loc"]))
 
 
 def _description(d: dict) -> TrackDescription:
@@ -136,6 +164,7 @@ class Receiver:
             config.max_objects,
             config.max_bytes,
             config.max_track_events,
+            int(config.companion_profile),
         )
         receiver.__endpoint = endpoint
         return receiver
@@ -181,17 +210,35 @@ class Receiver:
         return track._capsule
 
     def subscribe(
-        self, track: Track, *, start: StartMode = StartMode.CURRENT, priority: int | None = None
+        self, track: Track, *, start: StartMode = StartMode.CURRENT, priority: int | None = None,
+        location: LocationFilter | None = None, fill: FillConfig | None = None
     ) -> None:
         """Record the intent to receive `track`; the service subscribes on its
         thread. Start mode and priority apply only when the subscription is
         first issued. Refusals keep the native code: INVAL, WRONG_STATE
-        (ended/removed), CLOSED (terminal), UNSUPPORTED (namespace override)."""
+        (ended/removed), CLOSED (terminal), UNSUPPORTED (namespace override).
+        Explicit location supersedes start. None omits an option; even an
+        empty FillConfig requests a child. Either explicit option suppresses
+        the service's implicit current-group fill. Eligibility stays native."""
         capsule = self._own(track)
         start = StartMode(_integer(start, "start"))
         if priority is not None:
             priority = _bounded_integer(priority, "priority", _PRIORITY_MAX)
-        _call(_native.receiver_subscribe, self.__handle, capsule, int(start), priority)
+        loc = _location(location)
+        fill_value = None
+        if fill is not None:
+            if not isinstance(fill, FillConfig):
+                raise TypeError("fill must be FillConfig or None")
+            fill_value = (fill.priority, fill.group_order, fill.timeout_ms, _location(fill.location))
+        _call(_native.receiver_subscribe, self.__handle, capsule, int(start), priority, loc, fill_value)
+
+    def cancel_fill(self, track: Track, initiating_request_id: int) -> None:
+        """Schedule cancellation of one child, never unsubscribe its parent.
+        The SUBSCRIBE/UPDATE correlation ID is full uint64, including zero;
+        native refusal is reported exactly, with operation 'cancel_fill'."""
+        capsule = self._own(track)
+        request_id = _bounded_integer(initiating_request_id, "initiating_request_id", _UINT64_MAX)
+        _call(_native.receiver_cancel_fill, self.__handle, capsule, request_id)
 
     def unsubscribe(self, track: Track) -> None:
         """Pause delivery for `track` and purge its queued objects."""
@@ -200,6 +247,10 @@ class Receiver:
     def track_state(self, track: Track) -> TrackState | int:
         """A point-in-time delivery state; unknown future states stay integers."""
         return _known_or_int(TrackState, _call(_native.receiver_track_state, self.__handle, self._own(track)))
+
+    def track_state_extended(self, track: Track) -> ExtendedTrackState | int:
+        """Additive state names, including track-local FAILED (not ENDED)."""
+        return _known_or_int(ExtendedTrackState, self.track_state(track))
 
     def _track_from_capsule(self, capsule: object) -> Track:
         """Identity-cached Track for a native handle capsule (package-internal)."""
@@ -229,7 +280,7 @@ class Receiver:
             if outcome is PollOutcome.CLOSED:
                 self.__closed[0] = True
             return outcome
-        kind, capsule, desc, largest, expires_ms, drop = result
+        kind, capsule, desc, largest, expires_ms, drop, local_result, fill, origin, delivery_id = result
         # Convert everything BEFORE publishing anything: no half-updated
         # Track or cache survives a failure below.
         description = None if desc is None else _description(desc)
@@ -237,6 +288,13 @@ class Receiver:
         if drop is not None:
             cls, total, delta = drop
             parse_drop = ParseDrop(_known_or_int(ParseDropClass, cls), total, delta)
+        fill_terminal = None
+        if fill is not None:
+            fill_terminal = FillTerminal(
+                fill["initiating_request_id"],
+                None if fill["reason"] is None else _known_or_int(FillReason, fill["reason"]),
+                None if fill["error_domain"] is None else _known_or_int(FillErrorDomain, fill["error_domain"]),
+                fill["error_code"])
         track = None
         publish = None
         if capsule is not None:
@@ -246,7 +304,10 @@ class Receiver:
                 track = Track(self, capsule, key)
                 publish = key
         event = TrackEvent(_known_or_int(TrackEventKind, kind), track, description,
-                           None if largest is None else (largest[0], largest[1]), expires_ms, parse_drop)
+                           None if largest is None else (largest[0], largest[1]), expires_ms, parse_drop,
+                           local_result=local_result, fill_terminal=fill_terminal,
+                           delivery_origin=None if origin is None else _known_or_int(DeliveryOrigin, origin),
+                           delivery_initiating_request_id=delivery_id)
         if publish is not None:
             self.__tracks[publish] = track
         if track is not None:
@@ -276,7 +337,10 @@ class Receiver:
             return outcome
         (capsule, desc, config_generation, packaging, status, end_of_group, datagram, keyframe,
          capture_time_us, decode_time_us, composition_offset_us, presentation_time_us,
-         payload, fragment, mdat_offset, mdat_len, samples) = result
+         payload, fragment, mdat_offset, mdat_len, samples, extended) = result
+        extended["metadata"] = _metadata(extended["metadata"])
+        if extended["delivery_origin"] is not None:
+            extended["delivery_origin"] = _known_or_int(DeliveryOrigin, extended["delivery_origin"])
         description = _description(desc)
         key = _call(_native.track_key, capsule)
         track = self.__tracks.get(key)
@@ -301,6 +365,7 @@ class Receiver:
             mdat_offset=mdat_offset,
             mdat_len=mdat_len,
             samples=tuple(CmafSample(*sample) for sample in samples),
+            **extended,
         )
         # publish only now: the cache entry first, then the description
         if publish is not None:

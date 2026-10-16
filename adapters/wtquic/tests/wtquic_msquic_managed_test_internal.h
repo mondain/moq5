@@ -82,6 +82,15 @@ bool moq_wtquic_msquic_managed_test_server_child(
     bool *out_has_adapter, bool *out_has_ws);
 
 /*
+ * Server-side: the first established child's MoQ session state, read under
+ * its owning lane guard. A session the attach adapter started has left
+ * MOQ_SESS_IDLE; one whose profile could not be bound to its transport never
+ * does. False when no child has established.
+ */
+bool moq_wtquic_msquic_managed_test_server_child_state(
+    const moq_wtquic_msquic_managed_t *m, moq_session_state_t *out_state);
+
+/*
  * Drive an admitted child through the real on_established callback with the
  * given subprotocol token (a fake sentinel session stands in for the transport;
  * the release seam must be installed so no real handle is touched). An

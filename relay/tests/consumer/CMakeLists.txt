@@ -13,6 +13,22 @@ foreach(lang IN ITEMS c cxx)
         target_compile_options(consumer_${lang} PRIVATE -Wall -Wextra -Wpedantic -Werror)
     endif()
 endforeach()
+# The runtime's calls into relay-core, exercised through installed libraries.
+# The scenario pairs sessions with the installed simulator, so it is built
+# only by an SDK that installs one; REQUIRE_SIM makes its absence an error.
+option(REQUIRE_SIM "Fail when the installed SDK lacks moq::sim" OFF)
+if(RELAY_COMPONENT STREQUAL "relay" AND NOT TARGET moq::sim AND REQUIRE_SIM)
+    message(FATAL_ERROR "installed SDK lacks moq::sim for the runtime consumer")
+endif()
+if(RELAY_COMPONENT STREQUAL "relay" AND TARGET moq::sim)
+    add_executable(consumer_fetch_retrieval fetch_retrieval.c)
+    target_link_libraries(consumer_fetch_retrieval PRIVATE moq::relay moq::sim)
+    target_compile_features(consumer_fetch_retrieval PRIVATE c_std_11)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(consumer_fetch_retrieval PRIVATE
+            -Wall -Wextra -Wpedantic -Werror)
+    endif()
+endif()
 if(RELAY_COMPONENT STREQUAL "relay-core")
     if(TARGET moq::relay OR TARGET Threads::Threads)
         message(FATAL_ERROR "Engine consumer acquired runtime or thread dependency")

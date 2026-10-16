@@ -1,4 +1,5 @@
 #include "session_internal.h"
+#include "../bridge/transport_bridge_internal.h"
 
 /* Backstop registry feed: max-merge an outbound object's Location
  * into the owning subscription's or publication's reserved record. The facade
@@ -27,7 +28,7 @@ static bool sg_owner_cancelled(moq_session_t *s, const moq_sg_entry_t *sg)
         return sub_cancel_pending(s, sg->sub);
     if (moq_publication_is_valid(sg->pub)) {
         int slot = pub_resolve_handle(s, sg->pub);
-        return slot >= 0 && s->publishes[slot].update_failed;
+        return slot >= 0 && pub_control_reject_teardown(s, &s->publishes[slot]);
     }
     return false;
 }
@@ -43,7 +44,7 @@ static bool sg_send_allowed(moq_session_t *s, const moq_sg_entry_t *sg)
     if (moq_publication_is_valid(sg->pub)) {
         int slot = pub_resolve_handle(s, sg->pub);
         if (slot < 0) return false;
-        if (s->publishes[slot].update_failed) return false;
+        if (pub_control_reject_teardown(s, &s->publishes[slot])) return false;
         return s->publishes[slot].send_allowed;
     }
     return false;
@@ -63,7 +64,13 @@ static bool sg_is_duplicate(moq_session_t *s, moq_subscription_t sub,
 {
     for (size_t i = 0; i < s->sg_cap; i++) {
         moq_sg_entry_t *e = &s->subgroups[i];
-        if (e->state == MOQ_SG_FREE) continue;
+        /* A stream already reset carries nothing more: opening the subgroup
+         * on a new stream is how a sender continues it (§11.3.2: a relay
+         * that does not know an Object is the next one "MUST reset the
+         * Subgroup stream and open a new one to forward it"). */
+        if (e->state == MOQ_SG_FREE || e->state == MOQ_SG_RESETTING ||
+            e->state == MOQ_SG_RESET_OWED)
+            continue;
         if (moq_subscription_eq(e->sub, sub) &&
             e->group_id == group_id && e->subgroup_id == subgroup_id)
             return true;
@@ -104,7 +111,7 @@ static int sg_resolve_handle(moq_session_t *s, moq_subgroup_handle_t h)
     return r == -2 ? -1 : r;
 }
 
-static int sg_find_by_stream_ref(moq_session_t *s, moq_stream_ref_t ref)
+int sg_find_by_stream_ref(moq_session_t *s, moq_stream_ref_t ref)
 {
     for (size_t i = 0; i < s->sg_cap; i++) {
         moq_sg_entry_t *e = &s->subgroups[i];
@@ -119,6 +126,9 @@ void sg_free_entry(moq_session_t *s, size_t slot)
     moq_sg_entry_t *entries = s->subgroups;
     sg_occ_unlink(s, slot);
     entries[slot].delivery_deadline_us = UINT64_MAX;
+    entries[slot].streaming_deadline_us = UINT64_MAX;
+    entries[slot].ovr_has_object = entries[slot].ovr_has_subgroup = false;
+    entries[slot].timeout_expired = false;
     entries[slot].state = MOQ_SG_FREE;
     entries[slot].generation++;
     /* Clear ownership handles so a reused slot can never be matched by an
@@ -143,6 +153,232 @@ void sg_recompute_deadline(moq_session_t *s)
     s->subgroup_deadline_us = d;
 }
 
+/* -- Delivery timeouts (design: Delivery Timeouts and Data Reliability) --- */
+
+/* The delivery timeouts the subgroup's owner negotiated: the publisher-side
+ * values (this side's Track Properties) and the subscriber-side values (the
+ * peer's parameters), with the owner's scheduling identity. */
+static void sg_owner_terms(moq_session_t *s, const moq_sg_entry_t *e,
+                           moq_dt_scan_t *pub, moq_dt_scan_t *sub,
+                           uint64_t *owner, uint8_t *subscriber_priority,
+                           uint8_t *group_order)
+{
+    memset(pub, 0, sizeof(*pub));
+    memset(sub, 0, sizeof(*sub));
+    *owner = 0;
+    *subscriber_priority = 128;
+    *group_order = MOQ_GROUP_ORDER_ASCENDING;
+    int slot = sub_resolve_handle(s, e->sub);
+    if (slot >= 0) {
+        const moq_sub_entry_t *se = &s->subs[slot];
+        pub->has_object = se->dt_pub_has_object;     pub->object_ms = se->dt_pub_object_ms;
+        pub->has_subgroup = se->dt_pub_has_subgroup; pub->subgroup_ms = se->dt_pub_subgroup_ms;
+        sub->has_object = se->dt_sub_has_object;     sub->object_ms = se->dt_sub_object_ms;
+        sub->has_subgroup = se->dt_sub_has_subgroup; sub->subgroup_ms = se->dt_sub_subgroup_ms;
+        *owner = se->handle._opaque;
+        *subscriber_priority = se->subscriber_priority;
+        *group_order = session_group_order(se->group_order, se->track_group_order);
+        return;
+    }
+    slot = pub_resolve_handle(s, e->pub);
+    if (slot >= 0) {
+        const moq_pub_entry_t *pe = &s->publishes[slot];
+        pub->has_object = pe->dt_pub_has_object;     pub->object_ms = pe->dt_pub_object_ms;
+        pub->has_subgroup = pe->dt_pub_has_subgroup; pub->subgroup_ms = pe->dt_pub_subgroup_ms;
+        sub->has_object = pe->dt_sub_has_object;     sub->object_ms = pe->dt_sub_object_ms;
+        sub->has_subgroup = pe->dt_sub_has_subgroup; sub->subgroup_ms = pe->dt_sub_subgroup_ms;
+        *owner = pe->handle._opaque;
+        *subscriber_priority = pe->subscriber_priority;
+        *group_order = session_group_order(pe->group_order, pe->track_group_order);
+    }
+}
+
+/* The effective timeout of one kind for this subgroup: the publisher's value
+ * is the first object's property when the profile honours it and it was
+ * present, else the Track Property; the smaller of that and the subscriber's
+ * non-zero value applies. */
+static uint64_t sg_timeout_us(moq_session_t *s, const moq_sg_entry_t *e, bool subgroup_kind)
+{
+    moq_dt_scan_t pub, sub; uint64_t owner; uint8_t sp, go;
+    sg_owner_terms(s, e, &pub, &sub, &owner, &sp, &go);
+    bool ph, sh; uint64_t pm, sm;
+    if (subgroup_kind) {
+        ph = e->ovr_has_subgroup || pub.has_subgroup;
+        pm = e->ovr_has_subgroup ? e->ovr_subgroup_ms : pub.subgroup_ms;
+        sh = sub.has_subgroup; sm = sub.subgroup_ms;
+    } else {
+        ph = e->ovr_has_object || pub.has_object;
+        pm = e->ovr_has_object ? e->ovr_object_ms : pub.object_ms;
+        sh = sub.has_object; sm = sub.object_ms;
+    }
+    return ms_to_us_sat(dt_negotiate_ms(ph, pm, sh, sm));
+}
+
+uint64_t sg_object_deadline_us(moq_session_t *s, const moq_sg_entry_t *e, uint64_t now_us)
+{
+    uint64_t to = sg_timeout_us(s, e, false);
+    return to ? deadline_add(now_us, to) : UINT64_MAX;
+}
+
+uint64_t sg_subgroup_timeout_us(moq_session_t *s, const moq_sg_entry_t *e)
+{
+    return sg_timeout_us(s, e, true);
+}
+
+void sg_stream_meta(moq_session_t *s, const moq_sg_entry_t *e, moq_action_meta_t *out)
+{
+    moq_dt_scan_t pub, sub;
+    memset(out, 0, sizeof(*out));
+    out->deadline_us = UINT64_MAX;
+    sg_owner_terms(s, e, &pub, &sub, &out->owner, &out->subscriber_priority, &out->group_order);
+    out->publisher_priority = e->publisher_priority;
+    out->mode = MOQ_SCHED_MODE_SUBGROUP;
+    out->group_id = e->group_id;
+    out->subgroup_id = e->subgroup_id;
+    out->has_location = true;
+}
+
+/* The first object's delivery-timeout properties, read into a copy of the
+ * entry so the caller can price the object before committing anything. */
+static void sg_read_first_object_override(moq_session_t *s, moq_sg_entry_t *probe,
+                                          const uint8_t *props, size_t props_len)
+{
+    if (probe->has_prev_object || props_len == 0 ||
+        !s->profile->first_object_timeout_override || !s->profile->scan_delivery_timeouts)
+        return;
+    moq_dt_scan_t sc;
+    if (s->profile->scan_delivery_timeouts(props, props_len, true, &sc) != MOQ_OK) return;
+    probe->ovr_has_object = sc.has_object;     probe->ovr_object_ms = sc.object_ms;
+    probe->ovr_has_subgroup = sc.has_subgroup; probe->ovr_subgroup_ms = sc.subgroup_ms;
+}
+
+static void sg_commit_override(moq_sg_entry_t *entry, const moq_sg_entry_t *probe)
+{
+    entry->ovr_has_object = probe->ovr_has_object;
+    entry->ovr_object_ms = probe->ovr_object_ms;
+    entry->ovr_has_subgroup = probe->ovr_has_subgroup;
+    entry->ovr_subgroup_ms = probe->ovr_subgroup_ms;
+}
+
+/* Where a streamed object's clock starts: at its header on profiles that say
+ * so, otherwise at its first payload byte -- an object with no payload has
+ * no such byte, so its header is its first byte. */
+static uint64_t sg_streaming_header_deadline(moq_session_t *s, const moq_sg_entry_t *e,
+                                             uint64_t payload_length, uint64_t now_us)
+{
+    if (s->profile->object_timer_at_header || payload_length == 0)
+        return sg_object_deadline_us(s, e, now_us);
+    return UINT64_MAX;
+}
+
+void session_expire_queued_data(moq_session_t *s)
+{
+    uint64_t now = s->last_now_us;
+    size_t head = s->action_head, tail = s->action_tail, cap = s->action_cap;
+    bool any = false;
+    for (size_t i = head; i < tail && !any; i++)
+        any = s->action_meta[i % cap].deadline_us <= now;
+    if (!any) return;
+
+    /* Drop every expired datagram and, on a subgroup stream, everything from
+     * its first expired object onward; compact the ring in place. The first
+     * dropped action of a stream becomes its DELIVERY_TIMEOUT reset, in the
+     * same place: a reset that took the queue's tail would follow messages
+     * queued after the stream's data -- a PUBLISH_DONE queued behind the
+     * subgroup's FIN among them, which must come after every stream of the
+     * subscription is closed. */
+    size_t w = head;
+    for (size_t r = head; r < tail; r++) {
+        moq_action_t *a = &s->actions[r % cap];
+        moq_action_meta_t *m = &s->action_meta[r % cap];
+        bool drop = false;
+        moq_sg_entry_t *reset_sg = NULL;
+        if (a->kind == MOQ_ACTION_SEND_DATAGRAM) {
+            drop = m->deadline_us <= now;
+        } else if (a->kind == MOQ_ACTION_SEND_DATA) {
+            int slot = sg_find_by_stream_ref(s, a->u.send_data.stream_ref);
+            if (slot >= 0) {
+                moq_sg_entry_t *sg = &s->subgroups[slot];
+                if (sg->timeout_expired) drop = true;
+                else if (m->deadline_us <= now) {
+                    sg->timeout_expired = true;
+                    if (sg->state == MOQ_SG_RESETTING) drop = true;
+                    else reset_sg = sg;
+                }
+            }
+        }
+        if (drop) { moq_action_cleanup(a); continue; }
+        if (reset_sg) {
+            moq_action_cleanup(a);
+            memset(a, 0, sizeof(*a));
+            a->kind = MOQ_ACTION_RESET_DATA;
+            a->detail_size = (uint32_t)sizeof(moq_reset_data_action_t);
+            a->borrow_epoch = s->borrow_epoch;
+            a->u.reset_data.stream_ref = reset_sg->stream_ref;
+            a->u.reset_data.error_code = MOQ_RESET_DELIVERY_TIMEOUT;
+            a->u.reset_data.reliable_size = reset_sg->header_len;
+            memset(m, 0, sizeof(*m));
+            m->deadline_us = UINT64_MAX;
+            reset_sg->state = MOQ_SG_RESETTING;
+            reset_sg->streaming_payload_len = 0;
+            reset_sg->streaming_bytes_written = 0;
+            reset_sg->streaming_deadline_us = UINT64_MAX;
+            reset_sg->delivery_deadline_us = UINT64_MAX;
+        }
+        if (w != r) {
+            s->actions[w % cap] = *a;
+            s->action_meta[w % cap] = *m;
+        }
+        w++;
+    }
+    s->action_tail = w;
+
+    for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next)
+        s->subgroups[i].timeout_expired = false;
+    sg_recompute_deadline(s);
+}
+
+static void sg_queue_reset(moq_session_t *s, moq_sg_entry_t *sg, uint64_t code)
+{
+    moq_action_t a;
+    memset(&a, 0, sizeof(a));
+    a.kind = MOQ_ACTION_RESET_DATA;
+    a.detail_size = (uint32_t)sizeof(moq_reset_data_action_t);
+    a.borrow_epoch = s->borrow_epoch;
+    a.u.reset_data.stream_ref = sg->stream_ref;
+    a.u.reset_data.error_code = code;
+    a.u.reset_data.reliable_size = sg->header_len;
+    (void)push_action(s, &a);   /* the caller checked capacity */
+    sg->state = MOQ_SG_RESETTING;
+}
+
+void sg_reset_or_owe(moq_session_t *s, size_t slot, uint64_t code, size_t keep)
+{
+    moq_sg_entry_t *sg = &s->subgroups[slot];
+    sg->streaming_payload_len = 0;
+    sg->streaming_bytes_written = 0;
+    sg->streaming_deadline_us = UINT64_MAX;
+    bool had_deadline = sg->delivery_deadline_us != UINT64_MAX;
+    sg->delivery_deadline_us = UINT64_MAX;
+    if (action_queue_avail(s) > keep) {
+        sg_queue_reset(s, sg, code);
+    } else {
+        sg->state = MOQ_SG_RESET_OWED;
+        sg->owed_reset_code = code;
+    }
+    if (had_deadline) sg_recompute_deadline(s);
+}
+
+void sg_retry_owed_resets(moq_session_t *s)
+{
+    for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next) {
+        moq_sg_entry_t *sg = &s->subgroups[i];
+        if (sg->state != MOQ_SG_RESET_OWED) continue;
+        if (action_queue_full(s)) return;
+        sg_queue_reset(s, sg, sg->owed_reset_code);
+    }
+}
+
 /*
  * Reap CLOSING/RESETTING subgroups, resumably.
  *
@@ -165,8 +401,12 @@ bool sg_reap_terminal_resumable(moq_session_t *s, uint32_t *budget)
 #ifdef MOQ_SESSION_SWEEP_TESTING
         session_work_sg_reap_probes++;
 #endif
-        if (s->subgroups[i].state != MOQ_SG_CLOSING &&
-            s->subgroups[i].state != MOQ_SG_RESETTING) {
+        /* A CLOSING entry with an armed deadline is awaiting the transport's
+         * commit report for its FIN; it stays until that report or its timer. */
+        if ((s->subgroups[i].state != MOQ_SG_CLOSING &&
+             s->subgroups[i].state != MOQ_SG_RESETTING) ||
+            (s->subgroups[i].state == MOQ_SG_CLOSING &&
+             s->subgroups[i].delivery_deadline_us != UINT64_MAX)) {
             s->sweep_slot = (nxt >= 0) ? (size_t)nxt : s->sg_cap;
             continue;                      /* costs nothing; never suspends */
         }
@@ -228,11 +468,29 @@ uint64_t moq_subgroup_id_for_trace(moq_subgroup_handle_t h)
     return h._opaque;
 }
 
-void moq_subgroup_cfg_init(moq_subgroup_cfg_t *cfg)
+/* The sizeof of the layout that ends at end_of_group: the storage a caller
+ * built against it allocates. */
+#define SUBGROUP_CFG_SIZE_THROUGH_END_OF_GROUP                                 \
+    ((offsetof(moq_subgroup_cfg_t, end_of_group) + sizeof(bool) +              \
+      _Alignof(moq_subgroup_cfg_t) - 1u) &                                     \
+     ~(size_t)(_Alignof(moq_subgroup_cfg_t) - 1u))
+
+/* Parenthesized: defines the symbol, not the header's sized macro. A binary
+ * that calls the symbol may hold the layout that ends at end_of_group, so it
+ * clears and stamps only that extent; first_object stays unread. */
+void (moq_subgroup_cfg_init)(moq_subgroup_cfg_t *cfg)
 {
     if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(moq_subgroup_cfg_t);
+    memset(cfg, 0, SUBGROUP_CFG_SIZE_THROUGH_END_OF_GROUP);
+    cfg->struct_size = (uint32_t)SUBGROUP_CFG_SIZE_THROUGH_END_OF_GROUP;
+}
+
+void moq_subgroup_cfg_init_sized(moq_subgroup_cfg_t *cfg, size_t cfg_size)
+{
+    if (!cfg || cfg_size < sizeof(cfg->struct_size)) return;
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
 }
 
 /* -- Subgroup data path -------------------------------------------- */
@@ -245,8 +503,8 @@ moq_result_t moq_session_open_subgroup(
     if (!s || !cfg || !out_handle) return MOQ_ERR_INVAL;
     if (cfg->struct_size < offsetof(moq_subgroup_cfg_t, publisher_priority) +
         sizeof(cfg->publisher_priority)) return MOQ_ERR_INVAL;
-    if (cfg->group_id > MOQ_QUIC_VARINT_MAX) return MOQ_ERR_INVAL;
-    if (cfg->subgroup_id > MOQ_QUIC_VARINT_MAX) return MOQ_ERR_INVAL;
+    if (cfg->group_id > s->profile->location_varint_max) return MOQ_ERR_INVAL;
+    if (cfg->subgroup_id > s->profile->location_varint_max) return MOQ_ERR_INVAL;
     *out_handle = MOQ_SUBGROUP_INVALID;
 
     session_begin_advance(s, now_us);
@@ -276,6 +534,10 @@ moq_result_t moq_session_open_subgroup(
     if (cfg->struct_size >= offsetof(moq_subgroup_cfg_t, end_of_group) +
         sizeof(cfg->end_of_group))
         eog = cfg->end_of_group;
+    bool first = false;
+    if (cfg->struct_size >= offsetof(moq_subgroup_cfg_t, first_object) +
+        sizeof(cfg->first_object))
+        first = cfg->first_object;
 
     moq_subgroup_header_encode_args_t hdr_args = {
         .track_alias = s->subs[sub_slot].track_alias,
@@ -284,6 +546,7 @@ moq_result_t moq_session_open_subgroup(
         .publisher_priority = cfg->publisher_priority,
         .has_extensions = has_ext,
         .end_of_group = eog,
+        .first_object = first,
     };
 
     moq_action_t a;
@@ -306,7 +569,19 @@ moq_result_t moq_session_open_subgroup(
         ((uint64_t)s->subs[sub_slot].subscriber_priority << 8) |
         cfg->publisher_priority;
 
-    rc = push_action(s, &a);
+    /* The header is queued before the entry exists; its scheduling record
+     * is the record every later action on this stream will carry. */
+    moq_sg_entry_t probe;
+    memset(&probe, 0, sizeof(probe));
+    probe.sub = sub;
+    probe.pub = MOQ_PUBLICATION_INVALID;
+    probe.group_id = cfg->group_id;
+    probe.subgroup_id = cfg->subgroup_id;
+    probe.publisher_priority = cfg->publisher_priority;
+    moq_action_meta_t meta;
+    sg_stream_meta(s, &probe, &meta);
+
+    rc = push_action_ex(s, &a, &meta, UINT64_MAX);
     if (rc < 0) return rc;
 
     /* Commit. */
@@ -316,6 +591,7 @@ moq_result_t moq_session_open_subgroup(
     sg_occ_link(s, (size_t)slot);
     entry->state = MOQ_SG_OPEN;
     entry->publisher_priority = cfg->publisher_priority;
+    entry->header_len = a.u.send_data.header_len;
     entry->sub = sub;
     entry->pub = MOQ_PUBLICATION_INVALID;   /* subscription-backed: no owning
                                              * publication (mirror of the
@@ -327,14 +603,16 @@ moq_result_t moq_session_open_subgroup(
     entry->subgroup_id = cfg->subgroup_id;
     entry->has_prev_object = false;
     entry->has_extensions = has_ext;
-    /* §9.8: the subgroup timer uses the exact NEGOTIATED SUBGROUP timeout
-     * -- per-type min-nonzero of the publisher-side (our Track Properties)
-     * and subscriber-side (peer parameters/acked updates) values -- never
-     * the min_nonzero legacy projection, which could wrongly shorten it
-     * when the object timeout is smaller (d18 §8). Start instant (armed at
-     * open) is deliberately unchanged: this site does not correct the start
-     * instant (design §9.8 A2). */
-    {
+    entry->streaming_deadline_us = UINT64_MAX;
+    entry->ovr_has_object = entry->ovr_has_subgroup = false;
+    entry->timeout_expired = false;
+    /* The subgroup timer uses the negotiated SUBGROUP timeout: the per-type
+     * smaller non-zero of the publisher-side (our Track Properties) and
+     * subscriber-side (peer parameters / acknowledged updates) values. On
+     * profiles whose timer runs from the FIN it is armed by close_subgroup
+     * instead, where the first object's override is also known. */
+    entry->delivery_deadline_us = UINT64_MAX;
+    if (!s->profile->subgroup_timer_at_fin) {
         const moq_sub_entry_t *dte = &s->subs[sub_slot];
         uint64_t sg_ms = dt_negotiate_ms(
             dte->dt_pub_has_subgroup, dte->dt_pub_subgroup_ms,
@@ -344,10 +622,10 @@ moq_result_t moq_session_open_subgroup(
             entry->delivery_deadline_us = deadline_add(now_us, sg_us);
             if (entry->delivery_deadline_us < s->subgroup_deadline_us)
                 s->subgroup_deadline_us = entry->delivery_deadline_us;
-        } else {
-            entry->delivery_deadline_us = UINT64_MAX;
         }
     }
+    if (s->subs[sub_slot].subgroup_streams_opened != UINT64_MAX)
+        s->subs[sub_slot].subgroup_streams_opened++;
     s->next_stream_ref++;
 
     *out_handle = sg_make_handle(s, (size_t)slot);
@@ -414,7 +692,7 @@ moq_result_t moq_session_write_object(
     /* Incref AFTER all validation succeeds. */
     moq_rcbuf_incref(payload);
 
-    rc = push_action(s, &a);
+    rc = push_action_ex(s, &a, NULL, sg_object_deadline_us(s, entry, now_us));
     if (rc < 0) {
         moq_rcbuf_decref(payload);
         return rc;
@@ -487,7 +765,7 @@ moq_result_t moq_session_write_status_object(
     a.u.send_data.payload = NULL;   /* zero-length status object */
     a.u.send_data.fin = false;
 
-    rc = push_action(s, &a);
+    rc = push_action_ex(s, &a, NULL, sg_object_deadline_us(s, entry, now_us));
     if (rc < 0) return rc;
 
     entry->prev_object_id = object_id;
@@ -496,11 +774,78 @@ moq_result_t moq_session_write_status_object(
     return MOQ_OK;
 }
 
-void moq_object_cfg_init(moq_object_cfg_t *cfg)
+/* The extent a caller built before the gap fields were appended holds. */
+#define MOQ_OBJECT_CFG_SIZE_THROUGH_PROPERTIES \
+    (offsetof(moq_object_cfg_t, properties) + sizeof(moq_rcbuf_t *))
+#define OBJECT_CFG_HAS_GAPS(cfg) \
+    ((cfg)->struct_size >= offsetof(moq_object_cfg_t, prior_object_gap) + \
+                           sizeof(uint64_t))
+
+/* Parenthesized: defines the symbol, not the header's sized macro. */
+void (moq_object_cfg_init)(moq_object_cfg_t *cfg)
 {
     if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(*cfg);
+    memset(cfg, 0, MOQ_OBJECT_CFG_SIZE_THROUGH_PROPERTIES);
+    cfg->struct_size = (uint32_t)MOQ_OBJECT_CFG_SIZE_THROUGH_PROPERTIES;
+}
+
+void moq_object_cfg_init_sized(moq_object_cfg_t *cfg, size_t cfg_size)
+{
+    if (!cfg) return;
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    if (n < sizeof(cfg->struct_size)) return;   /* too small to even stamp */
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
+}
+
+static moq_result_t write_object_ex_impl(moq_session_t *s,
+                                         moq_subgroup_handle_t subgroup,
+                                         const moq_object_cfg_t *cfg,
+                                         uint64_t now_us);
+
+/* The object's properties with its Prior Group/Object ID Gaps added in type
+ * order (§10.8, §10.9), as a new buffer the caller releases. A gap the
+ * properties already state with another value is MOQ_ERR_INVAL. */
+static moq_result_t object_gap_properties(moq_session_t *s,
+                                          moq_subgroup_handle_t subgroup,
+                                          const moq_object_cfg_t *cfg,
+                                          moq_rcbuf_t **out)
+{
+    *out = NULL;
+    if (!s->profile->add_object_gap) return MOQ_ERR_UNSUPPORTED;
+    int slot = sg_resolve_handle(s, subgroup);
+    if (slot >= 0) {
+        if (cfg->has_prior_group_gap &&
+            cfg->prior_group_gap > s->subgroups[slot].group_id)
+            return MOQ_ERR_INVAL;
+    }
+    if (cfg->has_prior_object_gap && cfg->prior_object_gap > cfg->object_id)
+        return MOQ_ERR_INVAL;
+    size_t in_len = cfg->properties ? moq_rcbuf_len(cfg->properties) : 0;
+    const uint8_t *in = cfg->properties ? moq_rcbuf_data(cfg->properties) : NULL;
+    /* Each added pair is a type delta and a value (at most 9 bytes each), and
+     * re-deltas the pair after it by at most another 9. */
+    size_t cap = in_len + 2u * 27u;
+    uint8_t *a = (uint8_t *)s->alloc.alloc(cap, s->alloc.ctx);
+    uint8_t *b = (uint8_t *)s->alloc.alloc(cap, s->alloc.ctx);
+    moq_result_t rc = (a && b) ? MOQ_OK : MOQ_ERR_NOMEM;
+    size_t len = in_len;
+    if (rc == MOQ_OK && in_len > 0) memcpy(a, in, in_len);
+    if (rc == MOQ_OK && cfg->has_prior_group_gap) {
+        rc = s->profile->add_object_gap(a, len, false, cfg->prior_group_gap,
+                                        b, cap, &len);
+        if (rc == MOQ_OK) memcpy(a, b, len);
+    }
+    if (rc == MOQ_OK && cfg->has_prior_object_gap) {
+        rc = s->profile->add_object_gap(a, len, true, cfg->prior_object_gap,
+                                        b, cap, &len);
+        if (rc == MOQ_OK) memcpy(a, b, len);
+    }
+    if (rc == MOQ_ERR_BUFFER) rc = MOQ_ERR_INVAL;
+    if (rc == MOQ_OK) rc = moq_rcbuf_create(&s->alloc, a, len, out);
+    if (a) s->alloc.free(a, cap, s->alloc.ctx);
+    if (b) s->alloc.free(b, cap, s->alloc.ctx);
+    return rc;
 }
 
 moq_result_t moq_session_write_object_ex(
@@ -508,7 +853,29 @@ moq_result_t moq_session_write_object_ex(
     const moq_object_cfg_t *cfg, uint64_t now_us)
 {
     if (!s || !cfg) return MOQ_ERR_INVAL;
-    if (cfg->struct_size < sizeof(moq_object_cfg_t)) return MOQ_ERR_INVAL;
+    if (cfg->struct_size < MOQ_OBJECT_CFG_SIZE_THROUGH_PROPERTIES)
+        return MOQ_ERR_INVAL;
+    if (!OBJECT_CFG_HAS_GAPS(cfg) ||
+        (!cfg->has_prior_group_gap && !cfg->has_prior_object_gap))
+        return write_object_ex_impl(s, subgroup, cfg, now_us);
+    moq_rcbuf_t *props = NULL;
+    moq_result_t rc = object_gap_properties(s, subgroup, cfg, &props);
+    if (rc < 0) return rc;
+    moq_object_cfg_t merged;
+    moq_object_cfg_init_sized(&merged, MOQ_OBJECT_CFG_SIZE_THROUGH_PROPERTIES);
+    merged.object_id = cfg->object_id;
+    merged.payload = cfg->payload;
+    merged.properties = props;
+    rc = write_object_ex_impl(s, subgroup, &merged, now_us);
+    moq_rcbuf_decref(props);
+    return rc;
+}
+
+static moq_result_t write_object_ex_impl(moq_session_t *s,
+                                         moq_subgroup_handle_t subgroup,
+                                         const moq_object_cfg_t *cfg,
+                                         uint64_t now_us)
+{
 
     session_begin_advance(s, now_us);
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;
@@ -545,6 +912,11 @@ moq_result_t moq_session_write_object_ex(
     bool has_props = (props_len > 0);
     size_t slots_needed = has_props ? 2 : 1;
     if (action_queue_avail(s) < slots_needed) return MOQ_ERR_WOULD_BLOCK;
+
+    moq_sg_entry_t probe = *entry;
+    if (has_props)
+        sg_read_first_object_override(s, &probe, moq_rcbuf_data(cfg->properties), props_len);
+    uint64_t deadline = sg_object_deadline_us(s, &probe, now_us);
 
     if (has_props) {
         /* Two-action pattern: header+properties, then payload_len+payload. */
@@ -590,13 +962,13 @@ moq_result_t moq_session_write_object_ex(
         moq_rcbuf_incref(cfg->properties);
         if (cfg->payload) moq_rcbuf_incref(cfg->payload);
 
-        rc = push_action(s, &a1);
+        rc = push_action_ex(s, &a1, NULL, deadline);
         if (rc < 0) {
             moq_rcbuf_decref(cfg->properties);
             if (cfg->payload) moq_rcbuf_decref(cfg->payload);
             return rc;
         }
-        rc = push_action(s, &a2);
+        rc = push_action_ex(s, &a2, NULL, deadline);
         if (rc < 0) {
             if (cfg->payload) moq_rcbuf_decref(cfg->payload);
             return rc;
@@ -628,13 +1000,14 @@ moq_result_t moq_session_write_object_ex(
 
         if (cfg->payload) moq_rcbuf_incref(cfg->payload);
 
-        rc = push_action(s, &a);
+        rc = push_action_ex(s, &a, NULL, deadline);
         if (rc < 0) {
             if (cfg->payload) moq_rcbuf_decref(cfg->payload);
             return rc;
         }
     }
 
+    sg_commit_override(entry, &probe);
     entry->prev_object_id = cfg->object_id;
     entry->has_prev_object = true;
     sg_note_object_published(s, entry, cfg->object_id);
@@ -675,7 +1048,14 @@ moq_result_t moq_session_close_subgroup(
     if (rc < 0) return rc;
 
     s->subgroups[slot].state = MOQ_SG_CLOSING;
-    if (s->subgroups[slot].delivery_deadline_us != UINT64_MAX) {
+    s->subgroups[slot].streaming_deadline_us = UINT64_MAX;
+    if (s->profile->subgroup_timer_at_fin) {
+        /* All objects of the subgroup are published: the SUBGROUP timer
+         * runs from here until the transport reports the stream committed. */
+        uint64_t to = sg_subgroup_timeout_us(s, &s->subgroups[slot]);
+        s->subgroups[slot].delivery_deadline_us = to ? deadline_add(now_us, to) : UINT64_MAX;
+        sg_recompute_deadline(s);
+    } else if (s->subgroups[slot].delivery_deadline_us != UINT64_MAX) {
         s->subgroups[slot].delivery_deadline_us = UINT64_MAX;
         sg_recompute_deadline(s);
     }
@@ -708,6 +1088,7 @@ moq_result_t moq_session_reset_subgroup(
     a.borrow_epoch = s->borrow_epoch;
     a.u.reset_data.stream_ref = s->subgroups[slot].stream_ref;
     a.u.reset_data.error_code = error_code;
+    a.u.reset_data.reliable_size = s->subgroups[slot].header_len;
 
     moq_result_t rc = push_action(s, &a);
     if (rc < 0) return rc;
@@ -777,7 +1158,8 @@ moq_result_t moq_session_begin_object(
     a.u.send_data.payload = NULL;
     a.u.send_data.fin = false;
 
-    rc = push_action(s, &a);
+    uint64_t deadline = sg_streaming_header_deadline(s, entry, payload_length, now_us);
+    rc = push_action_ex(s, &a, NULL, deadline);
     if (rc < 0) return rc;
 
     entry->prev_object_id = object_id;
@@ -786,6 +1168,7 @@ moq_result_t moq_session_begin_object(
     entry->state = MOQ_SG_STREAMING;
     entry->streaming_payload_len = payload_length;
     entry->streaming_bytes_written = 0;
+    entry->streaming_deadline_us = deadline;
     return MOQ_OK;
 }
 
@@ -833,6 +1216,11 @@ moq_result_t moq_session_begin_object_ex(
     size_t slots_needed = has_props ? 2 : 1;
     if (action_queue_avail(s) < slots_needed) return MOQ_ERR_WOULD_BLOCK;
 
+    moq_sg_entry_t probe = *entry;
+    if (has_props)
+        sg_read_first_object_override(s, &probe, moq_rcbuf_data(cfg->properties), props_len);
+    uint64_t deadline = sg_streaming_header_deadline(s, &probe, cfg->payload_length, now_us);
+
     if (has_props) {
         /* Two-action: header(delta+extensions_len)+properties, then payload_len. */
         moq_object_header_encode_args_t hdr_args = {
@@ -877,12 +1265,12 @@ moq_result_t moq_session_begin_object_ex(
 
         moq_rcbuf_incref(cfg->properties);
 
-        rc = push_action(s, &a1);
+        rc = push_action_ex(s, &a1, NULL, deadline);
         if (rc < 0) {
             moq_rcbuf_decref(cfg->properties);
             return rc;
         }
-        rc = push_action(s, &a2);
+        rc = push_action_ex(s, &a2, NULL, deadline);
         if (rc < 0) return rc;
     } else {
         moq_object_header_encode_args_t obj_args = {
@@ -908,16 +1296,18 @@ moq_result_t moq_session_begin_object_ex(
         a.u.send_data.payload = NULL;
         a.u.send_data.fin = false;
 
-        rc = push_action(s, &a);
+        rc = push_action_ex(s, &a, NULL, deadline);
         if (rc < 0) return rc;
     }
 
+    sg_commit_override(entry, &probe);
     entry->prev_object_id = cfg->object_id;
     entry->has_prev_object = true;
     sg_note_object_published(s, entry, cfg->object_id);
     entry->state = MOQ_SG_STREAMING;
     entry->streaming_payload_len = cfg->payload_length;
     entry->streaming_bytes_written = 0;
+    entry->streaming_deadline_us = deadline;
     return MOQ_OK;
 }
 
@@ -960,12 +1350,17 @@ moq_result_t moq_session_write_object_data(
 
     moq_rcbuf_incref(data);
 
-    moq_result_t rc = push_action(s, &a);
+    uint64_t deadline = entry->streaming_deadline_us;
+    if (deadline == UINT64_MAX && entry->streaming_bytes_written == 0)
+        deadline = sg_object_deadline_us(s, entry, now_us);
+
+    moq_result_t rc = push_action_ex(s, &a, NULL, deadline);
     if (rc < 0) {
         moq_rcbuf_decref(data);
         return rc;
     }
 
+    entry->streaming_deadline_us = deadline;
     entry->streaming_bytes_written += data_len;
     return MOQ_OK;
 }
@@ -994,16 +1389,123 @@ moq_result_t moq_session_end_object(
     entry->state = MOQ_SG_OPEN;
     entry->streaming_payload_len = 0;
     entry->streaming_bytes_written = 0;
+    entry->streaming_deadline_us = UINT64_MAX;
     return MOQ_OK;
 }
 
 /* -- Datagram inbound handler -------------------------------------- */
+
+static moq_result_t datagram_fan_out(moq_session_t *s, uint64_t alias,
+    const moq_decoded_object_datagram_t *d,
+    const uint8_t *payload_data, size_t payload_len,
+    const uint8_t *props_data, size_t props_len)
+{
+    moq_alias_iter_t it;
+    moq_subscription_t sub;
+    moq_publication_t pub;
+    size_t n = 0;
+    moq_track_hist_t *h = NULL;
+    alias_iter_begin(s, &it, alias);
+    while (alias_iter_next(s, &it, &sub, &pub)) {
+        if (!h) h = alias_owner_hist(s, sub, pub);
+        if (alias_owner_accepts_object(s, sub, pub, d->group_id, d->object_id)) n++;
+    }
+    bool pend = h && h->pending_subs > 0;
+    size_t held = 0;
+    if (pend)
+        for (int32_t i = s->sub_occ_head; i >= 0; i = s->subs[i].occ_next)
+            if (sub_pending_for_track(&s->subs[i], h) &&
+                sub_pending_accepts(s, &s->subs[i], d->group_id, d->object_id))
+                held++;
+    if (n == 0 && held == 0) return MOQ_OK;
+    /* Every copy holds its own budget share, as the poll releases one per
+     * event. A datagram has no stream to park on: it is queued to all
+     * matching subscriptions at once, or refused like any datagram that
+     * finds no room. */
+    size_t obj_budget = payload_len + props_len;
+    if (event_queue_avail(s) < n) return MOQ_ERR_WOULD_BLOCK;
+    if (obj_budget != 0 &&
+        (n > SIZE_MAX / obj_budget ||
+         s->recv_payload_bytes > s->max_recv_buf ||
+         n * obj_budget > s->max_recv_buf - s->recv_payload_bytes))
+        return MOQ_ERR_WOULD_BLOCK;
+
+    moq_rcbuf_t *pay_rc = NULL;
+    moq_rcbuf_t *prop_rc = NULL;
+    if (payload_len > 0) {
+        moq_result_t rc = moq_rcbuf_create(&s->alloc, payload_data, payload_len,
+                                           &pay_rc);
+        if (rc < 0) return rc;
+    }
+    if (props_len > 0) {
+        moq_result_t rc = moq_rcbuf_create(&s->alloc, props_data, props_len,
+                                           &prop_rc);
+        if (rc < 0) {
+            if (pay_rc) moq_rcbuf_decref(pay_rc);
+            return rc;
+        }
+    }
+    /* Held copies for subscriptions to the track still awaiting their
+     * answer (draft-22 §3.1.3); the ring takes its own references. */
+    if (held) {
+        moq_held_object_t ho = {
+            .group_id = d->group_id, .subgroup_id = 0, .object_id = d->object_id,
+            .publisher_priority = d->publisher_priority, .status = (uint8_t)d->status,
+            .end_of_group = d->end_of_group, .datagram = true,
+            .default_priority = d->default_priority,
+            .payload = pay_rc, .properties = prop_rc,
+        };
+        for (int32_t i = s->sub_occ_head; i >= 0; i = s->subs[i].occ_next)
+            if (sub_pending_for_track(&s->subs[i], h) &&
+                sub_pending_accepts(s, &s->subs[i], d->group_id, d->object_id))
+                session_stage_held_object(s, s->subs[i].handle, alias, &ho);
+    }
+    alias_iter_begin(s, &it, alias);
+    while (alias_iter_next(s, &it, &sub, &pub)) {
+        if (!alias_owner_accepts_object(s, sub, pub, d->group_id, d->object_id)) continue;
+        moq_event_t e;
+        memset(&e, 0, sizeof(e));
+        e.kind = MOQ_EVENT_OBJECT_RECEIVED;
+        e.detail_size = (uint32_t)sizeof(moq_object_received_event_t);
+        e.borrow_epoch = s->borrow_epoch;
+        moq_object_received_event_t *obj = &e.u.object_received;
+        obj->sub                = sub;
+        obj->pub                = pub;
+        obj->group_id           = d->group_id;
+        obj->object_id          = d->object_id;
+        obj->publisher_priority = session_resolve_publisher_priority(s, sub, pub,
+            d->default_priority, d->publisher_priority);
+        obj->status             = d->status;
+        obj->end_of_group       = d->end_of_group;
+        obj->datagram           = true;
+        obj->payload    = pay_rc ? moq_rcbuf_incref(pay_rc) : NULL;
+        obj->properties = prop_rc ? moq_rcbuf_incref(prop_rc) : NULL;
+        (void)push_event(s, &e);   /* room reserved above */
+        s->recv_payload_bytes += obj_budget;
+    }
+    if (pay_rc) moq_rcbuf_decref(pay_rc);
+    if (prop_rc) moq_rcbuf_decref(prop_rc);
+    return MOQ_OK;
+}
 
 moq_result_t session_core_on_object_datagram(moq_session_t *s,
     const moq_decoded_object_datagram_t *d,
     const uint8_t *payload_data, size_t payload_len,
     const uint8_t *props_data, size_t props_len)
 {
+    /* A verdict the decoder already reached (a property block that cannot be
+     * parsed, a repeated non-repeatable property) is the Track's, whatever
+     * becomes of this datagram: it is latched before the unreliable
+     * admission below may drop the datagram, so a datagram dropped for
+     * receive limits still fails its Track. */
+    if (s->profile->malformed_track_local && d->malformed != MOQ_MALFORMED_NONE &&
+        (d->sub_slot >= 0 || d->pub_slot >= 0)) {
+        session_fail_malformed_alias(s, d->sub_slot >= 0
+                                            ? s->subs[d->sub_slot].track_alias
+                                            : s->publishes[d->pub_slot].track_alias);
+        return s->state == MOQ_SESS_CLOSED ? MOQ_ERR_CLOSED : MOQ_OK;
+    }
+
     /* Apply the same receive limits as the stream/fetch object paths. A datagram
      * is a self-contained, unreliable unit, so an over-limit one is dropped
      * (no event, session stays established) rather than closing the session.
@@ -1016,6 +1518,54 @@ moq_result_t session_core_on_object_datagram(moq_session_t *s,
     if (s->recv_payload_bytes > s->max_recv_buf ||
         obj_budget > s->max_recv_buf - s->recv_payload_bytes)
         return MOQ_ERR_WOULD_BLOCK;
+
+    /* §12.1: a datagram that makes its Track malformed fails the requests
+     * for that Track, not the session, and is not delivered. The verdict is
+     * latched on those requests before anything is retired, so a
+     * cancellation that cannot be queued now completes on a later call even
+     * if the peer sends nothing more; the datagram itself is dropped. A
+     * datagram for a Track already failed is dropped as well. */
+    if (s->profile->malformed_track_local && (d->sub_slot >= 0 || d->pub_slot >= 0)) {
+        uint64_t alias = d->sub_slot >= 0 ? s->subs[d->sub_slot].track_alias
+                                          : s->publishes[d->pub_slot].track_alias;
+        uint8_t why = d->malformed;
+        if (why == MOQ_MALFORMED_NONE && session_alias_failing(s, alias))
+            why = MOQ_MALFORMED_TRACK_FAILED;
+        if (why == MOQ_MALFORMED_NONE) {
+            moq_result_t trc;
+            moq_mt_track_t *t = mt_track_for_alias(s, alias, &trc);
+            if (trc < 0) return trc;
+            moq_mt_object_t mo = {
+                .group_id = d->group_id,
+                .object_id = d->object_id,
+                .end_of_group = d->end_of_group,
+                .status = d->status,
+                .gaps = &d->gaps,
+            };
+            why = mt_object(t, &mo);
+        }
+        if (why != MOQ_MALFORMED_NONE) {
+            session_fail_malformed_alias(s, alias);
+            return s->state == MOQ_SESS_CLOSED ? MOQ_ERR_CLOSED : MOQ_OK;
+        }
+    }
+
+    /* An alias several subscriptions share, or that a pending subscription
+     * to its track may share (draft-22 §3.1, §3.1.3): the datagram is
+     * surfaced once to every subscription whose filter -- Forward included --
+     * accepts it, all or none, held for a pending one, and discarded when
+     * none does. */
+    if (d->sub_slot >= 0 || d->pub_slot >= 0) {
+        uint64_t alias = d->sub_slot >= 0 ? s->subs[d->sub_slot].track_alias
+                                          : s->publishes[d->pub_slot].track_alias;
+        if (alias_attribution_shared(s, alias)) {
+            moq_track_hist_t *th = d->sub_slot >= 0 ? s->subs[d->sub_slot].hist
+                                                    : s->publishes[d->pub_slot].hist;
+            track_hist_merge(th, d->group_id, d->object_id);
+            return datagram_fan_out(s, alias, d, payload_data, payload_len,
+                                    props_data, props_len);
+        }
+    }
 
     /* Feed received-object history at ADMISSION -- once the object passed the
      * receive-limit checks above, before delivery capacity.
@@ -1038,6 +1588,7 @@ moq_result_t session_core_on_object_datagram(moq_session_t *s,
         return MOQ_OK;
     if (d->pub_slot >= 0 && !s->publishes[d->pub_slot].send_allowed)
         return MOQ_OK;
+
 
     if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
 
@@ -1074,7 +1625,8 @@ moq_result_t session_core_on_object_datagram(moq_session_t *s,
     obj->group_id           = d->group_id;
     obj->subgroup_id        = 0;
     obj->object_id          = d->object_id;
-    obj->publisher_priority = d->publisher_priority;
+    obj->publisher_priority = session_resolve_publisher_priority(s, obj->sub, obj->pub,
+        d->default_priority, d->publisher_priority);
     obj->status             = d->status;
     obj->end_of_group       = d->end_of_group;
     obj->datagram           = true;
@@ -1094,8 +1646,65 @@ moq_result_t session_core_on_object_datagram(moq_session_t *s,
 
 /* -- Datagram outbound send ---------------------------------------- */
 
+/* The smaller non-zero of two timeouts (0 = none). */
+static uint64_t dt_min_nonzero_us(uint64_t a, uint64_t b)
+{
+    if (a == 0) return b;
+    if (b == 0) return a;
+    return a < b ? a : b;
+}
+
+/* A datagram's scheduling record and OBJECT_DELIVERY_TIMEOUT expiry: the
+ * owner's subscriber priority and group order, and the smaller of the owner's
+ * two negotiated timeouts (SUBGROUP_DELIVERY_TIMEOUT acts as
+ * OBJECT_DELIVERY_TIMEOUT for datagrams). */
+static void datagram_meta(moq_session_t *s, int sub_slot, int pub_slot,
+                          const moq_datagram_encode_args_t *args,
+                          moq_action_meta_t *m, uint64_t *deadline)
+{
+    moq_dt_scan_t pub, sub;
+    memset(&pub, 0, sizeof(pub)); memset(&sub, 0, sizeof(sub));
+    memset(m, 0, sizeof(*m));
+    m->deadline_us = UINT64_MAX;
+    m->mode = MOQ_SCHED_MODE_DATAGRAM;
+    m->group_order = MOQ_GROUP_ORDER_ASCENDING;
+    m->subscriber_priority = 128;
+    if (sub_slot >= 0) {
+        const moq_sub_entry_t *se = &s->subs[sub_slot];
+        m->owner = se->handle._opaque;
+        m->subscriber_priority = se->subscriber_priority;
+        m->group_order = session_group_order(se->group_order, se->track_group_order);
+        pub.has_object = se->dt_pub_has_object;     pub.object_ms = se->dt_pub_object_ms;
+        pub.has_subgroup = se->dt_pub_has_subgroup; pub.subgroup_ms = se->dt_pub_subgroup_ms;
+        sub.has_object = se->dt_sub_has_object;     sub.object_ms = se->dt_sub_object_ms;
+        sub.has_subgroup = se->dt_sub_has_subgroup; sub.subgroup_ms = se->dt_sub_subgroup_ms;
+    } else if (pub_slot >= 0) {
+        const moq_pub_entry_t *pe = &s->publishes[pub_slot];
+        m->owner = pe->handle._opaque;
+        m->subscriber_priority = pe->subscriber_priority;
+        m->group_order = session_group_order(pe->group_order, pe->track_group_order);
+        pub.has_object = pe->dt_pub_has_object;     pub.object_ms = pe->dt_pub_object_ms;
+        pub.has_subgroup = pe->dt_pub_has_subgroup; pub.subgroup_ms = pe->dt_pub_subgroup_ms;
+        sub.has_object = pe->dt_sub_has_object;     sub.object_ms = pe->dt_sub_object_ms;
+        sub.has_subgroup = pe->dt_sub_has_subgroup; sub.subgroup_ms = pe->dt_sub_subgroup_ms;
+    }
+    m->publisher_priority = session_resolve_publisher_priority(s,
+        sub_slot >= 0 ? s->subs[sub_slot].handle : MOQ_SUBSCRIPTION_INVALID,
+        pub_slot >= 0 ? s->publishes[pub_slot].handle : MOQ_PUBLICATION_INVALID,
+        args->default_priority, args->publisher_priority);
+    m->group_id = args->group_id;
+    m->object_id = args->object_id;
+    m->has_location = true;
+    uint64_t o = ms_to_us_sat(dt_negotiate_ms(pub.has_object, pub.object_ms,
+                                              sub.has_object, sub.object_ms));
+    uint64_t g = ms_to_us_sat(dt_negotiate_ms(pub.has_subgroup, pub.subgroup_ms,
+                                              sub.has_subgroup, sub.subgroup_ms));
+    uint64_t to = dt_min_nonzero_us(o, g);
+    *deadline = to ? deadline_add(s->last_now_us, to) : UINT64_MAX;
+}
+
 static moq_result_t send_datagram_encoded(moq_session_t *s,
-    const moq_datagram_encode_args_t *args)
+    const moq_datagram_encode_args_t *args, int sub_slot, int pub_slot)
 {
     if (action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
 
@@ -1115,7 +1724,9 @@ static moq_result_t send_datagram_encoded(moq_session_t *s,
     a.u.send_datagram.data = s->send_buf + s->send_len;
     a.u.send_datagram.len  = elen;
 
-    rc = push_action(s, &a);
+    moq_action_meta_t meta; uint64_t deadline;
+    datagram_meta(s, sub_slot, pub_slot, args, &meta, &deadline);
+    rc = push_action_ex(s, &a, &meta, deadline);
     if (rc < 0) return rc;
 
     s->send_len += elen;
@@ -1161,7 +1772,7 @@ moq_result_t moq_session_send_object_datagram(
     args.payload            = pdata;
     args.payload_len        = plen;
 
-    moq_result_t drc = send_datagram_encoded(s, &args);
+    moq_result_t drc = send_datagram_encoded(s, &args, sub_slot, -1);
     if (drc >= 0)
         track_hist_merge(s->subs[sub_slot].hist, group_id, object_id);
     return drc;
@@ -1204,7 +1815,7 @@ moq_result_t moq_session_send_status_datagram(
     args.is_status          = true;
     args.object_status      = wire_status;
 
-    moq_result_t drc = send_datagram_encoded(s, &args);
+    moq_result_t drc = send_datagram_encoded(s, &args, sub_slot, -1);
     if (drc >= 0)
         track_hist_merge(s->subs[sub_slot].hist, group_id, object_id);
     return drc;
@@ -1231,7 +1842,7 @@ moq_result_t moq_session_send_pub_object_datagram(
         return MOQ_ERR_WRONG_STATE;
     if (s->publishes[slot].role != MOQ_PUB_ROLE_PUBLISHER)
         return MOQ_ERR_WRONG_STATE;
-    if (s->publishes[slot].update_failed) return MOQ_ERR_WRONG_STATE;
+    if (pub_control_reject_teardown(s, &s->publishes[slot])) return MOQ_ERR_WRONG_STATE;
     if (!s->publishes[slot].send_allowed)
         return MOQ_ERR_WRONG_STATE;
 
@@ -1250,7 +1861,7 @@ moq_result_t moq_session_send_pub_object_datagram(
     args.payload            = pdata;
     args.payload_len        = plen;
 
-    moq_result_t drc = send_datagram_encoded(s, &args);
+    moq_result_t drc = send_datagram_encoded(s, &args, -1, slot);
     if (drc >= 0)
         track_hist_merge(s->publishes[slot].hist, group_id, object_id);
     return drc;
@@ -1275,7 +1886,7 @@ moq_result_t moq_session_send_pub_status_datagram(
         return MOQ_ERR_WRONG_STATE;
     if (s->publishes[slot].role != MOQ_PUB_ROLE_PUBLISHER)
         return MOQ_ERR_WRONG_STATE;
-    if (s->publishes[slot].update_failed) return MOQ_ERR_WRONG_STATE;
+    if (pub_control_reject_teardown(s, &s->publishes[slot])) return MOQ_ERR_WRONG_STATE;
     if (!s->publishes[slot].send_allowed)
         return MOQ_ERR_WRONG_STATE;
 
@@ -1294,16 +1905,36 @@ moq_result_t moq_session_send_pub_status_datagram(
     args.is_status          = true;
     args.object_status      = wire_status;
 
-    moq_result_t drc = send_datagram_encoded(s, &args);
+    moq_result_t drc = send_datagram_encoded(s, &args, -1, slot);
     if (drc >= 0)
         track_hist_merge(s->publishes[slot].hist, group_id, object_id);
     return drc;
 }
 
-moq_result_t moq_session_on_data_stop(moq_session_t *s,
-                                       moq_stream_ref_t stream_ref,
-                                       uint64_t error_code,
-                                       uint64_t now_us)
+uint8_t bridge_session_subgroup_header_size(
+    const moq_session_t *s, const moq_send_data_action_t *data)
+{
+    return s->profile->classify_data_stream(data->header, data->header_len) ==
+        MOQ_STREAM_KIND_SUBGROUP ? data->header_len : 0;
+}
+
+bool bridge_session_has_queued_data_reset(
+    const moq_session_t *s, moq_stream_ref_t ref)
+{
+    for (size_t i = s->action_head; i < s->action_tail; ++i) {
+        const moq_action_t *a = &s->actions[i % s->action_cap];
+        if (a->kind == MOQ_ACTION_RESET_DATA &&
+            a->u.reset_data.stream_ref._v == ref._v)
+            return true;
+    }
+    return false;
+}
+
+static moq_result_t session_on_data_stop(moq_session_t *s,
+                                         moq_stream_ref_t stream_ref,
+                                         uint64_t error_code,
+                                         uint64_t now_us,
+                                         uint8_t retained_header_len)
 {
     if (!s) return MOQ_ERR_INVAL;
     if (error_code > MOQ_QUIC_VARINT_MAX) return MOQ_ERR_INVAL;
@@ -1312,9 +1943,22 @@ moq_result_t moq_session_on_data_stop(moq_session_t *s,
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;
 
     int slot = sg_find_by_stream_ref(s, stream_ref);
-    if (slot < 0) return MOQ_OK;
-    if (s->subgroups[slot].state != MOQ_SG_OPEN &&
-        s->subgroups[slot].state != MOQ_SG_STREAMING) return MOQ_OK;
+    if (slot < 0 && retained_header_len == 0) {
+        /* A fill stream answers the peer's STOP with its RESET and ends the
+         * child; a stream nobody owns is nothing to act on. */
+        moq_result_t frc = fill_on_data_stop(s, stream_ref, error_code);
+        return frc == MOQ_ERR_STALE_HANDLE ? MOQ_OK : frc;
+    }
+    if (slot >= 0) {
+        if (s->subgroups[slot].state != MOQ_SG_OPEN &&
+            s->subgroups[slot].state != MOQ_SG_STREAMING &&
+            s->subgroups[slot].state != MOQ_SG_CLOSING) return MOQ_OK;
+    } else {
+        /* Only a bridge-retained subgroup FIN can reach this fallback. A
+         * timeout/local reset may already own an action even though the slot
+         * was reaped: preserve that first reset and its exact code. */
+        if (bridge_session_has_queued_data_reset(s, stream_ref)) return MOQ_OK;
+    }
 
     if (action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
 
@@ -1325,9 +1969,12 @@ moq_result_t moq_session_on_data_stop(moq_session_t *s,
     a.borrow_epoch = s->borrow_epoch;
     a.u.reset_data.stream_ref = stream_ref;
     a.u.reset_data.error_code = error_code;
+    a.u.reset_data.reliable_size = slot >= 0
+        ? s->subgroups[slot].header_len : retained_header_len;
 
     moq_result_t rc = push_action(s, &a);
     if (rc < 0) return rc;
+    if (slot < 0) return MOQ_OK;
 
     s->subgroups[slot].state = MOQ_SG_RESETTING;
     s->subgroups[slot].streaming_payload_len = 0;
@@ -1336,5 +1983,38 @@ moq_result_t moq_session_on_data_stop(moq_session_t *s,
         s->subgroups[slot].delivery_deadline_us = UINT64_MAX;
         sg_recompute_deadline(s);
     }
+    return MOQ_OK;
+}
+
+moq_result_t moq_session_on_data_stop(moq_session_t *s,
+                                       moq_stream_ref_t stream_ref,
+                                       uint64_t error_code,
+                                       uint64_t now_us)
+{
+    return session_on_data_stop(s, stream_ref, error_code, now_us, 0);
+}
+
+moq_result_t bridge_session_on_subgroup_stop(
+    moq_session_t *s, moq_stream_ref_t ref, uint64_t error_code,
+    uint64_t now_us, uint8_t retained_header_len)
+{
+    return session_on_data_stop(s, ref, error_code, now_us, retained_header_len);
+}
+
+moq_result_t moq_session_on_data_committed(moq_session_t *s,
+                                            moq_stream_ref_t stream_ref,
+                                            uint64_t now_us)
+{
+    if (!s) return MOQ_ERR_INVAL;
+    if (moq_binding_required_unbound(s)) return MOQ_ERR_WRONG_STATE;
+    if (s->state == MOQ_SESS_CLOSED) return MOQ_ERR_CLOSED;
+    int slot = sg_find_by_stream_ref(s, stream_ref);
+    if (slot < 0 || s->subgroups[slot].state != MOQ_SG_CLOSING ||
+        s->subgroups[slot].delivery_deadline_us == UINT64_MAX)
+        return MOQ_OK;
+    moq_result_t arc = session_advance_entry(s, now_us);
+    if (arc != MOQ_OK) return arc;
+    s->subgroups[slot].delivery_deadline_us = UINT64_MAX;
+    sg_recompute_deadline(s);
     return MOQ_OK;
 }

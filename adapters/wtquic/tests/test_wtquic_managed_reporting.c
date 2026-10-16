@@ -97,7 +97,10 @@ int main(void)
         CHECK(p != NULL);
         if (!p) break;
         memcpy(p, &cfg, n);
-        ((moq_wtquic_network_managed_cfg_t *)p)->struct_size = (uint32_t)n;
+        /* The stamp is copied in at its offset: the block is smaller than
+         * the struct type, so no member is written through that type. */
+        uint32_t stamp = (uint32_t)n;
+        memcpy(p + offsetof(moq_wtquic_network_managed_cfg_t, struct_size), &stamp, sizeof(stamp));
         check_cfg((void *)p, n < floor ? MOQ_ERR_INVAL : MOQ_ERR_UNSUPPORTED);
         free(p);
     }

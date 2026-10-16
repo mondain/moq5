@@ -18,14 +18,39 @@ extern "C" {
 
 typedef struct moq_pq_conn moq_pq_conn_t;
 
+/* A RESET_STREAM_AT accepted from the bridge whose reliable prefix picoquic
+ * has not pulled from the send queue yet (picoquic refuses a reliable size
+ * beyond the bytes it has sent). */
+typedef struct {
+    uint64_t sid;
+    uint64_t error_code;
+    uint64_t reliable_size;
+} pq_deferred_reset_t;
+
 typedef struct {
     picoquic_cnx_t      *cnx;
+    moq_alloc_t          alloc;
     /* Adapter-owned outbound queue: MoQ stream bytes are held here and copied
      * into picoquic's packet buffer from prepare_to_send (pull model). */
     moq_pq_send_queue_t *queue;
     /* Telemetry (characterization): prepare_to_send calls and bytes provided. */
     uint64_t             prepare_count;
     uint64_t             provided_bytes;
+    /* Reliable resets waiting for their prefix to be sent, and the number of
+     * RESET_STREAM_AT frames issued (telemetry and test witness). */
+    pq_deferred_reset_t *deferred;
+    size_t               deferred_count;
+    size_t               deferred_cap;
+    uint64_t             reliable_resets;
+    /* Receive-side ownership hooks of the attaching adapter (NULL: none).
+     * rx_terminal_discard: asked before a STOP_SENDING; true when the
+     * adapter's own record shows the stream's receive half already terminal
+     * at the transport, in which case the adapter has discarded what it held
+     * for the stream and no STOP_SENDING is sent. rx_stopped: told after an
+     * accepted STOP_SENDING, so the adapter drops what it held. */
+    bool               (*rx_terminal_discard)(void *owner, uint64_t stream_id);
+    void               (*rx_stopped)(void *owner, uint64_t stream_id);
+    void                *rx_owner;
 } pq_endpoint_ctx_t;
 
 /* Send-path telemetry snapshot (characterization; not product API). */
@@ -70,6 +95,15 @@ int pq_endpoint_init(moq_transport_endpoint_ops_t *ops,
 
 /* Release the outbound queue (decref retained rcbufs, free copies). */
 void pq_endpoint_cleanup(pq_endpoint_ctx_t *ep_ctx);
+
+/* Issue every deferred reliable reset whose prefix picoquic has now taken.
+ * Called outside picoquic's prepare_to_send (the stream's sent offset only
+ * advances once that callback returns): from moq_pq_service and at the start
+ * of the other picoquic callbacks. Each issued entry is removed, never
+ * retried. Returns 0, or -1 when picoquic refused both a RESET_STREAM_AT and
+ * its plain RESET_STREAM fallback, so the stream could not be ended; the
+ * caller then fails the transport, as for a reset refused on the spot. */
+int pq_endpoint_flush_resets(pq_endpoint_ctx_t *ep_ctx);
 
 /* Service a picoquic_callback_prepare_to_send for `stream_id`: copy up to
  * `max` queued bytes into picoquic's buffer via `provide_ctx`, setting FIN and

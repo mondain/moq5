@@ -159,7 +159,12 @@ typedef struct moq_msquic_managed_cfg {
                                       server: bind address
                                       (default 0.0.0.0) */
     uint16_t port;                 /* client: remote (required);
-                                      server: listen, 0 = ephemeral */
+                                      server: listen, 0 = ephemeral: a
+                                      port no IPv4 socket holds, so IPv4
+                                      and IPv6 clients both reach the
+                                      listener (MsQuic binds the
+                                      dual-stack wildcard); read it back
+                                      with moq_msquic_managed_port() */
     const char *cert_path;         /* server: required */
     const char *key_path;          /* server: required */
     bool insecure_skip_verify;     /* client: skip cert validation
@@ -217,8 +222,18 @@ typedef struct moq_msquic_managed_cfg {
      * application state changes the value this query would return, the owner
      * MUST issue a facade/lane wake (moq_msquic_managed_wake /
      * moq_msquic_lane_wake) so the next loop recomputes the wait; an
-     * idle lane will not observe the new deadline on its own. Set via
-     * moq_msquic_managed_cfg_init_sized. */
+     * idle lane will not observe the new deadline on its own.
+     *
+     * Every lane folds this one value, whichever lane's state it describes.
+     * An application whose deadlines belong to particular lanes should use
+     * app_lane_deadline_us below instead, so a lane waits only for its own.
+     *
+     * A lane pumps for an application deadline once: when a pump of that
+     * lane has run at or after the instant returned, that same instant no
+     * longer wakes it. Returning a later instant (or waking the lane) asks
+     * for another pump; a query that keeps answering an instant already
+     * served leaves the lane waiting rather than pumping without pause. Set
+     * via moq_msquic_managed_cfg_init_sized. */
     uint64_t (*app_deadline_us)(void *ctx);
     void *app_deadline_ctx;
 
@@ -261,6 +276,41 @@ typedef struct moq_msquic_managed_cfg {
      * QUIC_SETTINGS.KeepAliveIntervalMs when this field is fully covered by
      * struct_size. */
     uint32_t keep_alive_interval_ms;
+
+    /* appended -- connection target (struct_size append-only ABI).
+     *
+     * target: the URI identity this facade binds each session with when the
+     * negotiated wire profile requires a transport binding (see
+     * <moq/connection_target.h>; draft-22 does, draft-16/18 do not). The
+     * facade supplies the transport facts itself -- each session is bound
+     * inside the connection's CONNECTED event, where the handshake has
+     * completed and QUIC DATAGRAM support is read from MsQuic for both
+     * sides -- and copies the target's fields and bytes during create()
+     * (accept_uri_ctx is borrowed until destroy()). CLIENT: the authority
+     * and path/query the connection dereferences, sent as the SETUP's
+     * AUTHORITY and PATH; NULL derives them from `host`, `port` and an empty
+     * path (a host whose host:port authority exceeds 1022 bytes is
+     * MOQ_ERR_INVAL at create(), not an unbound client). SERVER: the URI policy consulted for each client's SETUP; NULL
+     * serves every authority and path. A malformed target is MOQ_ERR_INVAL
+     * at create(). Honored only when struct_size covers the field; set via
+     * moq_msquic_managed_cfg_init_sized. */
+    const moq_connection_target_t *target;
+
+    /* appended: per-lane application service-deadline query -- ONE ABI block,
+     * read only when struct_size covers THROUGH app_lane_deadline_ctx (the
+     * callback and its context are honored together or not at all). The
+     * same contract as app_deadline_us above, asked for one lane:
+     * `lane_index` (0..lane_count-1) names the lane whose doorbell is
+     * computing its wait, and the answer is that lane's earliest pending
+     * time-based deadline (CLOCK_MONOTONIC us), or UINT64_MAX for none. A
+     * lane folds only the answer for its own index, so one lane's due
+     * deadline never wakes another. The served-once rule above applies per
+     * lane. Called from that lane's doorbell, concurrently with other lanes'
+     * pumps: MUST be pure/non-blocking and MUST NOT re-enter the facade.
+     * When both queries are set, each lane folds both. NULL = none. Set via
+     * moq_msquic_managed_cfg_init_sized. */
+    uint64_t (*app_lane_deadline_us)(void *ctx, uint32_t lane_index);
+    void *app_lane_deadline_ctx;
 } moq_msquic_managed_cfg_t;
 
 MOQ_API void moq_msquic_managed_cfg_init_sized(
@@ -332,7 +382,9 @@ MOQ_API moq_msquic_managed_conn_t *moq_msquic_lane_next_conn(
 
 /* Ask the adapter to pump this lane (schedules on_lane_pump on the
  * lane's doorbell). Does not grant session access outside the callback.
- * Safe from any thread, including inside a lane pump. */
+ * Signal-only from any thread, including inside a lane pump, another
+ * lane's pump, or another facade's callback: it never waits for a lane
+ * lock, so it returns promptly even while this lane is pumping. */
 MOQ_API moq_result_t moq_msquic_lane_wake(
     moq_msquic_managed_lane_t *lane);
 
@@ -539,6 +591,32 @@ MOQ_API moq_result_t moq_msquic_managed_wait(moq_msquic_managed_t *m,
 MOQ_API int moq_msquic_managed_pending_sends(
     const moq_msquic_managed_t *m);
 MOQ_API int moq_msquic_managed_pending_datagrams(
+    const moq_msquic_managed_t *m);
+
+/* Client-only local outbound flush observation, safe from application threads.
+ * Never advances the session, allocates, or waits behind a lane callback.
+ * MOQ_OK: no accepted local byte/FIN obligation remains in the core, bridge,
+ * adapter staging or provider completion domain. The connection may stay live;
+ * this is not peer application consumption or a promise about later enqueues.
+ * An accepted send-half reset or lawful peer STOP may withdraw an ordinary
+ * stream's remaining output (including delivery-timeout cancellation), but
+ * retained send borrows, submission and cancellation ownership must settle.
+ * This is not delivery of the withdrawn bytes, FIN or RESET, or request success.
+ * Session control output and receive-half-only aborts have no such exemption.
+ * MOQ_DONE: work remains, or a fresh serialized lane observation is unavailable.
+ * Wait/wake separately to drive progress. Future timers and unrelated inbound
+ * backpressure alone do not prevent flush. Provider send/FIN completion may be
+ * awaited conservatively, but stream/connection retirement is not ACK evidence.
+ * MOQ_ERR_INTERNAL: unexplained accepted-output loss, including a retired FIN
+ * without completion or qualifying withdrawal. Sticky for the live connection;
+ * later reset, unrelated success or stream reuse cannot clear it. This query
+ * does not make the connection fatal. Loss precedes ordinary pending work.
+ * MOQ_ERR_INVAL: NULL. MOQ_ERR_UNSUPPORTED: server mode.
+ * MOQ_ERR_WRONG_STATE: this instance's callback context (including on_activity).
+ * MOQ_ERR_CLOSED: stop requested or terminal; never overwritten by empty counts.
+ * Argument/mode/callback refusals precede terminal observation. As with other
+ * facade queries, destroy must not race the call. */
+MOQ_API moq_result_t moq_msquic_managed_poll_flush(
     const moq_msquic_managed_t *m);
 
 /* Terminal observation — CLIENT convenience (the single connection).

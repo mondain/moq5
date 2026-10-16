@@ -43,13 +43,17 @@ endif()
 if(MOQ_BUILD_TESTS)
     add_executable(test_media_object tests/test_media_object.c)
     target_link_libraries(test_media_object PRIVATE moq::media-object)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_media_object PRIVATE -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
     add_test(NAME media_object COMMAND test_media_object)
 
     add_executable(test_media_object_mpeg2ts tests/test_media_object_mpeg2ts.c
         tests/legacy_media_object_client.c)
     target_link_libraries(test_media_object_mpeg2ts PRIVATE moq::media-object)
     target_include_directories(test_media_object_mpeg2ts PRIVATE
-        ${CMAKE_SOURCE_DIR}/media/mpeg2ts/tests)
+        ${PROJECT_SOURCE_DIR}/media/mpeg2ts/tests)
     if(TARGET moq::mpeg2ts)
         target_compile_definitions(test_media_object_mpeg2ts PRIVATE
             MOQ_TEST_HAVE_MPEG2TS)
@@ -59,4 +63,17 @@ if(MOQ_BUILD_TESTS)
             -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
     endif()
     add_test(NAME media_object_mpeg2ts COMMAND test_media_object_mpeg2ts)
+
+    foreach(test IN ITEMS media_metadata media_old_client media_metadata_layout
+                          media_parsed_init)
+        add_executable(test_${test} tests/test_${test}.c)
+        target_link_libraries(test_${test} PRIVATE moq::media-object)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_${test} PRIVATE -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME ${test} COMMAND test_${test})
+    endforeach()
+    target_compile_definitions(test_media_metadata_layout PRIVATE
+        MOQ_MEDIA_LAYOUT_EXECUTE=1)
 endif()

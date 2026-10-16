@@ -14,6 +14,19 @@ platform thread synchronization for its bounded cross-shard queues; the host
 owns the workers and schedules every step. Transport adapters remain optional
 application dependencies.
 
+The binding serves draft-16, draft-18 and draft-22 sessions and forwards
+between them. On draft-22 it answers subscriber updates itself (applying a
+replacement Location Filter before acknowledging it), serves fills from the
+retained log with Timed-Out markers at the fill's deadline, retrieves a
+fill's missing range from the owning shard, resolves FETCH ranges against
+its own Largest Object, and retrieves upstream the part of a standalone
+FETCH it does not hold, in either group order, with the FETCH routed to the
+shard that owns the track. It turns on update deferral and deferred
+FETCH ranges on every session it attaches, so a host must not rely on those
+sessions answering on their own. A host that pumps on its own schedule wakes
+for `moqr_bind_next_deadline_us()`. Details and limits:
+[docs/architecture.md](docs/architecture.md#draft-22-behaviour).
+
 ## Build And Install
 
 From the project root, for the engine and runtime without the command:

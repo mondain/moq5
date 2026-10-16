@@ -195,6 +195,26 @@ MsQuic managed lane i  ->  shard i { one moqr_bind_t, one moqr_core_t, one trace
   in draft-16 Section 8.3 and draft-18 Section 9.3; a duplicate on the same
   session remains invalid. Cross-shard rendezvous applies the corresponding
   deterministic winner policy between shards.
+- **A fill is answered the same on every shard.** A shard whose feed of a
+  remote-owned track began at the owner's ACK cannot hold the Objects at or
+  below the Largest that ACK reported. The binding's fill source
+  (`moqr_bind_set_fill_source`, installed by the shard runtime when admission
+  is on) claims that part of a draft-22 fill's range — whole groups up to the
+  first group the feed brought — and the shard retrieves exactly it from the
+  owner over the same demand channels: a REQ carrying the range, the fill's
+  deadline and a credit window; the owner reads its own retained log through
+  a fill cursor on the requester's pseudo-binding, waits at a run it does not
+  hold until the deadline exactly as a fill served there would, and answers
+  OPEN, then one item per credit (object, Timed-Out run, evicted-prefix
+  marker), then END. The rest of the range is served from the shard's own
+  log. An answer that has not begun by the deadline is reported as one
+  Timed-Out run and ignored if it arrives later; one that has begun keeps
+  delivering the Objects the owner holds (draft-22 Section 3.2.3). Retrieved
+  Objects never enter the requester's log, so live subscribers there are
+  unaffected; window items stay charged to the channel that carried them
+  until the fill consumes them, so the channel caps and the capacity ceiling
+  bound them; and the owner sends retrieval answers ahead of live data, which
+  the credit window keeps from starving it.
 - **A shard step is six phases, in order:** (1) inbound drain — control
   mailboxes plus the demand channels, applying every message class above;
   (2) the bind pump; (3) dirty journal reconcile (mirrors, winners,
@@ -209,7 +229,7 @@ MsQuic managed lane i  ->  shard i { one moqr_bind_t, one moqr_core_t, one trace
 - **Cross-shard object data is production behaviour, automatically on for
   multiple lanes.** The shared CLI builder sets `admit_remote_demand =
   (lanes > 1)` — the single place that rule lives, consumed identically by
-  `capacity` and `serve`; a single-lane relay is the direct M1 path with no
+  `capacity` and `serve`; a single-lane relay uses the direct single-lane path with no
   cross-shard plane, and there is **no user-facing admission key or toggle**.
   When admission is on, the demand channel is one ordered FIFO per directed
   shard pair carrying the full vocabulary in arrival order:
@@ -256,9 +276,11 @@ MsQuic managed lane i  ->  shard i { one moqr_bind_t, one moqr_core_t, one trace
   a lane-1 relay's ceiling is byte-identical whether admission is nominally
   on or off (K=1 builds no manager, so admission storage is zero).
 - **Multi-version listener: one endpoint can serve several drafts.**
-  `listener.versions` is an ordered, non-empty set of known drafts, most
-  preferred first. The default is `[18]`; `[18, 16]` offers `moqt-18` and
-  `moqt-16` from one listener, and ALPN selects each connection's draft.
+  `listener.versions` is an ordered, non-empty set of known drafts (22, 18,
+  16), most preferred first. The default is `[18, 22, 16]`: every draft the
+  core reports wire-ready, draft-18 first; `[22, 18, 16]` prefers draft-22.
+  One listener offers `moqt-22`, `moqt-18` and `moqt-16`, and ALPN selects
+  each connection's draft.
   A single entry keeps the exact-version representation for byte-stable
   single-draft output.
 - **Signal dumps: lanes own their traversal; who owns the aggregate depends
@@ -318,13 +340,103 @@ contract row, not just the path text.
 | `moq_msquic_managed_session` | CLIENT-only convenience — NULL on a SERVER and outside the pump; the relay server must NOT use it, it iterates lane conns instead | `adapters/msquic/include/moq/msquic_managed.h` |
 | Other managed adapters (`moq_pq_threaded_t`, `moq_mvfst_managed_t`) — NOT the production relay transport | historical / non-production: same create/stop/destroy + `on_pump` confinement shape; the executable no longer links picoquic-threaded | `adapters/picoquic/include/moq/picoquic_threaded.h`, `adapters/mvfst/include/moq/mvfst.h` |
 
+## Draft-22 behaviour
+
+The relay serves drafts 16, 18 and 22 on one listener and forwards between
+sessions of different drafts. What is specific to draft-22 sessions:
+
+- **Update answers.** The binding turns on
+  `moq_session_set_defer_subscription_updates` for every session it
+  attaches, so no subscriber update is acknowledged before the relay has
+  decided. A replacement LOCATION_FILTER is mapped onto the relay
+  subscription exactly as a SUBSCRIBE's filter is and applied before the
+  acceptance, so REQUEST_UPDATE_OK follows the change; the acceptance states
+  the relay's own Largest Object for the track. A filter the relay does not
+  serve is refused with `moq_session_reject_subscription_update`
+  (REQUEST_UPDATE_ERROR INTERNAL_ERROR, reason "location filter not served"),
+  after which the session ends the subscription with PUBLISH_DONE
+  UPDATE_FAILED. An answer the session cannot take yet is held on the
+  subscription and retried every pump without holding up other
+  subscriptions. Updates on drafts 16 and 18 are accepted at once.
+- **Filters served.** None, Next Object, every Relative Start (0 is the
+  next group, 1 the current group, larger values count back), Absolute Start
+  and Absolute Start with a Group End, plus Absolute Range with an inclusive
+  object-level end (type 0x04). These six semantic forms are carried to
+  relay-core on SUBSCRIBE and replacement REQUEST_UPDATE. Range Filters are
+  separate: the session refuses them (MAX_FILTER_RANGES is 0).
+  A lowered start in a replacement filter keeps the delivery frontier where
+  it is: records already passed are not replayed (a subscriber that wants
+  them asks for a fill). On draft-22 a subscription stays established after
+  the Largest Object passes its filter's end, since draft-22 has no
+  SUBSCRIPTION_ENDED status.
+- **Fills.** A fill is served from the retained log on a fetch stream that
+  opens with its header at once, and every Location in its range is served
+  or marked (§3.2.2): a run upstream may still deliver is waited on until the
+  fill's deadline and then marked End of Timed-Out Range; a run with nothing
+  to wait on is marked End of Unknown Range while the wait budget lasts and
+  Timed-Out once it is spent; Locations past a known End of Group or End of
+  Track are left unmarked. The stream then ends with FIN. The wait is
+  min(FILL_TIMEOUT, maximum), or the default when the fill carries none; a
+  FILL_TIMEOUT of 0 reports everything unavailable as Timed-Out at once
+  (§9.20.5). The defaults are 1000 ms and a
+  10,000 ms maximum (`MOQR_BIND_DEF_FILL_TIMEOUT_MS`,
+  `MOQR_BIND_DEF_FILL_TIMEOUT_MAX_MS`), set per binding with
+  `moqr_bind_set_fill_timeouts` and per sharded runtime with the
+  `fill_timeout_default_ms` / `fill_timeout_max_ms` fields of
+  `moqr_shards_cfg_t`. On a shard that does not own the track, the part of
+  the range before the shard's own feed began is retrieved from the owner
+  (above, "A fill is answered the same on every shard").
+- **Fill deadlines wake the runtime.** `moqr_bind_next_deadline_us` reports
+  the nearest fill deadline; the `moq5-relay` command maps each lane to its
+  own shard's deadline through the MsQuic and WebTransport facades'
+  `app_lane_deadline_us`, so a fill on a quiet track ends at its deadline
+  rather than at the next unrelated wake.
+- **FETCH ranges** are resolved by the relay against its own Largest
+  (`moq_session_set_defer_fetch_ranges`, described under "Status").
+- **Standalone FETCH retrieves what the relay does not hold** (§3.2.3). A
+  draft-22 standalone FETCH is admitted once and answered with FETCH_OK at
+  once. Its range is then covered in the requested group order -- descending
+  orders groups, each group's Objects stay in Object order (§3.2.1) -- from
+  the cache, and each run the cache does not hold is retrieved with one
+  upstream FETCH for exactly that run, through the same retrieval cursor and
+  bounded collector pool fills use. FILL_TIMEOUT is one total budget for all
+  of a request's upstream FETCHes (§9.20.5): each upstream FETCH carries the
+  remaining budget, and a run still unavailable at the deadline is marked End
+  of Timed-Out Range while the response continues; a FILL_TIMEOUT of 0 asks
+  nothing upstream. A run with no connection to retrieve it from is marked
+  End of Unknown Range at once (Timed-Out once the budget is spent), and an
+  Object still arriving is waited for up to the deadline. Retrieved Objects
+  are not ingested into the live log. An upstream FETCH that fails resets the
+  response with UNKNOWN_OBJECT_STATUS (§3.2.2); a local failure resets it
+  with INTERNAL_ERROR; a request the relay cannot take on (no FETCH slot) is
+  refused with REQUEST_ERROR INTERNAL_ERROR. All of these are request-local:
+  the session, its subscriptions and its other FETCHes are unaffected, and a
+  reset the session cannot take yet is retried until it commits. The
+  subscriber's cancellation retires the request at once and cancels its
+  upstream FETCH. On a shard that does not own the track the FETCH is routed
+  to the owning shard, which admits it against its own log and answers it
+  from its cache and upstream across the shard channels (above), so the
+  response is the same whichever shard the subscriber landed on. Draft-16 and
+  draft-18 FETCH are served from the retained log as before.
+
+Tests: `relay_session_binding_fetch`, `relay_session_binding_d22`,
+`relay_shard_fill`,
+`relay_standalone_fetch_*`, `relay_standalone_fetch_shard_*`,
+`relay_fill_deadline_*`
+(single lane, lanes, fill subscriber first, dual listener), `relay_mixed_draft`,
+`relay_multiversion`, `scenario_relay_bootstrap_d22`.
+
 ## Status
 
 Implemented: the bounded log/cursor primitive with capacity model and trace
 ring; the control plane (namespace trie, track table with coalescing,
 pull-model subscribe delivery); retained standalone FETCH through the core
 cursor and production binding, including FETCH over chunk-retained COMPLETE
-records; bounded forwarding of an ascending Joining FETCH on a
+records, with every Location of a FETCH or fill response accounted for
+(served, marked as an End of Unknown Range -- or, on a draft-22 fill whose
+wait budget is spent, an End of Timed-Out Range -- or left unmarked only past
+a known END_OF_GROUP / END_OF_TRACK, since an unmarked gap tells the fetcher
+the Objects do not exist); bounded forwarding of an ascending Joining FETCH on a
 SUBSCRIBE-initiated subscription (one standalone upstream FETCH per request
 to the pinned source generation, the complete response collected within
 `fetch_forward_bytes` / 64 objects / 16 gaps before the downstream FETCH_OK,
@@ -334,7 +446,8 @@ take yet is held per connection and retried until it commits or the request
 goes away); and chunk-through ingest/delivery with
 live-edge stalls, downstream reset propagation, and retained replay. The
 production session binding is proven against real sessions over SimPair on
-both drafts.
+drafts 16, 18 and 22 (`relay_session_binding` and the
+`relay_session_binding_*` suites).
 
 The multi-shard runtime owns one core, binding, and trace per shard. Its
 deterministic runner preserves reproducible schedule oracles; its concurrent
@@ -402,9 +515,30 @@ reset carrying only the fixed §3.3.3 CANCELLED code, not a request-error code.
 Binding close retires the connection's grants, so a later tick never touches a
 torn-down session.
 
-Not yet implemented: cross-shard standalone FETCH (fetch serves only
-shard-local retained logs — the cross-shard message set carries object and
-demand kinds, no fetch kind); external selector-based auth revocation
+FETCH ranges are the relay's to resolve: every attached session leaves a
+draft-22 range stated relative to Largest Object (an open end, a relative or
+Next Object start, no Location Filter) unresolved
+(`moq_session_set_defer_fetch_ranges`), and `moqr_core_fetch_open` resolves
+it against the track's Largest in the same call that plans the range; the
+session holds the FETCH_OK End to the request's form. The Largest Object
+advances on the first byte of an Object (an OPEN record), so it can name an
+Object still arriving; a FETCH or fill whose range includes it waits for it
+(`MOQR_FETCH_ITEM_PENDING`) up to the request's wait budget, serves it whole
+once it completes, and marks its Location otherwise. A FETCH marks what it
+does not serve at once, Unknown while its FILL_TIMEOUT budget lasts and
+Timed-Out once it is spent (at once for a FILL_TIMEOUT of 0) on a draft whose
+fetch stream has that marker. On draft-22 a FETCH first retrieves upstream
+what it does not hold and marks only what stays unavailable ("Standalone
+FETCH retrieves what the relay does not hold", above). On a draft-22 shard
+that does not own the track a FETCH is routed to the owning shard and
+resolved there; on draft-16 and draft-18 it is resolved against the shard's
+copy only while the owner feeds it (its Largest then follows the owner's);
+otherwise it is refused with INTERNAL_ERROR, never answered DOES_NOT_EXIST or
+bounded by a Largest that lags.
+
+Not yet implemented: Prior Group/Object ID Gap
+properties are not read as evidence that Objects do not exist (those
+Locations are marked like any other the relay cannot vouch for); external selector-based auth revocation
 (`AUTH_REVOKE` — timer-driven lease revalidation is wired, immediate selector
 revoke is not); qlog, OpenTelemetry export, tenancy or authorization scopes,
 and paged route/session views. A second WebTransport listener exists as

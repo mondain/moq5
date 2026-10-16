@@ -45,9 +45,15 @@
 #   MOQ_PICOTLS_BUILD_CONFIG  dependency configuration (default: Release)
 #
 # The tracked dependency patches (patches/picoquic, patches/picotls) are
-# applied after checkout. Already-patched inputs are accepted; conflicting
-# inputs fail before any dependency build.
-# --self-test checks patching and the compiler policy with offline fixtures.
+# applied after checkout, in the order their `series` manifests declare (see
+# scripts/provider_patches.sh, which other recipes run directly).
+# Already-patched inputs are accepted; conflicting inputs fail before any
+# dependency build.
+#   --check-patch-consumers
+#       offline check that those other recipes apply patches only through
+#       scripts/provider_patches.sh and use the picotls build-directory layout.
+# --self-test checks patching, the patch consumers and the compiler policy
+# with offline fixtures.
 #
 # Requires: git, cmake, a C compiler, and OpenSSL dev headers
 # (Ubuntu: apt-get install -y libssl-dev cmake).
@@ -63,17 +69,20 @@ PICOQUIC_REF="${PICOQUIC_REF:-a602e60babea48da7849169d716aaf68684e66d6}"
 PICOTLS_REPO="${PICOTLS_REPO:-https://github.com/h2o/picotls.git}"
 PICOTLS_REF="${PICOTLS_REF:-f06553b877ada93c860dd1db9002eabf7365292d}"
 
-PICOQUIC_PATCHES=(
-    0002-reset-stream-after-fin.patch
-    0006-own-application-close-reason.patch
-)
-PICOTLS_PATCHES=(
-    0001-initialize-compiler-visible-scratch.patch
-    0002-minicrypto-distinct-chacha20-object.patch
-)
-
 script_dir=$(cd "$(dirname "$0")" && pwd)
 repo_root=$(cd "$script_dir/.." && pwd)
+
+# shellcheck source=provider_patches.sh
+. "$script_dir/provider_patches.sh"
+
+# The patch lists are the providers' series manifests.
+PICOQUIC_PATCHES=()
+while IFS= read -r _moq_patch; do PICOQUIC_PATCHES+=("$_moq_patch"); done \
+    < <(read_patch_series "$repo_root/patches/picoquic/series")
+PICOTLS_PATCHES=()
+while IFS= read -r _moq_patch; do PICOTLS_PATCHES+=("$_moq_patch"); done \
+    < <(read_patch_series "$repo_root/patches/picotls/series")
+unset _moq_patch
 MOQ_DEPS_DIR="${MOQ_DEPS_DIR:-$repo_root/.deps/picoquic-ci}"
 
 picoquic_dir="$MOQ_DEPS_DIR/picoquic"
@@ -86,6 +95,14 @@ die() { printf '[setup_picoquic_deps] ERROR: %s\n' "$*" >&2; exit 1; }
 build_picotls() {
     local source_dir=$1 build_dir=$2
     local config=${MOQ_PICOTLS_BUILD_CONFIG:-Release}
+    # picotls's configure writes a scratch file into the process's working
+    # directory (its USDT probe check runs `dtrace -o .tmp.dprobes.h`) and
+    # removes it relative to its own source directory instead. Configure and
+    # build therefore run from inside the build directory, so nothing lands
+    # in the caller's tree; the paths are made absolute first.
+    mkdir -p "$build_dir" || return $?
+    source_dir=$(cd "$source_dir" && pwd) || return $?
+    build_dir=$(cd "$build_dir" && pwd) || return $?
     local cmake_args=(-S "$source_dir" -B "$build_dir" "-DCMAKE_BUILD_TYPE=$config"
         "-DCMAKE_PROJECT_picotls_INCLUDE=$repo_root/cmake/MoqPicotlsBuildPolicy.cmake")
     # Same Apple Clang ABI-probe correction as the LibMoQ root (see
@@ -100,12 +117,48 @@ build_picotls() {
     fi
     # Preserve both streams for the caller's log (normal mode routes stdout
     # to stderr below so the two result assignments remain machine-readable).
-    cmake "${cmake_args[@]}" || return $?
-    # Only the library targets used by FindPTLS; not dependency CLI/test tools.
-    cmake --build "$build_dir" --config "$config" \
-        --target picotls-core picotls-openssl picotls-minicrypto \
-        -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
+    (
+        cd "$build_dir" || exit $?
+        cmake "${cmake_args[@]}" || exit $?
+        # Only the library targets used by FindPTLS; not dependency CLI/test tools.
+        cmake --build "$build_dir" --config "$config" \
+            --target picotls-core picotls-openssl picotls-minicrypto \
+            -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
+    )
 }
+
+# build_picotls must leave the caller's working directory and the LibMoQ
+# checkout untouched, even though picotls's configure writes a scratch file
+# into the process's working directory. The fixture reproduces that write.
+build_cwd_selftest() (
+    set -eu
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    local stray=.tmp.dprobes.h repo_had=0
+    [ -e "$repo_root/$stray" ] && repo_had=1
+    mkdir -p "$tmp/source" "$tmp/caller"
+    cat > "$tmp/source/CMakeLists.txt" <<'CMAKE'
+cmake_minimum_required(VERSION 3.13)
+project(picotls C)
+# Same shape as picotls's USDT check: output relative to the working directory.
+execute_process(COMMAND "${CMAKE_COMMAND}" -E touch .tmp.dprobes.h)
+foreach(target picotls-core picotls-openssl picotls-minicrypto)
+    add_library(${target} STATIC probe.c)
+endforeach()
+CMAKE
+    printf 'int moq_cwd_probe(void) { return 0; }\n' > "$tmp/source/probe.c"
+    (cd "$tmp/caller" && build_picotls ../source ../build) > "$tmp/build.log" 2>&1 || {
+        cat "$tmp/build.log" >&2; die "self-test: working-directory fixture build failed"
+    }
+    [ -z "$(ls -A "$tmp/caller")" ] \
+        || die "self-test: building picotls wrote into the caller's directory: $(ls -A "$tmp/caller")"
+    [ -e "$tmp/build/$stray" ] \
+        || die "self-test: the fixture's working-directory write did not happen in the build directory"
+    if [ "$repo_had" = 0 ] && [ -e "$repo_root/$stray" ]; then
+        die "self-test: building picotls left $stray in the LibMoQ checkout"
+    fi
+    printf 'picotls build working-directory self-test: caller directory and checkout untouched PASS\n'
+)
 
 compiler_policy_selftest() (
     set -eu
@@ -239,55 +292,16 @@ CMAKE
     printf 'picotls compiler policy self-test: assertions, caller flags, three archives, warning refusal, Debug/Release selection, MSVC source control PASS\n'
 )
 
-# Tracked provider patches live in patches/<provider>/ and are applied in the
-# declared order. Each one is applied, accepted when already applied, or
-# refused when it conflicts, before any dependency build.
-apply_provider_patch() {
-    local provider=$1 dir=$2 name=$3
-    local patch="$repo_root/patches/$provider/$name"
-    [ -f "$patch" ] || die "missing $provider patch: $patch"
-    # A non-repository child of libmoq can silently skip every patch path.
-    [ "$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" = "$(cd "$dir" && pwd -P)" ] \
-        || die "$provider patch input is not its own git root: $dir"
-    if git -C "$dir" apply --check "$patch" >/dev/null 2>&1; then
-        git -C "$dir" apply "$patch" || die "$provider patch $name failed to apply"
-        log "applied $provider patch $name"
-    elif git -C "$dir" apply --reverse --check "$patch" >/dev/null 2>&1; then
-        log "$provider patch $name already applied"
-    else
-        die "$provider patch $name conflicts with $dir"
-    fi
+# Patching itself lives in scripts/provider_patches.sh; the lists and the
+# patch directory follow repo_root, which the self-tests point at fixtures.
+apply_picoquic_patch() { provider_apply_patch picoquic "$repo_root/patches/picoquic" "$@"; }
+apply_picoquic_patches() {
+    provider_apply_series picoquic "$repo_root/patches/picoquic" "$1" "${PICOQUIC_PATCHES[@]}"
 }
-
-# apply_provider_patches <provider> <dir> <declared patch names...>
-# The declared list must name every tracked patch, in tracked order.
-apply_provider_patches() {
-    local provider=$1 dir=$2 name i
-    shift 2
-    local declared=("$@")
-    local files=()
-    for name in "$repo_root/patches/$provider/"*.patch; do
-        [ -f "$name" ] && files+=("$name")
-    done
-    for name in "${declared[@]}"; do
-        [ -f "$repo_root/patches/$provider/$name" ] \
-            || die "missing $provider patch: $repo_root/patches/$provider/$name"
-    done
-    [ "${#files[@]}" -eq "${#declared[@]}" ] \
-        || die "declared $provider patch list does not match tracked patches"
-    for ((i=0; i<${#files[@]}; ++i)); do
-        [ "${files[$i]##*/}" = "${declared[$i]}" ] \
-            || die "declared $provider patch list does not match tracked order"
-    done
-    for name in "${declared[@]}"; do
-        apply_provider_patch "$provider" "$dir" "$name"
-    done
+apply_picotls_patch() { provider_apply_patch picotls "$repo_root/patches/picotls" "$@"; }
+apply_picotls_patches() {
+    provider_apply_series picotls "$repo_root/patches/picotls" "$1" "${PICOTLS_PATCHES[@]}"
 }
-
-apply_picoquic_patch() { apply_provider_patch picoquic "$@"; }
-apply_picoquic_patches() { apply_provider_patches picoquic "$1" "${PICOQUIC_PATCHES[@]}"; }
-apply_picotls_patch() { apply_provider_patch picotls "$@"; }
-apply_picotls_patches() { apply_provider_patches picotls "$1" "${PICOTLS_PATCHES[@]}"; }
 
 # Write the minimal upstream context of a patch under <root>: each file holds
 # only the pre-image of its hunks (context and removed lines), which the patch
@@ -412,14 +426,11 @@ picotls_patch_selftest() (
         die "self-test: non-root picotls patch input was accepted"
     fi
     grep -qF 'picotls patch input is not its own git root' "$tmp/log"
-    if (PICOTLS_PATCHES=("$scratch_patch"); apply_picotls_patches "$tmp/tree") > "$tmp/log" 2>&1; then
-        die "self-test: omitted picotls patch was accepted"
+    if (PICOTLS_PATCHES=("$scratch_patch" "$member_patch" "$scratch_patch"); \
+        apply_picotls_patches "$tmp/tree") > "$tmp/log" 2>&1; then
+        die "self-test: a picotls patch listed twice was accepted"
     fi
-    grep -qF 'declared picotls patch list does not match tracked patches' "$tmp/log"
-    if (PICOTLS_PATCHES=("$member_patch" "$scratch_patch"); apply_picotls_patches "$tmp/tree") > "$tmp/log" 2>&1; then
-        die "self-test: reordered picotls patch list was accepted"
-    fi
-    grep -qF 'declared picotls patch list does not match tracked order' "$tmp/log"
+    grep -qF "picotls patch series lists $scratch_patch twice" "$tmp/log"
     printf 'picotls patch self-test: apply, repeat, submodule path, rename, conflict, missing, list PASS\n'
 )
 
@@ -453,16 +464,11 @@ patch_list_selftest() (
     grep -qF 'missing picoquic patch:' "$tmp/log"
     test "$(cat "$tmp/tree/one.txt")" = old
     mv "$tmp/two.patch" "$repo_root/patches/picoquic/0002-two.patch"
-    if (PICOQUIC_PATCHES=(0002-two.patch 0001-one.patch); \
+    if (PICOQUIC_PATCHES=(0001-one.patch 0001-one.patch); \
         apply_picoquic_patches "$tmp/tree") > "$tmp/log" 2>&1; then
-        die "self-test: reversed patch list was accepted"
+        die "self-test: a patch listed twice was accepted"
     fi
-    grep -qF 'does not match tracked order' "$tmp/log"
-    if (PICOQUIC_PATCHES=(0001-one.patch); \
-        apply_picoquic_patches "$tmp/tree") > "$tmp/log" 2>&1; then
-        die "self-test: omitted patch was accepted"
-    fi
-    grep -qF 'does not match tracked patches' "$tmp/log"
+    grep -qF 'picoquic patch series lists 0001-one.patch twice' "$tmp/log"
     test "$(cat "$tmp/tree/one.txt")" = old
     printf 'conflicting source\n' > "$tmp/tree/two.txt"
     if (apply_picoquic_patches "$tmp/tree") > "$tmp/log" 2>&1; then
@@ -470,16 +476,295 @@ patch_list_selftest() (
     fi
     grep -qF 'picoquic patch 0002-two.patch conflicts' "$tmp/log"
     test "$(cat "$tmp/tree/two.txt")" = 'conflicting source'
-    printf 'patch list self-test: all members, repeat, missing, order, omission, conflict PASS\n'
+    printf 'patch list self-test: all members, repeat, missing, duplicate, conflict PASS\n'
 )
 
-if [ "${1:-}" = "--self-test" ]; then
-    patch_selftest
-    picotls_patch_selftest
-    patch_list_selftest
-    compiler_policy_selftest
-    exit $?
-fi
+# Recipes outside this script that prepare picoquic/picotls checkouts. Each
+# must apply the tracked patches with `provider_patches.sh apply` against the
+# providers' series manifests (never a list of its own) and hand LibMoQ the
+# picotls build-directory layout this script produces: picotls configured
+# into <picotls>/build and that directory passed as MOQ_PICOTLS_PREFIX.
+PATCH_CONSUMERS=(
+    tools/moq-interop-client/Dockerfile
+)
+
+# check_picoquic_series_contracts <patch-dir> <series names...>
+# The picoquic adapters gate behaviour on contract macros a tracked patch
+# introduces (PICOQUIC_*_CONTRACT_VERSION); D22 attach is refused without
+# them. Every such macro the adapter sources test must be defined by a
+# patch in the series.
+check_picoquic_series_contracts() (
+    set -eu
+    local patch_dir=$1 macro name found
+    shift
+    local macros
+    macros=$(grep -rhoE 'PICOQUIC_[A-Z0-9_]+_CONTRACT_VERSION' \
+        "$repo_root/adapters/picoquic" "$repo_root/adapters/pico_wt" \
+        "$repo_root/adapters/common" --include='*.c' --include='*.h' 2>/dev/null | sort -u)
+    for macro in $macros; do
+        found=0
+        for name in "$@"; do
+            if grep -qE "^\+[[:space:]]*#[[:space:]]*define[[:space:]]+$macro([[:space:]]|$)" "$patch_dir/$name"; then
+                found=1
+                break
+            fi
+        done
+        [ "$found" = 1 ] \
+            || die "the picoquic series defines no $macro, which the picoquic adapters require"
+    done
+)
+
+check_patch_consumers() (
+    set -eu
+    local recipe path name provider build prefix joined tmp
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    for recipe in "${PATCH_CONSUMERS[@]}"; do
+        path="$repo_root/$recipe"
+        [ -f "$path" ] || die "patch consumer missing: $recipe"
+        # One logical line per instruction: join backslash continuations.
+        joined=$tmp/joined
+        awk '{ if (sub(/\\$/, "")) printf "%s ", $0; else print }' "$path" > "$joined"
+        for provider in picoquic picotls; do
+            grep -qE "provider_patches\.sh[[:space:]]+apply[[:space:]]+[^[:space:]]*patches/$provider[[:space:]]" "$joined" \
+                || die "$recipe does not apply the $provider series through provider_patches.sh apply"
+        done
+        # Neither a patch file path nor a tracked patch name may appear:
+        # either would be a second, divergent declaration of the list.
+        if grep -qE 'patches/(picoquic|picotls)/[^[:space:]]' "$joined"; then
+            die "$recipe names a patch file instead of applying the series"
+        fi
+        for provider in picoquic picotls; do
+            for name in "$repo_root/patches/$provider/"*.patch; do
+                [ -f "$name" ] || continue
+                name=${name##*/}
+                if grep -qF "${name%.patch}" "$joined"; then
+                    die "$recipe names tracked patch $name"
+                fi
+            done
+        done
+        build=$(sed -nE 's/.*cmake[[:space:]]+-B[[:space:]]+([^[:space:]]+)[[:space:]]+-S[[:space:]]+([^[:space:]]*picotls)([[:space:]].*)?$/\2|\1/p' "$joined")
+        prefix=$(sed -nE 's/.*-DMOQ_PICOTLS_PREFIX=([^[:space:]\\]+).*/\1/p' "$joined")
+        [ -n "$build" ] || die "$recipe: no picotls configure step found"
+        [ -n "$prefix" ] || die "$recipe: no MOQ_PICOTLS_PREFIX found"
+        case "${build#*|}" in
+            "${build%%|*}/build"|*"/${build%%|*}/build") ;;
+            *) die "$recipe builds picotls into ${build#*|}, not <picotls>/build" ;;
+        esac
+        case "$prefix" in
+            "${build#*|}"|*"/${build#*|}") ;;
+            *) die "$recipe passes MOQ_PICOTLS_PREFIX=$prefix, not its picotls build directory ${build#*|}" ;;
+        esac
+    done
+    check_picoquic_series_contracts "$repo_root/patches/picoquic" "${PICOQUIC_PATCHES[@]}"
+    printf 'patch consumers check: %s apply the series manifests and use the picotls build layout; the picoquic series provides the adapter contracts PASS\n' \
+        "${PATCH_CONSUMERS[*]}"
+)
+
+overlap_selftest() (
+    set -eu
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    repo_root=$tmp/root
+    PICOQUIC_PATCHES=(0001-add.patch 0002-rewrite.patch)
+    mkdir -p "$repo_root/patches/picoquic" "$tmp/tree"
+    git -C "$tmp/tree" init -q
+    printf 'a\nb\n' > "$tmp/tree/f.txt"
+    # The second patch rewrites the line the first one adds, so once both
+    # are in, the first no longer reverse-applies on its own.
+    printf '%s\n' 'diff --git a/f.txt b/f.txt' '--- a/f.txt' '+++ b/f.txt' \
+        '@@ -1,2 +1,3 @@' ' a' '+x' ' b' > "$repo_root/patches/picoquic/0001-add.patch"
+    printf '%s\n' 'diff --git a/f.txt b/f.txt' '--- a/f.txt' '+++ b/f.txt' \
+        '@@ -1,3 +1,3 @@' ' a' '-x' '+y' ' b' > "$repo_root/patches/picoquic/0002-rewrite.patch"
+    apply_picoquic_patches "$tmp/tree"
+    test "$(cat "$tmp/tree/f.txt")" = "$(printf 'a\ny\nb')"
+    apply_picoquic_patches "$tmp/tree" 2> "$tmp/log"
+    grep -qF 'picoquic patch 0001-add.patch already applied' "$tmp/log"
+    grep -qF 'picoquic patch 0002-rewrite.patch already applied' "$tmp/log"
+    test "$(cat "$tmp/tree/f.txt")" = "$(printf 'a\ny\nb')"
+    # First patch only: the second is applied on top.
+    printf 'a\nx\nb\n' > "$tmp/tree/f.txt"
+    apply_picoquic_patches "$tmp/tree" 2> "$tmp/log"
+    grep -qF 'picoquic patch 0001-add.patch already applied' "$tmp/log"
+    test "$(cat "$tmp/tree/f.txt")" = "$(printf 'a\ny\nb')"
+    printf 'a\nz\nb\n' > "$tmp/tree/f.txt"
+    if (apply_picoquic_patches "$tmp/tree") > "$tmp/log" 2>&1; then
+        die "self-test: conflicting overlapping series was accepted"
+    fi
+    grep -qF 'conflicts' "$tmp/log"
+    printf 'overlap self-test: fresh, fully applied, prefix applied, conflict PASS\n'
+)
+
+series_selftest() (
+    set -eu
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    local dir=$tmp/patches/picoquic helper=$script_dir/provider_patches.sh
+    mkdir -p "$dir" "$tmp/tree"
+    git -C "$tmp/tree" init -q
+    printf 'old\n' > "$tmp/tree/one.txt"
+    printf 'old\n' > "$tmp/tree/two.txt"
+    for pair in 0001-one 0002-two; do
+        name=${pair#*-}
+        printf '%s\n' "diff --git a/$name.txt b/$name.txt" \
+            "--- a/$name.txt" "+++ b/$name.txt" '@@ -1 +1 @@' '-old' '+new' \
+            > "$dir/$pair.patch"
+    done
+    # The real series name existing patches once each and provide the
+    # picoquic contracts the adapters require.
+    provider_check_series picoquic "$repo_root/patches/picoquic" "${PICOQUIC_PATCHES[@]}"
+    provider_check_series picotls "$repo_root/patches/picotls" "${PICOTLS_PATCHES[@]}"
+    check_picoquic_series_contracts "$repo_root/patches/picoquic" "${PICOQUIC_PATCHES[@]}"
+    # Without the entry that defines the D22 stream-terminal contract
+    # (found by content, wherever it sits in the series), the real picoquic
+    # series no longer provides it.
+    local short=() contract_patch="" name
+    for name in "${PICOQUIC_PATCHES[@]}"; do
+        if grep -qE '^\+[[:space:]]*#[[:space:]]*define[[:space:]]+PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION([[:space:]]|$)' \
+            "$repo_root/patches/picoquic/$name"; then
+            contract_patch=$name
+        else
+            short+=("$name")
+        fi
+    done
+    [ -n "$contract_patch" ] \
+        || die "self-test: no picoquic series entry defines PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION"
+    if (check_picoquic_series_contracts "$repo_root/patches/picoquic" "${short[@]}") > "$tmp/log" 2>&1; then
+        die "self-test: a picoquic series without $contract_patch passed the contract check"
+    fi
+    grep -qF 'PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION' "$tmp/log"
+    printf '# comment\n0001-one.patch\n\n0002-two.patch\n' > "$dir/series"
+    bash "$helper" apply "$dir" "$tmp/tree" 2> "$tmp/log"
+    test "$(cat "$tmp/tree/one.txt")" = new
+    test "$(cat "$tmp/tree/two.txt")" = new
+    bash "$helper" apply "$dir" "$tmp/tree" 2> "$tmp/log"
+    grep -qF 'picoquic patch 0002-two.patch already applied' "$tmp/log"
+    printf 'old\n' > "$tmp/tree/one.txt"
+    printf 'old\n' > "$tmp/tree/two.txt"
+    # The series is the selection: an unlisted patch file is not applied.
+    printf '0001-one.patch\n' > "$dir/series"
+    bash "$helper" apply "$dir" "$tmp/tree" 2> "$tmp/log"
+    test "$(cat "$tmp/tree/one.txt")" = new
+    test "$(cat "$tmp/tree/two.txt")" = old
+    grep -qF 'picoquic patch 0002-two.patch is not in the series; not applied' "$tmp/log"
+    printf 'old\n' > "$tmp/tree/one.txt"
+    printf '0001-one.patch\n0001-one.patch\n' > "$dir/series"
+    if bash "$helper" apply "$dir" "$tmp/tree" > "$tmp/log" 2>&1; then
+        die "self-test: a series listing a patch twice was accepted"
+    fi
+    grep -qF 'lists 0001-one.patch twice' "$tmp/log"
+    printf '0001-one.patch\n0002-two.patch\n0003-three.patch\n' > "$dir/series"
+    if bash "$helper" apply "$dir" "$tmp/tree" > "$tmp/log" 2>&1; then
+        die "self-test: a series naming a missing patch was accepted"
+    fi
+    grep -qF 'missing picoquic patch' "$tmp/log"
+    test "$(cat "$tmp/tree/one.txt")" = old
+    printf '0001-one.patch\n0002-two.patch\n' > "$dir/series"
+    printf 'conflicting source\n' > "$tmp/tree/two.txt"
+    if bash "$helper" apply "$dir" "$tmp/tree" > "$tmp/log" 2>&1; then
+        die "self-test: a conflicting checkout was accepted"
+    fi
+    grep -qF 'picoquic patch 0002-two.patch conflicts' "$tmp/log"
+    test "$(cat "$tmp/tree/one.txt")" = old
+    printf 'series self-test: real series and contracts, apply, repeat, unlisted patch, duplicate, missing, conflict PASS\n'
+)
+
+# The series trial must never act outside a scratch directory it created
+# and verified, and a failed preparation must stop the apply before the
+# checkout changes. Both are driven from a strict parent through command
+# substitution, as provider_apply_series calls the trial, with rm, mkdir, cp
+# and git replaced by recording functions; nothing outside $tmp is touched.
+trial_safety_selftest() (
+    set -eu
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    local helper=$script_dir/provider_patches.sh dir=$tmp/patches/picoquic
+    mkdir -p "$dir" "$tmp/tree" "$tmp/scratch-root"
+    git -C "$tmp/tree" init -q
+    printf 'old\n' > "$tmp/tree/one.txt"
+    printf '%s\n' 'diff --git a/one.txt b/one.txt' '--- a/one.txt' '+++ b/one.txt' \
+        '@@ -1 +1 @@' '-old' '+new' > "$dir/0001-one.patch"
+    cp "$tmp/tree/one.txt" "$tmp/one.before"
+
+    # mktemp fails: no further filesystem or git operation, no result.
+    : > "$tmp/rec"
+    (
+        set -euo pipefail
+        . "$helper"
+        mktemp() { printf 'mktemp %s\n' "$*" >> "$tmp/rec"; return 1; }
+        rm() { printf 'rm %s\n' "$*" >> "$tmp/rec"; }
+        mkdir() { printf 'mkdir %s\n' "$*" >> "$tmp/rec"; }
+        cp() { printf 'cp %s\n' "$*" >> "$tmp/rec"; }
+        git() { printf 'git %s\n' "$*" >> "$tmp/rec"; }
+        status=0
+        out=$(provider_applied_prefix "$dir" "$tmp/tree" 0001-one.patch) || status=$?
+        printf 'status=%s out=<%s>\n' "$status" "$out" > "$tmp/result"
+    )
+    grep -qxE 'status=[1-9][0-9]* out=<>' "$tmp/result" \
+        || die "self-test: a failed mktemp produced a trial result: $(cat "$tmp/result")"
+    [ "$(grep -cv '^mktemp ' "$tmp/rec")" = 0 ] \
+        || die "self-test: the trial acted after a failed mktemp: $(grep -v '^mktemp ' "$tmp/rec" | head -3)"
+
+    # The scratch copy fails: the apply stops before touching the checkout,
+    # and every path the trial removed, created or wrote is in its scratch.
+    : > "$tmp/rec"
+    if (
+        set -euo pipefail
+        . "$helper"
+        rm() { printf 'rm %s\n' "$*" >> "$tmp/rec"; command rm "$@"; }
+        mkdir() { printf 'mkdir %s\n' "$*" >> "$tmp/rec"; command mkdir "$@"; }
+        cp() { printf 'cp %s\n' "$*" >> "$tmp/rec"; return 1; }
+        TMPDIR=$tmp/scratch-root
+        provider_apply_series picoquic "$dir" "$tmp/tree" 0001-one.patch
+    ) > "$tmp/log" 2>&1; then
+        die "self-test: a failed trial copy still applied the series"
+    fi
+    grep -qF 'could not trial the picoquic series' "$tmp/log" \
+        || die "self-test: a failed trial copy was not reported as such: $(tail -1 "$tmp/log")"
+    cmp -s "$tmp/one.before" "$tmp/tree/one.txt" \
+        || die "self-test: the checkout changed after a failed trial copy"
+    grep -q '^cp ' "$tmp/rec" || die "self-test: the trial copy was never attempted"
+    local line word last
+    while IFS= read -r line; do
+        last=${line##* }
+        for word in ${line#* }; do
+            case "$word" in
+                /*) ;;
+                *) continue ;;
+            esac
+            # cp reads from the checkout; only its destination must be scratch.
+            if [ "${line%% *}" = cp ] && [ "$word" != "$last" ]; then
+                continue
+            fi
+            case "$word" in
+                "$tmp/scratch-root/moq-patch-trial."*) ;;
+                *) die "self-test: the trial reached outside its scratch: $line" ;;
+            esac
+        done
+    done < "$tmp/rec"
+    [ -z "$(ls -A "$tmp/scratch-root")" ] \
+        || die "self-test: the trial left its scratch directory behind"
+    printf 'trial safety self-test: failed mktemp, failed scratch copy PASS\n'
+)
+
+case "${1:-}" in
+    --self-test)
+        patch_selftest
+        picotls_patch_selftest
+        patch_list_selftest
+        overlap_selftest
+        series_selftest
+        trial_safety_selftest
+        build_cwd_selftest
+        check_patch_consumers
+        compiler_policy_selftest
+        exit $?
+        ;;
+    --check-patch-consumers)
+        check_patch_consumers
+        exit $?
+        ;;
+esac
 
 # Only the two KEY=VALUE result lines may reach real stdout (so callers
 # can `eval "$(...)"`). Route everything else - including git/cmake and

@@ -28,6 +28,15 @@ public struct TrackConfiguration: Sendable {
     public var role: String?
     public var language: String?
     public var label: String?
+    /// The track's Track Properties (draft-22 section 10), stated on every
+    /// answer for the track. Opaque and in the negotiated draft's encoding;
+    /// a property whose type and value are both below 64 encodes identically
+    /// on drafts 16, 18 and 22. A set the session refuses makes the sender
+    /// fatal.
+    public var trackProperties: Data?
+    /// Advertise DYNAMIC_GROUPS = 1: subscribers may then ask for a new
+    /// group, reported by ``MediaSender/takeNewGroupRequest(for:)``.
+    public var dynamicGroups: Bool = false
 
     public init(name: String, mediaType: MediaType,
                 packaging: MediaPackaging, codec: String, bitrate: UInt64) {

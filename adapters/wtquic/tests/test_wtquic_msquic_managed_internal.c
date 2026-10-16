@@ -21,6 +21,7 @@
  * real draft-16/18 loopback establishment is the separate loopback smoke.
  */
 #include "wtquic_msquic_managed_test_internal.h"
+#include "wtquic_managed_forwarding_test.h"
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -3021,7 +3022,9 @@ static void test_env_cfg_forwarding(void)
         acnt_destroy(&a);
     }
 
-    /* zero idle_timeout_ms -> tuning left as defaults (struct_size == 0) */
+    /* zero idle_timeout_ms -> the tuning is still materialized, carrying
+     * wtquic's own defaults (the facade reports its DATAGRAM receive
+     * advertisement from this tuning, so it is never left implicit) */
     {
         acnt_t a;
         acnt_init(&a);
@@ -3029,8 +3032,13 @@ static void test_env_cfg_forwarding(void)
         moq_wtquic_msquic_managed_t *m = make_client(&alloc, NULL, 0);
         if (m != NULL) {
             wtq_msquic_env_cfg_t ecfg;
+            wtq_msquic_tuning_t defaults;
+            wtq_msquic_tuning_init(&defaults);
             moq_wtquic_msquic_managed_test_fill_env_cfg(m, &ecfg);
-            CHECK(ecfg.tuning.struct_size == 0); /* defaults */
+            CHECK(ecfg.tuning.struct_size == sizeof(ecfg.tuning));
+            CHECK(ecfg.tuning.idle_timeout_ms == defaults.idle_timeout_ms);
+            CHECK(ecfg.tuning.datagram_receive_enabled ==
+                  defaults.datagram_receive_enabled);
             CHECK(ecfg.alloc != NULL && ecfg.alloc->alloc == acnt_alloc);
             moq_wtquic_msquic_managed_stop(m);
             moq_wtquic_msquic_managed_destroy(m);
@@ -3391,6 +3399,7 @@ static struct {
     wtq_msquic_accept_abandon_fn accept_abandon;
     wtq_msquic_transport_quiesced_fn on_quiesced;
     uint16_t port;
+    uint16_t ports[16];        /* the port each call asked for, in order */
     const char *subproto0;
     const char *subproto1;
 } g_lc;
@@ -3417,6 +3426,8 @@ static wtq_result_t lc_start(wtq_msquic_env_t *env,
     g_lc.accept_abandon = cfg->accept_abandon;
     g_lc.on_quiesced = cfg->on_transport_quiesced;
     g_lc.port = cfg->port;
+    if (g_lc.calls <= sizeof(g_lc.ports) / sizeof(g_lc.ports[0]))
+        g_lc.ports[g_lc.calls - 1] = cfg->port;
     g_lc.profile = cfg->webtransport_profile;
     g_lc.profiles = cfg->webtransport_profiles;
     g_lc.path_size = (cfg->paths != NULL && cfg->path_count > 0)
@@ -4093,6 +4104,45 @@ static void test_origin_abi_roles_bounds_forwarding(void)
         g_lc_rc = WTQ_OK;
     }
 
+    /* -- port 0: picked from the IPv4 allocator, a lost bind retried ------- */
+    {
+        moq_wtquic_msquic_managed_cfg_t c; OSRV(c);
+        moq_wtquic_msquic_managed_t *m = NULL;
+
+        /* the listener is asked for a concrete port, never 0 */
+        c.port = 0;
+        memset(&g_lc, 0, sizeof(g_lc));
+        OCREATE_OK(c, &m);
+        CHECK(g_lc.calls == 1);
+        CHECK(g_lc.ports[0] != 0);
+        ODONE(m);
+
+        /* a backend failure (the bind lost the port) is retried, each time
+         * on a picked port, a bounded number of times in all */
+        memset(&g_lc, 0, sizeof(g_lc));
+        g_lc_rc = WTQ_ERR_BACKEND;
+        CHECK(moq_wtquic_msquic_managed_create(&c, &m) == MOQ_ERR_INTERNAL);
+        CHECK(m == NULL);
+        CHECK(g_lc.calls == 8);
+        for (unsigned i = 0; i < 8; i++)
+            CHECK(g_lc.ports[i] != 0);
+
+        /* a refused configuration fails the same on every port: no retry */
+        memset(&g_lc, 0, sizeof(g_lc));
+        g_lc_rc = WTQ_ERR_INVALID_ARG;
+        CHECK(moq_wtquic_msquic_managed_create(&c, &m) == MOQ_ERR_INVAL);
+        CHECK(g_lc.calls == 1);
+
+        /* an explicit port is forwarded as given and never retried */
+        c.port = 4711;
+        memset(&g_lc, 0, sizeof(g_lc));
+        g_lc_rc = WTQ_ERR_BACKEND;
+        CHECK(moq_wtquic_msquic_managed_create(&c, &m) == MOQ_ERR_INTERNAL);
+        CHECK(g_lc.calls == 1);
+        CHECK(g_lc.ports[0] == 4711);
+        g_lc_rc = WTQ_OK;
+    }
+
     /* -- structural refusal has NO effects, even with a failing allocator -- */
     {
         static const char *const dup[2] = { "https://a.example",
@@ -4217,6 +4267,198 @@ static void test_app_deadline_fold(void)
         moq_wtquic_msquic_managed_test_pump_lane(m, 0);
         CHECK(moq_wtquic_msquic_managed_test_lane_deadline_us(m, 0) == V);
         atomic_store(&g_wmm_app_target, UINT64_MAX);   /* disarm before teardown */
+        moq_wtquic_msquic_managed_stop(m);
+        moq_wtquic_msquic_managed_destroy(m);
+    }
+    CHECK(acnt_live(&a) == 0);
+    acnt_destroy(&a);
+    moq_wtquic_msquic_managed_test_no_listener(false);
+}
+
+/* A due application deadline is served by the pump that recomputes it: an
+ * instant at or before that pump is never published as the lane's next
+ * deadline. Published, it would be due at the worker's next check, and the
+ * worker would pump the lane again at once, and again after that, for as long
+ * as the query keeps answering it. A later instant is still published. */
+static void test_app_deadline_served_once(void)
+{
+    moq_wtquic_msquic_managed_test_no_listener(true);
+    acnt_t a;
+    acnt_init(&a);
+    moq_alloc_t alloc = { &a, acnt_alloc, acnt_realloc, acnt_free };
+    moq_wtquic_msquic_managed_cfg_t cfg;
+    moq_wtquic_msquic_managed_cfg_init_sized(&cfg, sizeof(cfg));
+    cfg.alloc = &alloc;
+    cfg.perspective = MOQ_PERSPECTIVE_SERVER;
+    cfg.cert_path = "c";
+    cfg.key_path = "k";
+    cfg.on_lane_pump = pump;
+    cfg.max_connections = 1;
+    cfg.lane_count = 1;
+    cfg.app_deadline_us = wmm_app_deadline;
+    cfg.app_deadline_ctx = NULL;
+
+    atomic_store(&g_wmm_app_target, UINT64_MAX);
+    moq_wtquic_msquic_managed_t *m = NULL;
+    CHECK(moq_wtquic_msquic_managed_create(&cfg, &m) == MOQ_OK);
+    if (m != NULL) {
+        /* long past (the monotonic clock is far beyond 1 us) */
+        atomic_store(&g_wmm_app_target, 1);
+        moq_wtquic_msquic_managed_test_pump_lane(m, 0);
+        CHECK(moq_wtquic_msquic_managed_test_lane_deadline_us(m, 0) ==
+              UINT64_MAX);
+        /* the same instant on the next pump: still served */
+        moq_wtquic_msquic_managed_test_pump_lane(m, 0);
+        CHECK(moq_wtquic_msquic_managed_test_lane_deadline_us(m, 0) ==
+              UINT64_MAX);
+        /* a later instant is a new deadline */
+        const uint64_t V = ((uint64_t)1 << 60);
+        atomic_store(&g_wmm_app_target, V);
+        moq_wtquic_msquic_managed_test_pump_lane(m, 0);
+        CHECK(moq_wtquic_msquic_managed_test_lane_deadline_us(m, 0) == V);
+        atomic_store(&g_wmm_app_target, UINT64_MAX);
+        moq_wtquic_msquic_managed_stop(m);
+        moq_wtquic_msquic_managed_destroy(m);
+    }
+    CHECK(acnt_live(&a) == 0);
+    acnt_destroy(&a);
+    moq_wtquic_msquic_managed_test_no_listener(false);
+}
+
+/* The per-lane query: each lane's pump asks for its own index and publishes
+ * only its own answer, so a deadline that belongs to lane 1 never becomes
+ * lane 0's deadline; a due answer is served like any other. */
+static _Atomic uint64_t g_wmm_lane_target[2];
+static _Atomic uint64_t g_wmm_lane_asked[2];
+static _Atomic uint64_t g_wmm_lane_asked_bad;
+static _Atomic uint64_t g_wmm_lane_bad_ctx;
+static int g_wmm_lane_ctx;
+static uint64_t wmm_lane_deadline(void *ctx, uint32_t lane_index)
+{
+    if (ctx != &g_wmm_lane_ctx)
+        atomic_fetch_add(&g_wmm_lane_bad_ctx, 1);
+    if (lane_index >= 2) {
+        atomic_fetch_add(&g_wmm_lane_asked_bad, 1);
+        return UINT64_MAX;
+    }
+    atomic_fetch_add(&g_wmm_lane_asked[lane_index], 1);
+    return atomic_load(&g_wmm_lane_target[lane_index]);
+}
+
+static moq_wtquic_msquic_managed_t *
+wmm_lane_deadline_facade(moq_alloc_t *alloc, size_t cfg_size, bool facade_wide)
+{
+    moq_wtquic_msquic_managed_cfg_t cfg;
+    moq_wtquic_msquic_managed_cfg_init_sized(&cfg, sizeof(cfg));
+    cfg.alloc = alloc;
+    cfg.perspective = MOQ_PERSPECTIVE_SERVER;
+    cfg.cert_path = "c";
+    cfg.key_path = "k";
+    cfg.on_lane_pump = pump;
+    cfg.max_connections = 2;
+    cfg.lane_count = 2;
+    if (facade_wide)
+        cfg.app_deadline_us = wmm_app_deadline;
+    cfg.app_lane_deadline_us = wmm_lane_deadline;
+    cfg.app_lane_deadline_ctx = &g_wmm_lane_ctx;
+    cfg.struct_size = (uint32_t)cfg_size;
+    moq_wtquic_msquic_managed_t *m = NULL;
+    CHECK(moq_wtquic_msquic_managed_create(&cfg, &m) == MOQ_OK);
+    return m;
+}
+
+static void wmm_lane_reset(void)
+{
+    for (int i = 0; i < 2; i++) {
+        atomic_store(&g_wmm_lane_target[i], UINT64_MAX);
+        atomic_store(&g_wmm_lane_asked[i], 0);
+    }
+    atomic_store(&g_wmm_lane_asked_bad, 0);
+    atomic_store(&g_wmm_lane_bad_ctx, 0);
+    atomic_store(&g_wmm_app_target, UINT64_MAX);
+}
+
+/* The per-lane query block starts at the aggregate's alignment past the
+ * whole layout before it, tail padding included. */
+#define WMM_LAYOUT_THROUGH_TARGET                                            \
+    ((offsetof(moq_wtquic_msquic_managed_cfg_t, target) + sizeof(void *) +   \
+      _Alignof(moq_wtquic_msquic_managed_cfg_t) - 1) /                       \
+     _Alignof(moq_wtquic_msquic_managed_cfg_t) *                             \
+     _Alignof(moq_wtquic_msquic_managed_cfg_t))
+_Static_assert(offsetof(moq_wtquic_msquic_managed_cfg_t,
+                        app_lane_deadline_us) >= WMM_LAYOUT_THROUGH_TARGET,
+               "the per-lane deadline block starts past the previous sizeof");
+
+static void test_app_lane_deadline_per_lane(void)
+{
+    moq_wtquic_msquic_managed_test_no_listener(true);
+    acnt_t a;
+    acnt_init(&a);
+    moq_alloc_t alloc = { &a, acnt_alloc, acnt_realloc, acnt_free };
+    const uint64_t V = ((uint64_t)1 << 60);   /* finite, far future */
+
+    wmm_lane_reset();
+    moq_wtquic_msquic_managed_t *m = wmm_lane_deadline_facade(
+        &alloc, sizeof(moq_wtquic_msquic_managed_cfg_t), false);
+    if (m != NULL) {
+        atomic_store(&g_wmm_lane_target[1], V);
+        moq_wtquic_msquic_managed_test_pump_lane(m, 0);
+        moq_wtquic_msquic_managed_test_pump_lane(m, 1);
+        /* lane 1's deadline is lane 1's only */
+        CHECK(moq_wtquic_msquic_managed_test_lane_deadline_us(m, 0) ==
+              UINT64_MAX);
+        CHECK(moq_wtquic_msquic_managed_test_lane_deadline_us(m, 1) == V);
+        CHECK(atomic_load(&g_wmm_lane_asked[0]) >= 1);
+        CHECK(atomic_load(&g_wmm_lane_asked[1]) >= 1);
+        CHECK(atomic_load(&g_wmm_lane_asked_bad) == 0);
+        CHECK(atomic_load(&g_wmm_lane_bad_ctx) == 0);
+        /* lane 0's own, and a due one served by the pump that saw it */
+        atomic_store(&g_wmm_lane_target[0], V - 1);
+        atomic_store(&g_wmm_lane_target[1], 1);
+        moq_wtquic_msquic_managed_test_pump_lane(m, 0);
+        moq_wtquic_msquic_managed_test_pump_lane(m, 1);
+        CHECK(moq_wtquic_msquic_managed_test_lane_deadline_us(m, 0) == V - 1);
+        CHECK(moq_wtquic_msquic_managed_test_lane_deadline_us(m, 1) ==
+              UINT64_MAX);
+        wmm_lane_reset();
+        moq_wtquic_msquic_managed_stop(m);
+        moq_wtquic_msquic_managed_destroy(m);
+    }
+
+    /* both queries set: each lane folds both, the earlier wins */
+    wmm_lane_reset();
+    m = wmm_lane_deadline_facade(&alloc,
+                                 sizeof(moq_wtquic_msquic_managed_cfg_t), true);
+    if (m != NULL) {
+        atomic_store(&g_wmm_app_target, V);
+        atomic_store(&g_wmm_lane_target[1], V - 7);
+        moq_wtquic_msquic_managed_test_pump_lane(m, 0);
+        moq_wtquic_msquic_managed_test_pump_lane(m, 1);
+        CHECK(moq_wtquic_msquic_managed_test_lane_deadline_us(m, 0) == V);
+        CHECK(moq_wtquic_msquic_managed_test_lane_deadline_us(m, 1) == V - 7);
+        wmm_lane_reset();
+        moq_wtquic_msquic_managed_stop(m);
+        moq_wtquic_msquic_managed_destroy(m);
+    }
+
+    /* the block is read only when struct_size covers all of it */
+    const size_t sizes[] = {
+        offsetof(moq_wtquic_msquic_managed_cfg_t, app_lane_deadline_us),
+        offsetof(moq_wtquic_msquic_managed_cfg_t, app_lane_deadline_ctx),
+        offsetof(moq_wtquic_msquic_managed_cfg_t, app_lane_deadline_ctx) +
+            sizeof(void *) - 1u,
+    };
+    for (size_t k = 0; k < sizeof(sizes) / sizeof(sizes[0]); k++) {
+        wmm_lane_reset();
+        m = wmm_lane_deadline_facade(&alloc, sizes[k], false);
+        if (m == NULL)
+            continue;
+        atomic_store(&g_wmm_lane_target[0], V);
+        moq_wtquic_msquic_managed_test_pump_lane(m, 0);
+        CHECK(moq_wtquic_msquic_managed_test_lane_deadline_us(m, 0) ==
+              UINT64_MAX);
+        CHECK(atomic_load(&g_wmm_lane_asked[0]) == 0);
+        wmm_lane_reset();
         moq_wtquic_msquic_managed_stop(m);
         moq_wtquic_msquic_managed_destroy(m);
     }
@@ -4774,8 +5016,44 @@ static void test_ack_argument_and_context_errors(void)
     moq_wtquic_msquic_managed_test_no_listener(false);
 }
 
-int main(void)
+static wtq_session_t *commit_session;
+static wtq_stream_t *commit_stream;
+static void *commit_adapter;
+static unsigned commit_calls;
+static void record_managed_commit(wtq_session_t *session, wtq_stream_t *stream,
+                                  void *user)
 {
+    CHECK(session == commit_session);
+    CHECK(stream == commit_stream);
+    CHECK(user == commit_adapter);
+    ++commit_calls;
+}
+static void test_commit_table_dispatch(void)
+{
+    unsigned char session_tag, stream_tag, adapter_tag;
+    commit_session = (wtq_session_t *)&session_tag;
+    commit_stream = (wtq_stream_t *)&stream_tag;
+    commit_adapter = &adapter_tag;
+    commit_calls = 0;
+    const wtq_session_events_t forward = {
+        .struct_size = sizeof(forward),
+        .on_stream_send_committed = record_managed_commit,
+    };
+    int before = g_fail;
+    wtq_test_forward_table_t result = wtq_test_msquic_commit_dispatch(
+        &forward, commit_session, commit_stream, commit_adapter);
+    CHECK(result.table_size == sizeof(wtq_session_events_t));
+    CHECK(result.installed);
+    CHECK(commit_calls == 2); /* no managed dedup; absent adapter not forwarded */
+    if (g_fail == before) puts("PASS: msquic managed commit table dispatch");
+}
+
+int main(int argc, char **argv)
+{
+    test_commit_table_dispatch();
+    if (argc == 2 && strcmp(argv[1], "--commit-forwarding") == 0)
+        return g_fail ? 1 : 0;
+    if (argc != 1) return 2;
     /* Route client bring-up through a fake transport by default so the
      * lifecycle tests never touch the network; individual tests may install a
      * more specific connect probe. */
@@ -4823,6 +5101,8 @@ int main(void)
     test_doorbell_deadline_sweep();
     test_deadline_delivery();
     test_app_deadline_fold();
+    test_app_deadline_served_once();
+    test_app_lane_deadline_per_lane();
     test_wake_no_preservice();
     test_deadline_reap_no_use_after_publish();
     test_doorbell_wake_vs_stop();

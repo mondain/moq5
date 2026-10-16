@@ -18,6 +18,7 @@
 
 #define D16 MOQ_VERSION_DRAFT_16
 #define D18 MOQ_VERSION_DRAFT_18
+#define D22 MOQ_VERSION_DRAFT_22
 
 /* The swap is the whole reason this module exists: the same two meanings trade
  * numbers, so verbatim forwarding turns one into the other. */
@@ -164,6 +165,8 @@ test_invalid_versions(void)
                                                   &o) == MOQR_ERR_INVAL);
         MOQ_TEST_CHECK(moqr_pd_forward(v, D18, 0x2u, &o) == MOQR_ERR_INVAL);
         MOQ_TEST_CHECK(moqr_pd_forward(D18, v, 0x2u, &o) == MOQR_ERR_INVAL);
+        MOQ_TEST_CHECK(moqr_pd_forward(v, D22, 0x2u, &o) == MOQR_ERR_INVAL);
+        MOQ_TEST_CHECK(moqr_pd_forward(D22, v, 0x2u, &o) == MOQR_ERR_INVAL);
         MOQ_TEST_CHECK(moqr_reset_forward(v, D16, 0x1u, &o) == MOQR_ERR_INVAL);
         MOQ_TEST_CHECK(moqr_reset_forward(D16, v, 0x1u, &o) == MOQR_ERR_INVAL);
 
@@ -436,6 +439,157 @@ test_pd_extension(void)
     return failures;
 }
 
+/* draft-22 keeps every draft-18 number in both registries and drops exactly
+ * one meaning: PUBLISH_DONE SUBSCRIPTION_ENDED has no draft-22 code, because a
+ * draft-22 subscription does not end when Largest Object passes the end of its
+ * Location Filter. The relay therefore never invents a number for it there,
+ * and a foreign SUBSCRIPTION_ENDED crossing into draft-22 fails closed. */
+static int
+test_draft22_registries(void)
+{
+    int failures = 0;
+    uint64_t o = 0;
+
+    /* PUBLISH_DONE: identical to draft-18 for every meaning draft-22 keeps. */
+    static const struct { moqr_pd_status_t sem; uint64_t code; } pd_rows[] = {
+        { MOQR_PD_INTERNAL_ERROR, 0x0u },  { MOQR_PD_UNAUTHORIZED, 0x1u },
+        { MOQR_PD_TRACK_ENDED, 0x2u },     { MOQR_PD_GOING_AWAY, 0x4u },
+        { MOQR_PD_TOO_FAR_BEHIND, 0x5u },  { MOQR_PD_EXPIRED, 0x6u },
+        { MOQR_PD_UPDATE_FAILED, 0x8u },   { MOQR_PD_EXCESSIVE_LOAD, 0x9u },
+        { MOQR_PD_MALFORMED_TRACK, 0x12u },
+    };
+    for (size_t i = 0; i < sizeof(pd_rows) / sizeof(pd_rows[0]); i++) {
+        MOQ_TEST_CHECK(moqr_pd_encode(D22, pd_rows[i].sem, &o) == MOQR_OK);
+        MOQ_TEST_CHECK_EQ_U64(o, pd_rows[i].code);
+        MOQ_TEST_CHECK(moqr_pd_decode(D22, pd_rows[i].code) == pd_rows[i].sem);
+        /* A draft-18 <-> draft-22 hop is byte-identical for these. */
+        MOQ_TEST_CHECK(moqr_pd_forward(D18, D22, pd_rows[i].code, &o) == MOQR_OK);
+        MOQ_TEST_CHECK_EQ_U64(o, pd_rows[i].code);
+        MOQ_TEST_CHECK(moqr_pd_forward(D22, D18, pd_rows[i].code, &o) == MOQR_OK);
+        MOQ_TEST_CHECK_EQ_U64(o, pd_rows[i].code);
+    }
+    /* The swap still applies against draft-16. */
+    MOQ_TEST_CHECK(moqr_pd_forward(D22, D16, 0x5u, &o) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(o, 0x6u);   /* TOO_FAR_BEHIND renumbered */
+    MOQ_TEST_CHECK(moqr_pd_forward(D16, D22, 0x5u, &o) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(o, 0x6u);   /* EXPIRED renumbered */
+
+    /* SUBSCRIPTION_ENDED: 0x3 means nothing in draft-22. */
+    MOQ_TEST_CHECK(moqr_pd_decode(D22, 0x3u) == MOQR_PD_UNKNOWN);
+    MOQ_TEST_CHECK(moqr_pd_encode(D22, MOQR_PD_SUBSCRIPTION_ENDED, &o) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(o, 0x0u);   /* fails closed to INTERNAL_ERROR */
+    MOQ_TEST_CHECK(moqr_pd_forward(D18, D22, 0x3u, &o) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(o, 0x0u);
+    MOQ_TEST_CHECK(moqr_pd_forward(D16, D22, 0x3u, &o) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(o, 0x0u);
+    /* A draft-22 0x3 is an unknown code: verbatim within the draft, closed
+     * across -- never read as SUBSCRIPTION_ENDED by an older peer. */
+    MOQ_TEST_CHECK(moqr_pd_forward(D22, D22, 0x3u, &o) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(o, 0x3u);
+    MOQ_TEST_CHECK(moqr_pd_forward(D22, D18, 0x3u, &o) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(o, 0x0u);
+    /* The two-draft-only meaning still has its old numbers. */
+    MOQ_TEST_CHECK(moqr_pd_encode(D18, MOQR_PD_SUBSCRIPTION_ENDED, &o) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(o, 0x3u);
+
+    /* Data-stream resets: draft-22 is draft-18, number for number. */
+    static const struct { moqr_reset_cause_t sem; uint64_t code; } rs_rows[] = {
+        { MOQR_RESET_INTERNAL_ERROR, 0x0u },     { MOQR_RESET_CANCELLED, 0x1u },
+        { MOQR_RESET_DELIVERY_TIMEOUT, 0x2u },   { MOQR_RESET_SESSION_CLOSED, 0x3u },
+        { MOQR_RESET_GOING_AWAY, 0x4u },         { MOQR_RESET_TOO_FAR_BEHIND, 0x5u },
+        { MOQR_RESET_UNKNOWN_OBJECT_STATUS, 0x6u },
+        { MOQR_RESET_EXPIRED_AUTH_TOKEN, 0x7u }, { MOQR_RESET_EXCESSIVE_LOAD, 0x9u },
+        { MOQR_RESET_MALFORMED_TRACK, 0x12u },
+    };
+    for (size_t i = 0; i < sizeof(rs_rows) / sizeof(rs_rows[0]); i++) {
+        MOQ_TEST_CHECK(moqr_reset_encode(D22, rs_rows[i].sem, &o) == MOQR_OK);
+        MOQ_TEST_CHECK_EQ_U64(o, rs_rows[i].code);
+        MOQ_TEST_CHECK(moqr_reset_decode(D22, rs_rows[i].code) == rs_rows[i].sem);
+        MOQ_TEST_CHECK(moqr_reset_forward(D18, D22, rs_rows[i].code, &o) == MOQR_OK);
+        MOQ_TEST_CHECK_EQ_U64(o, rs_rows[i].code);
+    }
+    /* Across to draft-16 the relocation and degradations still apply. */
+    MOQ_TEST_CHECK(moqr_reset_forward(D22, D16, 0x6u, &o) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(o, 0x4u);   /* UNKNOWN_OBJECT_STATUS */
+    MOQ_TEST_CHECK(moqr_reset_forward(D22, D16, 0x4u, &o) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(o, 0x1u);   /* GOING_AWAY -> CANCELLED */
+    MOQ_TEST_CHECK(moqr_reset_forward(D16, D22, 0x4u, &o) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(o, 0x6u);
+    MOQ_TEST_CHECK(moqr_reset_encode_internal(D22, MOQR_RESET_CODE_EVICTED,
+                                              &o) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(o, 0x5u);
+    MOQ_TEST_CHECK(moqr_reset_encode_internal(D22, MOQR_RESET_CODE_STOPPED,
+                                              &o) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(o, 0x1u);
+
+    /* Unknown codes: verbatim within draft-22, closed across. */
+    MOQ_TEST_CHECK(moqr_pd_forward(D22, D22, 0x4242u, &o) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(o, 0x4242u);
+    MOQ_TEST_CHECK(moqr_reset_forward(D22, D18, 0x4242u, &o) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(o, 0x0u);
+    return failures;
+}
+
+/* A retained code written in draft-22's registry carries its own tag, and a
+ * relay-authored extension must mean nothing in all three drafts. */
+static int
+test_draft22_descriptors(void)
+{
+    int failures = 0;
+    uint64_t o = 0xDEADu;
+    moqr_pd_desc_t pd;
+    moqr_reset_desc_t rs;
+
+    MOQ_TEST_CHECK(moqr_pd_desc_wire(D22, 0x5u, &pd) == MOQR_OK);
+    MOQ_TEST_CHECK(pd.tag == MOQR_CODE_WIRE_D22);
+    MOQ_TEST_CHECK(pd.tag != MOQR_CODE_WIRE_D18 && pd.tag != MOQR_CODE_WIRE_D16);
+    MOQ_TEST_CHECK(moqr_pd_desc_valid(pd));
+    MOQ_TEST_CHECK(moqr_pd_desc_emit(pd, D22, &o) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(o, 0x5u);
+    MOQ_TEST_CHECK(moqr_pd_desc_emit(pd, D18, &o) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(o, 0x5u);
+    MOQ_TEST_CHECK(moqr_pd_desc_emit(pd, D16, &o) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(o, 0x6u);   /* TOO_FAR_BEHIND in draft-16 numbering */
+
+    /* A draft-18 SUBSCRIPTION_ENDED retained and later emitted to draft-22. */
+    MOQ_TEST_CHECK(moqr_pd_desc_wire(D18, 0x3u, &pd) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_pd_desc_emit(pd, D22, &o) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(o, 0x0u);
+    /* The local meaning likewise. */
+    MOQ_TEST_CHECK(moqr_pd_desc_local(MOQR_PD_SUBSCRIPTION_ENDED, &pd) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_pd_desc_emit(pd, D22, &o) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(o, 0x0u);
+    MOQ_TEST_CHECK(moqr_pd_desc_emit(pd, D18, &o) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(o, 0x3u);
+
+    MOQ_TEST_CHECK(moqr_reset_desc_wire(D22, 0x6u, &rs) == MOQR_OK);
+    MOQ_TEST_CHECK(rs.tag == MOQR_CODE_WIRE_D22);
+    MOQ_TEST_CHECK(moqr_reset_desc_valid(rs));
+    MOQ_TEST_CHECK(moqr_reset_desc_emit(rs, D16, &o) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(o, 0x4u);
+    MOQ_TEST_CHECK(moqr_reset_desc_emit(rs, D22, &o) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(o, 0x6u);
+
+    /* Well-formedness is enforced for the new origin too. */
+    const uint64_t over = UINT64_C(0x4000000000000000);
+    MOQ_TEST_CHECK(moqr_pd_desc_wire(D22, over, &pd) == MOQR_ERR_INVAL);
+    MOQ_TEST_CHECK(moqr_reset_desc_wire(D22, over, &rs) == MOQR_ERR_INVAL);
+    pd.tag = MOQR_CODE_WIRE_D22;
+    pd.value = over;
+    MOQ_TEST_CHECK(!moqr_pd_desc_valid(pd));
+    MOQ_TEST_CHECK(moqr_pd_desc_emit(pd, D22, &o) == MOQR_ERR_INVAL);
+
+    /* Extensions: 0x3 is unassigned in draft-22 but registered in the older
+     * drafts, so it is still refused; 0x7 is unassigned everywhere. */
+    MOQ_TEST_CHECK(moqr_pd_desc_extension(0x3u, &pd) == MOQR_ERR_INVAL);
+    MOQ_TEST_CHECK(moqr_pd_desc_extension(0x7u, &pd) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_pd_desc_emit(pd, D22, &o) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(o, 0x7u);
+    /* draft-22 Section 13 keeps the same GREASE pattern. */
+    MOQ_TEST_CHECK(moqr_pd_desc_extension(0x9Du + 2u * 0x7Fu, &pd) == MOQR_ERR_INVAL);
+    return failures;
+}
+
 int
 main(void)
 {
@@ -449,6 +603,8 @@ main(void)
     failures += test_retained_descriptors();
     failures += test_local_payload_validation();
     failures += test_pd_extension();
+    failures += test_draft22_registries();
+    failures += test_draft22_descriptors();
     if (failures == 0) {
         printf("PASS: relay_wire_codes\n");
     }

@@ -11,6 +11,21 @@ should use. They use **only public headers** and link **`moq::service`** — no
 - `media_send.c` — connect an endpoint, attach a sender, add a track, and write
   media objects (placeholder payloads; see the note below).
 
+These C examples leave the media companion at its default, AUTO, which follows
+the draft the endpoint negotiates. On drafts 16/18 that is the legacy profile:
+LOC-01 object metadata and the MSF-01 catalog in its legacy form, Group IDs
+from 0. On draft 22 it is the draft-22 profile: LOC-04 object metadata, the
+MSF-01 draft-01 catalog (`"version":"draft-01"`, init data in the root
+`initDataList`), and Group IDs starting at the sender's wallclock milliseconds.
+On draft 22 the sender generates the LOC-04 block from the typed fields of
+each RAW `write`: a capture time (`has_capture_time`) is a Unix-microsecond
+Timestamp; a presentation time alone, as in `media_send.c`, is media time and
+goes out with a Timescale of 1000000, so it is never presented as a wall
+clock. Setting `companion_profile` explicitly (with the `*_cfg_init_sized`
+initializers) pins one profile: `MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01` works
+only on drafts 16/18, and `MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC` only on
+draft 22, where RAW writes must then carry their own LOC metadata.
+
 ## The model
 
 ```
@@ -117,7 +132,9 @@ Codec init/decoder config travels in the **catalog**, not in the media objects:
   This applies to **any** packaging (RAW/LOC or CMAF) when the codec needs it.
   The service copies it during `add_track` (your buffer need not outlive the
   call). How it is published depends on packaging:
-  - **RAW/LOC** — base64'd **inline** on the track's catalog entry.
+  - **RAW/LOC** — base64'd **inline** on the track's catalog entry on drafts
+    16/18. With the draft-22 companion every init-bearing track goes through
+    `initDataList`/`initRef` instead, as CMAF does.
   - **CMAF** — published in the catalog's MSF-01 **`initDataList`** and
     referenced from the track via **`initRef`**. The emitter deduplicates:
     tracks whose CMAF init segment bytes are identical share a single
@@ -282,6 +299,8 @@ the service tier is optional and not folded into the core `.pc`.
 Its payloads are placeholder bytes, not an encoded bitstream — the example
 shows the send *lifecycle*, not media encoding. A real sender passes encoded
 access units (e.g. H.264 byte-stream AUs) as the payload and sets `is_sync`
-on random-access points; the service generates the LOC-01 timing/keyframe
-metadata from the typed fields. For a worked codec integration over a real
-relay, see the GStreamer `moqsrc`/`moqsink` elements.
+on random-access points; the service generates the LOC timing/keyframe
+metadata from the typed fields (LOC-01 on drafts 16/18, LOC-04 on draft 22,
+where this example's presentation times are sent as media time). For a worked
+codec integration over a real relay, see the GStreamer `moqsrc`/`moqsink`
+elements.

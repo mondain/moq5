@@ -94,6 +94,16 @@ void moq_pq_send_queue_commit(moq_pq_send_queue_t *q, uint64_t sid,
 /* Drop all queued bytes/FIN for `sid` (reset/stop/close), releasing chunks. */
 void moq_pq_send_queue_drop(moq_pq_send_queue_t *q, uint64_t sid);
 
+/* A reset that must still deliver the first `reliable` bytes of `sid`
+ * (counted from the stream's first pushed byte): keep only the part of that
+ * prefix not yet provided, drop and release everything after it and the
+ * FIN. "Provided" counts every byte handed to the provider so far, whether or
+ * not a FIN has been pushed behind them; it does not mean acknowledged.
+ * Returns the bytes still queued for `sid`; 0 means the prefix has been
+ * provided in full and the stream's queue is dropped, like _drop. */
+uint64_t moq_pq_send_queue_truncate(moq_pq_send_queue_t *q, uint64_t sid,
+                                    uint64_t reliable);
+
 /* Aggregate bytes currently buffered across all streams (test/telemetry). */
 uint64_t moq_pq_send_queue_queued_bytes(const moq_pq_send_queue_t *q);
 

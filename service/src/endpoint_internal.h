@@ -8,6 +8,7 @@
 
 #include <moq/endpoint.h>
 #include <moq/url.h>
+#include "endpoint_uri.h"
 
 /* The largest version-offer set: every version this build supports. */
 #define MOQ_ENDPOINT_MAX_VERSIONS 8
@@ -23,10 +24,14 @@ typedef struct moq_endpoint_resolved {
     moq_transport_backend_t  backend;    /* never AUTO after resolve */
     moq_url_t   url;                     /* parsed; spans borrow cfg->url */
     moq_bytes_t sni;                     /* cfg->sni, or url host */
-    moq_bytes_t wt_path;                 /* WEBTRANSPORT only (else empty):
-                                            cfg->wt_path, or url path, or "/moq" */
-    moq_bytes_t wt_query;                /* URL query including "?", unless
-                                            wt_path was explicitly supplied */
+    moq_bytes_t wt_path;                 /* WEBTRANSPORT only (else empty).
+                                            LEGACY: cfg->wt_path, or url path,
+                                            or "/moq". STANDARD: the raw
+                                            path/query; connect projects an
+                                            empty path to "/" */
+    moq_bytes_t wt_query;                /* LEGACY WEBTRANSPORT only: URL query
+                                            including "?", unless wt_path was
+                                            explicitly supplied */
     moq_version_policy_t policy;
     moq_version_t versions[MOQ_ENDPOINT_MAX_VERSIONS];
     size_t        version_count;
@@ -51,6 +56,23 @@ typedef struct moq_endpoint_resolved {
      * backend and provider can honour it. */
     moq_tls_certificate_verify_fn verify_certificate;
     void                         *verify_certificate_ctx;
+    /* URI mode, struct_size-gated at resolve; LEGACY when the cfg predates it. */
+    uint32_t      uri_mode;
+    /* STANDARD only: the parsed MOQT URI (spans borrow cfg->url). */
+    moq_endpoint_uri_t uri;
+    /* The connection target a natively carried session names in SETUP:
+     * authority and path/query spans borrow cfg->url; target_present is
+     * MOQ_BINDING_TARGET_COMPLETE when both components follow RFC 3986 with a
+     * nonempty host and 0 when the URL yields no target. LEGACY WebTransport
+     * keeps it only when its effective resource (wt_path + wt_query) is
+     * admitted too, and connect binds that resource as the path/query, so
+     * the session names what the CONNECT dereferences. Carries the server
+     * URI policy fields from the cfg (shape only; servers are reserved). */
+    moq_connection_target_t target;
+    /* The version an AUTO offer places first (the cfg's, else the library
+     * default, unless that default is one the backend cannot carry); 0 when
+     * the offer is not AUTO. */
+    moq_version_t preferred_version;
 } moq_endpoint_resolved_t;
 
 /*
@@ -157,6 +179,16 @@ bool moq_endpoint_interrupted_internal(const moq_endpoint_t *ep);
  * Mirrors that determination without ep->mu (a facade accessor it consults may
  * take its own non-endpoint lock). Safe to call from any thread. */
 bool moq_endpoint_is_closed_internal(const moq_endpoint_t *ep);
+
+/* Record the session-wide GOAWAY's New Session URI for
+ * moq_endpoint_get_goaway_uri(). Called from a pump hook (ep->mu held), as a
+ * facade reports the GOAWAY; the bytes are copied. */
+void moq_endpoint_note_goaway_locked(moq_endpoint_t *ep, moq_bytes_t new_session_uri);
+
+/* The versions this endpoint offers, preference order: at most `cap` written,
+ * the full count returned. Fixed at create; any thread. */
+size_t moq_endpoint_offered_versions_internal(const moq_endpoint_t *ep,
+                                              moq_version_t *out, size_t cap);
 
 bool moq_endpoint_is_fatal_internal(const moq_endpoint_t *ep);
 uint64_t moq_endpoint_fatal_code_internal(const moq_endpoint_t *ep);

@@ -43,6 +43,7 @@ final class ScriptedEndpointBackend: EndpointBackend, @unchecked Sendable {
         var destroyCount = 0
         var violations: [String] = []
         var waitActive = false
+        var parked = false        // Derived from the wait predicate for observations.
         var drainBlocked = false
         var serviceThread: Thread?
     }
@@ -54,6 +55,7 @@ final class ScriptedEndpointBackend: EndpointBackend, @unchecked Sendable {
     private var scriptedFatal = false
     private var scriptedFatalCode: UInt64 = 0
     private var scriptedVersion: MoQVersion?
+    private var scriptedWireVersion: WireVersion?
     private var interrupted = false
     private var wakeFlag = false                    /* level-retained activity */
     private var drainScript: [EndpointDrainResult] = []
@@ -83,6 +85,33 @@ final class ScriptedEndpointBackend: EndpointBackend, @unchecked Sendable {
         defer { cond.unlock() }
         tripwireLocked("negotiatedVersion")
         return scriptedVersion
+    }
+    var negotiatedWireVersion: WireVersion? {
+        cond.lock()
+        defer { cond.unlock() }
+        tripwireLocked("negotiatedWireVersion")
+        return scriptedWireVersion ?? scriptedVersion.map(WireVersion.init)
+    }
+
+    private var scriptedGoawayURI: Data?
+    var goawayNewSessionURI: Data? {
+        cond.lock()
+        defer { cond.unlock() }
+        tripwireLocked("goawayNewSessionURI")
+        return scriptedGoawayURI
+    }
+
+    func setGoawayURI(_ uri: Data?) {
+        cond.lock()
+        defer { cond.unlock() }
+        scriptedGoawayURI = uri
+    }
+
+    func setWireVersion(_ version: WireVersion) {
+        cond.lock()
+        defer { cond.unlock() }
+        scriptedWireVersion = version
+        scriptedVersion = version.legacyVersion
     }
     var isFatal: Bool {
         cond.lock()
@@ -237,7 +266,7 @@ final class ScriptedEndpointBackend: EndpointBackend, @unchecked Sendable {
     func snapshot() -> Snapshot {
         cond.lock()
         defer { cond.unlock() }
-        return r
+        return snapshotLocked()
     }
 
     /// Block the TEST thread until `predicate(snapshot)` holds (evaluated
@@ -251,7 +280,7 @@ final class ScriptedEndpointBackend: EndpointBackend, @unchecked Sendable {
         cond.lock()
         defer { cond.unlock() }
         let deadline = Date().addingTimeInterval(ceiling)
-        while !predicate(r) {
+        while !predicate(snapshotLocked()) {
             if !cond.wait(until: deadline) { return false }
         }
         return true
@@ -267,11 +296,11 @@ final class ScriptedEndpointBackend: EndpointBackend, @unchecked Sendable {
     }
 
     /// Await the engine parked inside waitForActivity with >= `entries` total
-    /// entries observed.
+    /// entries observed and the actual blocking predicate still satisfied.
     @discardableResult
     func awaitParked(entries: Int, ceiling: TimeInterval = 10) -> Bool {
         awaitCondition(ceiling: ceiling) {
-            $0.waitActive && $0.waitEntries >= entries
+            $0.parked && $0.waitEntries >= entries
         }
     }
 
@@ -292,6 +321,12 @@ final class ScriptedEndpointBackend: EndpointBackend, @unchecked Sendable {
     }
 
     // MARK: Internals (cond held)
+
+    private func snapshotLocked() -> Snapshot {
+        var snap = r
+        snap.parked = r.waitActive && !wakeFlag && !interrupted && scriptedState != .closed
+        return snap
+    }
 
     private func tripwireLocked(_ what: String) {
         if destroyed { r.violations.append("\(what) after destroy") }

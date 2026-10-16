@@ -165,6 +165,7 @@ int main(int argc, char **argv)
     for (int i = 0; i < 2; ++i) {
         if (!strcmp(argv[i + 2], "16")) versions[i] = MOQ_VERSION_DRAFT_16;
         else if (!strcmp(argv[i + 2], "18")) versions[i] = MOQ_VERSION_DRAFT_18;
+        else if (!strcmp(argv[i + 2], "22")) versions[i] = MOQ_VERSION_DRAFT_22;
         else return 2;
     }
     peer_t pub = {.publisher = true}, sub = {0};

@@ -157,6 +157,18 @@ uint64_t picoquic_get_next_local_stream_id(picoquic_cnx_t *cnx, int is_unidir)
     return id;
 }
 
+#if defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) && PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1
+/* The provider's terminal-observation contract (patch 0007): opt-in and the
+ * exact STOP code, inert here. */
+int picoquic_set_app_stream_ctx(picoquic_cnx_t *c, uint64_t sid, void *ctx)
+    { (void)c; (void)sid; (void)ctx; return 0; }
+int picoquic_enable_stream_send_commit(picoquic_cnx_t *c, uint64_t sid)
+    { (void)c; (void)sid; return 0; }
+int picoquic_get_remote_stop_error(picoquic_cnx_t *c, uint64_t sid,
+    uint64_t *out)
+    { (void)c; (void)sid; *out = 0; return 0; }
+#endif
+
 uint64_t picoquic_get_remote_stream_error(picoquic_cnx_t *cnx,
     uint64_t stream_id)
 {
@@ -184,6 +196,15 @@ int picoquic_reset_stream(picoquic_cnx_t *cnx, uint64_t stream_id,
     op->len = 0;
     op->fin = false;
     return 0;
+}
+
+/* The fake pair advertises no reset_stream_at, so the adapter never asks
+ * for a reliable reset here; recorded as a reset should it ever be called. */
+int picoquic_reset_stream_at(picoquic_cnx_t *cnx, uint64_t stream_id,
+    uint64_t error_code, uint64_t reliable_size)
+{
+    (void)reliable_size;
+    return picoquic_reset_stream(cnx, stream_id, error_code);
 }
 
 int picoquic_stop_sending(picoquic_cnx_t *cnx, uint64_t stream_id,

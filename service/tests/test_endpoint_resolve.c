@@ -4,6 +4,7 @@
  * defaults, version-offer validation, and the v0 UNSUPPORTED rejects.
  */
 #include "endpoint_internal.h"
+#include "endpoint_offer_expect.h"
 #include "test_support.h"
 #include "../../adapters/common/moq_setup_tokens.h"
 
@@ -96,12 +97,13 @@ static void test_setup_tokens(void)
     tokens[0].token_type = 7;
 
     /* The SETUP carrying them must fit the default 4096-byte session send
-     * arena the backends use (and so a default peer's receive buffer): one
-     * 4096-byte value does not; two values that each fit alone but not
-     * together do not; the largest value that fits does. */
+     * arena the backends use (and so a default peer's receive buffer), beside
+     * the URL as the connection target: one 4096-byte value does not; two
+     * values that each fit alone but not together do not; the largest value
+     * that fits does. */
     if (base == MOQ_OK) {
         static uint8_t big[4096];
-        size_t largest = 4096 - MOQ_SETUP_TOKENS_OTHER_OPTIONS - 32;
+        size_t largest = 4096 - MOQ_SETUP_TOKENS_OTHER_OPTIONS - 32 - c.url.len;
         tokens[0].token_value = (moq_bytes_t){ big, sizeof(big) };
         MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), MOQ_ERR_INVAL);
         tokens[0].token_value = (moq_bytes_t){ big, largest + 1 };
@@ -176,6 +178,25 @@ static void test_setup_token_copy_wiped(void)
     MOQ_TEST_CHECK(copy.tokens == NULL && copy.count == 0);
 }
 
+/* The original URL reading, selected explicitly: lowercase moqt/moq/https
+ * only, port 4433 for moqt and moq, the wt_path override and the "/moq"
+ * WebTransport default. */
+static moq_endpoint_cfg_t mkcfg_legacy(const char *url)
+{
+    moq_endpoint_cfg_t c;
+    moq_endpoint_cfg_init_sized(&c, sizeof(c));
+    c.url = B(url);
+    c.uri_mode = MOQ_ENDPOINT_URI_LEGACY;
+    return c;
+}
+
+static moq_endpoint_cfg_t mkcfg_standard(const char *url)
+{
+    moq_endpoint_cfg_t c = mkcfg_legacy(url);
+    c.uri_mode = MOQ_ENDPOINT_URI_STANDARD;
+    return c;
+}
+
 int main(void)
 {
     /* == cfg_init defaults ============================================ */
@@ -229,9 +250,11 @@ int main(void)
         MOQ_TEST_CHECK_EQ_U64(r.wt_profile,
                               (uint64_t)MOQ_WT_PROFILE_BACKEND_DEFAULT);
 
-        /* Full-size caller, BACKEND_DEFAULT explicitly: accepted on picoquic. */
+        /* Full-size caller, BACKEND_DEFAULT explicitly: accepted on picoquic.
+         * A full-size cfg is built with the sized initializer so every tail
+         * field is defined. */
         moq_endpoint_cfg_t c;
-        moq_endpoint_cfg_init_sized(&c, sizeof(c));   /* the whole tail too */
+        moq_endpoint_cfg_init_sized(&c, sizeof(c));
         c.url = B("https://relay.example/moq");
         c.wt_profile = (uint32_t)MOQ_WT_PROFILE_BACKEND_DEFAULT;
         MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
@@ -496,7 +519,12 @@ int main(void)
         c = mkcfg("");                                  /* empty URL */
         MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
                               (int)MOQ_ERR_INVAL);
-        c = mkcfg("ftp://relay.example");               /* unknown scheme */
+        /* An unknown scheme is not a connect URL in either reading: INVAL
+         * under both, the same defect class answered the same way. */
+        c = mkcfg("ftp://relay.example");
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
+                              (int)MOQ_ERR_INVAL);
+        c = mkcfg_legacy("ftp://relay.example");
         MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
                               (int)MOQ_ERR_INVAL);
         c = mkcfg("moqt://relay.example");
@@ -531,9 +559,20 @@ int main(void)
                               (int)MOQ_TRANSPORT_PROTOCOL_RAW_QUIC);
         MOQ_TEST_CHECK_EQ_INT((int)r.backend,
                               (int)MOQ_TRANSPORT_BACKEND_PICOQUIC);
-        MOQ_TEST_CHECK_EQ_U64(r.url.port, 4433);        /* moqt default */
+        MOQ_TEST_CHECK_EQ_U64(r.url.port, 4433);        /* legacy default */
+        c = mkcfg_standard("moqt://relay.example");
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(r.url.port, 443);
 
-        c = mkcfg("moq://relay.example");
+        /* The legacy reading keeps its own moqt default port, and the "moq"
+         * scheme only it admits. */
+        c = mkcfg_legacy("moqt://relay.example");
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(r.url.port, 4433);
+        c = mkcfg_standard("moq://relay.example");
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
+                              (int)MOQ_ERR_UNSUPPORTED);
+        c = mkcfg_legacy("moq://relay.example");
         MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT((int)r.protocol,
                               (int)MOQ_TRANSPORT_PROTOCOL_RAW_QUIC);
@@ -561,9 +600,14 @@ int main(void)
                               (int)MOQ_TRANSPORT_PROTOCOL_WEBTRANSPORT);
 
         /* The override knob re-interprets a KNOWN URL only: an unknown scheme
-         * stays MOQ_ERR_INVAL even with an explicit protocol (documented in
-         * endpoint.h -- host/port/path defaults derive from the parse). */
+         * stays MOQ_ERR_INVAL even with an explicit protocol, in both URI
+         * modes (documented in endpoint.h -- host/port/path defaults derive
+         * from the parse). */
         c = mkcfg("ws://relay.example");
+        c.protocol = MOQ_TRANSPORT_PROTOCOL_WEBTRANSPORT;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
+                              (int)MOQ_ERR_INVAL);
+        c = mkcfg_legacy("ws://relay.example");
         c.protocol = MOQ_TRANSPORT_PROTOCOL_WEBTRANSPORT;
         MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
                               (int)MOQ_ERR_INVAL);
@@ -753,7 +797,8 @@ int main(void)
         MOQ_TEST_CHECK(bytes_eq(r.sni, "override.example"));
     }
 
-    /* == WT path default: explicit > URL path > "/moq"; RAW empty ===== */
+    /* == WT path: the URL path as written (an empty path projects to "/" at
+     *    connect); LEGACY keeps explicit > URL path > "/moq"; RAW empty == */
     {
         moq_endpoint_resolved_t r;
         moq_endpoint_cfg_t c = mkcfg("https://relay.example/live/room1");
@@ -780,8 +825,25 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
         MOQ_TEST_CHECK(bytes_eq(r.wt_path, "/moq"));
         MOQ_TEST_CHECK_EQ_SIZE(r.wt_query.len, 0);
+        c = mkcfg_standard("https://relay.example");
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_SIZE(r.wt_path.len, 0);
+        c = mkcfg_legacy("https://relay.example");
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK(bytes_eq(r.wt_path, "/moq"));
+        MOQ_TEST_CHECK_EQ_SIZE(r.wt_query.len, 0);
+        /* STANDARD keeps the raw path and query as one span; the legacy
+         * query span stays empty so the query is never carried twice. */
+        c = mkcfg_standard("https://relay.example/live?jwt=abc");
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK(bytes_eq(r.wt_path, "/live?jwt=abc"));
+        MOQ_TEST_CHECK_EQ_SIZE(r.wt_query.len, 0);
 
-        c = mkcfg("https://relay.example/live?url=query");
+        c = mkcfg_standard("https://relay.example/live");
+        c.wt_path = B("/custom");
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
+                              (int)MOQ_ERR_INVAL);
+        c = mkcfg_legacy("https://relay.example/live?url=query");
         c.wt_path = B("/custom");
         MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
         MOQ_TEST_CHECK(bytes_eq(r.wt_path, "/custom"));
@@ -802,15 +864,41 @@ int main(void)
     /* == Version offers =============================================== */
     {
         moq_endpoint_resolved_t r;
-        /* Zero-init (struct_size 0) == AUTO == the full supported set. */
+        /* Zero-init offer == AUTO == every supported draft the selected
+         * backend can carry, newest first. */
         moq_endpoint_cfg_t c = mkcfg("moqt://relay.example");
         MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT((int)r.policy, (int)MOQ_VERSION_POLICY_AUTO);
-        /* Newest first: the client's offer order is the preference order on
-         * both transports (TLS ALPN and the WT protocol field). */
-        MOQ_TEST_CHECK_EQ_SIZE(r.version_count, 2);
-        MOQ_TEST_CHECK_EQ_INT((int)r.versions[0], (int)MOQ_VERSION_DRAFT_18);
-        MOQ_TEST_CHECK_EQ_INT((int)r.versions[1], (int)MOQ_VERSION_DRAFT_16);
+        /* The client's offer order is the preference order on both
+         * transports (TLS ALPN and the WT protocol field): the newest
+         * supported draft first, then each older one. */
+        const moq_version_t newest_first[] = {
+            MOQ_VERSION_DRAFT_22, MOQ_VERSION_DRAFT_18, MOQ_VERSION_DRAFT_16
+        };
+        size_t want = 0;
+        for (size_t i = 0; i < 3; i++) {
+            if (!moq_endpoint_version_supported(newest_first[i])) continue;
+            if (newest_first[i] == MOQ_VERSION_DRAFT_22 &&
+                !TEST_DEFAULT_BACKEND_HOSTS_D22)
+                continue;
+            MOQ_TEST_CHECK(want < r.version_count);
+            if (want < r.version_count)
+                MOQ_TEST_CHECK_EQ_INT((int)r.versions[want], (int)newest_first[i]);
+            want++;
+        }
+        MOQ_TEST_CHECK_EQ_SIZE(r.version_count, want);
+        if (moq_endpoint_version_supported(MOQ_VERSION_DRAFT_22) &&
+            moq_endpoint_version_supported(MOQ_VERSION_DRAFT_18) &&
+            moq_endpoint_version_supported(MOQ_VERSION_DRAFT_16)) {
+            if (TEST_DEFAULT_BACKEND_HOSTS_D22) {
+                MOQ_TEST_CHECK_EQ_SIZE(r.version_count, 3);
+                MOQ_TEST_CHECK_EQ_INT((int)r.preferred_version, (int)MOQ_VERSION_DRAFT_22);
+            } else {
+                /* Draft-22 is a supported profile the backend cannot carry. */
+                MOQ_TEST_CHECK_EQ_SIZE(r.version_count, 2);
+                MOQ_TEST_CHECK_EQ_INT((int)r.preferred_version, (int)MOQ_VERSION_DRAFT_18);
+            }
+        }
 
         /* LIST with supported versions passes through verbatim. */
         moq_version_t both[] = { MOQ_VERSION_DRAFT_18, MOQ_VERSION_DRAFT_16 };

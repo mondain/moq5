@@ -28,8 +28,10 @@
 
 typedef enum {
     NP_T_UNKNOWN   = 0,
-    NP_T_AVAILABLE = 1,   /* a profile for this draft is linked in */
+    NP_T_AVAILABLE = 1,   /* a complete profile for this draft is linked in */
     NP_T_ABSENT    = 2,   /* registered upstream, not built here */
+    NP_T_PENDING   = 3,   /* a profile is linked in but not yet wire-ready:
+                           * registered and named, never offered */
 } np_transport_state_t;
 
 #define NP_AUTO_RANK_NONE 0   /* not in the AUTO offer at all */
@@ -45,10 +47,12 @@ typedef struct {
     uint8_t              auto_rank;      /* 1 = offered first; 0 = not offered */
     /*
      * Why this transport cannot carry media, when it cannot. REQUIRED
-     * non-empty in exactly two situations, and forbidden otherwise:
+     * non-empty in the following situations, and forbidden otherwise:
      *
      *   - state == ABSENT: the ALPN is registered but no profile is built
      *     here, so the row exists to be compared against, not used;
+     *   - state == PENDING: the profile is built but not wire-ready, so it
+     *     carries no media and is never offered;
      *   - state == AVAILABLE with no SUPPORTED cell against an IMPLEMENTED
      *     media profile: an available transport that carries nothing is a
      *     declaration, not an oversight, and must say why.
@@ -67,7 +71,7 @@ typedef enum {
 } np_media_state_t;
 
 typedef struct {
-    const char      *id;        /* "loc01", "loc02" */
+    const char      *id;        /* "loc01", "loc02", "loc04" */
     np_media_state_t state;
     const char      *reason;    /* required non-empty when RESERVED */
     uint64_t         timestamp_property_id;   /* the reviewed property ID */
@@ -82,8 +86,9 @@ typedef enum {
 } np_cell_state_t;
 
 /*
- * A cell's two closure callbacks are its service send/receive closures.
- * Where they are absent, a non-empty WAIVER stands in their place. The rule is exact and half-states fail:
+ * A supported cell may provide two closure callbacks or name separately run
+ * service closures in its waiver. This declaration validator does not run
+ * those tests. The rule is exact and half-states fail:
  *
  *   callbacks BOTH present  <=> waiver absent
  *   callbacks BOTH absent   <=> waiver present and non-empty
@@ -96,7 +101,7 @@ typedef struct {
     const char         *media;
     np_cell_state_t     state;
     const char         *reason;        /* required non-empty when UNSUPPORTED */
-    const char         *waiver;       /* closure waiver (no callbacks) */
+    const char         *waiver;        /* reason closures run separately */
     np_send_closure_fn  send_closure;
     np_recv_closure_fn  recv_closure;
 } np_cell_row_t;

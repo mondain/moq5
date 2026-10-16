@@ -66,6 +66,7 @@
  */
 
 #include <moq/picoquic.h>
+#include <moq/connection_target.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -301,6 +302,24 @@ typedef struct moq_pq_threaded_cfg {
      * setup_auth_token_count. Set via moq_pq_threaded_cfg_init_sized. */
     const moq_auth_token_t *setup_auth_tokens;
     size_t             setup_auth_token_count;
+
+    /* Appended (struct_size append-only ABI) — connection target.
+     *
+     * target: the URI identity this facade binds each session with when the
+     * negotiated wire profile requires a transport binding (see
+     * <moq/connection_target.h>; draft-22 does, draft-16/18 do not). The
+     * facade supplies the transport facts itself -- the session is created
+     * only once the handshake has completed, and QUIC DATAGRAM support is
+     * read from both sides' transport parameters -- and copies the target's
+     * fields and bytes during _create (accept_uri_ctx is borrowed until
+     * _destroy). CLIENT: the authority and path/query the connection
+     * dereferences, sent as the SETUP's AUTHORITY and PATH; NULL derives
+     * them from `host`, `port` and an empty path. SERVER: the URI policy
+     * consulted for each client's SETUP; NULL serves every authority and
+     * path. A malformed target is MOQ_ERR_INVAL at _create. The SETUP
+     * carrying the target and any setup_auth_tokens must fit the session
+     * send arena together. Set via moq_pq_threaded_cfg_init_sized. */
+    const moq_connection_target_t *target;
 } moq_pq_threaded_cfg_t;
 
 /* Pointer-only initializer. Clears and stamps ONLY the frozen prefix that
@@ -308,7 +327,8 @@ typedef struct moq_pq_threaded_cfg {
  * storage size, so it must not write the full current sizeof -- that would
  * overflow an old caller's smaller struct). Fields appended after the prefix
  * (currently goaway_timeout_us, max_connections, idle_timeout_ms,
- * lane_count, app_deadline_us/ctx, and keep_alive_interval_ms)
+ * lane_count, app_deadline_us/ctx, keep_alive_interval_ms, ca_file and
+ * target)
  * default to disabled/zero (max_connections 0 = the 1024 default,
  * idle_timeout_ms 0 = the picoquic default, lane_count 0 = single lane,
  * keep_alive_interval_ms 0 = keepalive disabled); sni/alpn_* predate the prefix

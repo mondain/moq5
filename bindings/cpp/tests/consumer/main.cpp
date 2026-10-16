@@ -43,9 +43,6 @@ int main()
 {
     // -- 1. Foundation types (existing checks) -------------------------
 
-    moq::session_config cfg{};
-    cfg.perspective = moq::perspective::client;
-
     auto buf = moq::buffer::create(
         reinterpret_cast<const uint8_t *>("test"), 4);
     CHECK(buf.ok(), 1);

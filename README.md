@@ -2,13 +2,22 @@
 
 C library for [Media over QUIC Transport](https://datatracker.ietf.org/doc/draft-ietf-moq-transport/):
 a sans-I/O protocol core plus transport adapters, with a high-level **media
-service tier** for applications. Supports **draft-16 and draft-18**, selected by
-transport version negotiation.
+service tier** for applications. Supports **draft-16, draft-18 and
+draft-22**, selected per session by transport version negotiation; default
+offers list the newest draft first. **Draft-22 is an integration candidate,
+not a qualified release.**
 
 **Status:** the draft-16 and draft-18 protocol surfaces are substantially
 complete and exercised by deterministic scenario tests: subscribe, fetch
 (standalone and joining), publish, track status, object datagrams, namespace
-subscriptions, goaway, request updates, and auth tokens. On top of the core, a
+subscriptions, goaway, request updates, and auth tokens. Draft-22 adds fills,
+Location Filters, concurrent subscriptions to one track, application-answered
+request updates, publisher state notifications, and transport binding and
+SETUP options. Its public contracts, bounded resource handling, media-service
+integration and adapter qualification are not yet complete. Passing focused
+core tests is not a complete draft-22 conformance claim. Range Filters are not
+supported. Draft-18 remains preferred in the unchanged default offers (see
+"Versions" below and [docs/conformance.md](docs/conformance.md)). On top of the core, a
 **service tier** (`moq_endpoint_t`, `moq_media_receiver_t`, `moq_media_sender_t`)
 is the recommended surface for media applications (FFmpeg / VLC / GStreamer /
 OBS-style consumers) — it owns the connection, version negotiation, and the
@@ -29,12 +38,12 @@ own endpoint before depending on it.
 - **Deterministic simulation:** built for FoundationDB-style
   seed-replayable testing with fault injection, OOM loops, and
   bounded-output invariants (`moq-sim` / SimPair).
-- **Versioned profiles, negotiated not guessed:** draft-16 and draft-18 are
-  both implemented as profiles. The session's wire version is fixed at creation
-  and immutable; there is **no** version auto-detection. The version comes from
-  the negotiated transport context: raw QUIC selects a MoQ ALPN (`moqt-16` /
-  `moqt-18`); H3 WebTransport uses the `h3` ALPN plus WebTransport-protocol
-  selection. The service tier and managed adapters drive this negotiation for
+- **Versioned profiles, negotiated not guessed:** draft-16, draft-18 and
+  draft-22 are each implemented as a profile. The session's wire version is
+  fixed at creation and immutable; there is **no** version auto-detection. The
+  version comes from the negotiated transport context: raw QUIC selects a MoQ
+  ALPN (`moqt-16` / `moqt-18` / `moqt-22`); H3 WebTransport uses the `h3` ALPN
+  plus WebTransport-protocol selection. The service tier and managed adapters drive this negotiation for
   you (offer the set, create the session for the agreed version). An
   unknown/unoffered version fails rather than guessing.
 - **Shared transport bridge:** adapters do not each reimplement the
@@ -44,6 +53,28 @@ own endpoint before depending on it.
   adapter implements a thin endpoint-ops vtable; the bridge does the
   rest. (Private adapter SPI, versioned lockstep with `moq-core`; not a
   stable third-party/application ABI — see the API stability table.)
+
+## Versions
+
+Each session speaks one draft, fixed when it is created from what the
+transport negotiated. `moq_versions_supported()` reports the drafts this build
+supports, newest first: 22, 18 and 16. Default offers list every supported
+draft, newest first.
+
+| Component | Default offer | To choose another order |
+|---|---|---|
+| Service endpoint (`moq_endpoint_t`, AUTO policy) | 22, 18, 16 | set `moq_endpoint_cfg_t.preferred_version` after `moq_endpoint_cfg_init_sized()` to move one draft to the front, or give an explicit LIST / EXACT policy |
+| `moq5-relay` listeners (native and WebTransport) | `[22, 18, 16]` | `listener.versions` / `webtransport.versions` ([tools/moq5-relay/README.md](tools/moq5-relay/README.md)) |
+| Attach-mode hosts | the host's own | create the session with the version the connection negotiated |
+
+Draft-22 sessions need a transport binding before they start; managed facades
+supply it for configurations they admit. The Network.framework facade refuses
+creation for every draft, before allocation or network startup, and never
+reaches binding. Explicit draft-22 selection does not bypass backend limits.
+Per-draft status, known limitations and the
+interoperability evidence are in [docs/conformance.md](docs/conformance.md);
+the draft-22 wire format is in
+[docs/draft22-wire-reference.md](docs/draft22-wire-reference.md).
 
 ## Media service tier
 
@@ -92,26 +123,33 @@ supports and the shared scenarios run against it.
 
 | Adapter | Transport | Stack | Modes | Status |
 |---|---|---|---|---|
-| **picoquic** | raw QUIC (`moqt-16`/`moqt-18`) | picoquic (C) | attach + managed (`moq_pq_threaded_t`) | stable; lightest footprint |
-| **mvfst** | raw QUIC (`moqt-16`/`moqt-18`) | Meta mvfst (C++/folly) | attach + managed (`moq_mvfst_managed_t`) | stable; multi-connection server |
+| **picoquic** | raw QUIC (`moqt-16`/`-18`/`-22`) | picoquic (C) | attach + managed (`moq_pq_threaded_t`) | stable; lightest footprint |
+| **mvfst** | raw QUIC (`moqt-16`/`-18`/`-22`, one per connection) | Meta mvfst (C++/folly) | attach + managed (`moq_mvfst_managed_t`) | stable; multi-connection server |
+| **MsQuic** | raw QUIC (`moqt-16`/`-18`/`-22`) | Microsoft MsQuic (C) | attach + managed (`moq_msquic_managed_t`, lanes) | **experimental**; the relay runtime's transport |
 | **picoquic WebTransport** | WebTransport / HTTP-3 (`h3`) | picoquic h3zero/picowt (C) | attach + managed (`moq_pico_wt_managed_t`) | **experimental** |
-| **proxygen WebTransport** | WebTransport | proxygen (C++) | attach + managed (`moq_proxygen_wt_managed_t`) | **experimental** |
+| **wtquic WebTransport** | WebTransport / HTTP-3 | wtquic over MsQuic or Network.framework (C) | attach + managed (`moq_wtquic_msquic_managed_t`; the Network.framework facade refuses at create) | **experimental** |
+| **proxygen WebTransport** | WebTransport | proxygen (C++) | attach + managed client (`moq_proxygen_wt_managed_t`) | **experimental** |
 
-WebTransport is supported through the picoquic WT and proxygen WT
+WebTransport is supported through the picoquic WT, wtquic and proxygen WT
 adapters; libmoq does **not** depend on moxygen. WebTransport support is
 experimental relative to the raw-QUIC adapters. A *managed facade* owns
 the QUIC context, a network thread, and the connection lifecycle and
 hands you a running session to drive: picoquic raw, picoquic WT, mvfst
-raw, and proxygen WT all have one (proxygen's also drives the WT CONNECT
-itself). proxygen WT additionally offers a C++ attach mode where you own
+raw, MsQuic raw, wtquic over MsQuic and proxygen WT all have one (proxygen's
+also drives the WT CONNECT itself). proxygen WT additionally offers a C++ attach mode where you own
 the `proxygen::WebTransport*` and drive `service()` yourself.
 
 **Backpressure:** the shared bridge owns the core WOULD_BLOCK contract
-(retain and retry). Inbound backpressure depends on what the transport
-can do: mvfst and proxygen WT can pause/resume reads; picoquic/h3zero
-(pico_wt) cannot pause reads, so unresolvable inbound backpressure is a
-hard failure that tears the connection down rather than silently
-dropping data.
+(retain and retry). A data stream the session cannot admit yet is refused
+back to the adapter, which holds that chunk and redelivers it
+([docs/receive-admission.md](docs/receive-admission.md)); mvfst and proxygen
+WT pause reads meanwhile, picoquic and pico_wt keep the bytes in the adapter.
+
+**Resets:** every data-stream reset carries the length of the stream's
+header so the receiver can attribute it. picoquic and pico_wt keep it with
+RESET_STREAM_AT where negotiated; MsQuic waits for the header to be
+acknowledged and resets plainly; mvfst, wtquic and proxygen send plain
+resets. Details in [docs/adapters.md](docs/adapters.md#reliable-resets).
 
 See [docs/transport-integration-guide.md](docs/transport-integration-guide.md)
 for choosing and wiring a backend, and
@@ -194,7 +232,7 @@ surfaces differ in maturity and intended audience:
 | Surface | Headers | Status |
 |---|---|---|
 | **Media service API** (primary app API for media) | `<moq/endpoint.h>`, `<moq/media_receiver.h>`, `<moq/media_sender.h>` | the recommended surface for media applications; pre-1.0 |
-| **Core session API** (lower-level protocol API) | `<moq/moq.h>`, `<moq/session.h>`, `types.h`, `rcbuf.h`, `version.h` | the protocol engine; for relays, conformance, and app specialists who need direct control; pre-1.0 |
+| **Core session API** (lower-level protocol API) | `<moq/moq.h>`, `<moq/session.h>`, `types.h`, `rcbuf.h`, `version.h`, `location.h`, `fill.h`, `transport_binding.h`, `connection_target.h` | the protocol engine; for relays, conformance, and app specialists who need direct control; pre-1.0 |
 | **Core facade API** (lower-level conveniences, used under the service tier) | `publisher.h`, `subscriber.h`, `url.h` | publish/subscribe conveniences over the session; pre-1.0 |
 | **Relay SDK** (`moq::relay-core`, `moq::relay`) | `<moq/relay/relay.h>`, `<moq/relay/moqr_bind.h>`, `<moq/relay/moqr_shards.h>` | optional transport-independent routing and host-pumped runtime; [embedding guide](relay/README.md) and [network example](examples/relay/simple-relay/README.md); pre-1.0 |
 | **Media helpers** | `loc.h`, `cmaf.h`, `msf.h`, `media_object.h`, `playback.h`, `mpeg2ts.h` | pre-1.0 media parse/pipeline helpers (`mpeg2ts.h` with `MOQ_BUILD_MPEG2TS=ON`) |
@@ -203,7 +241,8 @@ surfaces differ in maturity and intended audience:
 | **Wire codec / tooling** | `codec.h`, `control.h`, `wire.h`, `buf.h`, `kvp.h` | draft-specific tooling for adapters/tests/tools, **not** the application API; details change across drafts |
 | **picoquic adapter** (raw + threaded) | `picoquic.h`, `picoquic_threaded.h`, `picoquic_verify.h` | transport-specific adapter API; mature but pre-1.0 |
 | **mvfst adapter** | `mvfst.h`, `mvfst.hpp` | transport-specific adapter API; mature but pre-1.0 |
-| **WebTransport adapters** | `pico_wt.h`, `pico_wt_managed.h`, `proxygen_wt.hpp` | **experimental**, expect API churn |
+| **MsQuic adapter** | `msquic.h`, `msquic_managed.h` | **experimental**, expect API churn |
+| **WebTransport adapters** | `pico_wt.h`, `pico_wt_managed.h`, `wtquic.h`, `wtquic_msquic_managed.h`, `wtquic_network_managed.h`, `proxygen_wt.hpp`, `proxygen_wt_managed.h` | **experimental**, expect API churn |
 | **Transport bridge** | `transport_bridge.h` | **private adapter SPI**, not a stable third-party/application ABI; symbols are exported from shared `moq-core` only so separately-built adapter DSOs can link them, versioned lockstep with the core and may change before 1.0/between minor releases; header excluded from install; exported set pinned by the `bridge_symbol_policy` test |
 
 Rule of thumb: build media applications on the **media service API**; drop to
@@ -224,9 +263,9 @@ tools/moq5-relay/ command, configuration, listeners and administration
 service/        moq-service: high-level media tier (endpoint, media
                 receiver/sender) over the managed adapters
 sim/            moq-sim: SimPair deterministic simulation + fault injection
-adapters/       picoquic, mvfst, pico_wt, proxygen (+ shared conformance)
+adapters/       picoquic, pico_wt, mvfst, msquic, wtquic, proxygen (+ shared helpers)
 bindings/cpp/   moq-cpp: header-only C++20 binding
-bindings/python/ CPython endpoint foundation over the installed service SDK
+bindings/python/ CPython endpoint, receiver and sender over the installed service SDK
 media/          loc, cmaf, mpeg2ts, msf catalog, media object, playback (parse helpers)
 tests/          unit, scenario, simulation, and adapter conformance tests
 fuzz/           fuzz targets and corpus
@@ -236,9 +275,10 @@ docs/           integration guide, adapter contract, conformance status
 scripts/        boundary checks, coverage, seed sweeps
 ```
 
-The [Python foundation](bindings/python/README.md) provides connection and
-endpoint lifetime management. Python media publishing/receiving and asyncio
-are separate follow-up work.
+The [Python binding](bindings/python/README.md) provides synchronous endpoint,
+media receiver and media sender APIs over the installed service SDK. See its
+support statement for the available surface and qualification limits; asyncio
+remains separate follow-up work.
 
 ## Author
 

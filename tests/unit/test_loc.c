@@ -4,12 +4,15 @@
 #include <moq/rcbuf.h>
 #include "test_support.h"
 #include "test_oom_support.h"
+#include <stdlib.h>
 #include <string.h>
 
 #define P01 MOQ_LOC_PROFILE_01
 #define D16 MOQ_VERSION_DRAFT_16
 #define D18 MOQ_VERSION_DRAFT_18
 #define P02 MOQ_LOC_PROFILE_02
+#define D22 MOQ_VERSION_DRAFT_22
+#define P04 MOQ_LOC_PROFILE_04
 
 int main(void)
 {
@@ -20,16 +23,18 @@ int main(void)
         moq_loc_headers_init(NULL);
     }
 
-    /* -- init sets struct_size --------------------------------------- */
+    /* -- init clears only the complete frozen old allocation ----------- */
     {
-        moq_loc_headers_t h;
-        moq_loc_headers_init(&h);
-        MOQ_TEST_CHECK_EQ_SIZE(h.struct_size, sizeof(moq_loc_headers_t));
-        MOQ_TEST_CHECK(h.has_timestamp == false);
-        MOQ_TEST_CHECK(h.has_timescale == false);
-        MOQ_TEST_CHECK(h.has_video_frame_marking == false);
-        MOQ_TEST_CHECK(h.has_audio_level == false);
-        MOQ_TEST_CHECK(h.has_video_config == false);
+        struct { moq_loc_headers_t h; uint8_t guard[16]; } g;
+        memset(&g, 0xAB, sizeof(g));
+        moq_loc_headers_init(&g.h);
+        MOQ_TEST_CHECK_EQ_SIZE(sizeof(g.h), MOQ_LOC_HEADERS_V0_SIZE);
+        MOQ_TEST_CHECK_EQ_SIZE(g.h.struct_size, sizeof(g.h));
+        for (size_t i = 0; i < sizeof(g.guard); ++i)
+            MOQ_TEST_CHECK(g.guard[i] == 0xAB);
+        MOQ_TEST_CHECK(!g.h.has_timestamp && !g.h.has_timescale &&
+                       !g.h.has_video_frame_marking && !g.h.has_audio_level &&
+                       !g.h.has_video_config);
     }
 
     /* -- parse empty ------------------------------------------------- */
@@ -1231,6 +1236,40 @@ int main(void)
             MOQ_TEST_CHECK(moq_loc_parse(bad_versions[i], P01, span,
                                          &parsed) == MOQ_ERR_INVAL);
         }
+    }
+
+    /* -- The revision table: LOC-01 ids on drafts 16 and 18, LOC-04 ids
+     * on draft 22; a revision paired with the wrong transport version is
+     * refused, and an unregistered version names no revision. -------- */
+    {
+        MOQ_TEST_CHECK_EQ_INT((int)moq_loc_profile_for_version(D16), (int)P01);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_loc_profile_for_version(D18), (int)P01);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_loc_profile_for_version(D22), (int)P04);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_loc_profile_for_version((moq_version_t)0), 0);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_loc_profile_for_version((moq_version_t)19), 0);
+
+        moq_loc_headers_t h;
+        moq_bytes_t empty = { NULL, 0 };
+        MOQ_TEST_CHECK(moq_loc_parse(D22, P01, empty, &h) == MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(moq_loc_parse(D16, P04, empty, &h) == MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(moq_loc_parse(D18, P04, empty, &h) == MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(moq_loc_parse(D22, P02, empty, &h) == MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(moq_loc_parse(D22, P04, empty, &h) == MOQ_ERR_INVAL);
+
+        const moq_alloc_t *alloc = moq_alloc_default();
+        moq_loc_headers_t e;
+        moq_loc_headers_init(&e);
+        e.has_timestamp = true;
+        e.timestamp = 7;
+        moq_rcbuf_t *out = NULL;
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, D22, P01, &e, &out) == MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(out == NULL);
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, D22, P04, &e, &out) == MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(out == NULL);
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, D18, P04, &e, &out) == MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(out == NULL);
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, D16, P04, &e, &out) == MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(out == NULL);
     }
 
     printf("%s: %d failures\n", failures ? "FAIL" : "PASS", failures);

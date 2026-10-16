@@ -39,6 +39,7 @@
 
 #include "session_internal.h"
 #include "../wire/control_d16_internal.h"
+#include "../wire/kvp_internal.h"
 #include "moq/control.h"
 
 /* ==================== REGION: PROFILE STATE / INIT ==================== */
@@ -180,14 +181,30 @@ static void d16_build_local_setup(const moq_session_t *s,
     }
 }
 
-/* Encode this side's CLIENT_SETUP / SERVER_SETUP into `w`: MAX_REQUEST_ID,
- * the configured AUTHORIZATION TOKENs and MAX_AUTH_TOKEN_CACHE_SIZE. */
+/* Encode this side's CLIENT_SETUP / SERVER_SETUP into `w`, parameters in
+ * ascending type order (delta-encoded): PATH, MAX_REQUEST_ID, the configured
+ * AUTHORIZATION TOKENs, MAX_AUTH_TOKEN_CACHE_SIZE, AUTHORITY. A client
+ * carried natively over QUIC names its connection target: PATH is the URI's
+ * path-abempty with "?" and the query appended when present, AUTHORITY the
+ * URI's authority (§9.3.1.1, §9.3.1.2). Neither is sent by a server, over
+ * WebTransport, or by a session never told its target. */
 static moq_result_t d16_encode_setup(moq_session_t *s,
                                      const moq_setup_params_t *local,
                                      bool is_client, moq_buf_writer_t *w)
 {
     moq_kvp_entry_t params[4 + MOQ_DECODED_MAX_TOKENS];
     size_t param_count = 0;
+    const bool target = is_client && moq_binding_sends_target(s);
+
+    if (target) {
+        params[param_count].type      = MOQ_SETUP_PARAM_PATH;
+        params[param_count].value     = s->binding.value.path_query.data;
+        params[param_count].value_len = s->binding.value.path_query.len;
+        params[param_count].is_varint = false;
+        params[param_count].raw       = NULL;
+        params[param_count].raw_len   = 0;
+        param_count++;
+    }
 
     uint8_t vbuf[8];
     if (local->has_max_request_id) {
@@ -227,6 +244,16 @@ static moq_result_t d16_encode_setup(moq_session_t *s,
         param_count++;
     }
 
+    if (target) {
+        params[param_count].type      = MOQ_SETUP_PARAM_AUTHORITY;
+        params[param_count].value     = s->binding.value.authority.data;
+        params[param_count].value_len = s->binding.value.authority.len;
+        params[param_count].is_varint = false;
+        params[param_count].raw       = NULL;
+        params[param_count].raw_len   = 0;
+        param_count++;
+    }
+
     return is_client ? moq_d16_encode_client_setup(w, params, param_count)
                      : moq_d16_encode_server_setup(w, params, param_count);
 }
@@ -246,6 +273,8 @@ static moq_result_t d16_encode_and_queue_setup(moq_session_t *s,
     size_t cap = 256;
     for (size_t i = 0; i < s->setup_token_count; i++)
         cap += s->setup_token_wire[i].len + 16u;
+    if (is_client && moq_binding_sends_target(s))
+        cap += s->binding.value.path_query.len + s->binding.value.authority.len;
     uint8_t stack_buf[256];
     uint8_t *buf = stack_buf;
     if (cap > sizeof(stack_buf)) {
@@ -394,6 +423,28 @@ static moq_result_t d16_handle_setup_client(moq_session_t *s,
     uint64_t err = d16_validate_peer_setup_params(&peer_tmp, setup.params,
                                                    setup.params_count, true);
     if (err) return close_with_error(s, err, "invalid setup parameter");
+    /* PATH and AUTHORITY are carried natively over QUIC only (§9.3.1.1,
+     * §9.3.1.2): over WebTransport each is INVALID_*, a value outside RFC 3986
+     * syntax is MALFORMED_*, and a raw server bound with a URI policy lets it
+     * decide whether it serves the named target. The policy may run again if
+     * this CLIENT_SETUP has to be retried before it commits. */
+    {
+        moq_bytes_t path = {0}, authority = {0};
+        for (size_t i = 0; i < setup.params_count; i++) {
+            if (setup.params[i].type == MOQ_SETUP_PARAM_PATH) {
+                path.data = setup.params[i].value;
+                path.len = setup.params[i].value_len;
+            } else if (setup.params[i].type == MOQ_SETUP_PARAM_AUTHORITY) {
+                authority.data = setup.params[i].value;
+                authority.len = setup.params[i].value_len;
+            }
+        }
+        const char *reason = NULL;
+        err = moq_binding_judge_peer_target(s, peer_tmp.has_path, path,
+                                            peer_tmp.has_authority, authority,
+                                            &reason);
+        if (err) return close_with_error(s, err, reason);
+    }
     if (!d16_setup_tokens_fit(&setup))
         return close_with_error(s, 0x1,
             "CLIENT_SETUP has more authorization tokens than this side holds");
@@ -833,7 +884,7 @@ static moq_result_t d16_handle_goaway(moq_session_t *s,
     if (rc < 0)
         return close_with_error(s, 0x3, "malformed GOAWAY");
 
-    return session_core_on_goaway(s, goaway.uri, goaway.uri_len);
+    return session_core_on_goaway(s, goaway.uri, goaway.uri_len, false, 0);
 }
 
 /* ==================== REGION: SHARED MESSAGE-PARAM VALIDATION KERNEL ==================== */
@@ -1016,11 +1067,6 @@ static moq_result_t d16_decode_subscribe(moq_session_t *s,
         *out_consumed = true;
         return close_with_error(s, 0x3, "SUBSCRIBE before ESTABLISHED");
     }
-    /* After our GOAWAY (§10.4) the peer must not open new requests. */
-    if (session_refuses_new_requests(s)) {
-        *out_consumed = true;
-        return close_with_error(s, 0x3, "SUBSCRIBE after local GOAWAY");
-    }
 
     /* Wire decode. */
     moq_bytes_t ns_parts[32];
@@ -1090,7 +1136,15 @@ static moq_result_t d16_decode_subscribe(moq_session_t *s,
         return MOQ_OK;
     }
 
-    if (auth_reject_code) {
+    /* A new request that crossed our GOAWAY (§9.4: the peer "SHOULD NOT
+     * initiate new requests"; we "MAY reject" them) is refused with a
+     * REQUEST_ERROR, never a session close. */
+    bool refuse = auth_reject_code != 0;
+    if (!refuse && session_refuses_new_requests(s)) {
+        refuse = true;
+        auth_reject_code = s->profile->going_away_request_error;
+    }
+    if (refuse) {
         uint8_t err_buf[256];
         moq_buf_writer_t ew;
         moq_buf_writer_init(&ew, err_buf, sizeof(err_buf));
@@ -1262,6 +1316,15 @@ static moq_result_t d16_validate_publisher_group_order(const uint8_t *data,
     }
 }
 
+/* The local check of a Track Extension set this side states: DYNAMIC_GROUPS
+ * 0 or 1 (§11.1.1.3: a peer closes on more), as the receiving side checks it.
+ * Structure is checked by the delivery-timeout scan beside it. */
+static moq_result_t d16_validate_track_properties(const uint8_t *data, size_t len)
+{
+    bool dyn = false;
+    return d16_scan_extensions_dynamic_groups(data, len, &dyn);
+}
+
 /* -- D16 inbound SUBSCRIBE_OK decode ------------------------------- */
 
 static const uint64_t d16_subscribe_ok_allowed_params[] = {
@@ -1335,8 +1398,7 @@ static moq_result_t d16_decode_subscribe_ok(moq_session_t *s,
         return close_with_error(s, perr, "invalid SUBSCRIBE_OK parameter");
     }
 
-    if (sub_track_alias_in_use(s, ok.track_alias) ||
-        pub_track_alias_in_use(s, ok.track_alias)) {
+    if (peer_track_alias_in_use(s, ok.track_alias)) {
         *out_consumed = true;
         return close_with_error(s, 0x5, "duplicate track alias");
     }
@@ -1601,11 +1663,6 @@ static moq_result_t d16_decode_publish_namespace(
         *out_consumed = true;
         return close_with_error(s, 0x3, "PUBLISH_NAMESPACE before ESTABLISHED");
     }
-    /* After our GOAWAY (§10.4) the peer must not open new requests. */
-    if (session_refuses_new_requests(s)) {
-        *out_consumed = true;
-        return close_with_error(s, 0x3, "PUBLISH_NAMESPACE after local GOAWAY");
-    }
 
     moq_bytes_t ns_parts[32];
     moq_kvp_entry_t params[16];
@@ -1672,7 +1729,15 @@ static moq_result_t d16_decode_publish_namespace(
         return MOQ_OK;
     }
 
-    if (auth_reject_code) {
+    /* A new request that crossed our GOAWAY (§9.4: the peer "SHOULD NOT
+     * initiate new requests"; we "MAY reject" them) is refused with a
+     * REQUEST_ERROR, never a session close. */
+    bool refuse = auth_reject_code != 0;
+    if (!refuse && session_refuses_new_requests(s)) {
+        refuse = true;
+        auth_reject_code = s->profile->going_away_request_error;
+    }
+    if (refuse) {
         uint8_t err_buf[256];
         moq_buf_writer_t ew;
         moq_buf_writer_init(&ew, err_buf, sizeof(err_buf));
@@ -1721,11 +1786,6 @@ static moq_result_t d16_decode_fetch(moq_session_t *s,
     if (!session_is_active(s)) {
         *out_consumed = true;
         return close_with_error(s, 0x3, "FETCH before ESTABLISHED");
-    }
-    /* After our GOAWAY (§10.4) the peer must not open new requests. */
-    if (session_refuses_new_requests(s)) {
-        *out_consumed = true;
-        return close_with_error(s, 0x3, "FETCH after local GOAWAY");
     }
 
     moq_bytes_t ns_parts[32];
@@ -1788,7 +1848,15 @@ static moq_result_t d16_decode_fetch(moq_session_t *s,
     if (rc < 0) { *out_consumed = true; return rc; }
     if (s->state == MOQ_SESS_CLOSED) { *out_consumed = true; return MOQ_OK; }
 
-    if (auth_reject_code) {
+    /* A new request that crossed our GOAWAY (§9.4: the peer "SHOULD NOT
+     * initiate new requests"; we "MAY reject" them) is refused with a
+     * REQUEST_ERROR, never a session close. */
+    bool refuse = auth_reject_code != 0;
+    if (!refuse && session_refuses_new_requests(s)) {
+        refuse = true;
+        auth_reject_code = s->profile->going_away_request_error;
+    }
+    if (refuse) {
         uint8_t err_buf[256];
         moq_buf_writer_t ew;
         moq_buf_writer_init(&ew, err_buf, sizeof(err_buf));
@@ -1937,11 +2005,6 @@ static moq_result_t d16_decode_publish(moq_session_t *s,
         *out_consumed = true;
         return close_with_error(s, 0x3, "PUBLISH before ESTABLISHED");
     }
-    /* After our GOAWAY (§10.4) the peer must not open new requests. */
-    if (session_refuses_new_requests(s)) {
-        *out_consumed = true;
-        return close_with_error(s, 0x3, "PUBLISH after local GOAWAY");
-    }
 
     /* Wire decode. */
     moq_bytes_t ns_parts[32];
@@ -2021,7 +2084,15 @@ static moq_result_t d16_decode_publish(moq_session_t *s,
         return MOQ_OK;
     }
 
-    if (auth_reject_code) {
+    /* A new request that crossed our GOAWAY (§9.4: the peer "SHOULD NOT
+     * initiate new requests"; we "MAY reject" them) is refused with a
+     * REQUEST_ERROR, never a session close. */
+    bool refuse = auth_reject_code != 0;
+    if (!refuse && session_refuses_new_requests(s)) {
+        refuse = true;
+        auth_reject_code = s->profile->going_away_request_error;
+    }
+    if (refuse) {
         uint8_t err_buf[256];
         moq_buf_writer_t ew;
         moq_buf_writer_init(&ew, err_buf, sizeof(err_buf));
@@ -2397,7 +2468,8 @@ static moq_result_t d16_decode_unsubscribe(
                 "UNSUBSCRIBE for non-established publish");
         }
         *out_consumed = true;
-        return session_core_on_publish_unsubscribed(s, ep.slot);
+        return session_core_on_publish_unsubscribed(s, ep.slot,
+                                                    request_terminal_by_message(), 0);
     }
 
     /* Subscription path: validate peer parity. */
@@ -2611,11 +2683,6 @@ static moq_result_t d16_decode_track_status_request(moq_session_t *s,
         *out_consumed = true;
         return close_with_error(s, 0x3, "TRACK_STATUS before ESTABLISHED");
     }
-    /* After our GOAWAY (§10.4) the peer must not open new requests. */
-    if (session_refuses_new_requests(s)) {
-        *out_consumed = true;
-        return close_with_error(s, 0x3, "TRACK_STATUS after local GOAWAY");
-    }
 
     moq_bytes_t ns_parts[32];
     moq_kvp_entry_t params[16];
@@ -2678,7 +2745,15 @@ static moq_result_t d16_decode_track_status_request(moq_session_t *s,
         return MOQ_OK;
     }
 
-    if (auth_reject_code) {
+    /* A new request that crossed our GOAWAY (§9.4: the peer "SHOULD NOT
+     * initiate new requests"; we "MAY reject" them) is refused with a
+     * REQUEST_ERROR, never a session close. */
+    bool refuse = auth_reject_code != 0;
+    if (!refuse && session_refuses_new_requests(s)) {
+        refuse = true;
+        auth_reject_code = s->profile->going_away_request_error;
+    }
+    if (refuse) {
         uint8_t err_buf[256];
         moq_buf_writer_t ew;
         moq_buf_writer_init(&ew, err_buf, sizeof(err_buf));
@@ -2952,7 +3027,7 @@ static moq_result_t d16_handle_control_message(moq_session_t *s,
             bool can_retry_p = (err.retry_interval > 0);
             return session_core_on_publish_error(s, ep.slot, err.error_code,
                 can_retry_p, can_retry_p ? (err.retry_interval - 1) : 0,
-                err.reason, err.reason_len, true);
+                err.reason, err.reason_len, true, NULL);
         }
         case MOQ_REQ_NAMESPACE_SUB:
             return close_with_error(s, 0x3,
@@ -2978,7 +3053,7 @@ static moq_result_t d16_handle_control_message(moq_session_t *s,
             if (ep.slot >= 0 && (size_t)ep.slot < s->sub_cap &&
                 s->subs[ep.slot].update_pending &&
                 s->subs[ep.slot].update_request_id == err.request_id)
-                return session_core_on_subscribe_update_error(s, ep.slot);
+                return session_core_on_subscribe_update_error(s, ep.slot, err.error_code);
             return MOQ_OK;
         }
         case MOQ_REQ_PUBLICATION_UPDATE: {
@@ -3448,6 +3523,7 @@ static moq_result_t d16_encode_subscribe(moq_session_t *s,
                                           const moq_subscribe_encode_args_t *args)
 {
     uint8_t local_param_bufs[8][16];
+    uint8_t filter_buf[4 * MOQ_QUIC_VARINT_MAX_LEN];
     moq_kvp_entry_t local_params[8];
     size_t param_count = 0;
 
@@ -3486,6 +3562,11 @@ static moq_result_t d16_encode_subscribe(moq_session_t *s,
         param_count++; pbi++;
     }
     if (args->filter != MOQ_SUBSCRIBE_FILTER_NONE) {
+        /* A relative start more than one group back and an absolute end
+         * object have no form on this draft. */
+        if (args->filter == MOQ_SUBSCRIBE_FILTER_RELATIVE_GROUP_INTERNAL ||
+            args->filter == MOQ_SUBSCRIBE_FILTER_OBJECT_END_INTERNAL)
+            return MOQ_ERR_UNSUPPORTED;
         moq_d16_subscription_filter_t f = {
             .filter_type = args->filter,
             .start_group = args->start_group,
@@ -3494,16 +3575,16 @@ static moq_result_t d16_encode_subscribe(moq_session_t *s,
         };
         size_t flen = 0;
         moq_result_t frc = moq_d16_encode_subscription_filter(
-            local_param_bufs[pbi], 16, &flen, &f);
+            filter_buf, sizeof(filter_buf), &flen, &f);
         if (frc < 0) {
             s->output_scratch_len = scratch_saved;
             return MOQ_ERR_INVAL;
         }
         params[param_count] = (moq_kvp_entry_t){
             .type = MOQ_MSG_PARAM_SUBSCRIPTION_FILTER,
-            .value = local_param_bufs[pbi], .value_len = flen,
+            .value = filter_buf, .value_len = flen,
             .is_varint = false, .raw = NULL, .raw_len = 0 };
-        param_count++; pbi++;
+        param_count++;
     }
     if (args->group_order != MOQ_GROUP_ORDER_DEFAULT) {
         size_t n = moq_quic_varint_encode(args->group_order,
@@ -3543,6 +3624,16 @@ static moq_result_t d16_encode_subscribe_ok(moq_session_t *s,
     size_t param_count = 0;
     uint8_t param_bufs[4][16];
 
+    /* Delta-typed parameters must remain in ascending type order. */
+    if (args->has_expires && args->expires_ms > 0) {
+        size_t n = moq_quic_varint_encode(args->expires_ms,
+                                           param_bufs[param_count], 16);
+        params[param_count] = (moq_kvp_entry_t){
+            .type = MOQ_MSG_PARAM_EXPIRES,
+            .value = param_bufs[param_count], .value_len = n,
+            .is_varint = true, .raw = NULL, .raw_len = 0 };
+        param_count++;
+    }
     if (args->has_largest) {
         moq_buf_writer_t lw;
         moq_buf_writer_init(&lw, param_bufs[param_count], 16);
@@ -3555,19 +3646,10 @@ static moq_result_t d16_encode_subscribe_ok(moq_session_t *s,
             .is_varint = false, .raw = NULL, .raw_len = 0 };
         param_count++;
     }
-    if (args->has_expires && args->expires_ms > 0) {
-        size_t n = moq_quic_varint_encode(args->expires_ms,
-                                           param_bufs[param_count], 16);
-        params[param_count] = (moq_kvp_entry_t){
-            .type = MOQ_MSG_PARAM_EXPIRES,
-            .value = param_bufs[param_count], .value_len = n,
-            .is_varint = true, .raw = NULL, .raw_len = 0 };
-        param_count++;
-    }
-
     return moq_d16_encode_subscribe_ok(w, args->request_id, args->track_alias,
         params, param_count,
-        args->track_properties, args->track_properties_len);
+        args->omit_track_properties ? NULL : args->track_properties,
+        args->omit_track_properties ? 0 : args->track_properties_len);
 }
 
 static moq_result_t d16_encode_request_ok(moq_session_t *s,
@@ -3631,6 +3713,7 @@ static moq_result_t d16_encode_request_update_op(moq_session_t *s,
     moq_buf_writer_t *w,
     const moq_request_update_encode_args_t *args)
 {
+    if (args->sender != MOQ_UPDATE_SENDER_SUBSCRIBER) return MOQ_ERR_UNSUPPORTED;
     /* Params must be in ascending KVP type order: DELIVERY_TIMEOUT 0x02,
      * AUTH_TOKEN 0x03 (repeatable), FORWARD 0x10, SUBSCRIBER_PRIORITY
      * 0x20. With auth tokens the entry array and encoded token values
@@ -3869,6 +3952,59 @@ static bool d16_track_properties_dynamic_groups(const uint8_t *data,
     if (d16_scan_extensions_dynamic_groups(data, len, &dyn) < 0)
         return false;
     return dyn;
+}
+
+/* §11.1.1.3 DYNAMIC_GROUPS (0x30) = 1 added to a Track Extension list. */
+static moq_result_t d16_track_properties_add_dynamic_groups(const uint8_t *in,
+                                                            size_t len,
+                                                            uint8_t *out,
+                                                            size_t cap,
+                                                            size_t *out_len)
+{
+    return moq_kvp_list_add_int(in, len, false, D16_EXT_DYNAMIC_GROUPS, 1,
+                                out, cap, out_len);
+}
+
+/* §11.1.1.2 DEFAULT_PUBLISHER_GROUP_ORDER Track Extension (0x22). */
+#define D16_EXT_GROUP_ORDER 0x22u
+static uint8_t d16_track_properties_group_order(const uint8_t *data, size_t len)
+{
+    uint8_t order = MOQ_GROUP_ORDER_DEFAULT;
+    if (!data || len == 0) return order;
+    moq_kvp_decoder_t dec;
+    moq_kvp_decoder_init(&dec, data, len);
+    for (;;) {
+        moq_kvp_entry_t e;
+        if (moq_kvp_decode_next(&dec, &e) != MOQ_OK) return order;
+        if (e.type != D16_EXT_GROUP_ORDER) continue;
+        uint64_t v = 0;
+        size_t n = moq_quic_varint_decode(e.value, e.value_len, &v);
+        if (n != 0 && n == e.value_len &&
+            (v == MOQ_GROUP_ORDER_ASCENDING || v == MOQ_GROUP_ORDER_DESCENDING))
+            order = (uint8_t)v;
+    }
+}
+
+/* §11.1.1 MAX_CACHE_DURATION Track Extension (0x04), milliseconds. */
+#define D16_EXT_MAX_CACHE_DURATION 0x04u
+static bool d16_track_properties_max_cache(const uint8_t *data, size_t len,
+                                           uint64_t *out_ms)
+{
+    bool found = false;
+    if (!data || len == 0) return false;
+    moq_kvp_decoder_t dec;
+    moq_kvp_decoder_init(&dec, data, len);
+    for (;;) {
+        moq_kvp_entry_t e;
+        if (moq_kvp_decode_next(&dec, &e) != MOQ_OK) return found;
+        if (e.type != D16_EXT_MAX_CACHE_DURATION) continue;
+        uint64_t v = 0;
+        size_t n = moq_quic_varint_decode(e.value, e.value_len, &v);
+        if (n != 0 && n == e.value_len) {
+            *out_ms = v;
+            found = true;
+        }
+    }
 }
 
 static moq_result_t d16_encode_publish_ok_op(
@@ -4274,8 +4410,10 @@ static moq_result_t d16_decode_subgroup_header_op(moq_session_t *s,
     out->track_alias = hdr.track_alias;
     out->group_id = hdr.group_id;
     out->publisher_priority = hdr.default_priority ? 128 : hdr.publisher_priority;
+    out->default_priority = false; /* Held D16 compatibility, not conformance. */
     out->has_extensions = hdr.has_extensions;
     out->end_of_group = hdr.end_of_group;
+    out->first_object = false;   /* draft-16 headers have no FIRST_OBJECT bit */
     switch (hdr.subgroup_id_mode) {
     case MOQ_SUBGROUP_ID_MODE_ZERO:
         out->subgroup_id = 0;
@@ -4297,7 +4435,10 @@ static moq_result_t d16_decode_subgroup_header_op(moq_session_t *s,
     return MOQ_OK;
 }
 
-static moq_object_status_t d16_wire_status_to_semantic(uint8_t wire_status)
+/* §10.2.1.1: Normal (0x0), End of Group (0x3) and End of Track (0x4) are the
+ * registered statuses; any other value, judged on the whole decoded varint,
+ * maps to 0xFF for the caller's PROTOCOL_VIOLATION. */
+static moq_object_status_t d16_wire_status_to_semantic(uint64_t wire_status)
 {
     switch (wire_status) {
     case 0x0: return MOQ_OBJECT_NORMAL;
@@ -4405,8 +4546,8 @@ static moq_result_t d16_decode_object_header(moq_session_t *s,
                                               bool has_prev_object,
                                               moq_decoded_object_header_t *out)
 {
-    (void)s;
     memset(out, 0, sizeof(*out));
+    bool track_scoped = s && s->profile && s->profile->malformed_track_local;
 
     uint64_t delta;
     if (moq_buf_read_varint(r, &delta) < 0) return MOQ_ERR_BUFFER;
@@ -4414,7 +4555,10 @@ static moq_result_t d16_decode_object_header(moq_session_t *s,
     if (has_extensions) {
         uint64_t ext_len;
         if (moq_buf_read_varint(r, &ext_len) < 0) return MOQ_ERR_BUFFER;
-        if ((size_t)ext_len > moq_buf_reader_remaining(r))
+        /* Compare at full width: a length beyond the buffered input (which
+         * includes any length above SIZE_MAX) waits for more bytes rather than
+         * narrowing to a smaller size_t. */
+        if (ext_len > moq_buf_reader_remaining(r))
             return MOQ_ERR_BUFFER;
         if (ext_len > 0) {
             const uint8_t *ext_ptr = moq_buf_reader_ptr(r);
@@ -4424,7 +4568,12 @@ static moq_result_t d16_decode_object_header(moq_session_t *s,
             moq_result_t kvp_rc;
             while ((kvp_rc = moq_kvp_decode_next(&kvp_dec, &kvp_entry)) == MOQ_OK)
                 ;
-            if (kvp_rc != MOQ_DONE) return MOQ_ERR_PROTO;
+            /* §11.2 "A Key-Value-Pair cannot be parsed" makes the Track
+             * malformed (§2.4.2), not the session. */
+            if (kvp_rc != MOQ_DONE) {
+                if (!track_scoped) return MOQ_ERR_PROTO;
+                out->malformed = MOQ_MALFORMED_PROPS_UNPARSEABLE;
+            }
             out->has_properties = true;
             out->properties = ext_ptr;
             out->properties_len = (size_t)ext_len;
@@ -4436,12 +4585,10 @@ static moq_result_t d16_decode_object_header(moq_session_t *s,
     if (moq_buf_read_varint(r, &payload_len) < 0) return MOQ_ERR_BUFFER;
     out->payload_len = payload_len;
 
-    uint8_t wire_status = 0;
+    uint64_t wire_status = 0;
     bool has_status = (payload_len == 0);
     if (has_status) {
-        uint64_t st;
-        if (moq_buf_read_varint(r, &st) < 0) return MOQ_ERR_BUFFER;
-        wire_status = (uint8_t)st;
+        if (moq_buf_read_varint(r, &wire_status) < 0) return MOQ_ERR_BUFFER;
     }
 
     moq_object_status_t semantic = d16_wire_status_to_semantic(
@@ -4586,7 +4733,9 @@ static moq_result_t d16_encode_fetch_ok_op(moq_session_t *s,
         .end_group = args->end_group,
         .end_object = args->end_object,
         .params = NULL, .params_count = 0, .params_cap = 0,
-        .track_extensions = NULL, .track_extensions_len = 0,
+        /* §9.17 (Figure 19): FETCH_OK ends with the Track Extensions. */
+        .track_extensions = args->track_properties,
+        .track_extensions_len = args->track_properties_len,
     };
     return moq_d16_encode_fetch_ok(w, &ok);
 }
@@ -4624,10 +4773,12 @@ static uint32_t d16_classify_data_stream(const uint8_t *data, size_t len)
 
 static moq_result_t d16_decode_fetch_object_op(moq_session_t *s,
                                                  moq_buf_reader_t *r,
+                                                 moq_group_order_t effective_order,
                                                  const moq_fetch_prior_object_t *prev,
                                                  moq_decoded_fetch_object_t *out)
 {
     (void)s;
+    (void)effective_order;  /* draft-16 carries absolute locations */
     const moq_d16_fetch_object_t *wire_prev = NULL;
     moq_d16_fetch_object_t prev_wire;
     /* Build a prior object only from an actual prior object (has_actual), not
@@ -4664,10 +4815,12 @@ static moq_result_t d16_decode_fetch_object_op(moq_session_t *s,
 
 static moq_result_t d16_encode_fetch_object_op(moq_session_t *s,
                                                  moq_buf_writer_t *w,
+                                                 moq_group_order_t effective_order,
                                                  const moq_fetch_object_encode_args_t *args,
                                                  const moq_fetch_prior_object_t *prev)
 {
     (void)s;
+    (void)effective_order;  /* draft-16 carries absolute locations */
     /* draft-16 fetch-object serialization has no Datagram forwarding-preference
      * bit; refuse rather than silently dropping the requested preference. */
     if (args->datagram) return MOQ_ERR_INVAL;
@@ -4926,6 +5079,15 @@ static const moq_profile_ops_t d16_ops = {
     .encode_goaway          = d16_encode_goaway,
     .encode_publish         = d16_encode_publish_op,
     .track_properties_dynamic_groups = d16_track_properties_dynamic_groups,
+    .track_properties_add_dynamic_groups = d16_track_properties_add_dynamic_groups,
+    .validate_track_properties = d16_validate_track_properties,
+    .track_properties_group_order = d16_track_properties_group_order,
+    .track_properties_max_cache = d16_track_properties_max_cache,
+    /* §2.4.2: "When a subscriber detects a Malformed Track, it MUST
+     * UNSUBSCRIBE any subscription and FETCH_CANCEL any fetch for that Track
+     * from that publisher". */
+    .malformed_track_local = true,
+    .scan_default_publisher_priority = NULL, /* Held Track Extension support. */
     .scan_delivery_timeouts = d16_scan_delivery_timeouts,
     .encode_setup_token     = d16_encode_setup_token,
     .encode_own_setup       = d16_encode_own_setup,
@@ -4963,18 +5125,39 @@ static const moq_profile_ops_t d16_ops = {
     .semantic_request_error          = d16_semantic_request_error,
     .fetch_descending_supported      = true,   /* absolute Group IDs on the wire */
     .uses_uni_control_channel        = false,
+    .wire_ready                      = true,
+    .request_retains_pending_original_input = false,
+    .request_fin_is_not_cancel       = false,
+    .premature_fin_fails_request     = false,
+    .request_drain_requires_receive_terminal = false,
+    .allows_concurrent_subscriptions = false,
+    .duplicate_subscription_error = MOQ_REQUEST_ERROR_DUPLICATE_SUBSCRIPTION,
+    .publish_initial_parameters      = false,
+    .publish_ok_carries_params       = true,
+    .supports_joining_fetch          = true,
+    .supports_fill                   = false,
+    .stream_count_unknown            = MOQ_QUIC_VARINT_MAX,
+    .subgroup_timer_at_fin           = false,
+    .object_timer_at_header          = true,
+    .first_object_timeout_override   = false,
+    .publish_done_subscription_ended = true,
+    .redirect_on_any_request         = false,
+    .request_update_errors_coalesce  = false,
+    .request_updates_max             = 0,   /* no bound is advertised */
+    .request_updates_exceeded_error  = 0,
+    /* §13.4.2 registers no GOING_AWAY REQUEST_ERROR code. */
+    .going_away_request_error        = MOQ_REQUEST_ERROR_INTERNAL_ERROR,
+    .capacity_request_error          = MOQ_REQUEST_ERROR_INTERNAL_ERROR,
+    .capacity_request_error_retryable = false,
+    .reserved_session_namespaces     = false,
+    .relative_group_clamps           = false,
+    .binding_requirements            = 0,
+    .auth_token_type_max             = MOQ_QUIC_VARINT_MAX,  /* §9.2.2.1: (i) */
     .classify_uni_stream             = NULL,
     .validate_inbound_request_stream = NULL,
 };
 
-const moq_profile_ops_t *moq_profile_lookup(moq_version_t version)
+const moq_profile_ops_t *moq_d16_profile_ops(void)
 {
-    switch (version) {
-    case MOQ_VERSION_DRAFT_16:
-        return &d16_ops;
-    case MOQ_VERSION_DRAFT_18:
-        return moq_d18_profile_ops();
-    default:
-        return NULL;
-    }
+    return &d16_ops;
 }

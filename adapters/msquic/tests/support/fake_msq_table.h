@@ -101,13 +101,18 @@ typedef struct fake_msq_send {
     fake_msq_stream_t *stream;
     const uint8_t *data;       /* first buffer's bytes (borrowed) */
     uint32_t len;              /* first buffer's length */
+    /* the send's whole buffer array, borrowed exactly as MsQuic borrows
+     * it: valid until this send's completion is delivered */
+    const QUIC_BUFFER *bufs;
     uint32_t buf_count;        /* buffers in this send */
     uint64_t total;            /* sum over all buffers */
     QUIC_SEND_FLAGS flags;
     void *client_ctx;
     bool completed;
     /* all buffers concatenated (capped) — a stable copy for relaying a
-     * send's bytes into a peer's receive path in paired tests */
+     * send's bytes into a peer's receive path in paired tests. A buffer
+     * that would overflow the cap is skipped whole, so bytes_len < total
+     * marks a copy that is NOT the send's byte sequence. */
     uint8_t bytes[FAKE_MSQ_SEND_CAP];
     uint32_t bytes_len;
 } fake_msq_send_t;
@@ -132,9 +137,17 @@ struct fake_msq {
     int dgram_count;
 
     int stream_start_fails;    /* make the next N StreamStart calls fail
-                                  synchronously, as MsQuic does when the
-                                  connection is already winding down */
-    int stream_send_fails;     /* make the next N StreamSend calls fail */
+                                  synchronously with a hard refusal
+                                  (QUIC_STATUS_OUT_OF_MEMORY) */
+    int stream_send_fails;     /* make the next N StreamSend calls fail,
+                                  the same way */
+    QUIC_STATUS stream_shutdown_status; /* synchronous shutdown refusal;
+                                           SUCCESS by default */
+    /* The peer has closed the connection, but its shutdown event has not
+     * been delivered yet. From here StreamOpen, StreamStart and StreamSend
+     * refuse with QUIC_STATUS_ABORTED, exactly as MsQuic's API does once
+     * the connection is ClosedRemotely. */
+    bool closed_remotely;
     int dgram_send_fails;      /* make the next N DatagramSend calls fail */
     int recv_set_enabled_fails;/* make the next N StreamReceiveSetEnabled
                                   calls fail (exercises the resume-fatal
@@ -150,6 +163,14 @@ struct fake_msq {
      * connection handle, with the context registered beside it. */
     QUIC_CONNECTION_CALLBACK_HANDLER conn_cb;
     void *conn_ctx;
+
+    /* SetParam on a stream handle: the calls, the last parameter and its
+     * 64-bit value (QUIC_PARAM_STREAM_RELIABLE_OFFSET), and an injected
+     * refusal for the next N calls (MsQuic's INVALID_STATE). */
+    int stream_setparam_calls;
+    uint32_t last_stream_param;
+    uint64_t last_stream_param_u64;
+    int stream_setparam_fails;
 };
 
 void fake_msq_init(fake_msq_t *f, bool is_client);

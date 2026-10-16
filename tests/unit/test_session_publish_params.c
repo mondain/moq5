@@ -719,7 +719,7 @@ static void test_d18_publish_ok_expires_legal_largest_fatal(void)
         moq_event_cleanup(&req);
         int slot = pub_resolve_handle(cl, cl_pub);
         MOQ_TEST_CHECK(slot >= 0);
-        moq_stream_ref_t ref = cl->publishes[slot].request_stream_ref;
+        moq_stream_ref_t ref = cl->publishes[slot].rs.ref;
 
         moq_d18_msg_params_t mp = {0};
         mp.has_expires = true; mp.expires_ms = 7500;
@@ -750,7 +750,7 @@ static void test_d18_publish_ok_expires_legal_largest_fatal(void)
         moq_event_cleanup(&req);
         int slot = pub_resolve_handle(cl, cl_pub);
         MOQ_TEST_CHECK(slot >= 0);
-        moq_stream_ref_t ref = cl->publishes[slot].request_stream_ref;
+        moq_stream_ref_t ref = cl->publishes[slot].rs.ref;
 
         moq_d18_msg_params_t mp = {0};
         mp.has_largest = true; mp.largest_group = 1; mp.largest_object = 1;

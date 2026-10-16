@@ -499,7 +499,7 @@ jobs:
       - name: Test (in-process adapter subset)
         run: >
           ctest --test-dir build/pq-ci --output-on-failure
-          -R '^(pq_conformance|adapter_backpressure|threaded_compile|threaded_tls_policy|threaded_tls_handshake|scenario_backpressure|scenario_delay_backpressure)$'
+          -R '^(pq_conformance|adapter_backpressure|pq_send_queue_offsets|threaded_compile|threaded_tls_policy|threaded_tls_handshake|scenario_backpressure|scenario_delay_backpressure)$'
 
       # Cold-consumer / packaging tier (kept separate so a packaging
       # failure is distinguishable from an adapter-behavior failure).
@@ -556,6 +556,8 @@ jobs:
         run: cmake --build build/pico-wt-ci
 
       # The 0x10 hard-failure teardown regression lives in pico_wt_loopback;
+      # pico_wt_loopback_private runs the loopback rows that call the
+      # adapter's private endpoint constructor;
       # pico_wt_conformance covers the WebTransport scenario suite and
       # pico_wt_public_compile proves the standalone public header.
       # pq_reset_after_fin pins the patched picoquic's reset-after-FIN
@@ -565,7 +567,7 @@ jobs:
       - name: Test (pico_wt regression + conformance)
         run: >
           ctest --test-dir build/pico-wt-ci --output-on-failure
-          -R '^(pq_close_reason|pq_close_reason_oom|pq_reset_after_fin|pico_wt_public_compile|pico_wt_capsule_sequence|pico_wt_loopback|pico_wt_conformance|pico_wt_managed_early_streams|pico_wt_managed_edges|pico_wt_rx_lifecycle|pico_wt_backpressure|pico_wt_hold_input|pico_wt_managed_keepalive|pico_wt_managed_keepalive_server|pico_wt_managed_stop_close|pico_wt_managed_pump_exit_close|pico_wt_managed_cfg_abi|endpoint_resolve|endpoint_wt_target)$'
+          -R '^(pq_close_reason|pq_close_reason_oom|pq_reset_after_fin|pico_wt_public_compile|pico_wt_capsule_sequence|pico_wt_loopback|pico_wt_loopback_private|pico_wt_conformance|pico_wt_managed_early_streams|pico_wt_managed_edges|pico_wt_rx_lifecycle|pico_wt_backpressure|pico_wt_hold_input|pico_wt_reset_after_fin|pico_wt_managed_keepalive|pico_wt_managed_keepalive_server|pico_wt_managed_stop_close|pico_wt_managed_pump_exit_close|pico_wt_managed_cfg_abi|endpoint_resolve|endpoint_wt_target)$'
 
       # Static archives conceal private references crossing adapter DSOs.
       # Require complete shared-library links, including the managed facade.
@@ -761,6 +763,61 @@ jobs:
         run: scripts/check_profile_boundary.sh
       - name: Process labels
         run: scripts/check_process_labels.sh
+      - name: ILP32 headers
+        run: scripts/check_ilp32_headers.sh
+
+  stack-frame-checks:
+    name: Stack Frames (${{ matrix.os }}, ${{ matrix.cc }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            cc: gcc
+          - os: macos-latest
+            cc: clang
+    env:
+      CC: ${{ matrix.cc }}
+      NM: nm
+    steps:
+      - uses: actions/checkout@v5
+      - name: Select macOS SDK
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          sdk=$(xcrun --sdk macosx --show-sdk-path 2> "$RUNNER_TEMP/stack-sdk.stderr")
+          cat "$RUNNER_TEMP/stack-sdk.stderr" >&2
+          test ! -s "$RUNNER_TEMP/stack-sdk.stderr"
+          test -d "$sdk"
+          printf 'SDKROOT=%s\n' "$sdk" >> "$GITHUB_ENV"
+      - name: SETUP and GOAWAY frames
+        shell: bash
+        run: |
+          compiler=$(command -v "$CC")
+          for gate in d22_setup_stack session_goaway_stack stack_gate_controls; do
+            /bin/bash "tests/check_${gate}.sh" "$PWD" "$compiler" \
+              "$RUNNER_TEMP/moq5-stack/$gate"
+          done
+      - name: Bash 3 compatible ILP32 headers
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          out="$RUNNER_TEMP/moq5-stack"
+          /bin/bash scripts/check_ilp32_headers.sh > "$out/headers.stdout" 2> "$out/headers.stderr"
+          cat "$out/headers.stdout"
+          cat "$out/headers.stderr" >&2
+          test ! -s "$out/headers.stderr"
+          test "$(grep -c '^PASSED:' "$out/headers.stdout")" -eq 10
+      - name: Retain frame measurements and controls
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: stack-frames-${{ matrix.os }}-${{ matrix.cc }}
+          path: |
+            ${{ runner.temp }}/moq5-stack/
+            ${{ runner.temp }}/stack-sdk.stderr
 
   seed-sweep-quick:
     name: Seed Sweep (quick)

@@ -91,6 +91,14 @@ typedef struct moqr_cursor  { uint64_t _opaque; } moqr_cursor_t;
 typedef struct moqr_binding { uint64_t _opaque; } moqr_binding_t;   /* one relay<->session attachment */
 typedef struct moqr_parked  { uint64_t _opaque; } moqr_parked_t;    /* deferred request (join/auth) */
 
+/* Sized binding input; the version-0 accepted prefix is frozen at 8 bytes. */
+typedef struct moqr_binding_options {
+    uint32_t struct_size;
+    uint32_t flags;
+} moqr_binding_options_t;
+
+#define MOQR_BINDING_TRACK_METADATA_MANAGED 1u
+
 #define MOQR_HANDLE_POOL_TRACK   1u
 #define MOQR_HANDLE_POOL_CURSOR  2u
 #define MOQR_HANDLE_POOL_BINDING 3u

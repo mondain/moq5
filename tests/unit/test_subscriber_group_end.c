@@ -9,7 +9,10 @@
  *     has been polled;
  *   - a FIN without END_OF_GROUP and a reset subgroup yield none;
  *   - with the option off (including a v0-sized cfg) nothing is queued;
- *   - a full Group-end queue holds the tick at WOULD_BLOCK and loses nothing.
+ *   - a full Group-end queue holds the tick at WOULD_BLOCK and loses nothing;
+ *   - on draft 22 a finished track whose Group end is still queued is not
+ *     released (its slot could otherwise be reused under the queued record);
+ *     drafts 16 and 18 release it as before.
  */
 #include <moq/subscriber.h>
 #include <moq/sim.h>
@@ -141,7 +144,8 @@ static bool poll_obj(fx_t *f, uint64_t g, uint64_t o)
 
 static const char *pname(moq_version_t v)
 {
-    return v == MOQ_VERSION_DRAFT_18 ? "d18" : "d16";
+    return v == MOQ_VERSION_DRAFT_22 ? "d22"
+         : v == MOQ_VERSION_DRAFT_18 ? "d18" : "d16";
 }
 
 /* The Group end follows the subgroup's objects and waits for them. */
@@ -295,6 +299,48 @@ static void test_queue_full_pending(moq_version_t ver)
         printf("PASS: group_end_queue_full_pending_%s\n", pname(ver));
 }
 
+/* A queued Group end holds a finished track's facade slot on draft 22 until
+ * it is polled; drafts 16 and 18 keep their release behavior. */
+static void test_release_with_queued_group_end(moq_version_t ver)
+{
+    int before = failures;
+    fx_t f;
+    fx_setup(&f, ver, true, false, 0);
+
+    write_obj(&f, 0, 0, true);
+    MOQ_TEST_CHECK(moq_pub_end_group(f.pub, f.ptrack,
+                                     moq_simpair_now_us(f.sp)) == MOQ_OK);
+    deliver(&f);
+    MOQ_TEST_CHECK(moq_sub_tick(f.sub, moq_simpair_now_us(f.sp)) == MOQ_OK);
+    MOQ_TEST_CHECK(poll_obj(&f, 0, 0));
+
+    MOQ_TEST_CHECK(moq_sub_unsubscribe(f.sub, f.track,
+                                       moq_simpair_now_us(f.sp)) == MOQ_OK);
+    deliver(&f);
+    moq_sub_tick(f.sub, moq_simpair_now_us(f.sp));
+
+    moq_sub_group_end_t ge;
+    if (ver == MOQ_VERSION_DRAFT_22) {
+        MOQ_TEST_CHECK(moq_sub_release_track(f.sub, f.track) ==
+                       MOQ_ERR_WRONG_STATE);
+        MOQ_TEST_CHECK(moq_sub_poll_group_end(f.sub, &ge) == MOQ_OK);
+        MOQ_TEST_CHECK(ge.track == f.track);
+        MOQ_TEST_CHECK_EQ_U64(ge.group_id, 0);
+        MOQ_TEST_CHECK(moq_sub_release_track(f.sub, f.track) == MOQ_OK);
+    } else {
+        /* Not checked on these drafts: the caller polls first, as the
+         * header says; the queued record is left for it. */
+        MOQ_TEST_CHECK(moq_sub_release_track(f.sub, f.track) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_sub_poll_group_end(f.sub, &ge) == MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(ge.group_id, 0);
+    }
+    MOQ_TEST_CHECK(moq_sub_poll_group_end(f.sub, &ge) == MOQ_DONE);
+
+    fx_teardown(&f);
+    if (failures == before)
+        printf("PASS: group_end_release_%s\n", pname(ver));
+}
+
 int main(void)
 {
     for (int vi = 0; vi < 2; vi++) {
@@ -305,7 +351,9 @@ int main(void)
         test_option_off(ver, true);
         test_option_off(ver, 2);
         test_queue_full_pending(ver);
+        test_release_with_queued_group_end(ver);
     }
+    test_release_with_queued_group_end(MOQ_VERSION_DRAFT_22);
     if (failures == 0) {
         printf("PASS: all subscriber group-end tests\n");
         return 0;

@@ -37,6 +37,7 @@
 
 #include <moq/types.h>
 #include <moq/session.h>
+#include <moq/connection_target.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -68,8 +69,10 @@ typedef struct moq_proxygen_wt_managed_cfg {
 
     const char           *host;           /* remote host; required */
     int                   port;           /* 1..65535; required */
-    const char           *sni;            /* TLS SNI + :authority; NULL = host */
-    const char           *path;           /* WT CONNECT :path; NULL = "/moq" */
+    const char           *sni;            /* TLS SNI; NULL = host. Never the
+                                             CONNECT :authority (see target) */
+    const char           *path;           /* WT CONNECT :path; NULL = "/moq",
+                                             or the target's (see target) */
 
     /* TLS. insecure_skip_verify and ca_file are mutually exclusive.
      *   insecure_skip_verify=true → accept any server cert (testing only)
@@ -96,9 +99,40 @@ typedef struct moq_proxygen_wt_managed_cfg {
 
     /* Session deadline tuning (0 = disabled). */
     uint64_t              goaway_timeout_us;
+
+    /* Connection target: the URI identity the session is bound with when the
+     * negotiated wire profile requires a transport binding (see
+     * <moq/connection_target.h>; draft-22 does, draft-16/18 do not). The
+     * facade supplies the transport facts itself: the session is created once
+     * the WebTransport session is up, which over HTTP/3 means QUIC DATAGRAM
+     * was negotiated and both sides advertised HTTP/3 datagrams. The target's
+     * fields and bytes are copied during create(); NULL derives the authority
+     * and path/query from `host`, `port` and `path`. A client target is
+     * complete with no policy, and is the one identity the CONNECT sends:
+     * :authority as spelled (or "host:port" when derived), :path the
+     * path/query as spelled with "/" in front of an empty or query-only one
+     * (RFC 9114 Section 4.3.1). A `path` set alongside a target must equal
+     * that projection; a conflict, an identity above the binding's bound
+     * (authority plus path/query over 65535 bytes) or one embedding a NUL is
+     * MOQ_ERR_INVAL at create(). A malformed target is
+     * MOQ_ERR_INVAL at create(). Read only when struct_size covers it. */
+    const moq_connection_target_t *target;
 } moq_proxygen_wt_managed_cfg_t;
 
+/*
+ * Both initializers clear the struct, stamp struct_size and default the
+ * perspective to CLIENT. A caller built against this header gets the full
+ * current struct: the function-like macro below passes its sizeof to
+ * moq_proxygen_wt_managed_cfg_init_sized(), which clears and stamps
+ * min(cfg_size, sizeof current). The symbol itself, which a caller built
+ * before `target` was appended calls, clears and stamps the layout through
+ * goaway_timeout_us and never writes past that caller's storage.
+ */
 MOQ_API void moq_proxygen_wt_managed_cfg_init(moq_proxygen_wt_managed_cfg_t *cfg);
+MOQ_API void moq_proxygen_wt_managed_cfg_init_sized(
+    moq_proxygen_wt_managed_cfg_t *cfg, size_t cfg_size);
+#define moq_proxygen_wt_managed_cfg_init(cfg) \
+    moq_proxygen_wt_managed_cfg_init_sized((cfg), sizeof(*(cfg)))
 
 /*
  * Create a managed proxygen WT client: spawn the network thread, connect +

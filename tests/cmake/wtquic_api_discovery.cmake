@@ -75,7 +75,7 @@ run(arguments-nested pass "${CMAKE_COMMAND}" "-DMOQ_SOURCE=${MOQ_SOURCE}"
     "-DRECEIPT=${WORK}/arguments-nested-command.log"
     -P "${MOQ_SOURCE}/tests/cmake/wtquic_api_diagnostic.cmake")
 probe_context(C context)
-foreach(kind old query new)
+foreach(kind old query admission flush-mode flush-query new)
     run("${kind}-configure" pass "${CMAKE_COMMAND}" -G "${GENERATOR}"
         -S "${MOQ_SOURCE}/tests/cmake/wtquic_api_fixture" -B "${WORK}/${kind}"
         "-DAPI_KIND=${kind}" "-DPROBE_CONFIG=${CONFIG}" ${context})
@@ -84,13 +84,20 @@ foreach(kind old query new)
 endforeach()
 foreach(lang C CXX)
     probe_context("${lang}" context)
-    foreach(kind old query new mixed)
+    foreach(kind old query admission flush-mode flush-query new mixed
+                 missing-flush-mode-library missing-flush-query-library)
         set(headers "${kind}")
         set(library "${kind}")
         set(expected fail)
         if(kind STREQUAL "mixed")
             set(headers new)
             set(library old)
+        elseif(kind STREQUAL "missing-flush-mode-library")
+            set(headers new)
+            set(library flush-query)
+        elseif(kind STREQUAL "missing-flush-query-library")
+            set(headers new)
+            set(library flush-mode)
         elseif(kind STREQUAL "new")
             set(expected pass)
         endif()
@@ -104,6 +111,10 @@ foreach(lang C CXX)
     # Repeat in the successful build dir, changing only its library input.
     run("${lang}-stale" fail "${CMAKE_COMMAND}" -S "${MOQ_SOURCE}/tests/cmake/wtquic_api_probe"
         -B "${WORK}/${lang}-new" "-DFIXTURE_LIBRARY=${lib_old}")
+    run("${lang}-restored" pass "${CMAKE_COMMAND}" -S "${MOQ_SOURCE}/tests/cmake/wtquic_api_probe"
+        -B "${WORK}/${lang}-new" "-DFIXTURE_LIBRARY=${lib_new}")
+    run("${lang}-stale-flush" fail "${CMAKE_COMMAND}" -S "${MOQ_SOURCE}/tests/cmake/wtquic_api_probe"
+        -B "${WORK}/${lang}-new" "-DFIXTURE_LIBRARY=${lib_admission}")
 endforeach()
 file(MAKE_DIRECTORY "${WORK}/warning/include/wtquic")
 file(READ "${WORK}/new/include/wtquic/session.h" warning_header)
@@ -162,4 +173,4 @@ foreach(diagnostic clean warning deprecation)
         message(FATAL_ERROR "nested ${diagnostic} escaped complete-output guard: ${out}${err}")
     endif()
 endforeach()
-message(STATUS "WT API discovery: C/C++ old/query/mixed/stale expected failures, API-only pass, warning/no-language diagnostics")
+message(STATUS "WT API discovery: C/C++ receive/admission/flush declaration and symbol refusals, stale-library refusals, API-only pass, warning/no-language diagnostics")

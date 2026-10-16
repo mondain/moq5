@@ -11,6 +11,41 @@ import CMoQService
 struct SenderConfigurationMappingTests {
 
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("The sender bridge exposes the complete native configuration")
+    func sizedConfiguration() {
+        withSenderCFG(.live(namespace: "live/cam1")) { cfg in
+            #expect(cfg.struct_size == MemoryLayout<moq_media_sender_cfg_t>.size)
+            #expect(cfg.companion_profile == moq_swift_media_companion_auto())
+        }
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("The sender profile maps independently of its other settings")
+    func companionProfileMapping() {
+        var configuration = MediaSender.Configuration(
+            namespace: "live/cam1", sendPolicy: .failFast)
+        configuration.validateCMAF = false
+        configuration.queueLimits = .init(maxObjects: 4, maxBytes: 1024)
+        for profile in MediaCompanionProfile.allCases {
+            configuration.companionProfile = profile
+            withSenderCFG(configuration) { cfg in
+                let expected: moq_media_companion_profile_t
+                switch profile {
+                case .automatic: expected = moq_swift_media_companion_auto()
+                case .legacyMSF01LOC01: expected = moq_swift_media_companion_legacy()
+                case .draft22MSF01LOC04Public: expected = moq_swift_media_companion_d22_public()
+                }
+                #expect(cfg.companion_profile == expected)
+                #expect(cfg.struct_size == MemoryLayout<moq_media_sender_cfg_t>.size)
+                #expect(cfg.backpressure == MOQ_MEDIA_SEND_BP_RETURN_WOULD_BLOCK)
+                #expect(cfg.validate_cmaf == false)
+                #expect(cfg.queue_max_objects == 4)
+                #expect(cfg.queue_max_bytes == 1024)
+            }
+        }
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
     @Test("Send policies map to the C backpressure modes")
     func policyMapping() throws {
         withSenderCFG(.live(namespace: "live/cam1")) { cfg in
@@ -22,6 +57,7 @@ struct SenderConfigurationMappingTests {
             /* Lossless is the SWIFT retry loop over C fail-fast -- never
              * BLOCK_TIMEOUT (uncancellable on the service thread). */
             #expect(cfg.backpressure == MOQ_MEDIA_SEND_BP_RETURN_WOULD_BLOCK)
+            #expect(cfg.companion_profile == moq_swift_media_companion_auto())
         }
         withSenderCFG(.init(namespace: "live/cam1", sendPolicy: .failFast)) { cfg in
             #expect(cfg.backpressure == MOQ_MEDIA_SEND_BP_RETURN_WOULD_BLOCK)

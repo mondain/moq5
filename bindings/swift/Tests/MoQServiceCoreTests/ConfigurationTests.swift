@@ -39,6 +39,94 @@ struct EndpointConfigurationTests {
         #expect(cfg.versions == .automatic)
         #expect(cfg.serverName == nil)
         #expect(!cfg.insecureSkipVerify)
+        #expect(cfg.webTransportPath == nil)
+        #expect(cfg.uriMode == .legacy)
+        #expect(cfg.preferredVersion == nil)
+    }
+}
+
+@Suite("Endpoint URI mode and preferred version")
+struct EndpointURIModeTests {
+
+    static let pathRefusal = MoQServiceError.invalidArgument(
+        "webTransportPath is a URIMode.legacy override; under URIMode.standard "
+        + "the URL carries the WebTransport path")
+
+    static let preferenceRefusal = MoQServiceError.invalidArgument(
+        "preferredVersion applies only to an automatic version offer; "
+        + "a list or exact offer already gives the order")
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("Under the standard mode a WebTransport path is refused, for every scheme")
+    func pathRefusedUnderStandard() {
+        for url in ["https://relay.example.com/session",
+                    "https://relay.example.com:4443",
+                    "moqt://relay.example.com:4443/live"] {
+            for path in ["/moq", "/live?track=1"] {
+                var cfg = MoQEndpoint.Configuration(url: URL(string: url)!)
+                cfg.uriMode = .standard
+                cfg.webTransportPath = path
+                #expect(throws: Self.pathRefusal) { try cfg.validate() }
+            }
+        }
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("Under the standard mode an absent or empty path passes preflight")
+    func emptyPathAcceptedUnderStandard() throws {
+        var cfg = MoQEndpoint.Configuration(
+            url: URL(string: "https://relay.example.com/session")!)
+        cfg.uriMode = .standard
+        cfg.webTransportPath = nil
+        try cfg.validate()
+        cfg.webTransportPath = ""
+        try cfg.validate()
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("Default and explicit legacy clients accept their path unchanged")
+    func pathAcceptedUnderLegacy() throws {
+        for explicit in [false, true] {
+            var cfg = MoQEndpoint.Configuration(
+                url: URL(string: "https://relay.example.com:4433")!)
+            if explicit { cfg.uriMode = .legacy }
+            cfg.webTransportPath = "/moq"
+            try cfg.validate()
+            #expect(cfg.uriMode == .legacy)
+            #expect(cfg.webTransportPath == "/moq")
+        }
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("A preferred version is accepted only with the automatic offer")
+    func preferredVersionOnlyWithAutomatic() throws {
+        var cfg = MoQEndpoint.Configuration(url: URL(string: "moqt://h:1")!)
+        for version in MoQVersion.allCases {
+            cfg.versions = .automatic
+            cfg.preferredVersion = version
+            try cfg.validate()
+
+            cfg.wireVersions = .list([.draft22, .draft18])
+            #expect(throws: Self.preferenceRefusal) { try cfg.validate() }
+
+            cfg.wireVersions = nil
+            cfg.versions = .exactly(version)
+            #expect(throws: Self.preferenceRefusal) { try cfg.validate() }
+        }
+        cfg.preferredVersion = nil
+        try cfg.validate()
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("Scheme and host are still checked first")
+    func urlCheckedBeforeModeRules() {
+        var cfg = MoQEndpoint.Configuration(
+            url: URL(string: "ftp://relay.example.com:4443")!)
+        cfg.webTransportPath = "/moq"
+        #expect(throws: MoQServiceError.invalidArgument(
+            "URL scheme must be moqt://, moq://, or https://")) {
+            try cfg.validate()
+        }
     }
 }
 
@@ -128,6 +216,23 @@ struct MediaNamespaceTests {
 struct ReceiverConfigurationTests {
 
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("Receiver constructors and presets default to the automatic companion")
+    func companionDefaults() throws {
+        let configurations: [MediaReceiver.Configuration] = [
+            .init(namespace: "live/cam1", overflowPolicy: .dropGroup()),
+            .live(namespace: "live/cam1"),
+            .flowControl(namespace: "vod/movie"),
+        ]
+        for var configuration in configurations {
+            #expect(configuration.companionProfile == .automatic)
+            configuration.companionProfile = .draft22MSF01LOC04Public
+            try configuration.validate()
+            #expect(configuration.companionProfile == .draft22MSF01LOC04Public)
+            #expect(configuration.timeMode == .raw)
+        }
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
     @Test("Live preset mirrors the C live preset")
     func livePreset() {
         let cfg = MediaReceiver.Configuration.live(namespace: "live/cam1")
@@ -161,6 +266,22 @@ struct ReceiverConfigurationTests {
 
 @Suite("Sender configuration")
 struct SenderConfigurationTests {
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("Sender constructors and presets default to the automatic companion")
+    func companionDefaults() throws {
+        let configurations: [MediaSender.Configuration] = [
+            .init(namespace: "live/cam1", sendPolicy: .failFast),
+            .live(namespace: "live/cam1"),
+            .lossless(namespace: "vod/movie"),
+        ]
+        for var configuration in configurations {
+            #expect(configuration.companionProfile == .automatic)
+            configuration.companionProfile = .draft22MSF01LOC04Public
+            try configuration.validate()
+            #expect(configuration.companionProfile == .draft22MSF01LOC04Public)
+        }
+    }
 
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
     @Test("Presets mirror the C presets")
@@ -272,6 +393,7 @@ struct ErrorValueTests {
     func versionNumbers() {
         #expect(MoQVersion.draft16.draftNumber == 16)
         #expect(MoQVersion.draft18.draftNumber == 18)
+        #expect(WireVersion.draft22.draftNumber == 22)
         #expect(MoQVersion.draft16 != MoQVersion.draft18)
     }
 }

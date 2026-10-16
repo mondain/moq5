@@ -20,10 +20,12 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <moq/session.h>
 #include <moq/transport_bridge.h>
+#include <moq/transport_binding.h>
 
 #include "held_bridge_driver.h"
 #include "support/fake_msq_managed.h"
@@ -304,11 +306,31 @@ shx_round(shx_driver_t *d)
         fake_msq_stream_t *st = snd->stream;
         shx_tap_t *tap = shx_tap_for(d, st->id);
         bool fin = (snd->flags & QUIC_SEND_FLAG_FIN) != 0;
+        const uint8_t *wire = snd->bytes;
+        size_t wire_len = snd->bytes_len;
+        uint8_t *whole = NULL;
 
         moved = true;
-        if (tap != NULL && tap->len + snd->bytes_len <= SHX_TAP_CAP) {
-            memcpy(tap->bytes + tap->len, snd->bytes, snd->bytes_len);
-            tap->len += snd->bytes_len;
+        if (snd->bytes_len != snd->total) {
+            /* The fake's stable copy is capped and skips whatever does not
+             * fit, so it is not this send's byte sequence. The send is not
+             * completed until it has been relayed (below), so its buffer
+             * array is still borrowed and holds every byte, in order. */
+            HELD_REQUIRE(!snd->completed && snd->bufs != NULL);
+            whole = malloc((size_t)snd->total);
+            HELD_REQUIRE(whole != NULL);
+            wire_len = 0;
+            for (uint32_t b = 0; b < snd->buf_count; b++) {
+                memcpy(whole + wire_len, snd->bufs[b].Buffer,
+                       snd->bufs[b].Length);
+                wire_len += snd->bufs[b].Length;
+            }
+            HELD_REQUIRE(wire_len == snd->total);
+            wire = whole;
+        }
+        if (tap != NULL && tap->len + wire_len <= SHX_TAP_CAP) {
+            memcpy(tap->bytes + tap->len, wire, wire_len);
+            tap->len += wire_len;
             if (fin) {
                 tap->fin_seen = true;
             }
@@ -332,17 +354,18 @@ shx_round(shx_driver_t *d)
         }
         if (st->uni) {
             rc = held_bridge_uni_bytes(
-                d->bridge, drv_id, snd->bytes, snd->bytes_len, fin, d->now);
+                d->bridge, drv_id, wire, wire_len, fin, d->now);
         } else if (d->ctrl_open && st->id == d->ctrl_child_id &&
                    d->version == MOQ_VERSION_DRAFT_16) {
             rc = moq_transport_bridge_on_peer_control_bytes(
-                d->bridge, drv_id, snd->bytes, snd->bytes_len, fin, d->now);
+                d->bridge, drv_id, wire, wire_len, fin, d->now);
         } else {
             rc = moq_transport_bridge_on_peer_bidi_bytes(
-                d->bridge, drv_id, snd->bytes, snd->bytes_len, fin, d->now);
+                d->bridge, drv_id, wire, wire_len, fin, d->now);
         }
         (void)rc; /* Owned WOULD_BLOCK belongs to the bridge; refused input
                    * belongs to the bounded held driver, replayed by service. */
+        free(whole); /* every consumer above copies what it keeps */
         (void)fake_msq_deliver_send_complete(f, false);
     }
 
@@ -381,6 +404,26 @@ shx_round(shx_driver_t *d)
             if (fl & QUIC_STREAM_SHUTDOWN_FLAG_ABORT_SEND) {
                 (void)held_bridge_reset(
                     d->bridge, sdrv_id, code, d->now);
+            } else if (fl & QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL) {
+                /* A graceful shutdown closes the send path cleanly: the peer
+                 * sees a FIN after the bytes already delivered, exactly as a
+                 * final send carrying QUIC_SEND_FLAG_FIN would deliver it. */
+                static const uint8_t no_bytes[1] = { 0 };
+                shx_tap_t *tap = shx_tap_for(d, st->id);
+                if (tap != NULL) {
+                    tap->fin_seen = true;
+                }
+                if (st->uni) {
+                    (void)held_bridge_uni_bytes(
+                        d->bridge, sdrv_id, no_bytes, 0, true, d->now);
+                } else if (d->ctrl_open && st->id == d->ctrl_child_id &&
+                           d->version == MOQ_VERSION_DRAFT_16) {
+                    (void)moq_transport_bridge_on_peer_control_bytes(
+                        d->bridge, sdrv_id, no_bytes, 0, true, d->now);
+                } else {
+                    (void)moq_transport_bridge_on_peer_bidi_bytes(
+                        d->bridge, sdrv_id, no_bytes, 0, true, d->now);
+                }
             }
             if (fl & QUIC_STREAM_SHUTDOWN_FLAG_ABORT_RECEIVE) {
                 (void)moq_transport_bridge_on_peer_stop_sending(
@@ -483,6 +526,26 @@ shx_driver_open(shx_driver_t *d, fake_mgd_t *fake, moq_version_t version,
         d->child->fake.stream_start_fails = 1;
     }
     fake_mgd_deliver_connected(d->child, alpn);
+    /* A profile that must be told how it is carried is bound first: this
+     * driver's peer is the fake managed listener, a raw QUIC connection
+     * whose handshake has completed with DATAGRAM negotiated both ways (the
+     * facts the fake API table reports), dialed as 127.0.0.1:4433 with an
+     * empty path. */
+    if (moq_session_binding_requirements(d->sess) != 0) {
+        static const char authority[] = "127.0.0.1:4433";
+        moq_transport_binding_t b;
+
+        moq_transport_binding_init(&b);
+        b.kind = MOQ_BINDING_RAW_QUIC;
+        b.facts_known = MOQ_BINDING_FACTS_ALL;
+        b.facts_supported = MOQ_BINDING_FACTS_ALL;
+        b.target_present = MOQ_BINDING_TARGET_COMPLETE;
+        b.authority.data = (const uint8_t *)authority;
+        b.authority.len = sizeof(authority) - 1;
+        if (moq_session_bind_transport(d->sess, &b, sizeof(b)) != MOQ_OK) {
+            return false;
+        }
+    }
     /* a client session starts in IDLE: begin the setup exchange */
     return moq_session_start(d->sess, d->now) == MOQ_OK;
 }

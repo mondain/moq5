@@ -1577,6 +1577,152 @@ run_range_complete_script(const char *label, moq_version_t version)
     return g_failures - before;
 }
 
+/* -- one downstream send wider than the fake's capture cap ---------------- *
+ * The relay forwards a burst of objects to a subscriber in ONE multi-buffer
+ * StreamSend (a header and a payload entry per object), and the publisher's
+ * subgroup end then reaches the subscriber as a graceful send shutdown. The
+ * subscriber must read every object intact and then the clean FIN: no
+ * truncated object, no protocol violation, the connection still open. */
+#define WIDE_OBJECTS 8u
+#define WIDE_PAYLOAD 200u
+
+static int
+wide_payload_count(const shx_driver_t *sub, uint8_t marker)
+{
+    uint8_t body[WIDE_PAYLOAD];
+    int count = 0;
+
+    memset(body, marker, sizeof(body));
+    for (int i = 0; i < SHX_MAX_STREAMS; i++) {
+        const shx_tap_t *tap = &sub->tap[i];
+
+        if (!tap->used || (tap->id & 2u) == 0) {
+            continue;
+        }
+        for (size_t off = 0; off + sizeof(body) <= tap->len; off++) {
+            if (memcmp(tap->bytes + off, body, sizeof(body)) == 0) {
+                count++;
+                off += sizeof(body) - 1;
+            }
+        }
+    }
+    return count;
+}
+
+static int
+run_wide_send_script(const char *label, moq_version_t version)
+{
+    int before = g_failures;
+    rig_t r;
+    shx_driver_t pa, sub;
+
+    T_CHECK(rig_up(&r, version, NULL));
+    if (r.m == NULL) {
+        rig_down(&r);
+        return g_failures - before;
+    }
+    T_CHECK(shx_driver_open(&pa, &r.fake, version, alpn_of(version)));
+    T_CHECK(shx_driver_open(&sub, &r.fake, version, alpn_of(version)));
+    T_CHECK(establish(&r, &pa));
+    T_CHECK(establish(&r, &sub));
+
+    shx_driver_t *ds[2] = { &pa, &sub };
+    moq_bytes_t nsp[2] = { { NS0, sizeof(NS0) - 1 },
+                           { NS1, sizeof(NS1) - 1 } };
+    moq_publish_namespace_cfg_t pcfg;
+
+    moq_publish_namespace_cfg_init(&pcfg);
+    pcfg.track_namespace = (moq_namespace_t){ .parts = nsp, .count = 2 };
+    moq_announcement_t ann_a;
+
+    T_CHECK(moq_session_publish_namespace(pa.sess, &pcfg, pa.now, &ann_a) ==
+            MOQ_OK);
+    pump_rounds(&r, ds, 2, 8);
+
+    moq_subscribe_cfg_t sc;
+
+    moq_subscribe_cfg_init(&sc);
+    sc.track_namespace = pcfg.track_namespace;
+    sc.track_name = (moq_bytes_t){ (const uint8_t *)"t", 1 };
+    sc.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
+    moq_subscription_t sh;
+
+    T_CHECK(moq_session_subscribe(sub.sess, &sc, sub.now, &sh) == MOQ_OK);
+    moq_subgroup_handle_t sgh_a;
+    bool sg_a = false;
+
+    for (int i = 0; i < 24 && !sg_a; i++) {
+        pump_rounds(&r, ds, 2, 2);
+        multipub_drive_pub(&pa, &sgh_a, &sg_a, 1);
+    }
+    T_CHECK(sg_a);
+    pump_rounds(&r, ds, 2, 8);
+    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_OK) == 1);
+
+    /* the whole burst is written before the relay's lane runs again, so one
+     * service pass forwards it as one batch */
+    for (uint32_t oid = 0; oid < WIDE_OBJECTS; oid++) {
+        uint8_t body[WIDE_PAYLOAD];
+        moq_rcbuf_t *pl = NULL;
+
+        memset(body, (int)(0x60u + oid), sizeof(body));
+        T_CHECK(moq_rcbuf_create(moq_alloc_default(), body, sizeof(body),
+                                 &pl) == MOQ_OK);
+        pa.now += 1000;
+        T_CHECK(moq_session_write_object(pa.sess, sgh_a, oid, pl, pa.now) ==
+                MOQ_OK);
+        moq_rcbuf_decref(pl);
+    }
+    pump_rounds(&r, ds, 2, 16);
+
+    /* the shape under test: a downstream data-stream send whose bytes
+     * exceed the fake's stable-copy cap */
+    const fake_msq_t *sf = &sub.child->fake;
+    uint64_t widest = 0;
+
+    for (int i = 0; i < sf->send_count; i++) {
+        if (sf->sends[i].stream->uni && sf->sends[i].total > widest) {
+            widest = sf->sends[i].total;
+        }
+    }
+    printf("ORACLE %s widest_downstream_send=%llu cap=%u\n", label,
+           (unsigned long long)widest, (unsigned)FAKE_MSQ_SEND_CAP);
+    T_CHECK(widest > FAKE_MSQ_SEND_CAP);
+    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_OBJECT_RECEIVED) ==
+            (int)WIDE_OBJECTS);
+    for (uint32_t oid = 0; oid < WIDE_OBJECTS; oid++) {
+        T_CHECK(wide_payload_count(&sub, (uint8_t)(0x60u + oid)) == 1);
+    }
+
+    /* the subgroup end follows the burst on the same stream as a FIN */
+    pa.now += 1000;
+    T_CHECK(moq_session_close_subgroup(pa.sess, sgh_a, pa.now) == MOQ_OK);
+    pump_rounds(&r, ds, 2, 16);
+    bool fin_seen = false;
+
+    for (int i = 0; i < SHX_MAX_STREAMS; i++) {
+        const shx_tap_t *tap = &sub.tap[i];
+
+        if (tap->used && (tap->id & 2u) != 0 && tap->len > 0 &&
+            tap->fin_seen) {
+            fin_seen = true;
+        }
+    }
+    T_CHECK(fin_seen);
+    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_OBJECT_RECEIVED) ==
+            (int)WIDE_OBJECTS);
+    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_SESSION_CLOSED) == 0);
+    T_CHECK(!sub.child->closed && sub.child->shutdowns == 0);
+
+    shx_driver_close(&pa);
+    shx_driver_close(&sub);
+    rig_down(&r);
+    if (g_failures == before) {
+        printf("PASS: %s\n", label);
+    }
+    return g_failures - before;
+}
+
 int moqr_multipub_main(void);
 int moqr_readmission_main(void);
 
@@ -1607,6 +1753,8 @@ main(int argc, char **argv)
     (void)run_d18_reject_script();
     (void)run_credit_script();
     (void)run_cancel_script();
+    (void)run_wide_send_script("seedx_d16_wide_send", MOQ_VERSION_DRAFT_16);
+    (void)run_wide_send_script("seedx_d18_wide_send", MOQ_VERSION_DRAFT_18);
     return g_failures;
 }
 

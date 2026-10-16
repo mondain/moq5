@@ -54,6 +54,7 @@ static moq_result_t pw_after_fin_service(moq_pico_wt_conn_t *c, uint64_t now)
 }
 static void pw_rx_free_all(moq_pico_wt_conn_t *c);
 static void pw_rx_drop(moq_pico_wt_conn_t *c, uint64_t sid);
+static bool pw_rx_terminal_discard(void *ctx, uint64_t sid);
 
 #ifdef MOQ_PICO_WT_TESTING
 #include "tests/pico_wt_test_seam.h"
@@ -79,6 +80,13 @@ void (*pw_test_grant_observer)(moq_pico_wt_conn_t *, uint64_t, uint64_t) = NULL;
 void (*pw_test_quic_lost_observer)(moq_pico_wt_conn_t *, bool) = NULL;
 #endif
 #ifdef MOQ_PICO_WT_TESTING
+static bool g_pw_test_hold_bidi = false;
+
+void moq_pico_wt_test_create_with_hold_bidi(bool on)
+{
+    g_pw_test_hold_bidi = on;
+}
+
 void moq_pico_wt_test_set_hold_input(moq_pico_wt_conn_t *conn, bool on)
 {
     if (on)
@@ -187,6 +195,17 @@ int moq_pico_wt_conn_create(const moq_pico_wt_conn_cfg_t *cfg,
         return -1;
     if (!cfg->alloc->alloc || !cfg->alloc->realloc || !cfg->alloc->free)
         return -1;
+#if !defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) || PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION < 1
+    if (moq_session_version(cfg->session) == MOQ_VERSION_DRAFT_22)
+        return -1; /* Exact STOP and ACK-through-FIN outcomes are required. */
+#endif
+
+    /* The transport parameters are final by now (attach contract) and are
+     * the receive accounting's basis: unreadable ones refuse the attach
+     * before anything is allocated or any callback is rebound. picoquic
+     * returns them for every valid connection; this guards the contract. */
+    const picoquic_tp_t *tp = picoquic_get_transport_parameters(cfg->cnx, 1);
+    if (tp == NULL) return -1;
 
     moq_pico_wt_conn_t *c = (moq_pico_wt_conn_t *)cfg->alloc->alloc(
         sizeof(moq_pico_wt_conn_t), cfg->alloc->ctx);
@@ -215,6 +234,8 @@ int moq_pico_wt_conn_create(const moq_pico_wt_conn_cfg_t *cfg,
     c->stop_sending_count = 0;
     c->last_stop_sending_stream_id = UINT64_MAX;
 
+    c->tp_max_streams_uni = tp->initial_max_stream_id_unidir;
+
     /* Initialize endpoint ops. */
     if (pico_wt_endpoint_init(&c->endpoint_ops, &c->endpoint_ctx,
                               cfg->cnx, cfg->h3_ctx, cfg->ctrl_ctx,
@@ -225,7 +246,12 @@ int moq_pico_wt_conn_create(const moq_pico_wt_conn_cfg_t *cfg,
     c->endpoint_ctx.on_bidi_opened = on_local_bidi_opened;
     c->endpoint_ctx.on_uni_opened = on_local_uni_opened;
     c->endpoint_ctx.on_local_stop_sending = on_local_stop_sending;
+    c->endpoint_ctx.rx_terminal_discard = pw_rx_terminal_discard;
     c->endpoint_ctx.cb_ctx = c;
+#ifdef MOQ_PICO_WT_TESTING
+    if (g_pw_test_hold_bidi)
+        c->endpoint_ops.capabilities |= MOQ_TRANSPORT_CAP_HOLD_BIDI_INPUT;
+#endif
     c->endpoint_ctx.app_callback = moq_pico_wt_callback;
     c->endpoint_ctx.app_callback_ctx = c;
 
@@ -484,6 +510,30 @@ static void pw_rx_drop(moq_pico_wt_conn_t *c, uint64_t sid)
     memset(st, 0, sizeof(*st));   /* active = false */
 }
 
+/* Asked before a STOP_SENDING (pico_wt_endpoint_ctx_t.rx_terminal_discard).
+ * True only for a stream this adapter still holds a refused chunk of whose
+ * receive half its own record shows terminal at the transport: the held
+ * chunk carried the FIN (held_fin), a later delivery retained behind it did
+ * (buf_fin), or the stream was replayed as already complete at the transport
+ * (rx_complete: the managed facade buffered its FIN before the session
+ * existed). h3zero reports post_fin only from picoquic's stream FIN, which
+ * picoquic delivers once every byte before it was delivered, and picoquic may
+ * then release the stream, so a STOP_SENDING would have nothing to stop. A
+ * peer RESET needs no fact here: its callback drops this state and settles
+ * the bridge's hold before any cancellation can be issued. The held bytes are
+ * discarded -- never delivered: the session never admitted the stream. */
+static bool pw_rx_terminal_discard(void *ctx, uint64_t sid)
+{
+    moq_pico_wt_conn_t *c = (moq_pico_wt_conn_t *)ctx;
+    if (!c) return false;
+    pw_rx_stream_t *st = pw_rx_find(c, sid);
+    if (st == NULL || !st->held_input ||
+        !(st->held_fin || st->buf_fin || st->rx_complete))
+        return false;
+    pw_rx_drop(c, sid);
+    return true;
+}
+
 static void pw_rx_free_all(moq_pico_wt_conn_t *c)
 {
     for (size_t i = 0; i < c->rx_count; i++)
@@ -710,6 +760,20 @@ static void pw_rx_after_service(moq_pico_wt_conn_t *c, uint64_t now)
      * connection was already closing. */
     if (moq_transport_bridge_is_terminal(c->bridge))
         return;
+    /* The attach contract fixes the transport parameters: a changed
+     * peer-unidirectional stream credit means a later
+     * picoquic_set_transport_parameters reset picoquic's stream accounting
+     * under this adapter. Fail closed. A detached adapter has nothing to
+     * read. */
+    if (c->cnx) {
+        const picoquic_tp_t *tp = picoquic_get_transport_parameters(c->cnx, 1);
+        if (tp == NULL ||
+            tp->initial_max_stream_id_unidir != c->tp_max_streams_uni) {
+            moq_transport_bridge_on_transport_error(
+                c->bridge, PICO_WT_INBOUND_FATAL_CODE, now);
+            return;
+        }
+    }
     for (size_t i = 0; i < c->rx_count; i++) {
         pw_rx_stream_t *st = &c->rx[i];
         if (!st->active) continue;
@@ -1125,20 +1189,31 @@ int moq_pico_wt_callback(picoquic_cnx_t *cnx,
 
     case picohttp_callback_stop_sending: {
         if (!stream_ctx) break;
-        /* picoquic has no public stop-sending error code getter, so a
-         * STOP_SENDING never carries an application code here. On the MoQ
-         * control channel it is therefore no MoQ-level verdict: like a
-         * control reset without one, the outcome belongs to the WebTransport
-         * session terminal (a close capsule, a clean CONNECT FIN, a CONNECT
-         * reset or the loss of the connection). */
-        if (sid != c->control_stream_id && pw_is_moq_control(c, sid))
+        /* The STOP_SENDING's application code is read through the provider's
+         * terminal-observation contract where it has one; a code outside the
+         * WebTransport application-error space, or no getter at all, carries
+         * no application code. On the MoQ control channel a STOP_SENDING
+         * without one is no MoQ-level verdict: like a control reset without
+         * one, the outcome belongs to the WebTransport session terminal (a
+         * close capsule, a clean CONNECT FIN, a CONNECT reset or the loss of
+         * the connection). */
+        uint64_t error_code = PICO_WT_RESET_NO_APP_CODE;
+        bool has_code = false;
+#if defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) && PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1
+        uint64_t wt_stop_code = 0;
+        if (picoquic_get_remote_stop_error(cnx, sid, &wt_stop_code) != 0)
+            return -1;
+        has_code = pico_wt_wt_err_to_moq(wt_stop_code, &error_code);
+        if (!has_code) error_code = PICO_WT_RESET_NO_APP_CODE;
+#endif
+        if (!has_code && sid != c->control_stream_id && pw_is_moq_control(c, sid))
             break;
         if (sid != c->control_stream_id) {
             /* STOP_SENDING aborts OUR sending direction only. On a bidi stream
              * the peer may keep sending, so inbound receive state is KEPT:
              * retained bytes still replay and credit keeps flowing. */
             moq_result_t rc = moq_transport_bridge_on_peer_stop_sending(
-                c->bridge, sid, 0, now);
+                c->bridge, sid, error_code, now);
             c->stop_sending_count++;
             c->last_stop_sending_stream_id = sid;
             if (rc < 0 && rc != MOQ_ERR_WOULD_BLOCK) {
@@ -1156,6 +1231,12 @@ int moq_pico_wt_callback(picoquic_cnx_t *cnx,
         }
         break;
     }
+
+#if defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) && PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1
+    case picohttp_callback_stream_send_committed:
+        moq_transport_bridge_on_local_stream_committed(c->bridge, sid, now);
+        break;
+#endif
 
     default:
         break;

@@ -80,9 +80,10 @@ but not by
 .TP
 .B versions
 Ordered, nonempty array containing unique integers from the set
-.BR {18,16} .
-The first entry is the server's preferred draft. The default is
-.BR [18] .
+.BR {22,18,16} .
+The first entry is the server's preferred draft. The default is every draft
+this build speaks, 18 first:
+.BR [18,22,16] .
 A single entry creates an exact\-version listener; multiple entries advertise
 multiple ALPNs on the same listener.
 .TP
@@ -126,10 +127,10 @@ Origin\-form HTTP request path. It must begin with a slash. The default is
 .TP
 .B versions
 Ordered, nonempty array of unique MoQ drafts from the set
-.BR {18,16} .
+.BR {22,18,16} .
 They are offered as WebTransport subprotocols, with the server's most preferred
-draft first. The default is
-.BR [18,16] .
+draft first. The default is every draft this build speaks, 18 first:
+.BR [18,22,16] .
 .TP
 .B profile
 WebTransport\-over\-HTTP/3 dialect. This is independent of the MoQ draft in

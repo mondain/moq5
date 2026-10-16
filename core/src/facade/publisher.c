@@ -1,4 +1,7 @@
 #include <moq/publisher.h>
+#include "fill_identity_internal.h"
+#include "migration_internal.h"
+#include "../session/publisher_fill_receipt.h"
 #include <moq/rcbuf.h>
 #include <moq/wire.h>
 #include "../internal/validate.h"
@@ -37,6 +40,11 @@ typedef struct {
     bool         end_of_group;
     moq_rcbuf_t *payload;       /* incref'd */
     moq_rcbuf_t *properties;    /* incref'd or NULL */
+    /* The Subgroup ID the object was assigned (its identity, draft-22
+     * section 2.3: a replay must never change it). Resolved from the track's
+     * group history when the object is installed, and copied with it into
+     * every FETCH / fill snapshot, which therefore never reads track state. */
+    uint64_t     subgroup_id;
 } pub_retained_obj_t;
 
 /* A fan-out slot targets EITHER an accepted subscription or a publication we
@@ -57,6 +65,14 @@ typedef struct {
     bool                  sg_end_of_group;
     bool                  streaming;
     uint64_t              cur_group;
+    /* The open subgroup's identity is (cur_group, cur_gen): the generation
+     * index is its Subgroup ID. sg_last is the last Object written on it;
+     * sg_omitted records that an Object assigned to that subgroup and at or
+     * after this destination's Start Location was not written on it, so the
+     * stream must end with RESET rather than FIN (draft-22 section 11.3.2). */
+    uint8_t               cur_gen;
+    bool                  sg_omitted;
+    uint64_t              sg_last;
     /* Subscription Forward state (drafts 16/18: a publisher sends no objects
      * while Forward is 0; the session rejects such writes WRONG_STATE). Kept
      * per slot through immediate/pending/deferred acceptance and updated on
@@ -68,6 +84,11 @@ typedef struct {
      * ALWAYS an explicit RESET_STREAM: omission via Forward 0 must never be
      * published as a cleanly finished subgroup (drafts 16/18). */
     bool                  needs_reset;
+    /* The destination is gone but the session kept its data streams (a
+     * per-request GOAWAY moves the request, not its data): the slot is
+     * inactive and keeps only its open subgroup until that subgroup's reset
+     * is queued (needs_reset, track_run_retires). Never reused before. */
+    bool                  retiring;
     /* Fan-out cursors. target_op: membership snapshot -- the slot is part of
      * the track's current operation iff target_op == track->cur_op, stamped
      * once when the operation STARTS (a slot installed or re-enabled mid
@@ -120,6 +141,16 @@ typedef struct {
     moq_object_status_t status;
     bool          end_of_group;
     uint64_t      payload_length;   /* BEGIN_OBJECT declared length */
+    /* Stream ops: the Subgroup ID (generation) assigned at admission, shared
+     * by every destination and every retry of the op; first_in_gen when the
+     * object is its generation's first Object (FIRST_OBJECT); has_below /
+     * below: the largest Object known to be assigned in the generation below
+     * this one (exact, ival_max_below), the witness of what a destination opening
+     * the subgroup mid-way, or skipping ahead on it, has omitted. */
+    uint8_t       subgroup;
+    bool          first_in_gen;
+    bool          has_below;
+    uint64_t      below;
     /* Retained content snapshot (NULL when the op carries none). */
     moq_rcbuf_t  *payload;          /* WRITE_OBJECT payload / WRITE_DATA chunk */
     moq_rcbuf_t  *properties;
@@ -136,9 +167,88 @@ typedef struct pub_ns_entry {
     size_t              refcount;
 } pub_ns_entry_t;
 
+/* Group history bounds (local policy, not wire limits). A track keeps an exact
+ * record for at most PUB_GROUP_RECORDS groups; a group revisited after its
+ * subgroup closed gets a new generation (Subgroup ID), at most
+ * PUB_GROUP_GENERATIONS per group (IDs 0..7), and stays recorded for the
+ * track's life ("pinned"); at most PUB_GROUP_PINS groups may be pinned, so one
+ * record always rolls. A record leaving the rolling set is compacted into one
+ * of PUB_SEALED_RUNS runs of sealed groups, which accept nothing further. */
+#define PUB_GROUP_RECORDS     16
+#define PUB_GROUP_GENERATIONS 8
+#define PUB_GROUP_PINS        15
+#define PUB_SEALED_RUNS       16
+/* Exact assignment membership: at most PUB_GROUP_INTERVALS owner-tagged
+ * closed intervals per group record, shared by its stream generations and
+ * its datagrams. An admission that would need one more interval after merging
+ * is refused with MOQ_ERR_NOMEM before any effect. */
+#define PUB_GROUP_INTERVALS   16
+#define PUB_OWNER_DATAGRAM    0xFFu   /* interval owner: datagram Objects;
+                                         otherwise the generation index */
+
+enum {                       /* pub_gen_t.end */
+    PUB_GEN_OPEN = 0,
+    PUB_GEN_FIN,             /* closed cleanly (group switch / end_group) */
+    PUB_GEN_RESET,           /* abandoned by moq_pub_reset_group */
+};
+enum {                       /* pub_group_rec_t.final_kind */
+    PUB_FINAL_NONE = 0,
+    PUB_FINAL_LAST,          /* nothing above final_at (END_OF_GROUP header
+                                + FIN, or a d16 whole-group FETCH) */
+    PUB_FINAL_FROM,          /* nothing at or above final_at (status 0x3) */
+    PUB_FINAL_SEALED,        /* moq_pub_end_group: nothing further */
+};
+enum {                       /* pub_sealed_run_t.flags */
+    PUB_SEALED_STREAM   = 1u << 0,
+    PUB_SEALED_RETAINED = 1u << 1,
+    PUB_SEALED_DATAGRAM = 1u << 2,
+};
+
+/* One generation of a group: Objects assigned to Subgroup ID == its index.
+ * first is its first assigned Object; last the highest assigned. */
+typedef struct {
+    uint64_t first, last;
+    uint8_t  end;
+    bool     eog_armed;      /* a stream op of this generation carried the
+                                END_OF_GROUP header bit */
+    bool     fin_seen;       /* a destination ended a stream of this
+                                subgroup with a FIN, which fixed its final
+                                Object for that receiver (section 12.1) */
+} pub_gen_t;
+
+/* Exact identity record of one group. Assignment happens at admission (live
+ * stream, datagram, or retained install), never at delivery. */
+typedef struct {
+    bool      used;
+    uint64_t  group;
+    uint64_t  seq;           /* latest admission order (rolling eviction) */
+    bool      has_max;
+    uint64_t  max;           /* highest Object assigned, any mode */
+    /* Every assigned Object, exactly: sorted, non-overlapping closed
+     * intervals ival[0..nival), each owned by one generation or by the
+     * datagram mode (ival_owner). Intervals of different owners never merge,
+     * so an Object's (Subgroup ID or datagram) identity is always known. */
+    uint8_t   nival;
+    uint8_t   ival_owner[PUB_GROUP_INTERVALS];
+    struct { uint64_t lo, hi; } ival[PUB_GROUP_INTERVALS];
+    bool      retained_origin;   /* generation 0 began from a retained install */
+    uint8_t   ngen;
+    pub_gen_t gen[PUB_GROUP_GENERATIONS];
+    uint8_t   final_kind;
+    uint64_t  final_at;
+} pub_group_rec_t;
+
+typedef struct {
+    uint64_t lo, hi, first;
+    uint8_t  flags;
+} pub_sealed_run_t;
+
 struct moq_pub_track {
     moq_pub_track_t    *next;
     moq_publisher_t    *pub;
+    /* Where the track's publication went when a REDIRECT or a per-request
+     * GOAWAY ended it; cleared when the track is published again. */
+    facade_migration_t  migration;
 
     uint8_t            *ns_buf;
     size_t              ns_buf_len;
@@ -169,8 +279,9 @@ struct moq_pub_track {
      * declared_through is the app's standing promise that no object with
      * group <= it will ever be published on this track again. Monotone
      * (max-merge, never rolled back); enforcement rejects sealed writes
-     * before any mutation; the completion sweep terminates every finite
-     * window it covers with SUBSCRIPTION_ENDED (0x3). streaming_group is
+     * before any mutation; on drafts with SUBSCRIPTION_ENDED (0x3) the
+     * completion sweep terminates every finite window it covers with that
+     * status. streaming_group is
      * the open bracket's group, valid only while streaming_active -- a
      * successful begin releases track->op (its identity is later
      * overwritten by chunk ops), so the bracket group must live here for
@@ -201,6 +312,29 @@ struct moq_pub_track {
     bool                wrote_object; /* a live object was written: the retained
                                         object is no longer the track's largest,
                                         so it must not be advertised as Largest */
+    /* Group history: every Object the track assigns keeps its (group,
+     * Subgroup ID, delivery mode) for the track's life (draft-22 sections 2.1
+     * and 7.1). Exact records for the rolling and pinned groups, sealed runs
+     * for compacted ones. See hist_* below. */
+    pub_group_rec_t     recs[PUB_GROUP_RECORDS];
+    uint64_t            rec_seq;
+    pub_sealed_run_t    sealed[PUB_SEALED_RUNS];
+    size_t              sealed_count;
+    /* The current logical stream position: the group and generation of the
+     * last admitted stream op (track-wide, whatever the destinations). */
+    bool                has_cur;
+    uint64_t            cur_group;
+    uint8_t             cur_gen;
+    /* An END_OF_TRACK status admitted at (eot_group, eot_object): nothing at
+     * or beyond it is admitted. */
+    bool                has_eot;
+    uint64_t            eot_group, eot_object;
+    /* The highest Object assigned in the retained group when its record was
+     * compacted into the sealed runs (a sealed group takes nothing more, so
+     * the value is final). Valid while has_sealed_retained_max and
+     * sealed_retained_group is the retained group. */
+    bool                has_sealed_retained_max;
+    uint64_t            sealed_retained_group, sealed_retained_max;
 
     /* Retained group (origin-local Joining-FETCH cache): objects 0..N of the
      * latest group, by ascending object_id. has_retained means count>0. */
@@ -225,7 +359,17 @@ struct moq_pub_track {
      * mandatory, so add_track fails (MOQ_ERR_NOMEM) rather than linking a
      * track without a reservation. */
     moq_track_hist_t   *hist;
+
+    /* The Track Properties every answer for this track carries (an owned
+     * copy, DYNAMIC_GROUPS added when declared; NULL when none), the size of
+     * that allocation, and whether they advertise DYNAMIC_GROUPS. */
+    uint8_t            *props;
+    size_t              props_len;
+    size_t              props_cap;
+    bool                dynamic_groups;
 };
+
+typedef struct pub_pending_fill pub_pending_fill_t;
 
 typedef struct {
     bool                active;
@@ -234,9 +378,51 @@ typedef struct {
     bool                accept;
     moq_request_error_t reject_code;
     bool                forward;   /* the request's Forward state, for the slot */
+    bool                fill_requested;
+    pub_pending_fill_t *fill_job;
+    bool                update;
+    moq_publication_t   publication;
+    uint64_t            update_id;
+    bool                has_filter;
+    moq_pub_subscribe_update_info_t update_info;
 } pub_pending_t;
 
-/* A single bounded retry slot for answering one FETCH from a track's retained
+/* D22 advertises one unanswered UPDATE per parent. Initial admission and
+ * sequential UPDATEs reuse this scalar cell at ACK commit, not child terminal.
+ * No borrowed event data or snapshot references live outside a fill job. */
+typedef struct {
+    uint64_t parent, update_id, reject_code, delivery_timeout_us;
+    moq_pub_track_t *track;
+    pub_pending_fill_t *fill_job;
+    uint32_t prev, next, flags, priority;
+} pub_admission_t;
+
+typedef struct {
+    pub_admission_t *cells;
+    size_t cap;
+    uint32_t head, tail;
+} pub_admissions_t;
+
+_Static_assert(sizeof(pub_admissions_t) <= sizeof(pub_pending_t) &&
+               _Alignof(pub_admissions_t) <= _Alignof(pub_pending_t),
+               "D22 bookkeeping must not enlarge the legacy publisher");
+
+#define PUB_ADMISSION_NONE UINT32_MAX
+enum {
+    PUB_ADMISSION_ACTIVE = 1u << 0,
+    PUB_ADMISSION_UPDATE = 1u << 1,
+    PUB_ADMISSION_PUBLICATION = 1u << 2,
+    PUB_ADMISSION_ACCEPT = 1u << 3,
+    PUB_ADMISSION_DEFERRED = 1u << 4,
+    PUB_ADMISSION_FILL = 1u << 5,
+    PUB_ADMISSION_FILTER = 1u << 6,
+    PUB_ADMISSION_FORWARD = 1u << 7,
+    PUB_ADMISSION_HAS_FORWARD = 1u << 8,
+    PUB_ADMISSION_HAS_PRIORITY = 1u << 9,
+    PUB_ADMISSION_HAS_TIMEOUT = 1u << 10
+};
+
+/* A bounded retry owner for answering one FETCH from a track's retained
  * object (see serve_retained_fetch). The retained object is SNAPSHOTTED here at
  * stage time (refs held, location/priority copied) so the response is
  * independent of the track's mutable storage -- a later clear/end/remove cannot
@@ -246,8 +432,9 @@ typedef struct {
  * finish, never REQUEST_ERROR). Mirrors pub_pending_t for subscribe. */
 typedef struct {
     bool                active;
+    bool                reject;     /* refused: INTERNAL_ERROR is code zero */
     moq_fetch_t         fetch;
-    moq_request_error_t reject_code; /* non-zero: reject (pre-accept only) */
+    moq_request_error_t reject_code; /* rejection wire code (pre-accept only) */
     bool                accepted;   /* accept_fetch (FETCH_OK) done */
     /* Snapshot of the retained GROUP (serve case; reject case leaves these 0).
      * Objects 0..count are written in order from next_idx; End Location is the
@@ -258,7 +445,52 @@ typedef struct {
     pub_retained_obj_t *objs;        /* incref'd snapshot; released on finish */
     size_t              obj_count;
     size_t              next_idx;    /* write cursor (resumes on WOULD_BLOCK) */
+    /* The served track, for the Track Properties its FETCH_OK states; cleared
+     * when the track is removed first (the answer then carries none). */
+    moq_pub_track_t    *track;
 } pub_pending_fetch_t;
+
+typedef struct {
+    pub_pending_fetch_t pending;
+    uint32_t prev, next;
+} pub_fetch_owner_t;
+
+typedef struct {
+    pub_fetch_owner_t *cells;
+    size_t cap;
+    uint32_t head, tail;
+} pub_fetch_owners_t;
+
+#define PUB_FETCH_NONE UINT32_MAX
+_Static_assert(sizeof(pub_fetch_owners_t) <= sizeof(pub_pending_fetch_t) &&
+               _Alignof(pub_fetch_owners_t) <= _Alignof(pub_pending_fetch_t),
+               "D22 FETCH bookkeeping must not enlarge the legacy publisher");
+
+/* One fill request in flight (draft-22 section 3.4). Mirrors
+ * pub_pending_fetch_t: the retained group is SNAPSHOTTED at stage time so the
+ * fill is independent of later track mutation, and the phases (opened /
+ * write cursor / FIN) make every retry idempotent. `abort` marks a request the
+ * facade cannot serve; it is answered on the wire as a header followed by
+ * RESET (section 3.4.1), never left pending. */
+struct pub_pending_fill {
+    bool                active;
+    moq_fill_t          fill;
+    moq_pub_fill_t      token;
+    moq_pub_track_t    *track;
+    moq_fill_request_event_t receipt;
+    bool                requested;   /* real FILL_REQUEST delivered */
+    bool                deferred;
+    bool                terminal_queued;
+    bool                abort;
+    uint64_t            abort_code;
+    bool                opened;      /* open_fill (FETCH_HEADER) done */
+    uint64_t            group_id;
+    uint8_t             priority;
+    pub_retained_obj_t  objs[MOQ_PUB_RETAINED_MAX_OBJECTS];
+    uint64_t            charge;
+    size_t              obj_count;
+    size_t              next_idx;    /* write cursor (resumes on WOULD_BLOCK) */
+};
 
 struct moq_pub_deferred {
     bool                active;
@@ -266,7 +498,22 @@ struct moq_pub_deferred {
     moq_subscription_t  sub;
     moq_pub_track_t    *track;
     bool                forward;   /* the request's Forward state, for the slot */
+    bool                fill_requested;
+    /* The request's NEW_GROUP_REQUEST, reported once it is accepted. */
+    bool                has_new_group;
+    uint64_t            new_group;
 };
+
+/* An answer this publisher owes a request it took (a TRACK_STATUS for one of
+ * its tracks) or that only it will see (tick mode refuses what it does not
+ * serve), held while the session cannot take it. track names the accepted
+ * TRACK_STATUS; otherwise the request is refused with code. */
+typedef struct pub_owed_answer {
+    moq_event_kind_t    kind;
+    uint64_t            handle;
+    moq_pub_track_t    *track;
+    moq_request_error_t code;
+} pub_owed_answer_t;
 
 struct moq_publisher {
     moq_session_t      *session;
@@ -279,10 +526,27 @@ struct moq_publisher {
     size_t              track_count;
     pub_ns_entry_t     *ns_entries;
     size_t              sub_slot_cap;
-    pub_pending_t       pending;
-    pub_pending_fetch_t pending_fetch;
+    /* Preserve the legacy publisher allocation size as well as its pump. */
+    union {
+        pub_pending_t pending;
+        pub_admissions_t admissions;
+    };
+    union {
+        pub_pending_fetch_t pending_fetch;
+        pub_fetch_owners_t fetch_owners;
+    };
+    pub_pending_fill_t *pending_fills;
+    size_t              pending_fill_cap;
+    uint64_t            fill_bytes;
+    bool                in_fill_callback;
     moq_pub_deferred_t  deferred;
+    /* Answers owed, in arrival order; allocated on first need. */
+    pub_owed_answer_t  *owed;
+    size_t              owed_count;
+    size_t              owed_cap;
 };
+
+static sub_fill_identity_allocator_t pub_fill_identities = SUB_FILL_IDENTITY_ALLOCATOR_INIT;
 
 /* -- Subscriber slot helpers (fan-out boundary) ------------------- */
 
@@ -310,7 +574,7 @@ static pub_sub_slot_t *track_find_slot_by_sub(moq_pub_track_t *t,
 static pub_sub_slot_t *track_find_free_slot(moq_pub_track_t *t)
 {
     for (size_t i = 0; i < t->slot_cap; i++)
-        if (!t->slots[i].active)
+        if (!t->slots[i].active && !t->slots[i].retiring)
             return &t->slots[i];
     return NULL;
 }
@@ -327,6 +591,40 @@ static size_t track_active_count(const moq_pub_track_t *t)
 static bool track_has_subscriber(const moq_pub_track_t *t)
 {
     return track_active_count(t) > 0;
+}
+
+static void *pub_alloc(moq_publisher_t *p, size_t sz);
+static void pub_free(moq_publisher_t *p, void *ptr, size_t sz);
+
+/* Where concurrent subscriptions to a track are allowed (draft-22 §3.1),
+ * each one is a destination slot of its own. Before a subscription is
+ * accepted, make sure a free slot will be waiting for it. D22 checks at each
+ * serialized ACK commit; legacy also reserves for its deferred authorizer.
+ * The install after session accept therefore cannot find the slots full.
+ * Slots are values,
+ * so growing the array moves no live reference. */
+static moq_result_t track_reserve_sub_slots(moq_publisher_t *pub,
+                                            moq_pub_track_t *t)
+{
+    size_t need = 1;
+    if (!moq_session_supports_fill(pub->session) &&
+        pub->deferred.active && pub->deferred.track == t) need++;
+    size_t free_slots = 0;
+    for (size_t i = 0; i < t->slot_cap; i++)
+        if (!t->slots[i].active && !t->slots[i].retiring) free_slots++;
+    if (free_slots >= need) return MOQ_OK;
+    size_t grow = need - free_slots;
+    if (t->slot_cap > SIZE_MAX / sizeof(pub_sub_slot_t) - grow)
+        return MOQ_ERR_NOMEM;
+    size_t cap = t->slot_cap + grow;
+    pub_sub_slot_t *ns = (pub_sub_slot_t *)pub_alloc(pub, cap * sizeof(pub_sub_slot_t));
+    if (!ns) return MOQ_ERR_NOMEM;
+    memcpy(ns, t->slots, t->slot_cap * sizeof(pub_sub_slot_t));
+    memset(ns + t->slot_cap, 0, grow * sizeof(pub_sub_slot_t));
+    pub_free(pub, t->slots, t->slot_cap * sizeof(pub_sub_slot_t));
+    t->slots = ns;
+    t->slot_cap = cap;
+    return MOQ_OK;
 }
 
 static void slot_install_sub_window(moq_publisher_t *pub, pub_sub_slot_t *sl);
@@ -348,6 +646,10 @@ static void track_set_subscriber(moq_publisher_t *pub, moq_pub_track_t *t,
     /* Copy the accept-resolved window at installation : a slot can
      * never inherit an old window (memset above) nor miss its own. */
     slot_install_sub_window(pub, s);
+    if (moq_session_supports_fill(pub->session)) {
+        int slot = sub_resolve_handle(pub->session, sub);
+        if (slot >= 0) pub->session->subs[slot].facade_defer_updates = true;
+    }
 }
 
 static void track_set_publication(moq_publisher_t *fpub, moq_pub_track_t *t,
@@ -424,6 +726,9 @@ static bool window_admits(const moq_resolved_window_t *w,
         (group_id == w->start_group && object_id < w->start_object))
         return false;
     if (w->has_end && group_id > w->end_group) return false;
+    if (w->has_end_object && group_id == w->end_group &&
+        object_id > w->end_object)
+        return false;
     return true;
 }
 
@@ -462,6 +767,20 @@ static bool track_header_admits(const moq_pub_track_t *t, uint64_t group_id,
         if (check_eog && want_eog != sl->sg_end_of_group) return false;
     }
     return true;
+}
+
+/* Closure completeness, kept apart from delivery eligibility (window_admits):
+ * the Objects of its subgroup a destination's stream must carry before it may
+ * end with a FIN. Only Objects below the subscription's Start Location are
+ * exempt (draft-22 section 11.3.2; draft-18 and draft-16 the same). An Object
+ * the window's end excludes is never delivered, but it is still owed, so a
+ * stream that ends without it ends with a RESET. */
+static bool window_owes(const moq_resolved_window_t *w,
+                        uint64_t group_id, uint64_t object_id)
+{
+    if (!w->has_window || w->unsatisfiable) return true;
+    return !(group_id < w->start_group ||
+             (group_id == w->start_group && object_id < w->start_object));
 }
 
 /* Install (or clear) a slot's window from the session's resolved copy --
@@ -519,12 +838,15 @@ static void slot_window_cut_check(moq_pub_track_t *t, pub_sub_slot_t *sl)
  * flag set and the slot ineligible; a later call resumes. Retirement is
  * always an EXPLICIT RESET_STREAM (error code 0): Forward-0 omission must
  * never be published as a cleanly finished subgroup. */
+static moq_result_t slot_close_subgroup(moq_publisher_t *pub,
+                                        moq_pub_track_t *t, pub_sub_slot_t *sl,
+                                        uint64_t now_us);
 static moq_result_t track_run_retires(moq_publisher_t *pub,
                                       moq_pub_track_t *t, uint64_t now_us)
 {
     for (size_t i = 0; i < t->slot_cap; i++) {
         pub_sub_slot_t *sl = &t->slots[i];
-        if (!sl->active || !sl->needs_reset) continue;
+        if (!(sl->active || sl->retiring) || !sl->needs_reset) continue;
         moq_result_t rc = moq_session_reset_subgroup(pub->session, sl->sg, 0,
                                                      now_us);
         /* Mutate ONLY on success: a WOULD_BLOCK or error leaves the flags
@@ -538,13 +860,33 @@ static moq_result_t track_run_retires(moq_publisher_t *pub,
         sl->sg_open = false;
         sl->streaming = false;
         sl->needs_reset = false;
+        if (sl->retiring) track_clear_slot(pub, sl);
     }
     return MOQ_OK;
 }
 
-/* §10: finite-window completion sweep for one track. Every active
- * destination whose finite filter end is covered by the declared watermark
- * terminates: FIN any clean open subgroup FIRST (streams close before the
+/* The destination of `sl` left while the session keeps its data streams.
+ * A subgroup still open did not deliver everything it began, so it is reset,
+ * never finished (draft-22 §11.3.2): the slot retires holding only that
+ * subgroup, outside every operation, and track_run_retires queues the reset
+ * and frees the slot, also under action pressure. Otherwise the slot is
+ * free at once. */
+static void track_retire_slot(moq_publisher_t *pub, moq_pub_track_t *t,
+                              pub_sub_slot_t *sl)
+{
+    if (!sl->sg_open && !sl->streaming) {
+        track_clear_slot(pub, sl);
+        return;
+    }
+    slot_forward_drop(t, sl);
+    sl->active = false;
+    sl->retiring = true;
+}
+
+/* §10: finite-window completion sweep for one track, on drafts whose
+ * PUBLISH_DONE has SUBSCRIPTION_ENDED. Every active destination whose finite
+ * filter end is covered by the declared watermark terminates: FIN any clean
+ * open subgroup FIRST (streams close before the
  * terminal control message, d16:3436/d18:4227), then SUBSCRIBE_DONE /
  * PUBLISH_DONE with SUBSCRIPTION_ENDED (0x3, the finite end was genuinely
  * reached) and the EXACT per-destination stream count. Retry-idempotent
@@ -583,6 +925,12 @@ static moq_result_t track_run_completions(moq_publisher_t *pub,
                                           moq_pub_track_t *t,
                                           uint64_t now_us)
 {
+    /* Only a draft with SUBSCRIPTION_ENDED ends a subscription at its filter
+     * end. Draft-22 has no such status (§16.11.3), and "A publisher does not
+     * end a subscription solely because the Largest Object advances past the
+     * end of the current Location Filter" (§3.3.1): the window keeps
+     * excluding later objects and the subscription stays established. */
+    if (!pub->session->profile->publish_done_subscription_ended) return MOQ_OK;
     uint64_t through;
     if (!track_complete_through(t, &through)) return MOQ_OK;
     for (size_t si = 0; si < t->slot_cap; si++) {
@@ -593,8 +941,7 @@ static moq_result_t track_run_completions(moq_publisher_t *pub,
         if (sl->streaming) continue;      /* defer: in-flight object lands */
         if (sl->needs_reset) continue;    /* defer: retire sweep owns it */
         if (sl->sg_open) {
-            moq_result_t rc = moq_session_close_subgroup(pub->session,
-                                                         sl->sg, now_us);
+            moq_result_t rc = slot_close_subgroup(pub, t, sl, now_us);
             if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
             /* STALE = the wire stream is already gone, not the
              * subscription/publication: normalize sg_open and CONTINUE to
@@ -803,6 +1150,679 @@ static bool slot_op_pending(moq_pub_track_t *t, pub_sub_slot_t *sl)
     return true;
 }
 
+/* -- Group history (identity of every assigned Object) --------------- *
+ *
+ * Every Object the track admits is assigned (group, Subgroup ID, delivery
+ * mode) at admission -- live stream, datagram or retained install, with or
+ * without destinations -- and keeps it for the track's life: a duplicate with
+ * another Subgroup ID or delivery mode is malformed (draft-22 sections 2.1 and
+ * 7.1). A subgroup ends with a FIN when the track moves to another group;
+ * that FIN fixes the subgroup's final Object (section 12.1), so a later Object
+ * of the same group goes into a NEW subgroup (Subgroup IDs are the
+ * publisher's choice within a group, section 2.2) and must be above every
+ * Object already assigned there. All checks run before any effect; a
+ * refusal is MOQ_ERR_WRONG_STATE for history / finality / mode conflicts and
+ * MOQ_ERR_NOMEM when the fixed bookkeeping cannot hold the result. */
+
+typedef enum {
+    HIST_STREAM = 0,
+    HIST_DATAGRAM,
+    HIST_STATUS_EOG,
+    HIST_STATUS_EOT,
+} hist_kind_t;
+
+typedef struct {
+    int      rec;        /* record holding the group after the op, or -1 */
+    bool     alloc;      /* a free or evicted record is (re)initialized */
+    int      victim;     /* record compacted into the sealed runs first */
+    bool     new_gen;    /* stream: the op starts a new generation */
+    uint8_t  gen;        /* stream: the generation (Subgroup ID) */
+} hist_plan_t;
+
+static int hist_find(const moq_pub_track_t *t, uint64_t group)
+{
+    for (int i = 0; i < PUB_GROUP_RECORDS; i++)
+        if (t->recs[i].used && t->recs[i].group == group) return i;
+    return -1;
+}
+
+static bool hist_sealed(const moq_pub_track_t *t, uint64_t group)
+{
+    for (size_t i = 0; i < t->sealed_count; i++)
+        if (group >= t->sealed[i].lo && group <= t->sealed[i].hi) return true;
+    return false;
+}
+
+static size_t hist_pins(const moq_pub_track_t *t)
+{
+    size_t n = 0;
+    for (int i = 0; i < PUB_GROUP_RECORDS; i++)
+        if (t->recs[i].used && t->recs[i].ngen >= 2) n++;
+    return n;
+}
+
+static bool ival_has_owner(const pub_group_rec_t *r, uint8_t owner);
+
+/* The sealed-run form of record r. */
+static pub_sealed_run_t hist_run_of(const pub_group_rec_t *r)
+{
+    pub_sealed_run_t run;
+    run.lo = run.hi = r->group;
+    run.first = r->ngen ? r->gen[0].first : 0;
+    run.flags = (uint8_t)((r->ngen ? PUB_SEALED_STREAM : 0) |
+                          (r->retained_origin ? PUB_SEALED_RETAINED : 0) |
+                          (ival_has_owner(r, PUB_OWNER_DATAGRAM)
+                               ? PUB_SEALED_DATAGRAM : 0));
+    return run;
+}
+
+/* Index of a sealed run that `run` (a single group) extends, or -1. */
+static int hist_run_neighbour(const moq_pub_track_t *t,
+                              const pub_sealed_run_t *run)
+{
+    for (size_t i = 0; i < t->sealed_count; i++) {
+        const pub_sealed_run_t *x = &t->sealed[i];
+        if (x->first != run->first || x->flags != run->flags) continue;
+        if ((x->hi != UINT64_MAX && x->hi + 1 == run->lo) ||
+            (x->lo != 0 && x->lo - 1 == run->hi))
+            return (int)i;
+    }
+    return -1;
+}
+
+static bool hist_seal_fits(const moq_pub_track_t *t, const pub_group_rec_t *r)
+{
+    pub_sealed_run_t run = hist_run_of(r);
+    return hist_run_neighbour(t, &run) >= 0 ||
+           t->sealed_count < PUB_SEALED_RUNS;
+}
+
+/* Record r leaves the exact set: an open subgroup of it on any destination is
+ * judged complete or not NOW (its record goes away), then the group joins
+ * the sealed runs. Capacity was priced by hist_seal_fits. */
+static void hist_seal(moq_pub_track_t *t, int ri)
+{
+    pub_group_rec_t *r = &t->recs[ri];
+    for (size_t i = 0; i < t->slot_cap; i++) {
+        pub_sub_slot_t *sl = &t->slots[i];
+        if (!sl->sg_open || sl->cur_group != r->group || sl->cur_gen >= r->ngen)
+            continue;
+        const pub_gen_t *g = &r->gen[sl->cur_gen];
+        if (g->last > sl->sg_last && window_owes(&sl->window, r->group, g->last))
+            sl->sg_omitted = true;
+    }
+    if (t->has_retained && t->retained_group_id == r->group && r->has_max) {
+        t->has_sealed_retained_max = true;
+        t->sealed_retained_group = r->group;
+        t->sealed_retained_max = r->max;
+    }
+    pub_sealed_run_t run = hist_run_of(r);
+    int n = hist_run_neighbour(t, &run);
+    if (n < 0) {
+        t->sealed[t->sealed_count++] = run;
+    } else {
+        pub_sealed_run_t *x = &t->sealed[n];
+        if (run.lo < x->lo) x->lo = run.lo;
+        if (run.hi > x->hi) x->hi = run.hi;
+        /* The run may now meet another with the same shape. */
+        for (size_t i = 0; i < t->sealed_count; i++) {
+            pub_sealed_run_t *y = &t->sealed[i];
+            if ((int)i == n || y->first != x->first || y->flags != x->flags)
+                continue;
+            if ((x->hi != UINT64_MAX && x->hi + 1 == y->lo) ||
+                (y->hi != UINT64_MAX && y->hi + 1 == x->lo)) {
+                if (y->lo < x->lo) x->lo = y->lo;
+                if (y->hi > x->hi) x->hi = y->hi;
+                t->sealed[i] = t->sealed[--t->sealed_count];
+                break;
+            }
+        }
+    }
+    if (t->has_cur && t->cur_group == r->group) t->has_cur = false;
+    memset(r, 0, sizeof(*r));
+}
+
+/* Plan a record for `group`: the existing one, a free one, or the least
+ * recently admitted unpinned record other than `keep` (the group current
+ * after the op), compacted into the sealed runs. With `compact_keep`, when no
+ * other record is free to compact, `keep` itself is compacted (its open
+ * destinations keep their completeness verdict, see hist_seal). Sealed-run
+ * capacity is priced here, before any effect. */
+static moq_result_t hist_plan_record(const moq_pub_track_t *t, uint64_t group,
+                                     bool has_keep, uint64_t keep,
+                                     bool compact_keep, hist_plan_t *pl)
+{
+    pl->rec = hist_find(t, group);
+    pl->alloc = false;
+    pl->victim = -1;
+    if (pl->rec >= 0) return MOQ_OK;
+    if (hist_sealed(t, group)) return MOQ_ERR_WRONG_STATE;
+    for (int i = 0; i < PUB_GROUP_RECORDS; i++)
+        if (!t->recs[i].used) { pl->rec = i; pl->alloc = true; return MOQ_OK; }
+    int v = -1;
+    for (int i = 0; i < PUB_GROUP_RECORDS; i++) {
+        const pub_group_rec_t *r = &t->recs[i];
+        if (r->ngen >= 2) continue;                   /* pinned */
+        if (has_keep && r->group == keep) continue;
+        if (v < 0 || r->seq < t->recs[v].seq) v = i;
+    }
+    if (v < 0 && has_keep && compact_keep) {
+        int k = hist_find(t, keep);
+        if (k >= 0 && t->recs[k].ngen < 2) v = k;
+    }
+    if (v < 0 || !hist_seal_fits(t, &t->recs[v])) return MOQ_ERR_NOMEM;
+    pl->rec = v;
+    pl->alloc = true;
+    pl->victim = v;
+    return MOQ_OK;
+}
+
+static void hist_take_record(moq_pub_track_t *t, const hist_plan_t *pl,
+                             uint64_t group)
+{
+    if (pl->victim >= 0) hist_seal(t, pl->victim);
+    pub_group_rec_t *r = &t->recs[pl->rec];
+    if (pl->alloc) {
+        memset(r, 0, sizeof(*r));
+        r->used = true;
+        r->group = group;
+    }
+    r->seq = ++t->rec_seq;
+}
+
+static bool hist_loc_at_or_after(uint64_t g, uint64_t o, uint64_t eg, uint64_t eo)
+{
+    return g > eg || (g == eg && o >= eo);
+}
+
+/* Finality and END_OF_TRACK: may Object `obj` be assigned in record r? */
+static bool hist_final_admits(const moq_pub_track_t *t,
+                              const pub_group_rec_t *r, uint64_t group,
+                              uint64_t obj)
+{
+    if (t->has_eot &&
+        hist_loc_at_or_after(group, obj, t->eot_group, t->eot_object))
+        return false;
+    if (!r) return true;
+    switch (r->final_kind) {
+    case PUB_FINAL_SEALED: return false;
+    case PUB_FINAL_LAST:   return obj <= r->final_at;
+    case PUB_FINAL_FROM:   return obj < r->final_at;
+    default:               return true;
+    }
+}
+
+/* -- Exact membership ------------------------------------------------- *
+ *
+ * Every assigned Object of a group is in exactly one closed interval of the
+ * record, owned by the generation (Subgroup ID) it was assigned to or by the
+ * datagram mode: an Object belongs to exactly one Subgroup or is a datagram
+ * (draft-22 section 2.1; draft-18 2.1, draft-16 2.4). Intervals stay sorted
+ * and non-overlapping and merge only with the same owner. Queries are exact,
+ * inclusive and bounded; no bound is formed by wrapping at 0 or UINT64_MAX. */
+
+static int ival_find(const pub_group_rec_t *r, uint64_t obj)
+{
+    for (uint8_t i = 0; i < r->nival; i++)
+        if (obj >= r->ival[i].lo && obj <= r->ival[i].hi) return (int)i;
+    return -1;
+}
+
+static bool ival_has_owner(const pub_group_rec_t *r, uint8_t owner)
+{
+    for (uint8_t i = 0; i < r->nival; i++)
+        if (r->ival_owner[i] == owner) return true;
+    return false;
+}
+
+/* Interval x and [lo, hi] overlap, or touch end to end. */
+static bool ival_touches(uint64_t xlo, uint64_t xhi, uint64_t lo, uint64_t hi)
+{
+    if (xlo <= hi && xhi >= lo) return true;
+    if (xhi != UINT64_MAX && xhi + 1 == lo) return true;
+    if (hi != UINT64_MAX && hi + 1 == xlo) return true;
+    return false;
+}
+
+/* Price assigning [lo, hi] (lo <= hi) to `owner`: false when an interval of
+ * another owner overlaps it (the identity is taken); otherwise *count is the
+ * number of intervals afterwards. Mutates nothing. */
+static bool ival_plan(const pub_group_rec_t *r, uint64_t lo, uint64_t hi,
+                      uint8_t owner, int *count)
+{
+    int merged = 0;
+    for (uint8_t i = 0; i < r->nival; i++) {
+        uint64_t xlo = r->ival[i].lo, xhi = r->ival[i].hi;
+        if (r->ival_owner[i] != owner) {
+            if (xlo <= hi && xhi >= lo) return false;
+            continue;
+        }
+        if (ival_touches(xlo, xhi, lo, hi)) merged++;
+    }
+    *count = (int)r->nival - merged + 1;
+    return true;
+}
+
+/* Apply a union priced by ival_plan (no conflict, room for the result). */
+static void ival_apply(pub_group_rec_t *r, uint64_t lo, uint64_t hi,
+                       uint8_t owner)
+{
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < r->nival; i++) {
+        bool merge = r->ival_owner[i] == owner &&
+                     ival_touches(r->ival[i].lo, r->ival[i].hi, lo, hi);
+        if (merge) {
+            if (r->ival[i].lo < lo) lo = r->ival[i].lo;
+            if (r->ival[i].hi > hi) hi = r->ival[i].hi;
+            continue;
+        }
+        r->ival[n] = r->ival[i];
+        r->ival_owner[n] = r->ival_owner[i];
+        n++;
+    }
+    uint8_t at = 0;
+    while (at < n && r->ival[at].lo < lo) at++;
+    for (uint8_t i = n; i > at; i--) {
+        r->ival[i] = r->ival[i - 1];
+        r->ival_owner[i] = r->ival_owner[i - 1];
+    }
+    r->ival[at].lo = lo;
+    r->ival[at].hi = hi;
+    r->ival_owner[at] = owner;
+    r->nival = (uint8_t)(n + 1);
+}
+
+/* The largest Object owned by `owner` below `obj`, if any (exact). */
+static bool ival_max_below(const pub_group_rec_t *r, uint8_t owner,
+                           uint64_t obj, uint64_t *out)
+{
+    bool has = false;
+    uint64_t best = 0;
+    if (obj == 0) return false;
+    for (uint8_t i = 0; i < r->nival; i++) {
+        if (r->ival_owner[i] != owner || r->ival[i].lo >= obj) continue;
+        uint64_t c = r->ival[i].hi < obj - 1 ? r->ival[i].hi : obj - 1;
+        if (!has || c > best) { best = c; has = true; }
+    }
+    if (has) *out = best;
+    return has;
+}
+
+static bool hist_known_stream(const pub_group_rec_t *r, uint64_t obj)
+{
+    int i = ival_find(r, obj);
+    return i >= 0 && r->ival_owner[i] != PUB_OWNER_DATAGRAM;
+}
+
+static bool hist_known_datagram(const pub_group_rec_t *r, uint64_t obj)
+{
+    int i = ival_find(r, obj);
+    return i >= 0 && r->ival_owner[i] == PUB_OWNER_DATAGRAM;
+}
+
+static void hist_note_max(pub_group_rec_t *r, uint64_t obj)
+{
+    if (!r->has_max || obj > r->max) r->max = obj;
+    r->has_max = true;
+}
+
+/* A generation's subgroup ends: with the END_OF_GROUP header bit armed, the
+ * clean end fixes the group's final Object (draft-22 section 11.3.1). */
+static void hist_end_gen(pub_group_rec_t *r, pub_gen_t *g)
+{
+    if (g->end != PUB_GEN_OPEN) return;
+    g->end = PUB_GEN_FIN;
+    if (g->eog_armed && r->final_kind == PUB_FINAL_NONE) {
+        r->final_kind = PUB_FINAL_LAST;
+        r->final_at = g->last;
+    }
+}
+
+/* The track leaves its current generation for another group (or seals it):
+ * that generation's subgroup ends with a FIN. */
+static void hist_close_current(moq_pub_track_t *t)
+{
+    if (!t->has_cur) return;
+    int ri = hist_find(t, t->cur_group);
+    if (ri < 0) return;
+    pub_group_rec_t *r = &t->recs[ri];
+    if (t->cur_gen >= r->ngen) return;
+    hist_end_gen(r, &r->gen[t->cur_gen]);
+}
+
+/* moq_pub_end_group: the current group is sealed (a local declaration that
+ * nothing more is assigned in it; on the wire its subgroups simply end). */
+static void hist_end_group(moq_pub_track_t *t)
+{
+    if (!t->has_cur) return;
+    hist_close_current(t);
+    int ri = hist_find(t, t->cur_group);
+    if (ri >= 0) t->recs[ri].final_kind = PUB_FINAL_SEALED;
+}
+
+/* moq_pub_reset_group: the current generation is abandoned. Its assignments
+ * stay; it fixes no final (section 11.3.1), and the group's next Object
+ * starts a new generation above every Object already assigned. */
+static void hist_reset_current(moq_pub_track_t *t)
+{
+    if (!t->has_cur) return;
+    int ri = hist_find(t, t->cur_group);
+    if (ri < 0 || t->cur_gen >= t->recs[ri].ngen) return;
+    pub_gen_t *g = &t->recs[ri].gen[t->cur_gen];
+    if (g->end == PUB_GEN_OPEN) g->end = PUB_GEN_RESET;
+    g->eog_armed = false;
+}
+
+/* Plan a stream Object (one-shot or streaming begin). */
+static moq_result_t hist_plan_stream(const moq_pub_track_t *t, uint64_t group,
+                                     uint64_t obj, hist_plan_t *pl)
+{
+    moq_result_t rc = hist_plan_record(t, group, true, group, false, pl);
+    if (rc < 0) return rc;
+    const pub_group_rec_t *r = pl->alloc ? NULL : &t->recs[pl->rec];
+    if (!hist_final_admits(t, r, group, obj)) return MOQ_ERR_WRONG_STATE;
+    pl->new_gen = false;
+    pl->gen = 0;
+    int count = 1;
+    if (!r || r->ngen == 0) {
+        if (r && !ival_plan(r, obj, obj, 0, &count))
+            return MOQ_ERR_WRONG_STATE;          /* a datagram Object */
+        if (count > PUB_GROUP_INTERVALS) return MOQ_ERR_NOMEM;
+        pl->new_gen = true;                         /* generation 0 */
+        return MOQ_OK;
+    }
+    uint8_t k = (uint8_t)(r->ngen - 1);
+    const pub_gen_t *g = &r->gen[k];
+    int at = ival_find(r, obj);
+    bool replay = at >= 0 && r->ival_owner[at] == k;
+    if (g->end == PUB_GEN_OPEN && (!g->fin_seen || replay)) {
+        /* Continue: the current generation, or a retained-origin generation
+         * never yet closed. Generations hold disjoint ascending ranges: an
+         * Object at or below the previous generation's highest belongs to an
+         * earlier subgroup (or may), so it is never assigned here. Once a
+         * destination ended this subgroup with a FIN, its final Object is
+         * fixed for that receiver (draft-22 section 12.1), so only the
+         * replay of an Object already assigned to it continues it. */
+        if (k >= 1 && obj <= r->gen[k - 1].last) return MOQ_ERR_WRONG_STATE;
+        if (!ival_plan(r, obj, obj, k, &count)) return MOQ_ERR_WRONG_STATE;
+        if (count > PUB_GROUP_INTERVALS) return MOQ_ERR_NOMEM;
+        pl->gen = k;
+        return MOQ_OK;
+    }
+    /* A new subgroup for a genuinely new, larger Object: a revisit after the
+     * subgroup closed or was reset, or the next generation after a
+     * destination's FIN. Subgroups of one group are the publisher's choice
+     * (draft-22 section 2.2). A subgroup whose header carried END_OF_GROUP
+     * holds the group's largest Object, so nothing may follow it. */
+    if (r->has_max && obj <= r->max) return MOQ_ERR_WRONG_STATE;
+    if (g->end == PUB_GEN_OPEN && g->eog_armed) return MOQ_ERR_WRONG_STATE;
+    if (r->ngen >= PUB_GROUP_GENERATIONS) return MOQ_ERR_NOMEM;
+    if (r->ngen == 1 && hist_pins(t) >= PUB_GROUP_PINS) return MOQ_ERR_NOMEM;
+    if (!ival_plan(r, obj, obj, r->ngen, &count)) return MOQ_ERR_WRONG_STATE;
+    if (count > PUB_GROUP_INTERVALS) return MOQ_ERR_NOMEM;
+    pl->new_gen = true;
+    pl->gen = r->ngen;
+    return MOQ_OK;
+}
+
+/* Commit a planned stream Object; the op is already committed (slots
+ * stamped), so destinations holding this generation open and not part of the
+ * op are marked as having omitted it, and destinations part of it that will
+ * skip an earlier assigned Object they owe are marked too. */
+static void hist_commit_stream(moq_pub_track_t *t, const hist_plan_t *pl,
+                               uint64_t group, uint64_t obj, bool eog)
+{
+    if (!(t->has_cur && t->cur_group == group))
+        hist_close_current(t);
+    hist_take_record(t, pl, group);
+    pub_group_rec_t *r = &t->recs[pl->rec];
+    t->op.subgroup = pl->gen;
+    t->op.has_below = false;
+    if (pl->new_gen) {
+        /* The generation before it, still open in this group (a FIN by a
+         * destination ended it), ends now; its destinations finish it. */
+        if (pl->gen >= 1)
+            hist_end_gen(r, &r->gen[pl->gen - 1]);
+        pub_gen_t *g = &r->gen[pl->gen];
+        memset(g, 0, sizeof(*g));
+        g->first = g->last = obj;
+        r->ngen = (uint8_t)(pl->gen + 1);
+        t->op.first_in_gen = true;
+    } else {
+        pub_gen_t *g = &r->gen[pl->gen];
+        /* Before this Object joins: the largest earlier assigned Object of
+         * the generation, the witness a destination must have carried. */
+        t->op.has_below = ival_max_below(r, pl->gen, obj, &t->op.below);
+        t->op.first_in_gen = (obj == g->first);
+        if (obj > g->last) g->last = obj;
+    }
+    ival_apply(r, obj, obj, pl->gen);
+    if (eog) r->gen[pl->gen].eog_armed = true;
+    hist_note_max(r, obj);
+    t->has_cur = true;
+    t->cur_group = group;
+    t->cur_gen = pl->gen;
+    for (size_t i = 0; i < t->slot_cap; i++) {
+        pub_sub_slot_t *sl = &t->slots[i];
+        if (!sl->sg_open || sl->cur_group != group || sl->cur_gen != pl->gen)
+            continue;
+        if (sl->target_op == t->cur_op) {
+            /* Part of this op: writing `obj` next on its stream skips every
+             * assigned Object between its last write and `obj`; owed ones
+             * (at or after its Start Location) are omitted. */
+            if (t->op.has_below && t->op.below > sl->sg_last &&
+                window_owes(&sl->window, group, t->op.below))
+                sl->sg_omitted = true;
+            continue;
+        }
+        if (window_owes(&sl->window, group, obj)) sl->sg_omitted = true;
+    }
+}
+
+/* Plan a datagram Object or status. Under record pressure the current
+ * stream group may itself be compacted into the sealed runs (its open
+ * destinations keep their completeness verdict; later writes to it are
+ * refused). */
+static moq_result_t hist_plan_datagram(const moq_pub_track_t *t,
+                                       hist_kind_t kind, uint64_t group,
+                                       uint64_t obj, hist_plan_t *pl)
+{
+    moq_result_t rc = hist_plan_record(t, group, t->has_cur, t->cur_group,
+                                       true, pl);
+    if (rc < 0) return rc;
+    const pub_group_rec_t *r = pl->alloc ? NULL : &t->recs[pl->rec];
+    if (!hist_final_admits(t, r, group, obj)) return MOQ_ERR_WRONG_STATE;
+    if (r && hist_known_stream(r, obj)) return MOQ_ERR_WRONG_STATE;
+    /* A status names a boundary below which Objects exist and at or above
+     * which none do (section 11.1.1): one already assigned at or above it
+     * contradicts it. A status is not an assigned Object. */
+    if (kind == HIST_STATUS_EOG && r && r->has_max && r->max >= obj &&
+        !(r->max == obj && hist_known_datagram(r, obj)))
+        return MOQ_ERR_WRONG_STATE;
+    if (kind == HIST_DATAGRAM && r) {
+        int count;
+        if (!ival_plan(r, obj, obj, PUB_OWNER_DATAGRAM, &count))
+            return MOQ_ERR_WRONG_STATE;
+        if (count > PUB_GROUP_INTERVALS) return MOQ_ERR_NOMEM;
+    }
+    return MOQ_OK;
+}
+
+static void hist_commit_datagram(moq_pub_track_t *t, const hist_plan_t *pl,
+                                 hist_kind_t kind, uint64_t group, uint64_t obj)
+{
+    hist_take_record(t, pl, group);
+    pub_group_rec_t *r = &t->recs[pl->rec];
+    if (kind == HIST_STATUS_EOT) {
+        if (!t->has_eot ||
+            !hist_loc_at_or_after(group, obj, t->eot_group, t->eot_object)) {
+            t->has_eot = true;
+            t->eot_group = group;
+            t->eot_object = obj;
+        }
+        return;
+    }
+    if (kind == HIST_STATUS_EOG) {
+        if (r->final_kind != PUB_FINAL_SEALED &&
+            (r->final_kind == PUB_FINAL_NONE ||
+             (r->final_kind == PUB_FINAL_FROM && obj < r->final_at))) {
+            r->final_kind = PUB_FINAL_FROM;
+            r->final_at = obj;
+        }
+        return;
+    }
+    ival_apply(r, obj, obj, PUB_OWNER_DATAGRAM);
+    hist_note_max(r, obj);
+}
+
+/* A retained install of dense Objects 0..last in `group`. Allowed for a group
+ * with no history, and for a group whose only assignments are generation 0
+ * (no datagram, no revisit): when 0..last are all already generation-0
+ * Objects it assigns nothing new and is allowed even after a FIN; otherwise
+ * it extends generation 0's interval starting at Object 0 over unassigned
+ * Objects, which only a subgroup no stream of which has ended with a FIN may
+ * take -- a FIN fixed the subgroup's final Object (section 12.1, conditions 2
+ * and 3). */
+static moq_result_t hist_plan_retained(const moq_pub_track_t *t, uint64_t group,
+                                       uint64_t last, hist_plan_t *pl)
+{
+    moq_result_t rc = hist_plan_record(t, group, t->has_cur, t->cur_group,
+                                       false, pl);
+    if (rc < 0) return rc;
+    pl->new_gen = false;
+    pl->gen = 0;
+    if (!hist_final_admits(t, pl->alloc ? NULL : &t->recs[pl->rec], group, last))
+        return MOQ_ERR_WRONG_STATE;
+    if (pl->alloc) return MOQ_OK;
+    const pub_group_rec_t *r = &t->recs[pl->rec];
+    if (ival_has_owner(r, PUB_OWNER_DATAGRAM) || r->ngen > 1)
+        return MOQ_ERR_WRONG_STATE;
+    if (r->ngen == 0) return MOQ_OK;
+    int at = ival_find(r, 0);
+    if (at < 0 || r->ival_owner[at] != 0) return MOQ_ERR_WRONG_STATE;
+    if (last <= r->ival[at].hi) return MOQ_OK;      /* nothing new */
+    if (r->gen[0].end == PUB_GEN_FIN || r->gen[0].fin_seen)
+        return MOQ_ERR_WRONG_STATE;
+    /* The extension takes only unassigned Objects. */
+    for (uint8_t i = 0; i < r->nival; i++)
+        if ((int)i != at && r->ival[i].lo <= last)
+            return MOQ_ERR_WRONG_STATE;
+    int count;
+    if (!ival_plan(r, 0, last, 0, &count)) return MOQ_ERR_WRONG_STATE;
+    if (count > PUB_GROUP_INTERVALS) return MOQ_ERR_NOMEM;
+    return MOQ_OK;
+}
+
+static void hist_commit_retained(moq_pub_track_t *t, const hist_plan_t *pl,
+                                 uint64_t group, uint64_t last)
+{
+    hist_take_record(t, pl, group);
+    pub_group_rec_t *r = &t->recs[pl->rec];
+    if (r->ngen == 0) {
+        memset(&r->gen[0], 0, sizeof(r->gen[0]));
+        r->gen[0].first = 0;
+        r->gen[0].last = last;
+        r->ngen = 1;
+        r->retained_origin = true;
+    } else if (last > r->gen[0].last) {
+        r->gen[0].last = last;
+        /* Destinations holding generation 0 open never saw these. */
+        for (size_t i = 0; i < t->slot_cap; i++) {
+            pub_sub_slot_t *sl = &t->slots[i];
+            if (sl->sg_open && sl->cur_group == group && sl->cur_gen == 0 &&
+                window_owes(&sl->window, group, last))
+                sl->sg_omitted = true;
+        }
+    }
+    ival_apply(r, 0, last, 0);
+    hist_note_max(r, last);
+}
+
+/* The Subgroup ID Object `obj` of `group` was assigned (0 for a group the
+ * track has no record of). */
+static uint64_t hist_subgroup_of(const moq_pub_track_t *t, uint64_t group,
+                                 uint64_t obj)
+{
+    int ri = hist_find(t, group);
+    if (ri < 0) return 0;
+    int at = ival_find(&t->recs[ri], obj);
+    if (at < 0 || t->recs[ri].ival_owner[at] == PUB_OWNER_DATAGRAM) return 0;
+    return t->recs[ri].ival_owner[at];
+}
+
+/* Draft-16 only: the last Object sent in a FETCH that requested the entire
+ * Group is that Group's final Object (draft-16 section 2.4.2, condition 7).
+ * A whole-group response served from the retained Objects 0..last may be
+ * staged only when no Object above `last` was ever assigned in the group --
+ * live, retained or datagram, including an admitted Object not yet sent. */
+static bool hist_whole_group_fetch_admits(const moq_pub_track_t *t,
+                                          uint64_t group, uint64_t last)
+{
+    int ri = hist_find(t, group);
+    if (ri >= 0)
+        return !(t->recs[ri].has_max && t->recs[ri].max > last);
+    if (hist_sealed(t, group))
+        return t->has_sealed_retained_max &&
+               t->sealed_retained_group == group &&
+               t->sealed_retained_max <= last;
+    return true;
+}
+
+/* A staged draft-16 whole-group response fixes the group's final Object at
+ * `last` at once: nothing above it is assigned from now on, so the response
+ * cannot be contradicted by a later admission while it waits to be sent. A
+ * sealed group already takes nothing more. */
+static void hist_whole_group_fetch_seal(moq_pub_track_t *t, uint64_t group,
+                                        uint64_t last)
+{
+    int ri = hist_find(t, group);
+    if (ri < 0) return;
+    pub_group_rec_t *r = &t->recs[ri];
+    if (r->final_kind == PUB_FINAL_SEALED) return;
+    if (r->final_kind == PUB_FINAL_LAST && r->final_at <= last) return;
+    r->final_kind = PUB_FINAL_LAST;
+    r->final_at = last;
+}
+
+/* Close a destination's open subgroup: FIN only when it carried every Object
+ * assigned to that subgroup at or after its Start Location (window_owes);
+ * otherwise RESET (a FIN would claim the omitted Objects do not exist,
+ * draft-22 section 11.3.2). A
+ * FIN that is queued is recorded on the generation: it fixed the subgroup's
+ * final Object for that receiver, so nothing above it may join the subgroup
+ * later (section 12.1). */
+static moq_result_t slot_close_subgroup(moq_publisher_t *pub,
+                                        moq_pub_track_t *t, pub_sub_slot_t *sl,
+                                        uint64_t now_us)
+{
+    bool reset = sl->sg_omitted;
+    pub_gen_t *g = NULL;
+    int ri = hist_find(t, sl->cur_group);
+    if (ri >= 0 && sl->cur_gen < t->recs[ri].ngen)
+        g = &t->recs[ri].gen[sl->cur_gen];
+    if (!reset && g && g->last > sl->sg_last &&
+        window_owes(&sl->window, sl->cur_group, g->last))
+        reset = true;
+    if (reset)
+        return moq_session_reset_subgroup(pub->session, sl->sg, 0x0, now_us);
+    moq_result_t rc = moq_session_close_subgroup(pub->session, sl->sg, now_us);
+    if (rc == MOQ_OK && g) g->fin_seen = true;
+    return rc;
+}
+
+/* A destination opens the op's subgroup at Object `obj`: it begins the
+ * subgroup (FIRST_OBJECT) only at the generation's first Object, and an
+ * earlier assigned Object at or after its Start Location is one it has
+ * omitted. */
+static void slot_open_note(moq_pub_track_t *t, pub_sub_slot_t *sl,
+                           uint64_t group, uint64_t obj)
+{
+    sl->cur_gen = t->op.subgroup;
+    sl->sg_last = obj;
+    sl->sg_omitted = t->op.has_below &&
+                     window_owes(&sl->window, group, t->op.below);
+}
+
 /* Release a retained-object vector (decref each element's refs, free array). */
 static void pub_retained_free(const moq_alloc_t *alloc,
                               pub_retained_obj_t *arr, size_t n)
@@ -862,6 +1882,20 @@ static uint64_t pub_track_retained_last_object_id(const moq_pub_track_t *t)
 static uint64_t pub_track_retained_first_object_id(const moq_pub_track_t *t)
 { return t->retained_count ? t->retained[0].object_id : 0; }
 
+/* Whether a FETCH starting at (sg, so) names a published Object of the
+ * track: something was published on it (its Largest Object is known to the
+ * session, or a retained group holds objects) and the start is not past the
+ * Largest Object. */
+static bool fetch_start_published(const moq_pub_track_t *t,
+                                  uint64_t sg, uint64_t so)
+{
+    if (t->hist && t->hist->has_largest) {
+        uint64_t lg = t->hist->largest_group, lo = t->hist->largest_object;
+        return sg < lg || (sg == lg && so <= lo);
+    }
+    return pub_track_has_retained(t);
+}
+
 /* Is location (g,o) inside the FETCH request range [start, end)? End is
  * exclusive; end_object == 0 means the whole end group is included (§9.16). */
 static bool loc_in_fetch_range(uint64_t g, uint64_t o,
@@ -912,52 +1946,273 @@ static void pub_init_accept_cfg(const moq_pub_track_t *t,
         acc->largest_group = pub_track_retained_group(t);
         acc->largest_object = pub_track_retained_last_object_id(t);
     }
+    acc->track_properties = (moq_bytes_t){ t->props, t->props_len };
 }
 
-/* Finish the pending fetch: release the snapshot refs and clear the slot. */
-static void pending_fetch_clear(moq_publisher_t *pub)
+/* -- Owed request answers ---------------------------------------- */
+
+/* The answer is settled: given, or its request is gone (a stale handle, or
+ * no longer awaiting an answer). WOULD_BLOCK and CLOSED are told apart by
+ * the callers; anything else is a local failure to answer. */
+static bool pub_answer_settled(moq_result_t rc)
 {
-    pub_pending_fetch_t *pf = &pub->pending_fetch;
+    return rc == MOQ_OK || rc == MOQ_ERR_STALE_HANDLE || rc == MOQ_ERR_WRONG_STATE;
+}
+
+/* One answer: a TRACK_STATUS accepted with what a SUBSCRIBE_OK for the track
+ * would carry (§9.13), or a refusal. An acceptance the session cannot encode
+ * (Track Properties larger than it can ever send) still owes the request its
+ * answer: it becomes an INTERNAL_ERROR refusal, which *a then holds, so a
+ * retry sends the refusal. */
+static moq_result_t pub_answer_request(moq_publisher_t *pub,
+                                       pub_owed_answer_t *a, uint64_t now_us)
+{
+    moq_session_t *s = pub->session;
+    switch (a->kind) {
+    case MOQ_EVENT_TRACK_STATUS_REQUEST: {
+        moq_track_status_handle_t h = { a->handle };
+        if (a->track) {
+            moq_accept_track_status_cfg_t acc;
+            moq_accept_track_status_cfg_init(&acc);
+            if (retained_can_advertise_largest(a->track)) {
+                acc.has_largest = true;
+                acc.largest_group = pub_track_retained_group(a->track);
+                acc.largest_object = pub_track_retained_last_object_id(a->track);
+            }
+            acc.track_properties = (moq_bytes_t){ a->track->props, a->track->props_len };
+            moq_result_t rc = moq_session_accept_track_status(s, h, &acc, now_us);
+            if (pub_answer_settled(rc) || rc == MOQ_ERR_WOULD_BLOCK ||
+                rc == MOQ_ERR_CLOSED)
+                return rc;
+            a->track = NULL;
+            a->code = MOQ_REQUEST_ERROR_INTERNAL_ERROR;
+        }
+        moq_reject_track_status_cfg_t rej;
+        moq_reject_track_status_cfg_init(&rej);
+        rej.error_code = a->code;
+        return moq_session_reject_track_status(s, h, &rej, now_us);
+    }
+    case MOQ_EVENT_SUBSCRIBE_REQUEST: {
+        moq_reject_subscribe_cfg_t rej;
+        moq_reject_subscribe_cfg_init(&rej);
+        rej.error_code = a->code;
+        return moq_session_reject_subscribe(s, (moq_subscription_t){ a->handle },
+                                            &rej, now_us);
+    }
+    case MOQ_EVENT_PUBLISH_REQUEST: {
+        moq_reject_publish_cfg_t rej;
+        moq_reject_publish_cfg_init(&rej);
+        rej.error_code = a->code;
+        return moq_session_reject_publish(s, (moq_publication_t){ a->handle },
+                                          &rej, now_us);
+    }
+    case MOQ_EVENT_NAMESPACE_PUBLISHED: {
+        moq_reject_namespace_cfg_t rej;
+        moq_reject_namespace_cfg_init(&rej);
+        rej.error_code = a->code;
+        return moq_session_reject_namespace(s, (moq_announcement_t){ a->handle },
+                                            &rej, now_us);
+    }
+    case MOQ_EVENT_NS_SUB_REQUEST: {
+        moq_reject_ns_sub_cfg_t rej;
+        moq_reject_ns_sub_cfg_init(&rej);
+        rej.error_code = a->code;
+        return moq_session_reject_ns_sub(s, (moq_ns_sub_handle_t){ a->handle },
+                                         &rej, now_us);
+    }
+    case MOQ_EVENT_SUBSCRIBE_TRACKS_REQUEST: {
+        moq_reject_subscribe_tracks_cfg_t rej;
+        moq_reject_subscribe_tracks_cfg_init(&rej);
+        rej.error_code = a->code;
+        return moq_session_reject_subscribe_tracks(
+            s, (moq_track_sub_handle_t){ a->handle }, &rej, now_us);
+    }
+    default:
+        return MOQ_OK;
+    }
+}
+
+/* Retry owed answers in arrival order. Only WOULD_BLOCK keeps an answer; one
+ * whose request has gone is dropped (there is nothing left to answer), and
+ * one the session refuses outright is dropped and reported. */
+static moq_result_t pub_owed_drive(moq_publisher_t *pub, uint64_t now_us)
+{
+    size_t done = 0;
+    moq_result_t out = MOQ_OK;
+    while (done < pub->owed_count) {
+        moq_result_t rc = pub_answer_request(pub, &pub->owed[done], now_us);
+        if (rc == MOQ_ERR_WOULD_BLOCK) { out = rc; break; }
+        if (rc == MOQ_ERR_CLOSED) { done = pub->owed_count; out = rc; break; }
+        if (!pub_answer_settled(rc) && out == MOQ_OK) out = rc;
+        done++;
+    }
+    if (done > 0) {
+        memmove(pub->owed, pub->owed + done,
+                (pub->owed_count - done) * sizeof(pub->owed[0]));
+        pub->owed_count -= done;
+    }
+    return out;
+}
+
+/* Answer now, or hold the answer when the session cannot take it yet (also
+ * when earlier answers are still held, so answers keep their order). Sets
+ * *held when it was held. MOQ_ERR_NOMEM when it can be neither; the
+ * session's own error when it refuses the answer outright. */
+static moq_result_t pub_answer_or_owe(moq_publisher_t *pub, const pub_owed_answer_t *in,
+                                      uint64_t now_us, bool *held)
+{
+    *held = false;
+    pub_owed_answer_t cur = *in;
+    const pub_owed_answer_t *a = &cur;
+    if (pub->owed_count == 0) {
+        moq_result_t rc = pub_answer_request(pub, &cur, now_us);
+        if (rc != MOQ_ERR_WOULD_BLOCK)
+            return pub_answer_settled(rc) ? MOQ_OK : rc;
+    }
+    if (pub->owed_count == pub->owed_cap) {
+        size_t cap = pub->owed_cap ? pub->owed_cap * 2 : 4;
+        if (cap > SIZE_MAX / sizeof(pub->owed[0])) return MOQ_ERR_NOMEM;
+        pub_owed_answer_t *grown = (pub_owed_answer_t *)pub_alloc(pub,
+            cap * sizeof(pub->owed[0]));
+        if (!grown) return MOQ_ERR_NOMEM;
+        if (pub->owed_count)
+            memcpy(grown, pub->owed, pub->owed_count * sizeof(pub->owed[0]));
+        if (pub->owed) pub_free(pub, pub->owed, pub->owed_cap * sizeof(pub->owed[0]));
+        pub->owed = grown;
+        pub->owed_cap = cap;
+    }
+    pub->owed[pub->owed_count++] = *a;
+    *held = true;
+    return MOQ_OK;
+}
+
+/* Tick mode is the session's only consumer: a request nothing took is
+ * answered here instead of being left open. A SUBSCRIBE or TRACK_STATUS
+ * reached this point because the track is not this publisher's; every other
+ * kind is one the facade does not serve (draft-22 §1.6: "Limited endpoints
+ * SHOULD respond to any unsupported messages with the appropriate
+ * NOT_SUPPORTED error code"). */
+static moq_result_t pub_refuse_unserved(moq_publisher_t *pub, const moq_event_t *ev,
+                                        uint64_t now_us)
+{
+    pub_owed_answer_t a = { .kind = ev->kind, .handle = 0, .track = NULL,
+                            .code = MOQ_REQUEST_ERROR_NOT_SUPPORTED };
+    switch (ev->kind) {
+    case MOQ_EVENT_SUBSCRIBE_REQUEST:
+        a.handle = ev->u.subscribe_request.sub._opaque;
+        a.code = MOQ_REQUEST_ERROR_DOES_NOT_EXIST;
+        break;
+    case MOQ_EVENT_TRACK_STATUS_REQUEST:
+        a.handle = ev->u.track_status_request.handle._opaque;
+        a.code = MOQ_REQUEST_ERROR_DOES_NOT_EXIST;
+        break;
+    case MOQ_EVENT_PUBLISH_REQUEST:
+        a.handle = ev->u.publish_request.pub._opaque;
+        break;
+    case MOQ_EVENT_NAMESPACE_PUBLISHED:
+        a.handle = ev->u.namespace_published.ann._opaque;
+        break;
+    case MOQ_EVENT_NS_SUB_REQUEST:
+        a.handle = ev->u.ns_sub_request.handle._opaque;
+        break;
+    case MOQ_EVENT_SUBSCRIBE_TRACKS_REQUEST:
+        a.handle = ev->u.subscribe_tracks_request.handle._opaque;
+        break;
+    default:
+        return MOQ_OK;
+    }
+    bool held;
+    return pub_answer_or_owe(pub, &a, now_us, &held);
+}
+
+
+/* Finish the pending fetch: release the snapshot refs and clear the slot. */
+static void pending_fetch_clear(moq_publisher_t *pub, pub_pending_fetch_t *pf)
+{
+    if (moq_session_supports_fill(pub->session) && pf->active) {
+        pub_fetch_owners_t *owners = &pub->fetch_owners;
+        pub_fetch_owner_t *cell = &owners->cells[moq_handle_slot(pf->fetch._opaque)];
+        if (cell->prev != PUB_FETCH_NONE)
+            owners->cells[cell->prev].next = cell->next;
+        else owners->head = cell->next;
+        if (cell->next != PUB_FETCH_NONE)
+            owners->cells[cell->next].prev = cell->prev;
+        else owners->tail = cell->prev;
+    }
     pub_retained_free(&pub->alloc, pf->objs, pf->obj_count);
     memset(pf, 0, sizeof(*pf));
 }
 
+static void pending_fetches_clear(moq_publisher_t *pub)
+{
+    if (!moq_session_supports_fill(pub->session)) {
+        pending_fetch_clear(pub, &pub->pending_fetch);
+        return;
+    }
+    while (pub->fetch_owners.head != PUB_FETCH_NONE)
+        pending_fetch_clear(pub,
+            &pub->fetch_owners.cells[pub->fetch_owners.head].pending);
+}
+
 /* Answer one spec FETCH from the snapshotted retained GROUP: FETCH_OK (End
  * Location = last object + 1), then each object 0..N as a FETCH_OBJECT in order,
- * then FIN. Driven by pub->pending_fetch. Phased and capacity-gated so a full
+ * then FIN. Phased and capacity-gated so a full
  * action queue defers to a later tick rather than leaving a half-served fetch;
  * the accepted flag + next_idx cursor make every retry idempotent (no duplicate
  * or skipped object). A reject is only ever issued BEFORE accept. The objects
  * are served from the snapshot, so a clear/end/remove of the source track after
  * staging does not affect the response. */
-static void serve_retained_fetch(moq_publisher_t *pub, uint64_t now_us)
+static moq_result_t serve_retained_fetch(moq_publisher_t *pub,
+                                         pub_pending_fetch_t *pf, uint64_t now_us)
 {
-    pub_pending_fetch_t *pf = &pub->pending_fetch;
-    if (!pf->active) return;
+    if (!pf->active) return MOQ_OK;
+    bool d22 = moq_session_supports_fill(pub->session);
+    /* Cancellation must release references even with no action credit. The
+     * resolver checks pool, session, slot and generation, without advancing. */
+    if (d22 && fetch_resolve_handle(pub->session, pf->fetch) < 0) {
+        pending_fetch_clear(pub, pf);
+        return MOQ_OK;
+    }
 
-    if (!pf->accepted && pf->reject_code != 0) {
+    /* The reject flag, not the code, decides: INTERNAL_ERROR is code zero
+     * on every draft. */
+    if (!pf->accepted && pf->reject) {
         moq_reject_fetch_cfg_t rej;
         moq_reject_fetch_cfg_init(&rej);
         rej.error_code = pf->reject_code;
         moq_result_t rc = moq_session_reject_fetch(pub->session, pf->fetch,
                                                    &rej, now_us);
-        if (rc == MOQ_ERR_WOULD_BLOCK) return;   /* retry the reject */
-        pending_fetch_clear(pub);
-        return;
+        if (rc == MOQ_ERR_WOULD_BLOCK) return rc;
+        if (d22 && rc < 0 && rc != MOQ_ERR_STALE_HANDLE && rc != MOQ_ERR_CLOSED)
+            return rc;   /* still owns an unanswered request */
+        pending_fetch_clear(pub, pf);
+        return d22 && rc == MOQ_ERR_CLOSED ? rc : MOQ_OK;
     }
 
     if (!pf->accepted) {
-        if (moq_session_action_capacity(pub->session) < 2) return;  /* defer */
+        if (moq_session_action_capacity(pub->session) < 2) return MOQ_ERR_WOULD_BLOCK;
         moq_accept_fetch_cfg_t acc;
         moq_accept_fetch_cfg_init(&acc);
         acc.end_of_track = false;
         acc.end_group = pf->group_id;
         acc.end_object = pf->end_object;   /* End Location: last object + 1 */
+        if (pf->track)
+            acc.track_properties = (moq_bytes_t){ pf->track->props, pf->track->props_len };
         moq_result_t rc = moq_session_accept_fetch(pub->session, pf->fetch,
                                                    &acc, now_us);
-        if (rc == MOQ_ERR_WOULD_BLOCK) return;   /* defer; not accepted */
-        if (rc < 0) { pending_fetch_clear(pub); return; }
+        if (rc == MOQ_ERR_WOULD_BLOCK) return rc;
+        if (rc < 0) {
+            if (d22 && rc != MOQ_ERR_STALE_HANDLE && rc != MOQ_ERR_CLOSED)
+                return rc;
+            pending_fetch_clear(pub, pf);
+            return d22 && rc == MOQ_ERR_CLOSED ? rc : MOQ_OK;
+        }
         pf->accepted = true;
+        /* An early refused UPDATE can terminate the FETCH at accept commit. */
+        if (d22 && fetch_resolve_handle(pub->session, pf->fetch) < 0) {
+            pending_fetch_clear(pub, pf);
+            return MOQ_OK;
+        }
     }
 
     /* Accepted: write each remaining object from the cursor, then FIN. Each
@@ -966,29 +2221,309 @@ static void serve_retained_fetch(moq_publisher_t *pub, uint64_t now_us)
     while (pf->next_idx < pf->obj_count) {
         const pub_retained_obj_t *o = &pf->objs[pf->next_idx];
         size_t need = (o->properties ? 2u : 1u);
-        if (moq_session_action_capacity(pub->session) < need) return;  /* defer */
+        if (moq_session_action_capacity(pub->session) < need) return MOQ_ERR_WOULD_BLOCK;
         moq_fetch_object_cfg_t oc;
         moq_fetch_object_cfg_init(&oc);
         oc.group_id = pf->group_id;
-        oc.subgroup_id = 0;
+        oc.subgroup_id = o->subgroup_id;
         oc.object_id = o->object_id;
         oc.publisher_priority = pf->priority;
         oc.payload = o->payload;
         oc.properties = o->properties;
         moq_result_t rc = moq_session_write_fetch_object(pub->session, pf->fetch,
                                                          &oc, now_us);
+        if (rc == MOQ_ERR_WOULD_BLOCK) return rc;
+        if (rc < 0) {
+            if (d22 && rc != MOQ_ERR_STALE_HANDLE && rc != MOQ_ERR_CLOSED)
+                return rc;
+            (void)moq_session_end_fetch(pub->session, pf->fetch, now_us);
+            pending_fetch_clear(pub, pf);
+            return d22 && rc == MOQ_ERR_CLOSED ? rc : MOQ_OK;
+        }
+        pf->next_idx++;
+    }
+    if (moq_session_action_capacity(pub->session) < 1) return MOQ_ERR_WOULD_BLOCK;
+    moq_result_t rc = moq_session_end_fetch(pub->session, pf->fetch, now_us);
+    if (rc == MOQ_ERR_WOULD_BLOCK) return rc;
+    if (d22 && rc < 0 && rc != MOQ_ERR_STALE_HANDLE && rc != MOQ_ERR_CLOSED)
+        return rc;
+    pending_fetch_clear(pub, pf);
+    return d22 && rc == MOQ_ERR_CLOSED ? rc : MOQ_OK;
+}
+
+/* One arrival-ordered pass, including later independent owners when an
+ * earlier one waits for event or drain credit. No polling or retry loop. */
+static moq_result_t serve_retained_fetches(moq_publisher_t *pub, uint64_t now_us)
+{
+    if (!moq_session_supports_fill(pub->session))
+        return serve_retained_fetch(pub, &pub->pending_fetch, now_us);
+    pub_fetch_owners_t *owners = &pub->fetch_owners;
+    for (uint32_t i = owners->head; i != PUB_FETCH_NONE;) {
+        uint32_t next = owners->cells[i].next;
+        moq_result_t rc = serve_retained_fetch(pub, &owners->cells[i].pending, now_us);
+        if (rc < 0 && rc != MOQ_ERR_WOULD_BLOCK) return rc;
+        i = next;
+    }
+    return owners->head == PUB_FETCH_NONE ? MOQ_OK : MOQ_ERR_WOULD_BLOCK;
+}
+
+/* Finish one pending fill: release the snapshot refs and clear the slot. */
+static void pending_fill_clear(moq_publisher_t *pub, pub_pending_fill_t *pf)
+{
+    for (size_t i = 0; i < pf->obj_count; i++) {
+        moq_rcbuf_decref(pf->objs[i].payload);
+        moq_rcbuf_decref(pf->objs[i].properties);
+    }
+    pub->fill_bytes -= pf->charge;
+    memset(pf, 0, sizeof(*pf));
+}
+
+static void pending_fills_clear_all(moq_publisher_t *pub)
+{
+    for (size_t i = 0; i < pub->pending_fill_cap; i++)
+        if (pub->pending_fills[i].active)
+            pending_fill_clear(pub, &pub->pending_fills[i]);
+}
+
+static pub_pending_fill_t *pending_fill_alloc(moq_publisher_t *pub)
+{
+    for (size_t i = 0; i < pub->pending_fill_cap; i++)
+        if (!pub->pending_fills[i].active)
+            return &pub->pending_fills[i];
+    return NULL;
+}
+
+static pub_pending_fill_t *pending_fill_find(moq_publisher_t *pub, moq_fill_t fill)
+{
+    for (size_t i = 0; i < pub->pending_fill_cap; i++)
+        if (pub->pending_fills[i].active &&
+            moq_fill_eq(pub->pending_fills[i].fill, fill))
+            return &pub->pending_fills[i];
+    return NULL;
+}
+
+static bool pending_fill_work(const pub_pending_fill_t *pf)
+{
+    return pf->active && pf->requested && !pf->terminal_queued &&
+           (!pf->deferred || pf->abort);
+}
+
+static bool pending_fills_active(const moq_publisher_t *pub)
+{
+    for (size_t i = 0; i < pub->pending_fill_cap; i++)
+        if (pending_fill_work(&pub->pending_fills[i])) return true;
+    return false;
+}
+
+static moq_result_t pending_fill_reserve(moq_publisher_t *pub, moq_pub_track_t *track,
+                                         pub_pending_fill_t **out)
+{
+    if (*out) return MOQ_OK; /* ACK retries never read the mutable cache again. */
+    if (pub->session->action_cap < 3 || pub->session->event_cap < 2)
+        return MOQ_ERR_BUFFER;
+    pub_pending_fill_t *pf = pending_fill_alloc(pub);
+    if (!pf) return MOQ_ERR_WOULD_BLOCK;
+    uint64_t cost = 0;
+    bool permanent = false;
+    for (size_t i = 0; i < track->retained_count; i++) {
+        uint64_t payload = moq_rcbuf_len(track->retained[i].payload);
+        uint64_t props = moq_rcbuf_len(track->retained[i].properties);
+        if (payload > UINT64_MAX - cost || props > UINT64_MAX - cost - payload) {
+            permanent = true;
+            break;
+        }
+        cost += payload + props;
+    }
+    if (cost > pub->cfg.max_fill_snapshot_bytes) permanent = true;
+    if (!permanent && cost > pub->cfg.max_fill_snapshot_bytes - pub->fill_bytes)
+        return MOQ_ERR_WOULD_BLOCK;
+    uint64_t identity;
+    if (!sub_fill_identity_next(&pub_fill_identities, &identity)) return MOQ_ERR_LIMIT;
+    pf->active = true;
+    pf->token._opaque = identity;
+    pf->track = track;
+    pf->group_id = track->retained_group_id;
+    pf->priority = track->priority;
+    if (permanent) {
+        pf->abort = true;
+        pf->abort_code = MOQ_STREAM_ERROR_INTERNAL_ERROR;
+    } else {
+        pf->obj_count = track->retained_count;
+        for (size_t i = 0; i < pf->obj_count; i++) {
+            pf->objs[i] = track->retained[i];
+            moq_rcbuf_incref(pf->objs[i].payload);
+            moq_rcbuf_incref(pf->objs[i].properties);
+        }
+        pf->charge = cost;
+        pub->fill_bytes += cost;
+    }
+    *out = pf;
+    return MOQ_OK;
+}
+
+static void pending_fill_bind(moq_publisher_t *pub, pub_pending_fill_t *pf,
+                              const moq_pub_fill_receipt_t *receipt)
+{
+    if (!pf) return;
+    if (receipt->outcome != 2) {
+        pending_fill_clear(pub, pf);
+        return;
+    }
+    pf->receipt = receipt->request;
+    pf->fill = receipt->request.fill;
+}
+
+/* Answer one fill from its snapshot: the fill fetch stream's header, each
+ * retained object in order, then a FIN -- or, for a request the facade
+ * cannot serve, the header followed by RESET (the session opens an unopened
+ * child before resetting it). Capacity-gated and phased like
+ * serve_retained_fetch so a full action queue defers to a later tick without
+ * a duplicate or skipped object. A child the session already ended (its
+ * parent cancelled, say) is stale here and simply released. */
+static void serve_pending_fill(moq_publisher_t *pub, pub_pending_fill_t *pf,
+                               uint64_t now_us)
+{
+    if (!pending_fill_work(pf)) return;
+
+    if (pf->abort) {
+        moq_result_t rc = moq_session_abort_fill(pub->session, pf->fill,
+                                                 pf->abort_code, now_us);
+        if (rc == MOQ_ERR_WOULD_BLOCK) return;   /* retry the abort */
+        pf->terminal_queued = true;
+        return;
+    }
+
+    if (!pf->opened) {
+        moq_result_t rc = moq_session_open_fill(pub->session, pf->fill, now_us);
+        if (rc == MOQ_ERR_WOULD_BLOCK) return;   /* defer; not opened */
+        if (rc == MOQ_ERR_STALE_HANDLE || rc == MOQ_ERR_CLOSED) {
+            pf->terminal_queued = true;
+            return;
+        }
+        if (rc < 0) {
+            pf->abort = true;
+            pf->abort_code = MOQ_STREAM_ERROR_INTERNAL_ERROR;
+            return;
+        }
+        pf->opened = true;
+    }
+
+    while (pf->next_idx < pf->obj_count &&
+           pf->objs[pf->next_idx].object_id <= pf->receipt.end_object) {
+        const pub_retained_obj_t *o = &pf->objs[pf->next_idx];
+        size_t need = (o->properties ? 2u : 1u);
+        if (moq_session_action_capacity(pub->session) < need) return;  /* defer */
+        moq_fetch_object_cfg_t oc;
+        moq_fetch_object_cfg_init(&oc);
+        oc.group_id = pf->group_id;
+        oc.subgroup_id = o->subgroup_id;
+        oc.object_id = o->object_id;
+        oc.publisher_priority = pf->priority;
+        oc.payload = o->payload;
+        oc.properties = o->properties;
+        moq_result_t rc = moq_session_write_fill_object(pub->session, pf->fill,
+                                                        &oc, now_us);
         if (rc == MOQ_ERR_WOULD_BLOCK) return;   /* resume at cursor */
         if (rc < 0) {
-            (void)moq_session_end_fetch(pub->session, pf->fetch, now_us);
-            pending_fetch_clear(pub);
+            /* A half-written fill is never finished as complete: fail it. */
+            pf->abort = true;
+            pf->abort_code = MOQ_STREAM_ERROR_INTERNAL_ERROR;
+            if (rc == MOQ_ERR_STALE_HANDLE || rc == MOQ_ERR_CLOSED)
+                pf->terminal_queued = true;
             return;
         }
         pf->next_idx++;
     }
     if (moq_session_action_capacity(pub->session) < 1) return;   /* defer the FIN */
-    moq_result_t rc = moq_session_end_fetch(pub->session, pf->fetch, now_us);
+    moq_result_t rc = moq_session_end_fill(pub->session, pf->fill, now_us);
     if (rc == MOQ_ERR_WOULD_BLOCK) return;
-    pending_fetch_clear(pub);
+    if (rc == MOQ_OK || rc == MOQ_ERR_STALE_HANDLE || rc == MOQ_ERR_CLOSED)
+        pf->terminal_queued = true;
+    else {
+        pf->abort = true;
+        pf->abort_code = MOQ_STREAM_ERROR_INTERNAL_ERROR;
+    }
+}
+
+static void serve_pending_fills(moq_publisher_t *pub, uint64_t now_us)
+{
+    for (size_t i = 0; i < pub->pending_fill_cap; i++)
+        serve_pending_fill(pub, &pub->pending_fills[i], now_us);
+}
+
+static moq_result_t pub_fill_lookup(moq_publisher_t *pub, moq_pub_fill_t fill,
+                                    pub_pending_fill_t **out)
+{
+    if (!pub) return MOQ_ERR_INVAL;
+    if (pub->in_fill_callback) return MOQ_ERR_WRONG_STATE;
+    for (size_t i = 0; i < pub->pending_fill_cap; i++) {
+        pub_pending_fill_t *pf = &pub->pending_fills[i];
+        if (!pf->active || !moq_pub_fill_eq(pf->token, fill)) continue;
+        if (pf->terminal_queued) return MOQ_ERR_STALE_HANDLE;
+        if (!pf->requested || !pf->deferred) return MOQ_ERR_WRONG_STATE;
+        *out = pf;
+        return MOQ_OK;
+    }
+    return MOQ_ERR_STALE_HANDLE;
+}
+
+moq_result_t moq_pub_open_fill(moq_publisher_t *pub, moq_pub_fill_t fill, uint64_t now_us)
+{
+    pub_pending_fill_t *pf;
+    moq_result_t rc = pub_fill_lookup(pub, fill, &pf);
+    if (rc < 0) return rc;
+    if (pf->abort) return MOQ_ERR_WRONG_STATE;
+    rc = moq_session_open_fill(pub->session, pf->fill, now_us);
+    if (rc == MOQ_OK) pf->opened = true;
+    return rc;
+}
+
+moq_result_t moq_pub_write_fill_object(moq_publisher_t *pub, moq_pub_fill_t fill,
+    const moq_fetch_object_cfg_t *cfg, uint64_t now_us)
+{
+    pub_pending_fill_t *pf;
+    moq_result_t rc = pub_fill_lookup(pub, fill, &pf);
+    if (rc < 0) return rc;
+    if (pf->abort) return MOQ_ERR_WRONG_STATE;
+    return moq_session_write_fill_object(pub->session, pf->fill, cfg, now_us);
+}
+
+moq_result_t moq_pub_write_fill_range(moq_publisher_t *pub, moq_pub_fill_t fill,
+    moq_fetch_range_kind_t kind, uint64_t group_id, uint64_t object_id, uint64_t now_us)
+{
+    pub_pending_fill_t *pf;
+    moq_result_t rc = pub_fill_lookup(pub, fill, &pf);
+    if (rc < 0) return rc;
+    if (pf->abort) return MOQ_ERR_WRONG_STATE;
+    return moq_session_write_fill_range(pub->session, pf->fill, kind,
+                                         group_id, object_id, now_us);
+}
+
+moq_result_t moq_pub_end_fill(moq_publisher_t *pub, moq_pub_fill_t fill, uint64_t now_us)
+{
+    pub_pending_fill_t *pf;
+    moq_result_t rc = pub_fill_lookup(pub, fill, &pf);
+    if (rc < 0) return rc;
+    if (pf->abort) return MOQ_ERR_WRONG_STATE;
+    rc = moq_session_end_fill(pub->session, pf->fill, now_us);
+    if (rc == MOQ_OK || rc == MOQ_ERR_STALE_HANDLE) pf->terminal_queued = true;
+    return rc;
+}
+
+moq_result_t moq_pub_abort_fill(moq_publisher_t *pub, moq_pub_fill_t fill,
+                                uint64_t error_code, uint64_t now_us)
+{
+    pub_pending_fill_t *pf;
+    moq_result_t rc = pub_fill_lookup(pub, fill, &pf);
+    if (rc < 0) return rc;
+    if (pf->abort && pf->abort_code != error_code) return MOQ_ERR_WRONG_STATE;
+    rc = moq_session_abort_fill(pub->session, pf->fill, error_code, now_us);
+    if (rc == MOQ_OK || rc == MOQ_ERR_STALE_HANDLE) pf->terminal_queued = true;
+    if (rc == MOQ_ERR_WOULD_BLOCK) {
+        pf->abort = true;
+        pf->abort_code = error_code;
+    }
+    return rc;
 }
 
 static void track_clear_subscriber(moq_pub_track_t *t)
@@ -1181,7 +2716,29 @@ static moq_pub_track_t *find_track_by_pub(moq_publisher_t *pub,
 }
 
 
+/* A removed track can no longer be stated: an owed TRACK_STATUS answer for it
+ * becomes DOES_NOT_EXIST, and a retained FETCH still to be answered carries no
+ * Track Properties. */
+static void pub_forget_track(moq_publisher_t *pub, const moq_pub_track_t *t)
+{
+    for (size_t i = 0; i < pub->owed_count; i++) {
+        if (pub->owed[i].track != t) continue;
+        pub->owed[i].track = NULL;
+        pub->owed[i].code = MOQ_REQUEST_ERROR_DOES_NOT_EXIST;
+    }
+    if (!moq_session_supports_fill(pub->session)) {
+        if (pub->pending_fetch.track == t) pub->pending_fetch.track = NULL;
+    } else if (pub->fetch_owners.cells) {
+        for (size_t i = 0; i < pub->fetch_owners.cap; i++)
+            if (pub->fetch_owners.cells[i].pending.track == t)
+                pub->fetch_owners.cells[i].pending.track = NULL;
+    }
+}
+
 static void free_track_state(moq_publisher_t *pub, moq_pub_track_t *t) {
+    pub_forget_track(pub, t);
+    facade_migration_clear(&t->migration, &pub->alloc);
+    if (t->props) pub_free(pub, t->props, t->props_cap);
     track_op_release(t);   /* exactly-once: idempotent via NULL/kind */
     track_release_retained(t);
     /* Drop the track's history reservation: an empty (unpublished) record is
@@ -1204,25 +2761,303 @@ static void unlink_track(moq_publisher_t *pub, moq_pub_track_t *t) {
     }
 }
 
+static moq_result_t pending_update_apply(moq_publisher_t *pub,
+                                         const pub_pending_t *p, uint64_t now_us)
+{
+    moq_pub_track_t *t = p->track;
+    const moq_pub_subscribe_update_info_t *u = &p->update_info;
+    bool publication = moq_publication_is_valid(p->publication);
+    pub_sub_slot_t *sl = publication ? track_find_publication_slot(t)
+                                    : track_find_slot_by_sub(t, p->sub);
+    if (sl && u->has_forward) {
+        bool prior = publication ? t->publish_forward : sl->forward;
+        if (!u->forward && prior) slot_forward_drop(t, sl);
+        if (publication) t->publish_forward = u->forward;
+        else sl->forward = u->forward;
+    }
+    if (sl && p->has_filter) {
+        if (publication) slot_install_pub_window(pub, sl);
+        else slot_install_sub_window(pub, sl);
+        slot_window_cut_check(t, sl);
+    }
+    if (publication) {
+        if (u->has_forward && CB_HAS(&pub->callbacks, on_publish_forward_changed))
+            pub->callbacks.on_publish_forward_changed(pub->callbacks.ctx, t, u->forward);
+    } else if (CB_HAS(&pub->callbacks, on_subscriber_updated)) {
+        pub->callbacks.on_subscriber_updated(pub->callbacks.ctx, t, u);
+    }
+    moq_result_t rc = track_run_retires(pub, t, now_us);
+    if (rc < 0 && rc != MOQ_ERR_STALE_HANDLE) return rc;
+    return track_run_completions(pub, t, now_us);
+}
+
+static bool admission_live(moq_publisher_t *pub, uint64_t parent,
+                           uint32_t flags, uint64_t update_id)
+{
+    const moq_owed_update_t *owed;
+    if (flags & PUB_ADMISSION_PUBLICATION) {
+        int slot = pub_resolve_handle(pub->session, (moq_publication_t){parent});
+        if (slot < 0) return false;
+        const moq_pub_entry_t *e = &pub->session->publishes[slot];
+        if (e->role != MOQ_PUB_ROLE_PUBLISHER || e->state != MOQ_PUB_ESTABLISHED)
+            return false;
+        owed = &e->owed_update;
+    } else {
+        int slot = sub_resolve_handle(pub->session, (moq_subscription_t){parent});
+        if (slot < 0) return false;
+        const moq_sub_entry_t *e = &pub->session->subs[slot];
+        if (e->role != MOQ_SUB_ROLE_PUBLISHER) return false;
+        if (!(flags & PUB_ADMISSION_UPDATE))
+            return e->state == MOQ_SUB_PENDING_PUBLISHER;
+        if (e->state != MOQ_SUB_ESTABLISHED) return false;
+        owed = &e->owed_update;
+    }
+    return owed->owed && owed->rec.request_id == update_id;
+}
+
+static pub_admission_t *admission_cell(moq_publisher_t *pub, uint64_t parent,
+                                      bool publication)
+{
+    size_t slot = moq_handle_slot(parent);
+    if (slot >= (publication ? pub->session->pub_cap : pub->session->sub_cap))
+        return NULL;
+    if (publication) slot += pub->session->sub_cap;
+    return &pub->admissions.cells[slot];
+}
+
+static void admission_clear(moq_publisher_t *pub, pub_admission_t *a)
+{
+    pub_admissions_t *q = &pub->admissions;
+    if (a->prev != PUB_ADMISSION_NONE) q->cells[a->prev].next = a->next;
+    else q->head = a->next;
+    if (a->next != PUB_ADMISSION_NONE) q->cells[a->next].prev = a->prev;
+    else q->tail = a->prev;
+    /* Bound jobs have already been detached at ACK commit. */
+    if (a->fill_job) pending_fill_clear(pub, a->fill_job);
+    if ((a->flags & PUB_ADMISSION_DEFERRED) && pub->deferred.active &&
+        pub->deferred.sub._opaque == a->parent)
+        pub->deferred.active = false;
+    memset(a, 0, sizeof(*a));
+}
+
+static bool admission_cancel(moq_publisher_t *pub, uint64_t parent, bool publication)
+{
+    pub_admission_t *a = admission_cell(pub, parent, publication);
+    if (!a || !(a->flags & PUB_ADMISSION_ACTIVE) || a->parent != parent)
+        return false;
+    admission_clear(pub, a);
+    return true;
+}
+
+static void admissions_clear(moq_publisher_t *pub)
+{
+    while (pub->admissions.head != PUB_ADMISSION_NONE)
+        admission_clear(pub, &pub->admissions.cells[pub->admissions.head]);
+}
+
+/* Claim only a live obligation. Replayed/stale events never authorize, and a
+ * new generation can reclaim its cell without touching an old bound child. */
+static moq_result_t admission_claim(moq_publisher_t *pub, uint64_t parent,
+    uint32_t flags, uint64_t update_id, pub_admission_t **out, bool *fresh)
+{
+    *out = NULL;
+    *fresh = false;
+    pub_admission_t *a = admission_cell(pub, parent,
+                                        (flags & PUB_ADMISSION_PUBLICATION) != 0);
+    if (!a) return MOQ_OK;
+    if ((a->flags & PUB_ADMISSION_ACTIVE) &&
+        !admission_live(pub, a->parent, a->flags, a->update_id))
+        admission_clear(pub, a);
+    if (!admission_live(pub, parent, flags, update_id)) return MOQ_OK;
+    if (a->flags & PUB_ADMISSION_ACTIVE) {
+        if (a->parent != parent || a->update_id != update_id ||
+            ((a->flags ^ flags) & PUB_ADMISSION_UPDATE))
+            return MOQ_ERR_WRONG_STATE;
+        *out = a;
+        return MOQ_OK;
+    }
+    pub_admissions_t *q = &pub->admissions;
+    uint32_t index = (uint32_t)(a - q->cells);
+    a->parent = parent;
+    a->update_id = update_id;
+    a->flags = flags | PUB_ADMISSION_ACTIVE;
+    a->prev = q->tail;
+    a->next = PUB_ADMISSION_NONE;
+    if (q->tail != PUB_ADMISSION_NONE) q->cells[q->tail].next = index;
+    else q->head = index;
+    q->tail = index;
+    *fresh = true;
+    *out = a;
+    return MOQ_OK;
+}
+
+static moq_result_t flush_admission(moq_publisher_t *pub, pub_admission_t *a,
+                                     uint64_t now_us)
+{
+    if (!admission_live(pub, a->parent, a->flags, a->update_id)) {
+        admission_clear(pub, a);
+        return MOQ_OK;
+    }
+    if (a->flags & PUB_ADMISSION_DEFERRED) return MOQ_ERR_WOULD_BLOCK;
+    bool update = (a->flags & PUB_ADMISSION_UPDATE) != 0;
+    bool publication = (a->flags & PUB_ADMISSION_PUBLICATION) != 0;
+    if (!update && (a->flags & PUB_ADMISSION_ACCEPT) && a->track->ended) {
+        a->flags &= ~PUB_ADMISSION_ACCEPT;
+        a->reject_code = MOQ_REQUEST_ERROR_DOES_NOT_EXIST;
+    }
+    bool accept = (a->flags & PUB_ADMISSION_ACCEPT) != 0;
+    moq_result_t rc;
+    if (accept && !update) {
+        /* No intervening poll/callback before ACK + slot installation. Many
+         * queued decisions must not promise the same destination slot. */
+        rc = track_reserve_sub_slots(pub, a->track);
+        if (rc < 0) return rc;
+    }
+    if (accept && (a->flags & PUB_ADMISSION_FILL)) {
+        rc = pending_fill_reserve(pub, a->track, &a->fill_job);
+        if (rc < 0) return rc;
+    }
+    moq_pub_fill_receipt_t receipt = {0};
+    if (update) {
+        moq_accept_subscription_update_cfg_t acc;
+        moq_accept_subscription_update_cfg_init_sized(&acc, sizeof(acc));
+        acc.update_request_id = a->update_id;
+        rc = publication
+            ? session_accept_publication_update_receipt(pub->session,
+                (moq_publication_t){a->parent}, &acc, now_us, &receipt)
+            : session_accept_subscription_update_receipt(pub->session,
+                (moq_subscription_t){a->parent}, &acc, now_us, &receipt);
+    } else if (accept) {
+        moq_accept_subscribe_cfg_t acc;
+        pub_init_accept_cfg(a->track, &acc);
+        rc = session_accept_subscribe_receipt(pub->session,
+                (moq_subscription_t){a->parent}, &acc, now_us, &receipt);
+    } else {
+        moq_reject_subscribe_cfg_t rej;
+        moq_reject_subscribe_cfg_init(&rej);
+        rej.error_code = a->reject_code;
+        rc = moq_session_reject_subscribe(pub->session,
+                (moq_subscription_t){a->parent}, &rej, now_us);
+    }
+    if (rc < 0) return rc; /* Retain the decision and immutable reservation. */
+    if (a->fill_job && accept) {
+        pending_fill_bind(pub, a->fill_job, &receipt);
+        a->fill_job = NULL; /* Only real terminal dispatch releases a bound job. */
+    }
+    moq_pub_track_t *t = a->track;
+    pub_pending_t committed = {
+        .track = t, .sub = {publication ? 0 : a->parent},
+        .publication = {publication ? a->parent : 0},
+        .has_filter = (a->flags & PUB_ADMISSION_FILTER) != 0,
+        .update_info = {
+            .has_subscriber_priority = (a->flags & PUB_ADMISSION_HAS_PRIORITY) != 0,
+            .subscriber_priority = (uint8_t)a->priority,
+            .has_forward = (a->flags & PUB_ADMISSION_HAS_FORWARD) != 0,
+            .forward = (a->flags & PUB_ADMISSION_FORWARD) != 0,
+            .has_delivery_timeout = (a->flags & PUB_ADMISSION_HAS_TIMEOUT) != 0,
+            .delivery_timeout_us = a->delivery_timeout_us
+        }
+    };
+    if (accept && !update)
+        track_set_subscriber(pub, t, (moq_subscription_t){a->parent},
+                              (a->flags & PUB_ADMISSION_FORWARD) != 0);
+    admission_clear(pub, a);
+    if (update) return pending_update_apply(pub, &committed, now_us);
+    if (accept) {
+        if (pub->callbacks.on_subscriber_joined)
+            pub->callbacks.on_subscriber_joined(pub->callbacks.ctx, t);
+        return track_run_completions(pub, t, now_us);
+    }
+    return MOQ_OK;
+}
+
+static moq_result_t flush_admissions(moq_publisher_t *pub, uint64_t now_us)
+{
+    pub_admissions_t *q = &pub->admissions;
+    uint32_t last = q->tail;
+    size_t remaining = q->cap;
+    moq_result_t result = MOQ_OK;
+    /* Visit this pass's occupied list once, oldest first. A credit waiter or
+     * unresolved authorizer must not prevent a later no-fill ACK. */
+    for (uint32_t i = q->head; i != PUB_ADMISSION_NONE && remaining--;) {
+        pub_admission_t *a = &q->cells[i];
+        if (!(a->flags & PUB_ADMISSION_ACTIVE)) break;
+        uint32_t next = a->next;
+        moq_result_t rc = flush_admission(pub, a, now_us);
+        if (rc == MOQ_ERR_WOULD_BLOCK) result = rc;
+        else if (rc < 0) return rc;
+        if (i == last) break;
+        i = next;
+    }
+    return result;
+}
+
+static moq_result_t stage_update(moq_publisher_t *pub, const pub_pending_t *p,
+                                  uint64_t now_us)
+{
+    bool publication = moq_publication_is_valid(p->publication);
+    pub_admission_t *a;
+    bool fresh;
+    moq_result_t rc = admission_claim(pub,
+        publication ? p->publication._opaque : p->sub._opaque,
+        PUB_ADMISSION_UPDATE | (publication ? PUB_ADMISSION_PUBLICATION : 0),
+        p->update_id, &a, &fresh);
+    if (rc < 0 || !a) return rc;
+    if (fresh) {
+        const moq_pub_subscribe_update_info_t *u = &p->update_info;
+        a->track = p->track;
+        a->flags |= PUB_ADMISSION_ACCEPT |
+            (p->fill_requested ? PUB_ADMISSION_FILL : 0) |
+            (p->has_filter ? PUB_ADMISSION_FILTER : 0) |
+            (u->has_forward ? PUB_ADMISSION_HAS_FORWARD : 0) |
+            (u->forward ? PUB_ADMISSION_FORWARD : 0) |
+            (u->has_subscriber_priority ? PUB_ADMISSION_HAS_PRIORITY : 0) |
+            (u->has_delivery_timeout ? PUB_ADMISSION_HAS_TIMEOUT : 0);
+        a->priority = u->subscriber_priority;
+        a->delivery_timeout_us = u->delivery_timeout_us;
+    }
+    return flush_admission(pub, a, now_us);
+}
+
 static moq_result_t flush_pending(moq_publisher_t *pub, uint64_t now_us,
                                    moq_pub_track_t **out_joined)
 {
     if (out_joined) *out_joined = NULL;
+    if (moq_session_supports_fill(pub->session))
+        return flush_admissions(pub, now_us);
     pub_pending_t *p = &pub->pending;
     if (!p->active) return MOQ_OK;
 
     /* A track ended while its accept was pending: reject the late subscriber
      * instead of completing the accept onto a terminal track. */
-    if (p->accept && p->track && p->track->ended) {
+    if (!p->update && p->accept && p->track && p->track->ended) {
         p->accept = false;
         p->reject_code = MOQ_REQUEST_ERROR_DOES_NOT_EXIST;
     }
 
     moq_result_t rc;
-    if (p->accept) {
+    if (p->accept && p->fill_requested) {
+        rc = pending_fill_reserve(pub, p->track, &p->fill_job);
+        if (rc < 0) {
+            if (rc != MOQ_ERR_WOULD_BLOCK) memset(p, 0, sizeof(*p));
+            return rc;
+        }
+    }
+    moq_pub_fill_receipt_t receipt = {0};
+    if (p->update) {
+        moq_accept_subscription_update_cfg_t acc;
+        moq_accept_subscription_update_cfg_init_sized(&acc, sizeof(acc));
+        acc.update_request_id = p->update_id;
+        rc = moq_publication_is_valid(p->publication)
+            ? session_accept_publication_update_receipt(pub->session, p->publication,
+                                                         &acc, now_us, &receipt)
+            : session_accept_subscription_update_receipt(pub->session, p->sub,
+                                                          &acc, now_us, &receipt);
+    } else if (p->accept) {
         moq_accept_subscribe_cfg_t acc;
         pub_init_accept_cfg(p->track, &acc);
-        rc = moq_session_accept_subscribe(pub->session, p->sub, &acc, now_us);
+        rc = session_accept_subscribe_receipt(pub->session, p->sub, &acc,
+                                               now_us, &receipt);
     } else {
         moq_reject_subscribe_cfg_t rej;
         moq_reject_subscribe_cfg_init(&rej);
@@ -1232,12 +3067,22 @@ static moq_result_t flush_pending(moq_publisher_t *pub, uint64_t now_us,
 
     if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
 
+    if (p->fill_job) {
+        if (rc == MOQ_OK && p->accept) pending_fill_bind(pub, p->fill_job, &receipt);
+        else pending_fill_clear(pub, p->fill_job);
+    }
+
+    if (rc == MOQ_OK && p->update) {
+        pub_pending_t committed = *p;
+        memset(p, 0, sizeof(*p));
+        return pending_update_apply(pub, &committed, now_us);
+    }
     if (rc == MOQ_OK && p->accept && p->track) {
         track_set_subscriber(pub, p->track, p->sub, p->forward);
         if (out_joined) *out_joined = p->track;
     }
 
-    p->active = false;
+    memset(p, 0, sizeof(*p));
     return rc < 0 ? rc : MOQ_OK;
 }
 
@@ -1254,8 +3099,10 @@ static void pub_close_local(moq_publisher_t *pub, uint64_t code)
     if (pub->closed) return;
     pub->closed = true;
     pub->deferred.active = false;
-    pub->pending.active = false;
-    pending_fetch_clear(pub);   /* release retained-FETCH snapshot refs now */
+    if (moq_session_supports_fill(pub->session)) admissions_clear(pub);
+    else pub->pending.active = false;
+    pending_fetches_clear(pub);   /* release retained-FETCH snapshot refs now */
+    pending_fills_clear_all(pub);
     for (moq_pub_track_t *t = pub->tracks; t; t = t->next) {
         track_clear_subscriber(t);
         track_op_release(t);    /* wrapped-buffer release must not wait for
@@ -1268,23 +3115,42 @@ static void pub_close_local(moq_publisher_t *pub, uint64_t code)
 /*
  * Progress ALL staged, action-queue-limited work: a pending subscribe accept/
  * reject (firing on_subscriber_joined exactly once on completion), a deferred
- * retained FETCH, and lazy Forward-0 subgroup retirements. Idempotent under
- * retry -- flush_pending guards on pending.active, serve_retained_fetch and
- * track_run_retires mutate only on success and re-arm on WOULD_BLOCK -- so a
+ * retained FETCH, pending fills, and lazy Forward-0 subgroup retirements.
+ * Idempotent under retry -- admission cells unlink at commit (legacy uses
+ * pending.active),
+ * serve_retained_fetch, serve_pending_fills and track_run_retires mutate only
+ * on success and re-arm on WOULD_BLOCK -- so a
  * repeated call never doubles a callback or a wire action. Shared by
  * moq_pub_flush (manual mode) and moq_pub_tick.
  */
 static moq_result_t pub_progress_staged(moq_publisher_t *pub, uint64_t now_us)
 {
+    /* Answers already owed go first, in the order the requests came. */
+    moq_result_t orc = pub_owed_drive(pub, now_us);
+    if (orc == MOQ_ERR_CLOSED) return orc;
+    bool owed_waiting = orc == MOQ_ERR_WOULD_BLOCK;
+    /* An owed answer the session refused outright is reported once the
+     * rest has progressed. */
+    moq_result_t owed_err = orc < 0 && !owed_waiting ? orc : MOQ_OK;
+    /* Progress held children even when the next parent waits for their credit.
+     * Waiting for a real terminal is not action-queue-limited work. */
+    serve_pending_fills(pub, now_us);
     moq_pub_track_t *joined = NULL;
     moq_result_t rc = flush_pending(pub, now_us, &joined);
     if (joined && pub->callbacks.on_subscriber_joined)
         pub->callbacks.on_subscriber_joined(pub->callbacks.ctx, joined);
-    if (rc < 0) return rc;   /* WOULD_BLOCK or error: retry drains + reflushes */
+    bool waiting = rc == MOQ_ERR_WOULD_BLOCK || owed_waiting;
+    if (rc < 0 && (!waiting || !moq_session_supports_fill(pub->session)))
+        return rc;
 
-    if (pub->pending_fetch.active) {
-        serve_retained_fetch(pub, now_us);
-        if (pub->pending_fetch.active) return MOQ_ERR_WOULD_BLOCK;
+    rc = serve_retained_fetches(pub, now_us);
+    if (rc < 0 && (rc != MOQ_ERR_WOULD_BLOCK ||
+                   !moq_session_supports_fill(pub->session))) return rc;
+    waiting |= rc == MOQ_ERR_WOULD_BLOCK;
+
+    if (pending_fills_active(pub)) {
+        serve_pending_fills(pub, now_us);
+        if (pending_fills_active(pub)) return MOQ_ERR_WOULD_BLOCK;
     }
 
     for (moq_pub_track_t *t = pub->tracks; t; t = t->next) {
@@ -1300,7 +3166,8 @@ static moq_result_t pub_progress_staged(moq_publisher_t *pub, uint64_t now_us)
         if (crc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
         if (crc < 0 && crc != MOQ_ERR_STALE_HANDLE) return crc;
     }
-    return MOQ_OK;
+    if (owed_err != MOQ_OK) return owed_err;
+    return waiting ? MOQ_ERR_WOULD_BLOCK : MOQ_OK;
 }
 
 /* -- Config field access ------------------------------------------- */
@@ -1353,6 +3220,34 @@ void moq_pub_callbacks_init_sized(moq_pub_callbacks_t *cb, size_t cb_size) {
     (offsetof(moq_pub_cfg_t, default_publisher_priority) + \
      sizeof(((moq_pub_cfg_t *)0)->default_publisher_priority))
 
+/* Older configs can have weaker alignment than the current type. Keep caller
+ * storage byte-addressed; only the local current record gets typed accesses. */
+static void pub_cfg_init_bytes(void *storage, size_t n)
+{
+    moq_pub_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.struct_size = (uint32_t)n;
+    if (n >= offsetof(moq_pub_cfg_t, accept_mode) + sizeof(cfg.accept_mode))
+        cfg.accept_mode = MOQ_PUB_REJECT_ALL;
+    if (n >= MOQ_PUB_CFG_V0_SIZE)
+        cfg.default_publisher_priority = 128;
+    if (n > offsetof(moq_pub_cfg_t, callbacks))
+        moq_pub_callbacks_init_sized(&cfg.callbacks,
+                                     n - offsetof(moq_pub_cfg_t, callbacks));
+    memcpy(storage, &cfg, n);
+}
+
+static bool pub_cfg_normalize(const void *storage, moq_pub_cfg_t *cfg)
+{
+    uint32_t size;
+    memcpy(&size, storage, sizeof(size));
+    if (size < MOQ_PUB_CFG_V0_SIZE) return false;
+    size_t n = size < sizeof(*cfg) ? size : sizeof(*cfg);
+    memset(cfg, 0, sizeof(*cfg));
+    memcpy(cfg, storage, n);
+    return true;
+}
+
 void moq_pub_cfg_init(moq_pub_cfg_t *cfg) {
     if (!cfg) return;
     /* Clear and stamp ONLY the frozen prefix: writing sizeof(*cfg) here would
@@ -1360,10 +3255,7 @@ void moq_pub_cfg_init(moq_pub_cfg_t *cfg) {
      * fields (on_subscribe, on_subscribe_ctx, callbacks) stay disabled
      * (struct_size == prefix); callers that want them use
      * moq_pub_cfg_init_sized(). */
-    memset(cfg, 0, MOQ_PUB_CFG_V0_SIZE);
-    cfg->struct_size = (uint32_t)MOQ_PUB_CFG_V0_SIZE;
-    cfg->accept_mode = MOQ_PUB_REJECT_ALL;
-    cfg->default_publisher_priority = 128;
+    pub_cfg_init_bytes((void *)cfg, MOQ_PUB_CFG_V0_SIZE);
 }
 
 void moq_pub_cfg_init_sized(moq_pub_cfg_t *cfg, size_t cfg_size) {
@@ -1374,22 +3266,12 @@ void moq_pub_cfg_init_sized(moq_pub_cfg_t *cfg, size_t cfg_size) {
      * own initializer. Set each default only when it lies within cfg_size. */
     size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
     if (n < sizeof(cfg->struct_size)) return;  /* too small to even stamp */
-    memset(cfg, 0, n);
-    cfg->struct_size = (uint32_t)n;
-    if (n >= offsetof(moq_pub_cfg_t, accept_mode) + sizeof(cfg->accept_mode))
-        cfg->accept_mode = MOQ_PUB_REJECT_ALL;
-    if (n >= offsetof(moq_pub_cfg_t, default_publisher_priority) +
-             sizeof(cfg->default_publisher_priority))
-        cfg->default_publisher_priority = 128;
-    /* Initialize as much of the nested callbacks struct as the caller's
-     * storage covers, so a full-size caller can set the appended
-     * on_publish_* fields directly after this call. */
-    if (n > offsetof(moq_pub_cfg_t, callbacks))
-        moq_pub_callbacks_init_sized(&cfg->callbacks,
-                                     n - offsetof(moq_pub_cfg_t, callbacks));
+    pub_cfg_init_bytes((void *)cfg, n);
 }
 
-#define PUB_CFG_MIN_SIZE MOQ_PUB_CFG_V0_SIZE
+/* Pending fill slots when the config names none. The pool is never smaller
+ * than the session's own fill pool (see moq_pub_create). */
+#define PUB_DEFAULT_MAX_FILLS 16u
 
 /* Largest prefix of moq_pub_callbacks_t (in bytes) that contains only WHOLE
  * fields and fits in `avail`. moq_pub_create copies exactly this many bytes so a
@@ -1426,8 +3308,9 @@ moq_result_t moq_pub_create(moq_session_t *session,
     if (!session || !alloc || !cfg || !out) return MOQ_ERR_INVAL;
     *out = NULL;
 
-    if (cfg->struct_size < PUB_CFG_MIN_SIZE)
-        return MOQ_ERR_INVAL;
+    moq_pub_cfg_t normalized;
+    if (!pub_cfg_normalize((const void *)cfg, &normalized)) return MOQ_ERR_INVAL;
+    cfg = &normalized;
 
     moq_pub_subscribe_cb on_subscribe = NULL;
     void *on_subscribe_ctx = NULL;
@@ -1438,11 +3321,62 @@ moq_result_t moq_pub_create(moq_session_t *session,
                           sizeof(cfg->on_subscribe_ctx)))
         on_subscribe_ctx = cfg->on_subscribe_ctx;
 
-    if (cfg->accept_mode == MOQ_PUB_CALLBACK) {
-        if (!on_subscribe) return MOQ_ERR_INVAL;
-    } else if (cfg->accept_mode != MOQ_PUB_REJECT_ALL &&
-               cfg->accept_mode != MOQ_PUB_ACCEPT_ALL) {
+    moq_pub_subscribe_v1_cb on_subscribe_v1 = NULL;
+    void *on_subscribe_v1_ctx = NULL;
+    bool has_v1 = pub_cfg_has_field(cfg, offsetof(moq_pub_cfg_t, on_subscribe_v1_ctx),
+                                    sizeof(cfg->on_subscribe_v1_ctx));
+    /* Never install or ignore a torn authorizer block, even in a legacy mode. */
+    if (cfg->struct_size > offsetof(moq_pub_cfg_t, on_subscribe_v1) && !has_v1)
         return MOQ_ERR_INVAL;
+    if (has_v1) {
+        on_subscribe_v1 = cfg->on_subscribe_v1;
+        on_subscribe_v1_ctx = cfg->on_subscribe_v1_ctx;
+    }
+    if (cfg->accept_mode == MOQ_PUB_CALLBACK_V1) {
+        if (!has_v1 || !on_subscribe_v1 || on_subscribe) return MOQ_ERR_INVAL;
+    } else {
+        if (on_subscribe_v1 || on_subscribe_v1_ctx) return MOQ_ERR_INVAL;
+        if (cfg->accept_mode == MOQ_PUB_CALLBACK) {
+            if (!on_subscribe) return MOQ_ERR_INVAL;
+        } else if (cfg->accept_mode != MOQ_PUB_REJECT_ALL &&
+                   cfg->accept_mode != MOQ_PUB_ACCEPT_ALL) {
+            return MOQ_ERR_INVAL;
+        }
+    }
+
+    size_t req_begin = offsetof(moq_pub_cfg_t, on_fill_request);
+    size_t req_end = offsetof(moq_pub_cfg_t, on_fill_request_ctx) + sizeof(void *);
+    size_t term_begin = offsetof(moq_pub_cfg_t, on_fill_terminal);
+    size_t term_end = offsetof(moq_pub_cfg_t, on_fill_terminal_ctx) + sizeof(void *);
+    size_t ngr_begin = offsetof(moq_pub_cfg_t, on_new_group_request);
+    size_t ngr_end = offsetof(moq_pub_cfg_t, on_new_group_request_ctx) + sizeof(void *);
+    if ((cfg->struct_size > req_begin && cfg->struct_size < req_end) ||
+        (cfg->struct_size > term_begin && cfg->struct_size < term_end) ||
+        (cfg->struct_size > ngr_begin && cfg->struct_size < ngr_end))
+        return MOQ_ERR_INVAL;
+    if (!moq_session_supports_fill(session) &&
+        ((cfg->struct_size >= req_end && (cfg->on_fill_request || cfg->on_fill_request_ctx)) ||
+         (cfg->struct_size >= term_end && (cfg->on_fill_terminal || cfg->on_fill_terminal_ctx)) ||
+         (pub_cfg_has_field(cfg, offsetof(moq_pub_cfg_t, max_fill_snapshot_bytes),
+                           sizeof(cfg->max_fill_snapshot_bytes)) && cfg->max_fill_snapshot_bytes)))
+        return MOQ_ERR_UNSUPPORTED;
+
+    size_t admission_cap = 0, fetch_cap = 0;
+    if (moq_session_supports_fill(session)) {
+        /* The fixed-cell proof does not extend to profiles allowing multiple
+         * unanswered UPDATEs on one parent. Fail closed if that changes. */
+        if (session->profile->request_updates_max != 1)
+            return MOQ_ERR_UNSUPPORTED;
+        if (session->pub_cap > SIZE_MAX - session->sub_cap)
+            return MOQ_ERR_LIMIT;
+        admission_cap = session->sub_cap + session->pub_cap;
+        if (admission_cap >= PUB_ADMISSION_NONE ||
+            admission_cap > SIZE_MAX / sizeof(pub_admission_t))
+            return MOQ_ERR_LIMIT;
+        fetch_cap = session->fetch_cap;
+        if (fetch_cap >= PUB_FETCH_NONE ||
+            fetch_cap > SIZE_MAX / sizeof(pub_fetch_owner_t))
+            return MOQ_ERR_LIMIT;
     }
 
     moq_publisher_t *p = (moq_publisher_t *)alloc->alloc(
@@ -1456,6 +3390,27 @@ moq_result_t moq_pub_create(moq_session_t *session,
     p->cfg.default_publisher_priority = cfg->default_publisher_priority;
     p->cfg.on_subscribe = on_subscribe;
     p->cfg.on_subscribe_ctx = on_subscribe_ctx;
+    p->cfg.on_subscribe_v1 = on_subscribe_v1;
+    p->cfg.on_subscribe_v1_ctx = on_subscribe_v1_ctx;
+    p->cfg.max_fill_snapshot_bytes = UINT64_C(16) * 1024 * 1024;
+    if (pub_cfg_has_field(cfg, offsetof(moq_pub_cfg_t, max_fill_snapshot_bytes),
+                          sizeof(cfg->max_fill_snapshot_bytes)) && cfg->max_fill_snapshot_bytes)
+        p->cfg.max_fill_snapshot_bytes = cfg->max_fill_snapshot_bytes;
+    if (cfg->struct_size >= req_end) {
+        p->cfg.on_fill_request = cfg->on_fill_request;
+        p->cfg.on_fill_request_ctx = cfg->on_fill_request_ctx;
+    }
+    if (cfg->struct_size >= term_end) {
+        p->cfg.on_fill_terminal = cfg->on_fill_terminal;
+        p->cfg.on_fill_terminal_ctx = cfg->on_fill_terminal_ctx;
+    }
+    if (cfg->struct_size >= ngr_end) {
+        p->cfg.on_new_group_request = cfg->on_new_group_request;
+        p->cfg.on_new_group_request_ctx = cfg->on_new_group_request_ctx;
+    }
+    if (pub_cfg_has_field(cfg, offsetof(moq_pub_cfg_t, on_goaway),
+                          sizeof(cfg->on_goaway)))
+        p->cfg.on_goaway = cfg->on_goaway;
     {
         size_t cb_off = offsetof(moq_pub_cfg_t, callbacks);
         if (cfg->struct_size > cb_off) {
@@ -1480,16 +3435,80 @@ moq_result_t moq_pub_create(moq_session_t *session,
 
     p->sub_slot_cap = 1;
 
+    /* Fill slots exist only on a draft that can carry a fill request; on
+     * the others the session never surfaces one, so nothing is reserved. */
+    if (moq_session_supports_fill(session)) {
+        uint32_t nfills = 0;
+        if (pub_cfg_has_field(cfg, offsetof(moq_pub_cfg_t, max_fills),
+                              sizeof(cfg->max_fills)))
+            nfills = cfg->max_fills;
+        if (nfills == 0) nfills = PUB_DEFAULT_MAX_FILLS;
+        if ((uint64_t)nfills * sizeof(pub_pending_fill_t) > SIZE_MAX) {
+            alloc->free(p, sizeof(*p), alloc->ctx);
+            return MOQ_ERR_LIMIT;
+        }
+        p->pending_fills = (pub_pending_fill_t *)alloc->alloc(
+            (size_t)nfills * sizeof(pub_pending_fill_t), alloc->ctx);
+        if (!p->pending_fills) {
+            alloc->free(p, sizeof(moq_publisher_t), alloc->ctx);
+            return MOQ_ERR_NOMEM;
+        }
+        memset(p->pending_fills, 0, (size_t)nfills * sizeof(pub_pending_fill_t));
+        p->pending_fill_cap = nfills;
+        p->admissions.head = p->admissions.tail = PUB_ADMISSION_NONE;
+        p->admissions.cap = admission_cap;
+        if (admission_cap) {
+            p->admissions.cells = alloc->alloc(
+                admission_cap * sizeof(pub_admission_t), alloc->ctx);
+            if (!p->admissions.cells) {
+                alloc->free(p->pending_fills,
+                    p->pending_fill_cap * sizeof(pub_pending_fill_t), alloc->ctx);
+                alloc->free(p, sizeof(*p), alloc->ctx);
+                return MOQ_ERR_NOMEM;
+            }
+            memset(p->admissions.cells, 0, admission_cap * sizeof(pub_admission_t));
+        }
+        p->fetch_owners.head = p->fetch_owners.tail = PUB_FETCH_NONE;
+        p->fetch_owners.cap = fetch_cap;
+        if (fetch_cap) {
+            p->fetch_owners.cells = alloc->alloc(
+                fetch_cap * sizeof(pub_fetch_owner_t), alloc->ctx);
+            if (!p->fetch_owners.cells) {
+                if (p->admissions.cells)
+                    alloc->free(p->admissions.cells,
+                        admission_cap * sizeof(pub_admission_t), alloc->ctx);
+                alloc->free(p->pending_fills,
+                    p->pending_fill_cap * sizeof(pub_pending_fill_t), alloc->ctx);
+                alloc->free(p, sizeof(*p), alloc->ctx);
+                return MOQ_ERR_NOMEM;
+            }
+            memset(p->fetch_owners.cells, 0, fetch_cap * sizeof(pub_fetch_owner_t));
+        }
+    }
+
     *out = p;
     return MOQ_OK;
 }
 
 void moq_pub_destroy(moq_publisher_t *pub) {
     if (!pub) return;
-    pending_fetch_clear(pub);   /* release any snapshot refs held for a fetch */
+    if (pub->in_fill_callback) return;
+    if (moq_session_supports_fill(pub->session)) admissions_clear(pub);
+    pending_fetches_clear(pub);   /* release any snapshot refs held for a fetch */
+    pending_fills_clear_all(pub);
     moq_pub_track_t *t = pub->tracks;
     while (t) {
         moq_pub_track_t *next = t->next;
+        for (size_t i = 0; i < t->slot_cap; i++) {
+            const pub_sub_slot_t *sl = &t->slots[i];
+            if (!sl->active || sl->kind != PUB_SLOT_SUBSCRIPTION) continue;
+            int slot = sub_resolve_handle(pub->session, sl->sub);
+            if (slot >= 0) pub->session->subs[slot].facade_defer_updates = false;
+        }
+        if (t->publish_requested) {
+            int slot = pub_resolve_handle(pub->session, t->publication);
+            if (slot >= 0) pub->session->publishes[slot].facade_defer_updates = false;
+        }
         t->ns_entry = NULL;
         free_track_state(pub, t);
         t = next;
@@ -1503,6 +3522,17 @@ void moq_pub_destroy(moq_publisher_t *pub) {
         pub_free(pub, nse, sizeof(*nse));
     }
     moq_alloc_t alloc = pub->alloc;
+    if (pub->owed)
+        alloc.free(pub->owed, pub->owed_cap * sizeof(pub->owed[0]), alloc.ctx);
+    if (moq_session_supports_fill(pub->session) && pub->fetch_owners.cells)
+        alloc.free(pub->fetch_owners.cells,
+                   pub->fetch_owners.cap * sizeof(pub_fetch_owner_t), alloc.ctx);
+    if (moq_session_supports_fill(pub->session) && pub->admissions.cells)
+        alloc.free(pub->admissions.cells,
+                   pub->admissions.cap * sizeof(pub_admission_t), alloc.ctx);
+    if (pub->pending_fills)
+        alloc.free(pub->pending_fills,
+                   pub->pending_fill_cap * sizeof(pub_pending_fill_t), alloc.ctx);
     alloc.free(pub, sizeof(moq_publisher_t), alloc.ctx);
 }
 
@@ -1513,30 +3543,92 @@ void moq_pub_destroy(moq_publisher_t *pub) {
  * this prefix, so an old caller that allocated the original-sized struct
  * is never overflowed, and every appended field stays disabled unless
  * _init_sized opts in. */
-/* §10 ABI boundary. The v0 sizeof is defined INDEPENDENTLY of the
- * appended field -- the align-rounded end of has_publisher_priority, the
- * old struct's last member -- so the pin cannot follow a drifting
- * monotonic_groups offset. Equality (not >=): the appended field must sit
- * EXACTLY at the old sizeof boundary; starting later would silently grow
- * dead padding, starting earlier would read an old full-size caller's
- * uninitialized trailing padding as an explicit declaration. */
-#define MOQ_PUB_TRACK_CFG_PRE_S3_SIZE \
-    ((offsetof(moq_pub_track_cfg_t, has_publisher_priority) + \
-      sizeof(((moq_pub_track_cfg_t *)0)->has_publisher_priority) + \
-      (_Alignof(moq_pub_track_cfg_t) - 1)) & \
-     ~(size_t)(_Alignof(moq_pub_track_cfg_t) - 1))
+/* Historical storage and frozen current placement are separate guards:
+ * pre-monotonic sizeof is 64 on LP64, 36 on i686, and 40 on ARM ILP32.
+ * Never derive the old allocation from the current type's layout. */
+typedef struct pub_track_cfg_pre_monotonic {
+    uint32_t struct_size;
+    moq_namespace_t track_namespace;
+    moq_bytes_t track_name;
+    bool advertise_namespace;
+    uint8_t publisher_priority;
+    uint64_t max_retained_bytes;
+    bool has_publisher_priority;
+} pub_track_cfg_pre_monotonic_t;
 _Static_assert(offsetof(moq_pub_track_cfg_t, monotonic_groups) ==
-               MOQ_PUB_TRACK_CFG_PRE_S3_SIZE,
-               "monotonic_groups must sit exactly at the v0 sizeof");
+               (sizeof(void *) == 8 ? 64 : 40),
+               "monotonic_groups must retain its frozen offset");
+_Static_assert(offsetof(moq_pub_track_cfg_t, monotonic_groups) >=
+               sizeof(pub_track_cfg_pre_monotonic_t),
+               "monotonic_groups must not reuse historical storage");
 
-#define MOQ_PUB_TRACK_CFG_V0_SIZE \
-    (offsetof(moq_pub_track_cfg_t, max_retained_bytes))
+#define MOQ_PUB_TRACK_CFG_V0_SIZE (sizeof(void *) == 8 ? 48u : 24u)
+_Static_assert(offsetof(moq_pub_track_cfg_t, max_retained_bytes) ==
+               MOQ_PUB_TRACK_CFG_V0_SIZE, "frozen original track cfg prefix");
+
+/* Original ARM callers have only four-byte alignment, even though the
+ * appended uint64_t makes the current type eight-aligned. */
+static void pub_track_cfg_init_bytes(void *storage, size_t n)
+{
+    moq_pub_track_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.struct_size = (uint32_t)n;
+    if (n >= offsetof(moq_pub_track_cfg_t, publisher_priority) +
+             sizeof(cfg.publisher_priority))
+        cfg.publisher_priority = 128;
+    memcpy(storage, &cfg, n);
+}
+
+static bool pub_track_cfg_normalize(const void *storage, moq_pub_track_cfg_t *cfg)
+{
+    uint32_t size;
+    memcpy(&size, storage, sizeof(size));
+    if (size < MOQ_PUB_TRACK_CFG_V0_SIZE) return false;
+    memset(cfg, 0, sizeof(*cfg));
+    memcpy(cfg, storage, size < sizeof(*cfg) ? size : sizeof(*cfg));
+    return true;
+}
+
+/* Own the track's Track Properties: the caller's set, with DYNAMIC_GROUPS = 1
+ * added in the session's encoding when declared, validated as the session
+ * validates an accept's properties. MOQ_ERR_INVAL for a set the session would
+ * refuse; MOQ_ERR_NOMEM. Nothing is allocated for an empty set. */
+static moq_result_t track_set_properties(moq_publisher_t *pub, moq_pub_track_t *t,
+                                         moq_bytes_t in, bool dynamic)
+{
+    const moq_profile_ops_t *p = pub->session->profile;
+    if (in.len > 0 && !in.data) return MOQ_ERR_INVAL;
+    /* The added pair is two integers, and the delta that follows it can only
+     * shrink: 2 x 8 bytes cover it in either integer encoding. */
+    if (dynamic && in.len > SIZE_MAX - 16) return MOQ_ERR_INVAL;
+    size_t cap = in.len + (dynamic ? 16 : 0);
+    if (cap == 0) return MOQ_OK;
+    uint8_t *buf = (uint8_t *)pub_alloc(pub, cap);
+    if (!buf) return MOQ_ERR_NOMEM;
+    size_t n = in.len;
+    moq_result_t rc = MOQ_OK;
+    if (dynamic)
+        rc = p->track_properties_add_dynamic_groups(in.data, in.len, buf, cap, &n);
+    else
+        memcpy(buf, in.data, in.len);
+    /* The same checks moq_track_properties_validate() applies before a
+     * session exists. */
+    if (rc == MOQ_OK && moq_profile_check_track_properties(p, buf, n) < 0)
+        rc = MOQ_ERR_INVAL;
+    if (rc < 0) {
+        pub_free(pub, buf, cap);
+        return MOQ_ERR_INVAL;
+    }
+    t->props = buf;
+    t->props_len = n;
+    t->props_cap = cap;
+    t->dynamic_groups = p->track_properties_dynamic_groups(buf, n);
+    return MOQ_OK;
+}
 
 void moq_pub_track_cfg_init(moq_pub_track_cfg_t *cfg) {
     if (!cfg) return;
-    memset(cfg, 0, MOQ_PUB_TRACK_CFG_V0_SIZE);
-    cfg->struct_size = (uint32_t)MOQ_PUB_TRACK_CFG_V0_SIZE;
-    cfg->publisher_priority = 128;
+    pub_track_cfg_init_bytes(cfg, MOQ_PUB_TRACK_CFG_V0_SIZE);
 }
 
 void moq_pub_track_cfg_init_sized(moq_pub_track_cfg_t *cfg, size_t cfg_size) {
@@ -1544,12 +3636,8 @@ void moq_pub_track_cfg_init_sized(moq_pub_track_cfg_t *cfg, size_t cfg_size) {
     /* Clear exactly what the caller allocated, never beyond this library's
      * struct (clamp down for a caller newer than the library). */
     size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
-    if (n < sizeof(cfg->struct_size)) return;  /* too small to even stamp */
-    memset(cfg, 0, n);
-    cfg->struct_size = (uint32_t)n;
-    if (n >= offsetof(moq_pub_track_cfg_t, publisher_priority) +
-             sizeof(cfg->publisher_priority))
-        cfg->publisher_priority = 128;
+    if (n < sizeof(uint32_t)) return;  /* too small to even stamp */
+    pub_track_cfg_init_bytes(cfg, n);
 }
 
 moq_result_t moq_pub_add_track(moq_publisher_t *pub,
@@ -1558,11 +3646,13 @@ moq_result_t moq_pub_add_track(moq_publisher_t *pub,
                                  moq_pub_track_t **out)
 {
     if (!pub || !cfg || !out) return MOQ_ERR_INVAL;
+    if (pub->in_fill_callback) return MOQ_ERR_WRONG_STATE;
     *out = NULL;
 
     if (pub->closed) return MOQ_ERR_CLOSED;
-    if (cfg->struct_size < offsetof(moq_pub_track_cfg_t, max_retained_bytes))
-        return MOQ_ERR_INVAL;
+    moq_pub_track_cfg_t normalized_cfg;
+    if (!pub_track_cfg_normalize(cfg, &normalized_cfg)) return MOQ_ERR_INVAL;
+    cfg = &normalized_cfg;
 
     /* Validate namespace + track name against full-track-name budget. */
     if (moq_validate_full_track_name_min_fields(
@@ -1604,8 +3694,8 @@ moq_result_t moq_pub_add_track(moq_publisher_t *pub,
         t->max_retained_bytes = (msb == 0) ? (1024u * 1024u) : msb;
     }
     /* Whole-field gate: an old caller's struct_size can never cover the
-     * appended bool (it starts at the old sizeof boundary, see the
-     * _Static_assert at the initializers). */
+     * appended bool (it starts at or beyond the old sizeof boundary, see
+     * the independent guards at the initializers). */
     if (cfg->struct_size >= offsetof(moq_pub_track_cfg_t, monotonic_groups) +
         sizeof(cfg->monotonic_groups))
         t->monotonic = cfg->monotonic_groups;
@@ -1680,6 +3770,24 @@ moq_result_t moq_pub_add_track(moq_publisher_t *pub,
         }
     }
 
+    /* The Track Properties every answer for the track carries, checked as
+     * an accept would check them, so no later answer fails on them. */
+    {
+        moq_bytes_t in = { NULL, 0 };
+        bool dynamic = false;
+        if (cfg->struct_size >= offsetof(moq_pub_track_cfg_t, track_properties) +
+                                sizeof(cfg->track_properties))
+            in = cfg->track_properties;
+        if (cfg->struct_size >= offsetof(moq_pub_track_cfg_t, dynamic_groups) +
+                                sizeof(cfg->dynamic_groups))
+            dynamic = cfg->dynamic_groups;
+        moq_result_t prc = track_set_properties(pub, t, in, dynamic);
+        if (prc < 0) {
+            free_track_state(pub, t);
+            return prc;
+        }
+    }
+
     /* Namespace advertisement with refcounting. */
     if (cfg->advertise_namespace) {
         moq_namespace_t ns = { t->ns_parts, t->ns_count };
@@ -1721,18 +3829,36 @@ moq_result_t moq_pub_remove_track(moq_publisher_t *pub,
                                     uint64_t now_us)
 {
     if (!pub || !track) return MOQ_ERR_INVAL;
+    if (pub->in_fill_callback) return MOQ_ERR_WRONG_STATE;
     if (track->pub != pub) return MOQ_ERR_INVAL;
+
+    for (size_t i = 0; i < pub->pending_fill_cap; i++)
+        if (pub->pending_fills[i].active && pub->pending_fills[i].track == track)
+            return MOQ_ERR_WOULD_BLOCK;
 
     /* Pre-flight checks before any side effects. */
     if (pub->deferred.active && pub->deferred.track == track)
         return MOQ_ERR_WOULD_BLOCK;
-    if (pub->pending.active && pub->pending.track == track)
+    if (moq_session_supports_fill(pub->session)) {
+        for (uint32_t i = pub->admissions.head; i != PUB_ADMISSION_NONE;
+             i = pub->admissions.cells[i].next)
+            if (pub->admissions.cells[i].track == track)
+                return MOQ_ERR_WOULD_BLOCK;
+    } else if (pub->pending.active && pub->pending.track == track) {
         return MOQ_ERR_WOULD_BLOCK;
+    }
     /* A pending retained FETCH is served from its own snapshot, so removing the
      * source track here is safe -- no guard needed. */
     if (track->ns_entry && track->ns_entry->state == PUB_NS_PENDING &&
         track->ns_entry->refcount <= 1)
         return MOQ_ERR_WRONG_STATE;
+
+    /* Subgroups of departed destinations are reset before the track goes. */
+    {
+        moq_result_t rr = track_run_retires(pub, track, now_us);
+        if (rr == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
+        if (rr < 0 && rr != MOQ_ERR_STALE_HANDLE) return rr;
+    }
 
     if (track->publish_requested) {
         pub_sub_slot_t *psl = track_find_publication_slot(track);
@@ -1763,8 +3889,7 @@ moq_result_t moq_pub_remove_track(moq_publisher_t *pub,
                 rc = moq_session_reset_subgroup(pub->session, psl->sg, 0x0,
                                                 now_us);
             else
-                rc = moq_session_close_subgroup(pub->session, psl->sg,
-                                                now_us);
+                rc = slot_close_subgroup(pub, track, psl, now_us);
             if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
             if (rc != MOQ_OK && rc != MOQ_ERR_STALE_HANDLE) return rc;
             psl->sg_open = false;
@@ -1875,8 +4000,17 @@ static moq_result_t track_install_retained(moq_pub_track_t *t, uint64_t group_id
         if (pr > t->max_retained_bytes - total) return MOQ_ERR_INVAL;
         total += pr;
     }
+    /* Group history: a retained install assigns Objects 0..n-1 of the group
+     * generation 0 (Subgroup ID 0), so it must agree with what the group
+     * already holds; checked before any effect. */
+    hist_plan_t hp;
+    moq_result_t hr = hist_plan_retained(t, group_id, src[n - 1].object_id, &hp);
+    if (hr < 0) return hr;
     pub_retained_obj_t *vec = pub_retained_snapshot(&t->pub->alloc, src, n);
     if (!vec) return MOQ_ERR_NOMEM;
+    hist_commit_retained(t, &hp, group_id, src[n - 1].object_id);
+    for (size_t i = 0; i < n; i++)
+        vec[i].subgroup_id = hist_subgroup_of(t, group_id, vec[i].object_id);
     track_release_retained(t);
     t->retained = vec;
     t->retained_count = n;
@@ -1901,6 +4035,7 @@ moq_result_t moq_pub_set_retained_group(moq_publisher_t *pub,
                                         const moq_pub_retained_group_cfg_t *cfg)
 {
     if (!pub || !track || !cfg) return MOQ_ERR_INVAL;
+    if (pub->in_fill_callback) return MOQ_ERR_WRONG_STATE;
     if (track->pub != pub) return MOQ_ERR_INVAL;
     if (cfg->struct_size < sizeof(moq_pub_retained_group_cfg_t))
         return MOQ_ERR_INVAL;
@@ -1919,6 +4054,7 @@ moq_result_t moq_pub_set_retained_group(moq_publisher_t *pub,
         tmp[i].end_of_group = cfg->objects[i].end_of_group;
         tmp[i].payload      = cfg->objects[i].payload;
         tmp[i].properties   = cfg->objects[i].properties;
+        tmp[i].subgroup_id  = 0;
     }
     return track_install_retained(track, cfg->group_id, tmp, cfg->object_count);
 }
@@ -1927,6 +4063,7 @@ moq_result_t moq_pub_clear_retained_group(moq_publisher_t *pub,
                                           moq_pub_track_t *track)
 {
     if (!pub || !track) return MOQ_ERR_INVAL;
+    if (pub->in_fill_callback) return MOQ_ERR_WRONG_STATE;
     if (track->pub != pub) return MOQ_ERR_INVAL;
     track_release_retained(track);
     return MOQ_OK;
@@ -1964,20 +4101,21 @@ static moq_result_t write_stream_object(moq_publisher_t *pub,
         sizeof(obj->end_of_group))
         want_eog = obj->end_of_group;
 
-    /* Same-group extension mode mismatch: can't reopen mid-stream. */
-    if (slot->sg_open && slot->cur_group == obj->group_id &&
-        need_ext && !slot->sg_has_extensions)
+    /* The op's subgroup: (group, generation assigned at admission). */
+    bool same_sg = slot->sg_open && slot->cur_group == obj->group_id &&
+                   slot->cur_gen == track->op.subgroup;
+
+    /* Same-subgroup extension mode mismatch: can't reopen mid-stream. */
+    if (same_sg && need_ext && !slot->sg_has_extensions)
         return MOQ_ERR_WRONG_STATE;
 
-    /* Same-group end_of_group mismatch: header already on the wire. */
-    if (slot->sg_open && slot->cur_group == obj->group_id &&
-        want_eog != slot->sg_end_of_group)
+    /* Same-subgroup end_of_group mismatch: header already on the wire. */
+    if (same_sg && want_eog != slot->sg_end_of_group)
         return MOQ_ERR_WRONG_STATE;
 
-    /* Close subgroup if group changed. */
-    if (slot->sg_open && slot->cur_group != obj->group_id) {
-        moq_result_t rc = moq_session_close_subgroup(pub->session,
-            slot->sg, now_us);
+    /* Close the open subgroup if the op belongs to another one. */
+    if (slot->sg_open && !same_sg) {
+        moq_result_t rc = slot_close_subgroup(pub, track, slot, now_us);
         if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
         if (rc == MOQ_ERR_STALE_HANDLE) {
             track_clear_slot(pub, slot);
@@ -1991,10 +4129,11 @@ static moq_result_t write_stream_object(moq_publisher_t *pub,
         moq_subgroup_cfg_t sgcfg;
         moq_subgroup_cfg_init(&sgcfg);
         sgcfg.group_id = obj->group_id;
-        sgcfg.subgroup_id = 0;
+        sgcfg.subgroup_id = track->op.subgroup;
         sgcfg.publisher_priority = track->priority;
         sgcfg.object_properties = need_ext;
         sgcfg.end_of_group = want_eog;
+        sgcfg.first_object = track->op.first_in_gen;
 
         moq_result_t rc = (slot->kind == PUB_SLOT_PUBLICATION)
             ? moq_session_open_pub_subgroup(pub->session,
@@ -2013,6 +4152,7 @@ static moq_result_t write_stream_object(moq_publisher_t *pub,
         slot->sg_has_extensions = need_ext;
         slot->sg_end_of_group = want_eog;
         slot->cur_group = obj->group_id;
+        slot_open_note(track, slot, obj->group_id, obj->object_id);
     }
 
     if (need_ext || slot->sg_has_extensions) {
@@ -2028,6 +4168,7 @@ static moq_result_t write_stream_object(moq_publisher_t *pub,
             track_clear_slot(pub, slot);
             return MOQ_OK;
         }
+        if (rc == MOQ_OK) slot->sg_last = obj->object_id;
         return rc;
     }
 
@@ -2038,6 +4179,7 @@ static moq_result_t write_stream_object(moq_publisher_t *pub,
         track_clear_slot(pub, slot);
         return MOQ_OK;
     }
+    if (rc == MOQ_OK) slot->sg_last = obj->object_id;
     return rc;
 }
 
@@ -2087,6 +4229,7 @@ moq_result_t moq_pub_write_object_ex(moq_publisher_t *pub,
                                        uint64_t now_us)
 {
     if (!pub || !track || !obj) return MOQ_ERR_INVAL;
+    if (pub->in_fill_callback) return MOQ_ERR_WRONG_STATE;
     if (track->pub != pub) return MOQ_ERR_INVAL;
     if (obj->struct_size < offsetof(moq_pub_object_cfg_t, _reserved_obj))
         return MOQ_ERR_INVAL;
@@ -2127,6 +4270,8 @@ moq_result_t moq_pub_write_object_ex(moq_publisher_t *pub,
         obj->has_status ? obj->status : MOQ_OBJECT_NORMAL,
         want_eog, 0, obj->payload, obj->properties);
     if (st == MOQ_ERR_WRONG_STATE) return MOQ_ERR_WRONG_STATE;
+    hist_plan_t hp;
+    hist_kind_t hk = HIST_STREAM;
     if (st == 1) {
         uint64_t plen = obj->payload ? moq_rcbuf_len(obj->payload) : 0;
         moq_result_t vr = validate_new_object(track, obj->group_id,
@@ -2139,6 +4284,17 @@ moq_result_t moq_pub_write_object_ex(moq_publisher_t *pub,
          * always above the watermark. */
         if (track->has_declared && obj->group_id <= track->declared_through)
             return MOQ_ERR_WRONG_STATE;
+        /* Group history: identity, finality and capacity, before any
+         * effect. */
+        hk = !obj->datagram ? HIST_STREAM
+           : !obj->has_status ? HIST_DATAGRAM
+           : obj->status == MOQ_OBJECT_END_OF_GROUP ? HIST_STATUS_EOG
+           : obj->status == MOQ_OBJECT_END_OF_TRACK ? HIST_STATUS_EOT
+           : HIST_DATAGRAM;
+        moq_result_t hr = hk == HIST_STREAM
+            ? hist_plan_stream(track, obj->group_id, obj->object_id, &hp)
+            : hist_plan_datagram(track, hk, obj->group_id, obj->object_id, &hp);
+        if (hr < 0) return hr;
         /* §10 (A): the monotonic promise is enforced, which is what
          * makes the evidence trustworthy. Decreasing groups reject; a
          * group with recorded End-of-Group evidence rejects; SAME-group
@@ -2168,6 +4324,12 @@ moq_result_t moq_pub_write_object_ex(moq_publisher_t *pub,
             want_eog, 0, obj->payload, obj->properties);
         track_hist_merge(track->hist, obj->group_id, obj->object_id);
         MOQ_PUB_TEST_BUMP(moq_pub_test_merge_count);
+        if (hk == HIST_STREAM)
+            hist_commit_stream(track, &hp, obj->group_id, obj->object_id,
+                               want_eog);
+        else
+            hist_commit_datagram(track, &hp, hk, obj->group_id,
+                                 obj->object_id);
         if (track->monotonic) {
             /* begun_high stamps exactly once at commit (the retry-safe
              * point history already uses), status objects and
@@ -2258,6 +4420,7 @@ moq_result_t moq_pub_end_track(moq_publisher_t *pub, moq_pub_track_t *track,
                                uint64_t now_us)
 {
     if (!pub || !track) return MOQ_ERR_INVAL;
+    if (pub->in_fill_callback) return MOQ_ERR_WRONG_STATE;
     if (track->pub != pub) return MOQ_ERR_INVAL;
     if (pub->closed) return MOQ_ERR_CLOSED;
     if (track->ended) return MOQ_OK;          /* idempotent: already terminated */
@@ -2357,8 +4520,9 @@ moq_result_t moq_pub_end_track(moq_publisher_t *pub, moq_pub_track_t *track,
              * finish_subscribers; a Forward-0 slot's open subgroup was
              * already RESET by the retire sweep above), then
              * SUBSCRIBE_DONE/PUBLISH_DONE. Status is exact wire semantics:
-             * SUBSCRIPTION_ENDED (0x3) ONLY when the subscription's FINITE
-             * filter end was genuinely passed by the terminal Location;
+             * SUBSCRIPTION_ENDED (0x3) ONLY on a draft that defines it and
+             * when the subscription's FINITE filter end was genuinely passed
+             * by the terminal Location;
              * everything else -- open-ended windows the track never
              * reached, Forward-0 pauses -- is TRACK_ENDED (0x2): the track
              * is no longer being published. Stream count is EXACT: the
@@ -2368,8 +4532,7 @@ moq_result_t moq_pub_end_track(moq_publisher_t *pub, moq_pub_track_t *track,
              * WOULD_BLOCK retry resumes exactly where it stopped and never
              * doubles the done. */
             if (slot->sg_open) {
-                moq_result_t rc = moq_session_close_subgroup(pub->session,
-                                                             slot->sg, now_us);
+                moq_result_t rc = slot_close_subgroup(pub, track, slot, now_us);
                 if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
                 if (rc == MOQ_ERR_STALE_HANDLE) {
                     track_clear_slot(pub, slot);
@@ -2381,12 +4544,15 @@ moq_result_t moq_pub_end_track(moq_publisher_t *pub, moq_pub_track_t *track,
             moq_done_subscribe_cfg_t dcfg;
             moq_done_subscribe_cfg_init(&dcfg);
             dcfg.status_code =
-                (term_fresh &&
+                (pub->session->profile->publish_done_subscription_ended &&
+                 term_fresh &&
                  slot->window.has_window && slot->window.has_end &&
                  term_g > slot->window.end_group)
                     ? 0x3    /* SUBSCRIPTION_ENDED: past the finite end */
                     : 0x2;   /* TRACK_ENDED (incl. the no-fresh-terminal
-                              * degraded mode: the track just ended) */
+                              * degraded mode: the track just ended, and
+                              * every end on a draft without
+                              * SUBSCRIPTION_ENDED) */
             dcfg.stream_count = slot->streams_opened;
             moq_result_t rc = moq_session_done_subscribe(pub->session,
                                                          slot->sub, &dcfg,
@@ -2403,8 +4569,7 @@ moq_result_t moq_pub_end_track(moq_publisher_t *pub, moq_pub_track_t *track,
          * independently retry-safe -- it clears sg_open, so a retry skips
          * this block. */
         if (slot->sg_open) {
-            moq_result_t rc = moq_session_close_subgroup(pub->session,
-                slot->sg, now_us);
+            moq_result_t rc = slot_close_subgroup(pub, track, slot, now_us);
             if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
             if (rc == MOQ_ERR_STALE_HANDLE) {
                 track_clear_slot(pub, slot);
@@ -2426,6 +4591,10 @@ moq_result_t moq_pub_end_track(moq_publisher_t *pub, moq_pub_track_t *track,
         sgcfg.subgroup_id = 0;
         sgcfg.publisher_priority = track->priority;
         sgcfg.object_properties = false;
+        /* The terminal status object starts its subgroup unless a stream
+         * object was already published in that group. */
+        sgcfg.first_object = hist_find(track, term_g) < 0 &&
+                             !hist_sealed(track, term_g);
         moq_subgroup_handle_t sg;
         moq_result_t rc = moq_session_open_subgroup(pub->session, slot->sub,
             &sgcfg, now_us, &sg);
@@ -2467,6 +4636,7 @@ moq_result_t moq_pub_finish_subscribers(moq_publisher_t *pub,
                                         uint64_t status_code, uint64_t now_us)
 {
     if (!pub || !track) return MOQ_ERR_INVAL;
+    if (pub->in_fill_callback) return MOQ_ERR_WRONG_STATE;
     if (track->pub != pub) return MOQ_ERR_INVAL;
     if (pub->closed) return MOQ_ERR_CLOSED;
 
@@ -2492,8 +4662,7 @@ moq_result_t moq_pub_finish_subscribers(moq_publisher_t *pub,
          * sg_open clears only on success, so a WOULD_BLOCK retry re-runs the same
          * close and the done is never reached twice. */
         if (slot->sg_open) {
-            moq_result_t rc = moq_session_close_subgroup(pub->session,
-                                                         slot->sg, now_us);
+            moq_result_t rc = slot_close_subgroup(pub, track, slot, now_us);
             if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
             if (rc != MOQ_OK && rc != MOQ_ERR_STALE_HANDLE) return rc;
             slot->sg_open = false;
@@ -2570,6 +4739,7 @@ static moq_result_t begin_object_impl(moq_publisher_t *pub,
         cfg->group_id, cfg->object_id, false, false, MOQ_OBJECT_NORMAL,
         false, cfg->payload_length, NULL, begin_props);
     if (st == MOQ_ERR_WRONG_STATE) return MOQ_ERR_WRONG_STATE;
+    hist_plan_t hp;
     if (st == 1) {
         moq_result_t vr = validate_new_object(track, cfg->group_id,
             cfg->object_id, cfg->payload_length, begin_props);
@@ -2578,6 +4748,9 @@ static moq_result_t begin_object_impl(moq_publisher_t *pub,
          * moq_pub_write_object_ex). */
         if (track->has_declared && cfg->group_id <= track->declared_through)
             return MOQ_ERR_WRONG_STATE;
+        moq_result_t hr = hist_plan_stream(track, cfg->group_id,
+                                           cfg->object_id, &hp);
+        if (hr < 0) return hr;
         /* §10 (A): same monotonicity rules as the one-shot path. */
         if (track->monotonic) {
             if (track->has_begun && cfg->group_id < track->begun_high)
@@ -2600,6 +4773,7 @@ static moq_result_t begin_object_impl(moq_publisher_t *pub,
             false, cfg->payload_length, NULL, begin_props);
         track_hist_merge(track->hist, cfg->group_id, cfg->object_id);
         MOQ_PUB_TEST_BUMP(moq_pub_test_merge_count);
+        hist_commit_stream(track, &hp, cfg->group_id, cfg->object_id, false);
         if (track->monotonic &&
             (!track->has_begun || cfg->group_id > track->begun_high)) {
             track->has_begun = true;
@@ -2616,9 +4790,9 @@ static moq_result_t begin_object_impl(moq_publisher_t *pub,
             continue;
         }
 
-        if (slot->sg_open && slot->cur_group != cfg->group_id) {
-            moq_result_t rc = moq_session_close_subgroup(pub->session,
-                slot->sg, now_us);
+        if (slot->sg_open && (slot->cur_group != cfg->group_id ||
+                              slot->cur_gen != track->op.subgroup)) {
+            moq_result_t rc = slot_close_subgroup(pub, track, slot, now_us);
             if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
             if (rc == MOQ_ERR_STALE_HANDLE) {
                 track_clear_slot(pub, slot);
@@ -2632,9 +4806,10 @@ static moq_result_t begin_object_impl(moq_publisher_t *pub,
             moq_subgroup_cfg_t sgcfg;
             moq_subgroup_cfg_init(&sgcfg);
             sgcfg.group_id = cfg->group_id;
-            sgcfg.subgroup_id = 0;
+            sgcfg.subgroup_id = track->op.subgroup;
             sgcfg.publisher_priority = track->priority;
             sgcfg.object_properties = need_ext;
+            sgcfg.first_object = track->op.first_in_gen;
             moq_result_t rc = (slot->kind == PUB_SLOT_PUBLICATION)
                 ? moq_session_open_pub_subgroup(pub->session,
                     slot->pub, &sgcfg, now_us, &slot->sg)
@@ -2650,6 +4825,7 @@ static moq_result_t begin_object_impl(moq_publisher_t *pub,
             slot->streams_opened++;
             slot->sg_has_extensions = need_ext;
             slot->cur_group = cfg->group_id;
+            slot_open_note(track, slot, cfg->group_id, cfg->object_id);
         }
 
         moq_result_t rc;
@@ -2673,6 +4849,7 @@ static moq_result_t begin_object_impl(moq_publisher_t *pub,
         if (rc < 0) return rc;
 
         slot->streaming = true;
+        slot->sg_last = cfg->object_id;
         if (slot->active) slot->done_op = track->cur_op;
     }
 
@@ -2705,6 +4882,7 @@ moq_result_t moq_pub_begin_object(moq_publisher_t *pub,
                                     const moq_pub_begin_object_cfg_t *cfg,
                                     uint64_t now_us)
 {
+    if (pub && pub->in_fill_callback) return MOQ_ERR_WRONG_STATE;
     moq_result_t rc = begin_object_impl(pub, track, cfg, now_us);
     /* A successful begin (incl. the no-subscriber OK path) produced a live
      * object: the retained object is no longer the track's largest. WOULD_BLOCK
@@ -2719,6 +4897,7 @@ moq_result_t moq_pub_write_data(moq_publisher_t *pub,
                                   uint64_t now_us)
 {
     if (!pub || !track || !chunk) return MOQ_ERR_INVAL;
+    if (pub->in_fill_callback) return MOQ_ERR_WRONG_STATE;
     if (track->pub != pub) return MOQ_ERR_INVAL;
     if (pub->closed) return MOQ_ERR_CLOSED;
     if (track->ended) return MOQ_ERR_WRONG_STATE;  /* terminal: no writes */
@@ -2766,6 +4945,7 @@ moq_result_t moq_pub_end_object(moq_publisher_t *pub,
                                   uint64_t now_us)
 {
     if (!pub || !track) return MOQ_ERR_INVAL;
+    if (pub->in_fill_callback) return MOQ_ERR_WRONG_STATE;
     if (track->pub != pub) return MOQ_ERR_INVAL;
     if (pub->closed) return MOQ_ERR_CLOSED;
     if (track->ended) return MOQ_ERR_WRONG_STATE;  /* terminal: no writes */
@@ -2808,6 +4988,7 @@ moq_result_t moq_pub_end_group(moq_publisher_t *pub,
                                  uint64_t now_us)
 {
     if (!pub || !track) return MOQ_ERR_INVAL;
+    if (pub->in_fill_callback) return MOQ_ERR_WRONG_STATE;
     if (track->pub != pub) return MOQ_ERR_INVAL;
     if (pub->closed) return MOQ_ERR_CLOSED;
     if (track->streaming_active) return MOQ_ERR_WRONG_STATE;  /* mid object */
@@ -2819,6 +5000,9 @@ moq_result_t moq_pub_end_group(moq_publisher_t *pub,
     moq_result_t st = track_op_begin(track, PUB_OP_END_GROUP,
         0, 0, false, false, MOQ_OBJECT_NORMAL, false, 0, NULL, NULL);
     if (st == MOQ_ERR_WRONG_STATE) return MOQ_ERR_WRONG_STATE;
+    /* The current logical group is sealed at once, whatever the
+     * destinations: its subgroup ends, and nothing more is assigned in it. */
+    if (st == 1) hist_end_group(track);
 
     for (size_t si = 0; si < track->slot_cap; si++) {
         pub_sub_slot_t *slot = &track->slots[si];
@@ -2827,8 +5011,7 @@ moq_result_t moq_pub_end_group(moq_publisher_t *pub,
             slot->done_op = track->cur_op;
             continue;
         }
-        moq_result_t rc = moq_session_close_subgroup(pub->session,
-            slot->sg, now_us);
+        moq_result_t rc = slot_close_subgroup(pub, track, slot, now_us);
         if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
         if (rc == MOQ_ERR_STALE_HANDLE) {
             track_clear_slot(pub, slot);
@@ -2858,6 +5041,7 @@ moq_result_t moq_pub_declare_groups_complete_through(moq_publisher_t *pub,
                                                       uint64_t now_us)
 {
     if (!pub || !track) return MOQ_ERR_INVAL;
+    if (pub->in_fill_callback) return MOQ_ERR_WRONG_STATE;
     if (track->pub != pub) return MOQ_ERR_INVAL;
     if (pub->closed) return MOQ_ERR_CLOSED;
 
@@ -2901,6 +5085,7 @@ moq_result_t moq_pub_reset_group(moq_publisher_t *pub,
                                    uint64_t error_code, uint64_t now_us)
 {
     if (!pub || !track) return MOQ_ERR_INVAL;
+    if (pub->in_fill_callback) return MOQ_ERR_WRONG_STATE;
     if (track->pub != pub) return MOQ_ERR_INVAL;
     if (pub->closed) return MOQ_ERR_CLOSED;
 
@@ -2927,9 +5112,29 @@ moq_result_t moq_pub_reset_group(moq_publisher_t *pub,
      * completed EOG write. (Destination-local Forward/window retires do
      * NOT clear it: promotion only ever rides clean FINs.) */
     track->eog_armed = false;
+    hist_reset_current(track);
     track_op_release(track);
     track->streaming_active = false;
     return MOQ_OK;
+}
+
+/* NEW_GROUP_REQUEST on a track that advertises DYNAMIC_GROUPS: surfaced when
+ * it warrants a new group, its value 0 or larger than the current group
+ * (§9.20.19). A track without DYNAMIC_GROUPS ignores it. */
+static void pub_new_group_request(moq_publisher_t *pub, moq_pub_track_t *t,
+                                  uint64_t value)
+{
+    if (!t || !t->dynamic_groups || !pub->cfg.on_new_group_request) return;
+    moq_pub_new_group_request_info_t info;
+    memset(&info, 0, sizeof(info));
+    info.struct_size = (uint32_t)sizeof(info);
+    info.requested_group = value;
+    if (t->hist && t->hist->has_largest) {
+        info.has_current_group = true;
+        info.current_group = t->hist->largest_group;
+    }
+    if (value != 0 && info.has_current_group && value <= info.current_group) return;
+    pub->cfg.on_new_group_request(pub->cfg.on_new_group_request_ctx, t, &info);
 }
 
 /*
@@ -2948,15 +5153,13 @@ moq_result_t moq_pub_reset_group(moq_publisher_t *pub,
  * WOULD_BLOCK pairs with the result to say what happened:
  *   - WOULD_BLOCK + CONSUMED: this event WAS taken and staged owned work (a
  *     pending accept/reject, a deferred retained FETCH, or an armed subgroup
- *     retirement) that could not complete against a full action queue. Recover
- *     by draining session actions and calling moq_pub_flush -- NOT by replaying
- *     the event; replaying would double the state transition.
- *   - WOULD_BLOCK + IGNORED: the event was NOT taken because the single pending
- *     slot is still occupied by earlier staged work. Under the serialized
- *     contract this cannot arise (the prior event is flushed to MOQ_OK before
- *     the next poll); it only signals a serialization violation by the caller.
- * See the moq_pub_handle_event header for the full serialized drain+flush
- * recovery. `*result` is assumed pre-initialized by the caller.
+ *     retirement). Drain actions and call moq_pub_flush; D22 also continues
+ *     FIFO event dispatch to return event/fill credit. Never replay an owned
+ *     event. flush itself does not poll.
+ *   - WOULD_BLOCK + IGNORED: the event was NOT taken. Legacy profiles require
+ *     flushing their single pending admission/FETCH owner before another poll.
+ * See the moq_pub_handle_event header for the profile-specific pump contract.
+ * `*result` is assumed pre-initialized by the caller.
  */
 static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
                                        const moq_event_t *event,
@@ -2977,7 +5180,9 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
     if (event->kind == MOQ_EVENT_GOAWAY) {
         /* Shared broadcast: observe draining locally, stay forwardable. */
         pub->draining = true;
-        if (pub->callbacks.on_draining)
+        if (pub->cfg.on_goaway)
+            pub->cfg.on_goaway(pub->callbacks.ctx, event->u.goaway.new_session_uri);
+        else if (pub->callbacks.on_draining)
             pub->callbacks.on_draining(pub->callbacks.ctx);
         return MOQ_OK;
     }
@@ -3048,6 +5253,32 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
         return MOQ_OK;
     }
 
+    if (event->kind == MOQ_EVENT_NAMESPACE_TERMINATED) {
+        if (event->detail_size < sizeof(moq_namespace_terminated_event_t))
+            return MOQ_ERR_INVAL;
+        const moq_namespace_terminated_event_t *terminal =
+            &event->u.namespace_terminated;
+        pub_ns_entry_t *e = find_ns_entry_by_ann(pub, terminal->ann);
+        if (e && e->state != PUB_NS_TERMINAL) {
+            e->state = PUB_NS_TERMINAL;
+            *result = MOQ_PUB_EVENT_CONSUMED;
+            if (CB_HAS(&pub->callbacks, on_namespace_terminal)) {
+                moq_pub_namespace_terminal_info_t info;
+                memset(&info, 0, sizeof(info));
+                info.struct_size = (uint32_t)sizeof(info);
+                info.kind = MOQ_PUB_NAMESPACE_TERMINATED;
+                info.namespace_ = (moq_namespace_t){ e->id_parts, e->id_count };
+                info.cause = terminal->cause;
+                info.local_role = terminal->local_role;
+                info.stream_error_code = terminal->stream_error_code;
+                pub->callbacks.on_namespace_terminal(pub->callbacks.ctx, &info);
+            }
+        } else if (e) {
+            *result = MOQ_PUB_EVENT_CONSUMED;
+        }
+        return MOQ_OK;
+    }
+
     /* The peer unsubscribed: the core has freed the subscription entry, so the
      * facade must retire the matching per-track slot. Otherwise
      * moq_pub_active_subscriptions() keeps reporting a subscriber that no longer
@@ -3065,13 +5296,31 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
                 pub->callbacks.on_subscriber_left(pub->callbacks.ctx, t);
             break;
         }
-        if (pub->pending.active && moq_subscription_eq(pub->pending.sub, sub)) {
-            pub->pending.active = false;
+        if (moq_session_supports_fill(pub->session)) {
+            if (admission_cancel(pub, sub._opaque, false))
+                *result = MOQ_PUB_EVENT_CONSUMED;
+        } else if (pub->pending.active && moq_subscription_eq(pub->pending.sub, sub)) {
+            if (pub->pending.fill_job) pending_fill_clear(pub, pub->pending.fill_job);
+            memset(&pub->pending, 0, sizeof(pub->pending));
             *result = MOQ_PUB_EVENT_CONSUMED;
         }
         if (pub->deferred.active && moq_subscription_eq(pub->deferred.sub, sub)) {
             pub->deferred.active = false;
             *result = MOQ_PUB_EVENT_CONSUMED;
+        }
+        return MOQ_OK;
+    }
+
+    if (event->kind == MOQ_EVENT_FETCH_CANCELLED &&
+        moq_session_supports_fill(pub->session)) {
+        moq_fetch_t fetch = event->u.fetch_cancelled.fetch;
+        uint32_t slot = moq_handle_slot(fetch._opaque);
+        if (slot < pub->fetch_owners.cap) {
+            pub_pending_fetch_t *pf = &pub->fetch_owners.cells[slot].pending;
+            if (pf->active && moq_fetch_eq(pf->fetch, fetch)) {
+                pending_fetch_clear(pub, pf);
+                *result = MOQ_PUB_EVENT_CONSUMED;
+            }
         }
         return MOQ_OK;
     }
@@ -3084,12 +5333,29 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
      * is origin-local and not a general object store -- the range guard below
      * keeps standalone serve bounded to exactly the retained group. */
     if (event->kind == MOQ_EVENT_FETCH_REQUEST) {
-        if (pub->pending_fetch.active)
-            return MOQ_ERR_WOULD_BLOCK;   /* one retained FETCH at a time */
         const moq_fetch_request_event_t *fr = &event->u.fetch_request;
-        *result = MOQ_PUB_EVENT_CONSUMED;
+        bool d22 = moq_session_supports_fill(pub->session);
+        pub_pending_fetch_t *pf;
+        int slot = -1;
+        if (d22) {
+            slot = fetch_resolve_handle(pub->session, fr->fetch);
+            if (slot < 0) return MOQ_OK;   /* stale event owns no references */
+            pf = &pub->fetch_owners.cells[slot].pending;
+            if (pf->active && moq_fetch_eq(pf->fetch, fr->fetch)) {
+                *result = MOQ_PUB_EVENT_CONSUMED;
+                return serve_retained_fetches(pub, now_us);
+            }
+            /* Reusing a core slot cannot inherit an old generation's refs or
+             * FIFO position. Resolve first, then retire only that old owner. */
+            if (pf->active) pending_fetch_clear(pub, pf);
+        } else {
+            pf = &pub->pending_fetch;
+            if (pf->active) return MOQ_ERR_WOULD_BLOCK;
+        }
 
         moq_request_error_t reject_code = 0;
+        bool reject = true;
+        bool whole_group_d16 = false;
 
         /* Resolve the retained track: by the joining subscription for a Joining
          * FETCH, or by explicit namespace/name for a standalone FETCH. */
@@ -3124,12 +5390,25 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
             pub->cfg.accept_mode != MOQ_PUB_ACCEPT_ALL &&
             !(track && track_has_subscriber(track))) {
             reject_code = MOQ_REQUEST_ERROR_UNAUTHORIZED;
-        } else if (!track || track->ended || !pub_track_has_retained(track)) {
-            /* Nothing to serve: the track may be unknown, ended, or exist with
-             * no retained group (never set, or cleared after its Largest was
-             * advertised) -- this cache does not track a Largest after a clear,
-             * so it cannot bound an empty-range FETCH response. Reject
-             * DOES_NOT_EXIST rather than synthesize an empty fetch. */
+        } else if (!track) {
+            reject_code = MOQ_REQUEST_ERROR_DOES_NOT_EXIST;
+        } else if (!fetch_start_published(track, fr->start_group,
+                                          fr->start_object)) {
+            /* The track exists but nothing was published on it, or the start
+             * lies past its Largest Object: INVALID_RANGE. Draft-22 §3.2 and
+             * draft-18 §10.12.3 require both. Draft-16 §9.16.3 states only the
+             * start-past-Largest case (and §9.16.2 the no-object Joining
+             * Fetch); answering a no-object standalone FETCH the same way is
+             * this library's policy there. An ended track keeps its objects,
+             * so the same rule applies. */
+            reject_code = MOQ_REQUEST_ERROR_INVALID_RANGE;
+        } else if (track->ended || !pub_track_has_retained(track)) {
+            /* Objects were published, but there is nothing to serve them from:
+             * the track ended, or its retained group was never set or was
+             * cleared after its Largest was advertised -- this cache does not
+             * keep the objects of a cleared group, so it cannot answer the
+             * range. Reject DOES_NOT_EXIST rather than synthesize an empty
+             * fetch. */
             reject_code = MOQ_REQUEST_ERROR_DOES_NOT_EXIST;
         } else if (pub_track_retained_group(track) > MOQ_QUIC_VARINT_MAX ||
                    pub_track_retained_last_object_id(track) >= MOQ_QUIC_VARINT_MAX) {
@@ -3154,34 +5433,173 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
              * Joining-FETCH(offset 0) and a standalone FETCH covering 0..last
              * satisfy it. */
             reject_code = MOQ_REQUEST_ERROR_NOT_SUPPORTED;
+        } else {
+            /* Draft-16: a FETCH that requests the entire Group (End Location
+             * Object 0, or a later end Group; draft-16 section 9.16.1) makes
+             * the last Object it sends the Group's final Object (section
+             * 2.4.2). When the track assigned an Object above the retained
+             * ones, the snapshot cannot answer it: the request is refused with
+             * REQUEST_ERROR NOT_SUPPORTED, like any range the retained group
+             * cannot cover, leaving history unchanged. */
+            whole_group_d16 =
+                moq_session_version(pub->session) == MOQ_VERSION_DRAFT_16 &&
+                (fr->end_group > pub_track_retained_group(track) ||
+                 fr->end_object == 0);
+            if (whole_group_d16 &&
+                !hist_whole_group_fetch_admits(track,
+                    pub_track_retained_group(track),
+                    pub_track_retained_last_object_id(track)))
+                reject_code = MOQ_REQUEST_ERROR_NOT_SUPPORTED;
+            else
+                reject = false;
         }
 
         /* Stage. For the serve case, SNAPSHOT the whole retained group (hold
          * refs) so the response is independent of a later clear/end/remove or a
          * set_retained_group that replaces the track's vector. */
-        pending_fetch_clear(pub);
-        pub->pending_fetch.active = true;
-        pub->pending_fetch.fetch = fr->fetch;
-        pub->pending_fetch.reject_code = reject_code;
-        if (reject_code == 0) {
+        memset(pf, 0, sizeof(*pf));
+        pf->active = true;
+        pf->fetch = fr->fetch;
+        pf->reject_code = reject_code;
+        pf->reject = reject;
+        if (d22) {
+            pub_fetch_owners_t *owners = &pub->fetch_owners;
+            pub_fetch_owner_t *cell = &owners->cells[slot];
+            cell->prev = owners->tail;
+            cell->next = PUB_FETCH_NONE;
+            if (owners->tail != PUB_FETCH_NONE)
+                owners->cells[owners->tail].next = (uint32_t)slot;
+            else owners->head = (uint32_t)slot;
+            owners->tail = (uint32_t)slot;
+        }
+        if (!reject) {
             pub_retained_obj_t *snap = pub_retained_snapshot(&pub->alloc,
                 track->retained, track->retained_count);
             if (!snap) {
                 /* NOMEM staging the snapshot: reject rather than half-serve. */
-                pub->pending_fetch.reject_code = MOQ_REQUEST_ERROR_INTERNAL_ERROR;
+                pf->reject_code = MOQ_REQUEST_ERROR_INTERNAL_ERROR;
+                pf->reject = true;
             } else {
-                pub->pending_fetch.objs = snap;
-                pub->pending_fetch.obj_count = track->retained_count;
-                pub->pending_fetch.next_idx = 0;
-                pub->pending_fetch.group_id = pub_track_retained_group(track);
-                pub->pending_fetch.end_object =
+                pf->objs = snap;
+                pf->obj_count = track->retained_count;
+                pf->group_id = pub_track_retained_group(track);
+                pf->end_object =
                     pub_track_retained_last_object_id(track) + 1;
-                pub->pending_fetch.priority = track->priority;
+                pf->priority = track->priority;
+                pf->track = track;
+                /* Committed together with the snapshot's ownership: a
+                 * staging that failed above fixes nothing. */
+                if (whole_group_d16)
+                    hist_whole_group_fetch_seal(track, pf->group_id,
+                                                pf->end_object - 1);
             }
         }
-        serve_retained_fetch(pub, now_us);
-        if (pub->pending_fetch.active)
+        /* No advancing call precedes ownership of every borrowed input. */
+        *result = MOQ_PUB_EVENT_CONSUMED;
+        return serve_retained_fetches(pub, now_us);
+    }
+
+    /* A fill request on a subscription this facade serves (draft-22 section
+     * 3.4): AUTO_RETAINED's snapshot must cover the entire authoritative
+     * inclusive range; send only that range, or fail with header then RESET
+     * (section 3.4.1). A strict subset never finishes successfully. This is not
+     * the explicit-FETCH whole-group policy or catalog-base requirement. The
+     * subscription itself is never touched. A request for a subscription this
+     * facade does not know stays IGNORED for a multiplexing caller. */
+    if (event->kind == MOQ_EVENT_FILL_REQUEST) {
+        const moq_fill_request_event_t *fr = &event->u.fill_request;
+        moq_pub_track_t *track = moq_publication_is_valid(fr->pub)
+            ? find_track_by_pub(pub, fr->pub)
+            : find_track_by_sub(pub, fr->sub);
+        if (!track) return MOQ_OK;
+        *result = MOQ_PUB_EVENT_CONSUMED;
+
+        pub_pending_fill_t *pf = pending_fill_find(pub, fr->fill);
+        if (!pf || !moq_subscription_eq(fr->sub, pf->receipt.sub) ||
+            !moq_publication_eq(fr->pub, pf->receipt.pub) ||
+            fr->initiating_request_id != pf->receipt.initiating_request_id ||
+            fr->start_group != pf->receipt.start_group ||
+            fr->start_object != pf->receipt.start_object ||
+            fr->end_group != pf->receipt.end_group ||
+            fr->end_object != pf->receipt.end_object ||
+            fr->processed_at_us != pf->receipt.processed_at_us ||
+            fr->group_order != pf->receipt.group_order ||
+            fr->subscriber_priority != pf->receipt.subscriber_priority ||
+            fr->has_fill_timeout != pf->receipt.has_fill_timeout ||
+            fr->fill_timeout_ms != pf->receipt.fill_timeout_ms) {
+            *result = MOQ_PUB_EVENT_ERROR;
+            return MOQ_ERR_WRONG_STATE;
+        }
+        if (pf->requested) return MOQ_OK;
+        pf->requested = true;
+        moq_pub_fill_decision_t decision = MOQ_PUB_FILL_AUTO_RETAINED;
+        if (pub->cfg.on_fill_request) {
+            moq_pub_fill_request_t info = {
+                .struct_size = sizeof(info), .fill = pf->token,
+                .sub = fr->sub, .pub = fr->pub,
+                .initiating_request_id = fr->initiating_request_id,
+                .start_group = fr->start_group, .start_object = fr->start_object,
+                .end_group = fr->end_group, .end_object = fr->end_object,
+                .processed_at_us = fr->processed_at_us,
+                .fill_timeout_ms = fr->fill_timeout_ms,
+                .group_order = (uint8_t)fr->group_order,
+                .subscriber_priority = fr->subscriber_priority,
+                .has_fill_timeout = fr->has_fill_timeout
+            };
+            pub->in_fill_callback = true;
+            decision = pub->cfg.on_fill_request(pub->cfg.on_fill_request_ctx, track, &info);
+            pub->in_fill_callback = false;
+        }
+        if (!pf->abort && decision == MOQ_PUB_FILL_DEFER) {
+            pf->deferred = true;
+            return MOQ_OK;
+        }
+        if (!pf->abort && decision != MOQ_PUB_FILL_AUTO_RETAINED) {
+            pf->abort = true;
+            pf->abort_code = MOQ_STREAM_ERROR_INTERNAL_ERROR;
+        }
+        /* The snapshot must cover the ENTIRE authoritative inclusive range,
+         * not merely fit inside it. No end+1 arithmetic at UINT64_MAX. */
+        if (!pf->abort && (pf->obj_count == 0 ||
+            fr->start_group != pf->group_id || fr->end_group != pf->group_id ||
+            fr->start_object < pf->objs[0].object_id ||
+            fr->end_object > pf->objs[pf->obj_count - 1].object_id)) {
+            pf->abort = true;
+            pf->abort_code = MOQ_STREAM_ERROR_UNKNOWN_OBJECT_STATUS;
+        }
+        while (pf->next_idx < pf->obj_count &&
+               pf->objs[pf->next_idx].object_id < fr->start_object) pf->next_idx++;
+        serve_pending_fill(pub, pf, now_us);
+        if (pending_fill_work(pf))
             return MOQ_ERR_WOULD_BLOCK;   /* deferred; the tick drains it */
+        return MOQ_OK;
+    }
+
+    /* The session ended a fill this facade was still answering (the parent
+     * was cancelled or ended, or the peer stopped the stream): drop the
+     * snapshot. Nothing to send -- the child's teardown is the session's. */
+    if (event->kind == MOQ_EVENT_FILL_TERMINAL) {
+        pub_pending_fill_t *pf = pending_fill_find(pub, event->u.fill_terminal.fill);
+        if (!pf) return MOQ_OK;
+        const moq_fill_terminal_event_t *term = &event->u.fill_terminal;
+        if (!moq_subscription_eq(term->sub, pf->receipt.sub) ||
+            !moq_publication_eq(term->pub, pf->receipt.pub) ||
+            term->initiating_request_id != pf->receipt.initiating_request_id)
+            return MOQ_ERR_WRONG_STATE;
+        if (pub->cfg.on_fill_terminal) {
+            moq_pub_fill_terminal_t info = {
+                .struct_size = sizeof(info), .fill = pf->token,
+                .sub = term->sub, .pub = term->pub,
+                .initiating_request_id = term->initiating_request_id,
+                .reason = term->reason, .error_domain = term->error_domain,
+                .error_code = term->error_code
+            };
+            pub->in_fill_callback = true;
+            pub->cfg.on_fill_terminal(pub->cfg.on_fill_terminal_ctx, pf->track, &info);
+            pub->in_fill_callback = false;
+        }
+        pending_fill_clear(pub, pf);
+        *result = MOQ_PUB_EVENT_CONSUMED;
         return MOQ_OK;
     }
 
@@ -3189,6 +5607,34 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
         moq_pub_track_t *t = find_track_by_sub(pub,
             event->u.subscribe_updated.sub);
         if (!t) return MOQ_OK;
+        const moq_subscribe_updated_event_t *u = &event->u.subscribe_updated;
+        if (event->detail_size >= offsetof(moq_subscribe_updated_event_t, new_group_request) +
+                                  sizeof(u->new_group_request) &&
+            u->has_new_group_request)
+            pub_new_group_request(pub, t, u->new_group_request);
+        if (event->detail_size >= sizeof(*u) && u->answer_owed) {
+            pub_pending_t local = {0};
+            pub_pending_t *p = moq_session_supports_fill(pub->session)
+                ? &local : &pub->pending;
+            if (p->active && (!p->update || !moq_subscription_eq(p->sub, u->sub)))
+                return MOQ_ERR_WOULD_BLOCK;
+            p->active = p->accept = p->update = true;
+            p->track = t;
+            p->sub = u->sub;
+            p->update_id = u->update_request_id;
+            p->fill_requested = u->fill_requested;
+            p->has_filter = u->has_filter || u->options != NULL;
+            p->update_info = (moq_pub_subscribe_update_info_t){
+                .has_subscriber_priority = u->has_subscriber_priority,
+                .subscriber_priority = u->subscriber_priority,
+                .has_forward = u->has_forward, .forward = u->forward,
+                .has_delivery_timeout = u->has_delivery_timeout,
+                .delivery_timeout_us = u->delivery_timeout_us
+            };
+            *result = MOQ_PUB_EVENT_CONSUMED;
+            return moq_session_supports_fill(pub->session)
+                ? stage_update(pub, p, now_us) : flush_pending(pub, now_us, NULL);
+        }
         *result = MOQ_PUB_EVENT_CONSUMED;
         /* Track the subscription's Forward state on its slot. A drop to
          * Forward 0 with wire state open arms a subgroup retire (RESET_STREAM,
@@ -3279,6 +5725,34 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
         moq_pub_track_t *t = find_track_by_pub(pub,
             event->u.publish_updated.pub);
         if (!t) return MOQ_OK;
+        const moq_publish_updated_event_t *u = &event->u.publish_updated;
+        if (event->detail_size >= offsetof(moq_publish_updated_event_t, new_group_request) +
+                                  sizeof(u->new_group_request) &&
+            u->has_new_group_request)
+            pub_new_group_request(pub, t, u->new_group_request);
+        if (event->detail_size >= sizeof(*u) && u->answer_owed) {
+            pub_pending_t local = {0};
+            pub_pending_t *p = moq_session_supports_fill(pub->session)
+                ? &local : &pub->pending;
+            if (p->active && (!p->update || !moq_publication_eq(p->publication, u->pub)))
+                return MOQ_ERR_WOULD_BLOCK;
+            p->active = p->accept = p->update = true;
+            p->track = t;
+            p->publication = u->pub;
+            p->update_id = u->update_request_id;
+            p->fill_requested = u->fill_requested;
+            p->has_filter = u->has_filter || u->options != NULL;
+            p->update_info = (moq_pub_subscribe_update_info_t){
+                .has_subscriber_priority = u->has_subscriber_priority,
+                .subscriber_priority = u->subscriber_priority,
+                .has_forward = u->has_forward, .forward = u->forward,
+                .has_delivery_timeout = u->has_delivery_timeout,
+                .delivery_timeout_us = u->delivery_timeout_us
+            };
+            *result = MOQ_PUB_EVENT_CONSUMED;
+            return moq_session_supports_fill(pub->session)
+                ? stage_update(pub, p, now_us) : flush_pending(pub, now_us, NULL);
+        }
         *result = MOQ_PUB_EVENT_CONSUMED;
         bool armed_retire = false;
         if (event->u.publish_updated.has_forward) {
@@ -3317,6 +5791,85 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
         return MOQ_OK;
     }
 
+    /* The peer refused the PUBLISH with REDIRECT: it ends as PUBLISH_ERROR
+     * does, and the track keeps where it went (moq_pub_get_track_migration). */
+    if (event->kind == MOQ_EVENT_REQUEST_REDIRECT &&
+        event->u.request_redirect.family == MOQ_REQUEST_FAMILY_PUBLISH) {
+        const moq_request_redirect_event_t *rd = &event->u.request_redirect;
+        moq_pub_track_t *t = find_track_by_pub(pub, rd->handle.publication);
+        if (!t) return MOQ_OK;
+        *result = MOQ_PUB_EVENT_CONSUMED;
+        facade_migration_set(&t->migration, &pub->alloc, true, rd->can_retry,
+            rd->retry_after_ms, 0, rd->connect_uri, &rd->track_namespace,
+            rd->track_name);
+        t->publish_requested = false;
+        t->publish_ok = false;
+        pub_sub_slot_t *sl = track_find_publication_slot(t);
+        if (sl) track_clear_slot(pub, sl);
+        if (CB_HAS(&pub->callbacks, on_publish_error))
+            pub->callbacks.on_publish_error(pub->callbacks.ctx, t, rd->error_code);
+        return MOQ_OK;
+    }
+
+    /* The subscriber migrated an accepted subscription with a GOAWAY on its
+     * request stream (draft-22 §9.2, draft-18 §10.4): the session has retired
+     * it but left its data streams, so it leaves like an UNSUBSCRIBE except
+     * that an open subgroup is reset here (track_retire_slot). Only that
+     * subscription and its pending accept/update work go. */
+    if (event->kind == MOQ_EVENT_REQUEST_GOAWAY &&
+        event->u.request_goaway.family == MOQ_REQUEST_FAMILY_SUBSCRIBE) {
+        moq_subscription_t sub = event->u.request_goaway.handle.subscription;
+        for (moq_pub_track_t *t = pub->tracks; t; t = t->next) {
+            pub_sub_slot_t *sl = track_find_slot_by_sub(t, sub);
+            if (!sl) continue;
+            track_retire_slot(pub, t, sl);
+            *result = MOQ_PUB_EVENT_CONSUMED;
+            if (pub->callbacks.on_subscriber_left)
+                pub->callbacks.on_subscriber_left(pub->callbacks.ctx, t);
+            break;
+        }
+        if (moq_session_supports_fill(pub->session)) {
+            if (admission_cancel(pub, sub._opaque, false))
+                *result = MOQ_PUB_EVENT_CONSUMED;
+        } else if (pub->pending.active && moq_subscription_eq(pub->pending.sub, sub)) {
+            if (pub->pending.fill_job) pending_fill_clear(pub, pub->pending.fill_job);
+            memset(&pub->pending, 0, sizeof(pub->pending));
+            *result = MOQ_PUB_EVENT_CONSUMED;
+        }
+        if (pub->deferred.active && moq_subscription_eq(pub->deferred.sub, sub)) {
+            pub->deferred.active = false;
+            *result = MOQ_PUB_EVENT_CONSUMED;
+        }
+        return MOQ_OK;
+    }
+
+    /* The peer migrated the publication with a GOAWAY on its request stream
+     * (draft-22 §9.2): it ends as a peer-terminated publication does, to be
+     * published again at the new session, and the track keeps where. */
+    if (event->kind == MOQ_EVENT_REQUEST_GOAWAY &&
+        event->u.request_goaway.family == MOQ_REQUEST_FAMILY_PUBLISH) {
+        const moq_request_goaway_event_t *ga = &event->u.request_goaway;
+        moq_pub_track_t *t = find_track_by_pub(pub, ga->handle.publication);
+        if (!t) return MOQ_OK;
+        if (moq_session_supports_fill(pub->session)) {
+            (void)admission_cancel(pub, ga->handle.publication._opaque, true);
+        } else if (pub->pending.active &&
+            moq_publication_eq(pub->pending.publication, ga->handle.publication)) {
+            if (pub->pending.fill_job) pending_fill_clear(pub, pub->pending.fill_job);
+            memset(&pub->pending, 0, sizeof(pub->pending));
+        }
+        *result = MOQ_PUB_EVENT_CONSUMED;
+        facade_migration_set(&t->migration, &pub->alloc, false, false, 0,
+            ga->timeout_ms, ga->new_session_uri, NULL, (moq_bytes_t){ NULL, 0 });
+        t->publish_requested = false;
+        t->publish_ok = false;
+        pub_sub_slot_t *sl = track_find_publication_slot(t);
+        if (sl) track_retire_slot(pub, t, sl);
+        if (CB_HAS(&pub->callbacks, on_publish_finished))
+            pub->callbacks.on_publish_finished(pub->callbacks.ctx, t);
+        return MOQ_OK;
+    }
+
     if (event->kind == MOQ_EVENT_PUBLISH_ERROR) {
         moq_pub_track_t *t = find_track_by_pub(pub, event->u.publish_error.pub);
         if (!t) return MOQ_OK;
@@ -3341,6 +5894,13 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
         moq_pub_track_t *t = find_track_by_pub(pub,
             event->u.publish_unsubscribed.pub);
         if (!t) return MOQ_OK;
+        if (moq_session_supports_fill(pub->session)) {
+            (void)admission_cancel(pub, event->u.publish_unsubscribed.pub._opaque, true);
+        } else if (pub->pending.active &&
+            moq_publication_eq(pub->pending.publication, event->u.publish_unsubscribed.pub)) {
+            if (pub->pending.fill_job) pending_fill_clear(pub, pub->pending.fill_job);
+            memset(&pub->pending, 0, sizeof(pub->pending));
+        }
         *result = MOQ_PUB_EVENT_CONSUMED;
         /* Return the track to the UN-published state (like PUBLISH_ERROR): a
          * peer-terminated publication must be restartable -- leaving
@@ -3359,19 +5919,66 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
      * emits it to the SUBSCRIBER role only, so it can never match a
      * publisher-role facade track. It falls through to IGNORED. */
 
+    /* A TRACK_STATUS for one of this publisher's tracks is answered as a
+     * SUBSCRIBE would be (§9.13), without subscription state: the Largest
+     * Object and Track Properties a SUBSCRIBE_OK would carry, or the refusal
+     * a SUBSCRIBE would get. The callback is not consulted (it authorizes
+     * subscriptions); in a callback mode the track must already have an
+     * accepted subscription on this session, the rule a standalone FETCH
+     * follows. A track that is not this publisher's stays IGNORED. */
+    if (event->kind == MOQ_EVENT_TRACK_STATUS_REQUEST) {
+        const moq_track_status_request_event_t *q = &event->u.track_status_request;
+        moq_pub_track_t *track = find_track(pub, &q->track_namespace, q->track_name);
+        if (!track) return MOQ_OK;
+        *result = MOQ_PUB_EVENT_CONSUMED;
+        pub_owed_answer_t a = { .kind = event->kind, .handle = q->handle._opaque,
+                                .track = NULL, .code = 0 };
+        if (track->ended)
+            a.code = MOQ_REQUEST_ERROR_DOES_NOT_EXIST;
+        else if (pub->cfg.accept_mode == MOQ_PUB_REJECT_ALL ||
+                 (pub->cfg.accept_mode != MOQ_PUB_ACCEPT_ALL &&
+                  !track_has_subscriber(track)))
+            a.code = MOQ_REQUEST_ERROR_UNAUTHORIZED;
+        else
+            a.track = track;
+        bool held = false;
+        moq_result_t rc = pub_answer_or_owe(pub, &a, now_us, &held);
+        if (rc < 0) return rc;
+        return held ? MOQ_ERR_WOULD_BLOCK : MOQ_OK;
+    }
+
     if (event->kind != MOQ_EVENT_SUBSCRIBE_REQUEST)
         return MOQ_OK;
 
     const moq_subscribe_request_event_t *req = &event->u.subscribe_request;
+    bool fill_requested = event->detail_size >=
+        offsetof(moq_subscribe_request_event_t, options) + sizeof(req->options) &&
+        req->options && req->options->struct_size >= MOQ_SUBSCRIPTION_ADMISSION_OPTIONS_V0_SIZE &&
+        (req->options->flags & MOQ_SUBSCRIPTION_ADMISSION_FILL) != 0;
     moq_pub_track_t *track = find_track(pub, &req->track_namespace,
                                           req->track_name);
     if (!track)
         return MOQ_OK;
+    const bool new_group = event->detail_size >=
+        offsetof(moq_subscribe_request_event_t, new_group_request) +
+        sizeof(req->new_group_request) && req->has_new_group_request;
 
-    if (pub->pending.active)
+    bool d22 = moq_session_supports_fill(pub->session);
+    if (!d22 && pub->pending.active)
         return MOQ_ERR_WOULD_BLOCK;
 
     *result = MOQ_PUB_EVENT_CONSUMED;
+    pub_admission_t *admission = NULL;
+    if (d22) {
+        bool fresh;
+        moq_result_t rc = admission_claim(pub, req->sub._opaque, 0, 0,
+                                           &admission, &fresh);
+        if (rc < 0 || !admission) return rc;
+        if (!fresh) return flush_admission(pub, admission, now_us);
+        admission->track = track;
+        admission->flags |= (req->forward ? PUB_ADMISSION_FORWARD : 0) |
+                            (fill_requested ? PUB_ADMISSION_FILL : 0);
+    }
 
     bool want_accept;
     moq_request_error_t reject_code = 0;
@@ -3383,13 +5990,21 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
          * terminal. Checked before the app callback so it is never consulted. */
         want_accept = false;
         reject_code = MOQ_REQUEST_ERROR_DOES_NOT_EXIST;
-    } else if (track_has_subscriber(track)) {
+    } else if (!moq_session_supports_concurrent_subscriptions(pub->session) &&
+               track_has_subscriber(track)) {
         want_accept = false;
         reject_code = MOQ_REQUEST_ERROR_DUPLICATE_SUBSCRIPTION;
+    } else if (!d22 && moq_session_supports_concurrent_subscriptions(pub->session) &&
+               track_reserve_sub_slots(pub, track) < 0) {
+        /* No memory for one more destination on the track: refused, like a
+         * full subscription pool. */
+        want_accept = false;
+        reject_code = MOQ_REQUEST_ERROR_INTERNAL_ERROR;
     } else if (pub->cfg.accept_mode == MOQ_PUB_REJECT_ALL) {
         want_accept = false;
         reject_code = MOQ_REQUEST_ERROR_UNAUTHORIZED;
-    } else if (pub->cfg.accept_mode == MOQ_PUB_CALLBACK) {
+    } else if (pub->cfg.accept_mode == MOQ_PUB_CALLBACK ||
+               pub->cfg.accept_mode == MOQ_PUB_CALLBACK_V1) {
         moq_pub_subscribe_info_t info;
         memset(&info, 0, sizeof(info));
         info.track = track;
@@ -3409,9 +6024,36 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
         info.deferred_id = pub->deferred.generation + 1;
 
         moq_request_error_t cb_error = 0;
-        moq_pub_accept_decision_t decision =
-            pub->cfg.on_subscribe(pub->cfg.on_subscribe_ctx,
-                                   &info, &cb_error);
+        moq_pub_accept_decision_t decision;
+        if (pub->cfg.accept_mode == MOQ_PUB_CALLBACK_V1) {
+            moq_pub_subscribe_info_v1_t v1 = {
+                .struct_size = sizeof(v1),
+                .track = info.track,
+                .track_namespace = info.track_namespace,
+                .track_name = info.track_name,
+                .filter = info.filter,
+                .subscriber_priority = info.subscriber_priority,
+                .group_order = info.group_order,
+                .forward = info.forward,
+                .start_group = info.start_group,
+                .start_object = info.start_object,
+                .end_group = info.end_group,
+                .delivery_timeout_us = info.delivery_timeout_us,
+                .tokens = info.tokens,
+                .token_count = info.token_count,
+                .deferred = info.deferred,
+                .deferred_id = info.deferred_id,
+                .options = NULL,
+            };
+            if (event->detail_size >= offsetof(moq_subscribe_request_event_t, options) +
+                                      sizeof(req->options))
+                v1.options = req->options;
+            decision = pub->cfg.on_subscribe_v1(pub->cfg.on_subscribe_v1_ctx,
+                                               &v1, &cb_error);
+        } else {
+            decision = pub->cfg.on_subscribe(pub->cfg.on_subscribe_ctx,
+                                            &info, &cb_error);
+        }
 
         if (decision == MOQ_PUB_DECISION_ACCEPT) {
             want_accept = true;
@@ -3429,6 +6071,10 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
                 pub->deferred.sub = req->sub;
                 pub->deferred.track = track;
                 pub->deferred.forward = req->forward;
+                pub->deferred.fill_requested = fill_requested;
+                pub->deferred.has_new_group = new_group;
+                pub->deferred.new_group = new_group ? req->new_group_request : 0;
+                if (admission) admission->flags |= PUB_ADMISSION_DEFERRED;
                 return MOQ_OK;
             }
         } else {
@@ -3439,36 +6085,28 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
         want_accept = true;
     }
 
-    moq_result_t rc;
-    if (want_accept) {
-        moq_accept_subscribe_cfg_t acc;
-        pub_init_accept_cfg(track, &acc);
-        rc = moq_session_accept_subscribe(pub->session, req->sub,
-            &acc, now_us);
-    } else {
-        moq_reject_subscribe_cfg_t rej;
-        moq_reject_subscribe_cfg_init(&rej);
-        rej.error_code = reject_code;
-        rc = moq_session_reject_subscribe(pub->session, req->sub,
-            &rej, now_us);
-    }
+    if (want_accept && new_group)
+        pub_new_group_request(pub, track, req->new_group_request);
 
-    if (rc == MOQ_ERR_WOULD_BLOCK) {
-        pub->pending.active = true;
-        pub->pending.sub = req->sub;
-        pub->pending.track = want_accept ? track : NULL;
-        pub->pending.accept = want_accept;
-        pub->pending.reject_code = reject_code;
-        pub->pending.forward = req->forward;
-        return MOQ_ERR_WOULD_BLOCK;
+    if (admission) {
+        if (want_accept) admission->flags |= PUB_ADMISSION_ACCEPT;
+        admission->reject_code = reject_code;
+        return flush_admission(pub, admission, now_us);
     }
+    pub->pending = (pub_pending_t){
+        .active = true, .sub = req->sub, .track = want_accept ? track : NULL,
+        .accept = want_accept, .reject_code = reject_code,
+        .forward = req->forward, .fill_requested = fill_requested
+    };
+    moq_pub_track_t *joined = NULL;
+    moq_result_t rc = flush_pending(pub, now_us, &joined);
+    if (rc == MOQ_ERR_WOULD_BLOCK) return rc;
     if (rc < 0) {
         *result = MOQ_PUB_EVENT_ERROR;
         return rc;
     }
 
-    if (want_accept) {
-        track_set_subscriber(pub, track, req->sub, req->forward);
+    if (joined) {
         /* Immediate accept: fire the joined callback here, exactly once. The
          * WOULD_BLOCK / deferred paths returned above without accepting; they
          * fire it later via flush_pending when the accept completes, so the
@@ -3498,6 +6136,7 @@ moq_result_t moq_pub_handle_event(moq_publisher_t *pub,
 {
     if (!pub || !event || !result) return MOQ_ERR_INVAL;
     *result = MOQ_PUB_EVENT_IGNORED;
+    if (pub->in_fill_callback) return MOQ_ERR_WRONG_STATE;
     return pub_dispatch_event(pub, event, now_us, result);
 }
 
@@ -3509,9 +6148,28 @@ moq_result_t moq_pub_resolve_deferred(moq_publisher_t *pub,
                                         uint64_t now_us)
 {
     if (!pub || !deferred) return MOQ_ERR_INVAL;
+    if (pub->in_fill_callback) return MOQ_ERR_WRONG_STATE;
     if (deferred != &pub->deferred) return MOQ_ERR_INVAL;
     if (!deferred->active || deferred->generation != deferred_id)
         return MOQ_ERR_STALE_HANDLE;
+
+    if (moq_session_supports_fill(pub->session)) {
+        pub_admission_t *a = admission_cell(pub, deferred->sub._opaque, false);
+        if (!a || !(a->flags & PUB_ADMISSION_DEFERRED) ||
+            a->parent != deferred->sub._opaque)
+            return MOQ_ERR_STALE_HANDLE;
+        if (!admission_live(pub, a->parent, a->flags, a->update_id)) {
+            admission_clear(pub, a);
+            return MOQ_ERR_STALE_HANDLE;
+        }
+        a->flags &= ~PUB_ADMISSION_DEFERRED;
+        if (accept) a->flags |= PUB_ADMISSION_ACCEPT;
+        a->reject_code = error_code;
+        deferred->active = false;
+        if (accept && deferred->has_new_group)
+            pub_new_group_request(pub, deferred->track, deferred->new_group);
+        return flush_admission(pub, a, now_us);
+    }
 
     /* The facade has a single pending accept/reject slot. If an earlier
      * backpressured accept/reject still occupies it, resolving now would have to
@@ -3529,38 +6187,23 @@ moq_result_t moq_pub_resolve_deferred(moq_publisher_t *pub,
         error_code = MOQ_REQUEST_ERROR_DOES_NOT_EXIST;
     }
 
-    moq_result_t rc;
-    if (accept) {
-        moq_accept_subscribe_cfg_t acc;
-        pub_init_accept_cfg(deferred->track, &acc);
-        rc = moq_session_accept_subscribe(pub->session, deferred->sub,
-            &acc, now_us);
-    } else {
-        moq_reject_subscribe_cfg_t rej;
-        moq_reject_subscribe_cfg_init(&rej);
-        rej.error_code = error_code;
-        rc = moq_session_reject_subscribe(pub->session, deferred->sub,
-            &rej, now_us);
-    }
-
-    if (rc == MOQ_ERR_WOULD_BLOCK) {
-        pub->pending.active = true;
-        pub->pending.sub = deferred->sub;
-        pub->pending.track = accept ? deferred->track : NULL;
-        pub->pending.accept = accept;
-        pub->pending.reject_code = error_code;
-        pub->pending.forward = deferred->forward;
-        deferred->active = false;
-        return MOQ_ERR_WOULD_BLOCK;
-    }
+    pub->pending = (pub_pending_t){
+        .active = true, .sub = deferred->sub, .track = accept ? deferred->track : NULL,
+        .accept = accept, .reject_code = error_code, .forward = deferred->forward,
+        .fill_requested = deferred->fill_requested
+    };
+    deferred->active = false;
+    if (accept && deferred->has_new_group)
+        pub_new_group_request(pub, deferred->track, deferred->new_group);
+    moq_pub_track_t *joined = NULL;
+    moq_result_t rc = flush_pending(pub, now_us, &joined);
+    if (rc == MOQ_ERR_WOULD_BLOCK) return rc;
     if (rc < 0) {
         deferred->active = false;
         return rc;
     }
 
-    if (accept && deferred->track) {
-        track_set_subscriber(pub, deferred->track, deferred->sub,
-                             deferred->forward);
+    if (joined) {
         if (pub->callbacks.on_subscriber_joined)
             pub->callbacks.on_subscriber_joined(pub->callbacks.ctx,
                 deferred->track);
@@ -3582,6 +6225,7 @@ moq_result_t moq_pub_resolve_deferred(moq_publisher_t *pub,
 
 moq_result_t moq_pub_flush(moq_publisher_t *pub, uint64_t now_us) {
     if (!pub) return MOQ_ERR_INVAL;
+    if (pub->in_fill_callback) return MOQ_ERR_WRONG_STATE;
     /* All staged manual-mode work runs through the one shared progression
      * helper (also used by moq_pub_tick), so the two never drift. */
     return pub_progress_staged(pub, now_us);
@@ -3625,6 +6269,7 @@ moq_result_t moq_pub_publish_track(moq_publisher_t *pub,
                                    uint64_t now_us)
 {
     if (!pub || !track || !cfg) return MOQ_ERR_INVAL;
+    if (pub->in_fill_callback) return MOQ_ERR_WRONG_STATE;
     if (track->pub != pub) return MOQ_ERR_INVAL;
     if (cfg->struct_size < sizeof(moq_pub_publish_cfg_t)) return MOQ_ERR_INVAL;
     if (pub->closed) return MOQ_ERR_CLOSED;
@@ -3641,7 +6286,10 @@ moq_result_t moq_pub_publish_track(moq_publisher_t *pub,
     pcfg.track_alias = cfg->track_alias;
     pcfg.has_forward = cfg->has_forward;
     pcfg.forward = cfg->forward;
-    pcfg.track_properties = cfg->track_properties;
+    /* The publish cfg's properties when it has some, else the track's. */
+    pcfg.track_properties = cfg->track_properties.len > 0
+        ? cfg->track_properties
+        : (moq_bytes_t){ track->props, track->props_len };
     pcfg.auth_tokens = cfg->auth_tokens;
     pcfg.auth_token_count = cfg->auth_token_count;
 
@@ -3650,6 +6298,11 @@ moq_result_t moq_pub_publish_track(moq_publisher_t *pub,
     if (rc < 0) return rc;   /* REQUEST_BLOCKED / WOULD_BLOCK: nothing bound, retry */
 
     track->publication = handle;
+    if (moq_session_supports_fill(pub->session)) {
+        int slot = pub_resolve_handle(pub->session, handle);
+        if (slot >= 0) pub->session->publishes[slot].facade_defer_updates = true;
+    }
+    facade_migration_clear(&track->migration, &pub->alloc);
     track->publish_requested = true;
     track->publish_forward = cfg->has_forward ? cfg->forward : true;
     return MOQ_OK;
@@ -3660,6 +6313,7 @@ moq_result_t moq_pub_unpublish_track(moq_publisher_t *pub,
                                      uint64_t now_us)
 {
     if (!pub || !track) return MOQ_ERR_INVAL;
+    if (pub->in_fill_callback) return MOQ_ERR_WRONG_STATE;
     if (track->pub != pub) return MOQ_ERR_INVAL;
     if (pub->closed) return MOQ_ERR_CLOSED;
     if (!track->publish_requested) return MOQ_OK;   /* not published: no-op */
@@ -3691,8 +6345,7 @@ moq_result_t moq_pub_unpublish_track(moq_publisher_t *pub,
     /* Close the data subgroup cleanly before PUBLISH_DONE (finish needs no open
      * stream). Retryable: WOULD_BLOCK at any step lets the caller retry. */
     if (psl && psl->sg_open) {
-        moq_result_t rc = moq_session_close_subgroup(pub->session,
-            psl->sg, now_us);
+        moq_result_t rc = slot_close_subgroup(pub, track, psl, now_us);
         if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
         if (rc != MOQ_OK && rc != MOQ_ERR_STALE_HANDLE) return rc;
         psl->sg_open = false;
@@ -3713,6 +6366,15 @@ moq_result_t moq_pub_unpublish_track(moq_publisher_t *pub,
     track->publish_ok = false;
     if (psl) track_clear_slot(pub, psl);
     return MOQ_OK;
+}
+
+moq_result_t moq_pub_get_track_migration(const moq_publisher_t *pub,
+    const moq_pub_track_t *track, moq_request_migration_t *out, size_t out_size)
+{
+    if (!pub || !track) return MOQ_ERR_INVAL;
+    for (const moq_pub_track_t *t = pub->tracks; t; t = t->next)
+        if (t == track) return facade_migration_get(&t->migration, out, out_size);
+    return MOQ_ERR_INVAL;
 }
 
 bool moq_pub_track_is_published(const moq_publisher_t *pub,
@@ -3761,36 +6423,62 @@ static void drain_closed_event(moq_publisher_t *pub)
 moq_result_t moq_pub_tick(moq_publisher_t *pub, uint64_t now_us)
 {
     if (!pub) return MOQ_ERR_INVAL;
+    if (pub->in_fill_callback) return MOQ_ERR_WRONG_STATE;
 
     /* Progress previously-staged work: a pending accept (-> on_subscriber_
      * joined), a deferred retained FETCH, and retirements armed in earlier
      * ticks. Shared with moq_pub_flush so the two never drift. */
     moq_result_t frc = pub_progress_staged(pub, now_us);
-    if (frc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
-    if (frc < 0) {
+    bool d22 = moq_session_supports_fill(pub->session);
+    bool waiting_credit = !d22 && pub->pending.active && pub->pending.fill_requested &&
+                          !pub->pending.fill_job;
+    /* Legacy profiles serialize through the single owner. D22 can keep
+     * consuming FIFO events into its bounded owners to return event credit. */
+    if (frc == MOQ_ERR_WOULD_BLOCK &&
+        !d22 && (pub->pending_fetch.active || !waiting_credit)) return frc;
+    if (frc < 0 && frc != MOQ_ERR_WOULD_BLOCK) {
         if (frc == MOQ_ERR_CLOSED) drain_closed_event(pub);
         return frc;
     }
 
     moq_event_t ev;
-    while (moq_session_poll_events(pub->session, &ev, 1) == 1) {
+    size_t remaining = d22 ? pub->session->event_cap : SIZE_MAX;
+    while (remaining-- && moq_session_poll_events(pub->session, &ev, 1) == 1) {
         /* One canonical dispatcher for every event -- identical handling to
          * the public moq_pub_handle_event path. A WOULD_BLOCK means the event
          * staged work (pending accept / deferred FETCH / armed retirement);
          * the next tick, via pub_progress_staged, drains it. */
         moq_pub_event_result_t res = MOQ_PUB_EVENT_IGNORED;
         moq_result_t drc = pub_dispatch_event(pub, &ev, now_us, &res);
-        if (drc == MOQ_ERR_WOULD_BLOCK) {
+        waiting_credit = !d22 && pub->pending.active && pub->pending.fill_requested &&
+                         !pub->pending.fill_job;
+        if (drc == MOQ_ERR_WOULD_BLOCK &&
+            ((!d22 && (pub->pending_fetch.active || !waiting_credit)) ||
+             res != MOQ_PUB_EVENT_CONSUMED)) {
             moq_event_cleanup(&ev);
             return MOQ_ERR_WOULD_BLOCK;
         }
-        if (drc < 0) {
+        if (drc < 0 && drc != MOQ_ERR_WOULD_BLOCK) {
             moq_event_cleanup(&ev);
             if (drc == MOQ_ERR_CLOSED)
                 drain_closed_event(pub);
             return drc;
         }
+        /* Nothing else polls this session: answer a request nobody took. */
+        if (drc == MOQ_OK && res == MOQ_PUB_EVENT_IGNORED) {
+            moq_result_t urc = pub_refuse_unserved(pub, &ev, now_us);
+            if (urc < 0) {
+                moq_event_cleanup(&ev);
+                if (urc == MOQ_ERR_CLOSED) drain_closed_event(pub);
+                return urc;
+            }
+        }
+        bool returned_credit = d22 && ev.kind == MOQ_EVENT_FILL_TERMINAL;
         moq_event_cleanup(&ev);
+        if (waiting_credit || returned_credit) {
+            frc = pub_progress_staged(pub, now_us);
+            if (frc < 0 && frc != MOQ_ERR_WOULD_BLOCK) return frc;
+        }
     }
 
     /* Progress work armed by events processed THIS tick (Forward-0

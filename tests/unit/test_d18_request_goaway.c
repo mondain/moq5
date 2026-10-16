@@ -2,10 +2,11 @@
  * Draft-18 per-request-stream GOAWAY (§10.4, receive): a peer sends a GOAWAY on an
  * established request bidi to migrate that single request. The library surfaces a
  * dedicated MOQ_EVENT_REQUEST_GOAWAY (all 7 request families), frees the request,
- * closes our half (if still open), and puts the ref into a GOAWAY-strict drain so a
- * duplicate GOAWAY / late bytes close the session while FIN/RESET retire it. Data
+ * closes our half (if still open), and drains the ref: messages the peer still
+ * owes there are discarded, a second GOAWAY closes the session, and FIN/RESET
+ * retire it. Data
  * streams are left intact (graceful migration). Covers the codec, per-family
- * surfacing, close-half gating, strict duplicate, validation, and preflight
+ * surfacing, close-half gating, duplicate GOAWAY, validation, and preflight
  * WOULD_BLOCK-before-mutation.
  */
 #include <moq/moq.h>
@@ -300,7 +301,7 @@ int main(void)
         moq_session_destroy(s);
     }
 
-    /* == Strict duplicate: second GOAWAY (bytes) closes 0x3 ========== */
+    /* == Second GOAWAY closes 0x3 ===================================== */
     {
         moq_session_t *s = make_session(MOQ_PERSPECTIVE_CLIENT);
         moq_stream_ref_t ref = open_subscribe(s);
@@ -310,13 +311,13 @@ int main(void)
         moq_event_t ev; while (moq_session_poll_events(s, &ev, 1) > 0)
             moq_event_cleanup(&ev);
         MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
-        /* A duplicate GOAWAY (non-empty bytes) on the strict-drained ref closes. */
+        /* A second GOAWAY on the drained ref closes. */
         (void)moq_session_on_bidi_stream_bytes(s, ref, msg, n, false, 1);
         MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_CLOSED);
         moq_session_destroy(s);
     }
 
-    /* == Strict drain: a clean FIN after GOAWAY retires (no close) ==== */
+    /* == Drain: a clean FIN after GOAWAY retires (no close) =========== */
     {
         moq_session_t *s = make_session(MOQ_PERSPECTIVE_CLIENT);
         moq_stream_ref_t ref = open_subscribe(s);
@@ -332,14 +333,25 @@ int main(void)
         moq_session_destroy(s);
     }
 
-    /* == Same-chunk trailing bytes after GOAWAY closes 0x3 =========== */
+    /* == Same-chunk bytes after GOAWAY: a message is discarded, a second
+     *    GOAWAY closes 0x3 ============================================== */
     {
         moq_session_t *s = make_session(MOQ_PERSPECTIVE_CLIENT);
         moq_stream_ref_t ref = open_subscribe(s);
         uint8_t msg[64];
         size_t n = encode_req_goaway(msg, sizeof(msg), NULL, 0);
-        msg[n] = 0xAB;   /* trailing garbage in the same chunk */
+        msg[n] = 0xAB;   /* the first byte of a further message's header */
         (void)moq_session_on_bidi_stream_bytes(s, ref, msg, n + 1, false, 1);
+        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
+        moq_session_destroy(s);
+    }
+    {
+        moq_session_t *s = make_session(MOQ_PERSPECTIVE_CLIENT);
+        moq_stream_ref_t ref = open_subscribe(s);
+        uint8_t msg[64];
+        size_t n = encode_req_goaway(msg, sizeof(msg), NULL, 0);
+        n += encode_req_goaway(msg + n, sizeof(msg) - n, NULL, 0);
+        (void)moq_session_on_bidi_stream_bytes(s, ref, msg, n, false, 1);
         MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_CLOSED);
         moq_session_destroy(s);
     }

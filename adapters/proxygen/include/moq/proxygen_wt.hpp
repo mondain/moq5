@@ -30,6 +30,18 @@
  * Threading: the adapter, its callbacks, and destruction must all run on
  * the same executor (typically the proxygen EventBase thread).
  *
+ * Transport binding: a session whose wire profile requires one
+ * (moq_session_binding_requirements() != 0, e.g. draft-22) must be bound by
+ * the attaching caller with moq_session_bind_transport() before
+ * moq_session_start(): kind MOQ_BINDING_WEBTRANSPORT_H3; an established
+ * WebTransport-over-HTTP/3 session supplies every fact (handshake complete,
+ * QUIC DATAGRAM and HTTP/3 datagrams negotiated on both sides); the target
+ * is the authority and path/query the CONNECT named. A profile without
+ * requirements (draft-16, draft-18) accepts the same binding optionally;
+ * bound, its server refuses a target a client names inside WebTransport.
+ * The adapter never binds or starts the session; the managed facade in
+ * <moq/proxygen_wt_managed.h> does.
+ *
  * Experimental: C++ only; no managed client/server. API may evolve.
  */
 

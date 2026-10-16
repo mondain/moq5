@@ -1,10 +1,23 @@
 # MOQ5 Relay
 
 A deterministic Media over QUIC relay. The protocol core is sans-I/O and the
-relay serves draft-16 and draft-18 from one listener, translating terminal
-codes by meaning rather than forwarding raw numbers between registries.
+relay serves draft-16, draft-18 and draft-22 from one listener, translating
+terminal codes by meaning rather than forwarding raw numbers between
+registries.
 
 The installed command is `moq5-relay`.
+
+By default the native listener offers exactly draft 18 and the WebTransport
+listener offers drafts 18 and 16 in that order. Draft-22
+requires an explicit `listener.versions` / `webtransport.versions` list
+containing 22; put 22 first to prefer it. On draft-22 connections the relay
+answers subscriber updates itself, serves fills from its retained log and ends each at its deadline with
+Timed-Out markers, using the relay library's default fill wait (1 s when a
+fill names no FILL_TIMEOUT, at most 10 s when it does); the command has no
+configuration key for these. All six semantic Location Filter forms are
+supported, including Absolute Range with an inclusive object-level end.
+Range Filters are a separate feature and are not supported. Behaviour and limits:
+[relay/docs/architecture.md](../../relay/docs/architecture.md#draft-22-behaviour).
 
 Forwarding code lives in the top-level `relay/` component. The command under
 `tools/moq5-relay/` composes those transport-independent libraries with
@@ -57,13 +70,13 @@ cmake -S . -B build-relay-dual \
 cmake --build build-relay-dual --target moq5-relay
 ```
 
-The WTQuic recipe pins `c4973f427226834d1bac08dcb92aeb125cd7c7c2`, which includes
-typed callback registration and the accounted receive/bounded stream admission
-APIs. It applies no WTQuic patches and keeps pedantic warnings enabled. Its
-MsQuic backend requires at least 2.5.9. `wtquic_DIR` is discovered from the
-actual installation, including `lib64` layouts. `WTQ_MSQUIC_ROOT` is
-an alternative for a source/build tree; it is not required with an installed
-`msquic_DIR`. Both scripts accept individual extra CMake configure arguments.
+The WTQuic recipe pins `644644727ed7ba853c3f14450dd42a9e8a40d7e4`, which includes
+typed callback registration, the accounted receive/bounded stream admission
+APIs, and the reliable local-flush and send-commitment APIs. It applies no
+WTQuic patches and keeps pedantic warnings enabled. Its MsQuic backend
+requires at least 2.5.9. `wtquic_DIR` is discovered from the actual
+installation, including `lib64` layouts. `WTQ_MSQUIC_ROOT` is an alternative
+for a source/build tree; it is not required with an installed `msquic_DIR`. Both scripts accept individual extra CMake configure arguments.
 
 Use `cmake --install <build-dir> --prefix <destination>` to install. The private
 provider is not copied into the relay installation: arrange for the platform
@@ -140,14 +153,14 @@ as absolute paths.
 | key | meaning |
 |---|---|
 | `listener.host`, `listener.port` | where the relay listens |
-| `listener.versions` | ordered draft set; default `[18]`, use `[18, 16]` to serve both drafts from one listener |
+| `listener.versions` | ordered draft set from `{22, 18, 16}`; default: every supported draft, newest first (`[22, 18, 16]`); a single entry such as `[22]` pins one exact draft |
 | `listener.lanes` | independent shard lanes; more than one enables the cross-shard demand plane |
 | `listener.cert`, `listener.key` | server credential, PEM |
 | `webtransport` | optional second listener carrying MoQ over WebTransport, for browsers; absent means raw-only, exactly as before |
 | `webtransport.host`, `.port`, `.cert`, `.key` | its own address and credential, separate from the raw listener |
 | `webtransport.lanes` | its own shard lanes; `listener.lanes + webtransport.lanes` must not exceed the runtime cap |
 | `webtransport.path` | request path browsers connect to, default `/moq` |
-| `webtransport.versions` | ordered drafts offered as WebTransport subprotocols, default `[18, 16]` |
+| `webtransport.versions` | ordered drafts from `{22, 18, 16}` offered as WebTransport subprotocols; default: every supported draft, newest first (`[22, 18, 16]`) |
 | `webtransport.profile` | WebTransport-over-HTTP/3 dialect: `current` (default), `d13_14_compat`, or opt-in `d02_rfc9297_compat`; a selection of what the listener emits, not a claim about any peer |
 | `webtransport.origin_policy` | how a client's serialized Origin is authorized: `unset` (default, no Origin rule), `allow_any_non_opaque`, `allowlist`, or `allow_any_including_null`; required when `profile` is `d02_rfc9297_compat` |
 | `webtransport.allowed_origins` | 1 to 8 exact Origin strings, at most 320 bytes each excluding its terminator and 512 bytes in total **including** every terminator; accepted only with `origin_policy: "allowlist"`, and required by it. Compared byte for byte, never normalized |

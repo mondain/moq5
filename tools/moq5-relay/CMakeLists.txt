@@ -33,13 +33,13 @@ if(MOQ_BUILD_TESTS)
     add_executable(test_relay_cli_config
         tests/test_relay_cli_config.c cli/config.c cli/admin_listen_size.c cli/info_doc.c cli/shards_doc.c cli/snapshot.c)
     target_include_directories(test_relay_cli_config PRIVATE
-        cli ${CMAKE_SOURCE_DIR}/media/msf/vendor)
+        cli ${PROJECT_SOURCE_DIR}/media/msf/vendor)
     target_link_libraries(test_relay_cli_config PRIVATE moqr-admin)
     # The per-lane attribution row grammar (pure string tests; no transport).
     add_executable(test_relay_lane_stats
         tests/test_relay_lane_stats.c cli/lanestats.c cli/logevent.c)
     target_include_directories(test_relay_lane_stats PRIVATE
-        cli ${CMAKE_SOURCE_DIR}/core/include)
+        cli ${PROJECT_SOURCE_DIR}/core/include)
     target_link_libraries(test_relay_lane_stats PRIVATE moqr-admin)
     if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
         target_compile_options(test_relay_lane_stats PRIVATE
@@ -48,6 +48,16 @@ if(MOQ_BUILD_TESTS)
     endif()
     add_test(NAME relay_lane_stats COMMAND test_relay_lane_stats)
     set_tests_properties(relay_lane_stats PROPERTIES LABELS "relay")
+    # The per-lane fill-deadline fold the lane pumps publish into and both
+    # managed facades read (pure; header-only helper, no transport).
+    add_executable(test_relay_lane_deadlines tests/test_relay_lane_deadlines.c)
+    target_include_directories(test_relay_lane_deadlines PRIVATE cli)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_relay_lane_deadlines PRIVATE
+            -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME relay_lane_deadlines COMMAND test_relay_lane_deadlines)
 
     # The serve's stdout sink and structured events: frozen text baseline,
     # JSON events through an independent parser, the latching stream, the
@@ -56,8 +66,8 @@ if(MOQ_BUILD_TESTS)
         tests/test_relay_log_sink.c cli/lanestats.c cli/logevent.c cli/config.c
         cli/admin_listen_size.c cli/info_doc.c cli/shards_doc.c cli/snapshot.c)
     target_include_directories(test_relay_log_sink PRIVATE
-        cli ${CMAKE_SOURCE_DIR}/core/include
-        ${CMAKE_SOURCE_DIR}/media/msf/vendor)
+        cli ${PROJECT_SOURCE_DIR}/core/include
+        ${PROJECT_SOURCE_DIR}/media/msf/vendor)
     target_link_libraries(test_relay_log_sink PRIVATE moqr-admin)
     if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
         target_compile_options(test_relay_log_sink PRIVATE
@@ -71,7 +81,7 @@ if(MOQ_BUILD_TESTS)
     add_executable(test_relay_dual_listener
         tests/test_relay_dual_listener.c cli/config.c cli/admin_listen_size.c cli/info_doc.c cli/shards_doc.c cli/snapshot.c)
     target_include_directories(test_relay_dual_listener PRIVATE
-        cli ${CMAKE_SOURCE_DIR}/media/msf/vendor)
+        cli ${PROJECT_SOURCE_DIR}/media/msf/vendor)
     target_link_libraries(test_relay_dual_listener PRIVATE moqr-admin)
     if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
         target_compile_options(test_relay_dual_listener PRIVATE
@@ -99,7 +109,7 @@ if(MOQ_BUILD_TESTS)
     target_compile_definitions(test_relay_verify_seam PRIVATE
         MOQR_VERIFY_SEAM)
     target_include_directories(test_relay_verify_seam PRIVATE
-        cli ${CMAKE_SOURCE_DIR}/media/msf/vendor)
+        cli ${PROJECT_SOURCE_DIR}/media/msf/vendor)
     target_link_libraries(test_relay_verify_seam PRIVATE moqr-admin)
     if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
         target_compile_options(test_relay_verify_seam PRIVATE
@@ -154,7 +164,7 @@ if(MOQ_BUILD_TESTS)
         if(MOQ_BUILD_MSQUIC_MANAGED)
             add_test(NAME relay_production_targets_build COMMAND ${MOQR_WIRE_BASH}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_production_targets_build.sh
-                ${CMAKE_BINARY_DIR})
+                ${PROJECT_BINARY_DIR})
             set_tests_properties(relay_production_targets_build
                 PROPERTIES LABELS "relay" TIMEOUT 600)
         endif()
@@ -192,7 +202,7 @@ if(MOQ_BUILD_TESTS)
             -I${CMAKE_CURRENT_SOURCE_DIR}/admin
             -I${MOQR_LIBRARY_INCLUDE_DIR}
             -I${PROJECT_SOURCE_DIR}/relay/private
-            -I${CMAKE_SOURCE_DIR}/core/include)
+            -I${PROJECT_SOURCE_DIR}/core/include)
         set_tests_properties(relay_clock_call_sites
             PROPERTIES LABELS "relay" TIMEOUT 60)
         add_test(NAME relay_listener_contracts COMMAND ${MOQR_WIRE_BASH}
@@ -204,7 +214,7 @@ if(MOQ_BUILD_TESTS)
             -I${CMAKE_CURRENT_SOURCE_DIR}/cli
             -I${CMAKE_CURRENT_SOURCE_DIR}/admin
             -I${MOQR_LIBRARY_INCLUDE_DIR}
-            -I${CMAKE_SOURCE_DIR}/core/include)
+            -I${PROJECT_SOURCE_DIR}/core/include)
         set_tests_properties(relay_listener_contracts
             PROPERTIES LABELS "relay" TIMEOUT 60)
 
@@ -245,7 +255,7 @@ if(MOQ_BUILD_TESTS)
         # the generator emit that archive twice and the linker warn.
         add_test(NAME relay_link_hygiene COMMAND ${MOQR_WIRE_BASH}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_link_hygiene.sh
-            ${CMAKE_BINARY_DIR})
+            ${PROJECT_BINARY_DIR})
         set_tests_properties(relay_link_hygiene
             PROPERTIES LABELS "relay" TIMEOUT 60)
         # The gate reads generated commands, so a shape it cannot interpret
@@ -332,7 +342,7 @@ if(MOQ_BUILD_TESTS)
         set(MOQR_GRAPH_EXPECT_SELFTEST OFF)
     endif()
     add_test(NAME relay_ctest_graph COMMAND ${CMAKE_COMMAND}
-        -DMOQR_BUILD_DIR=${CMAKE_BINARY_DIR}
+        -DMOQR_BUILD_DIR=${PROJECT_BINARY_DIR}
         -DMOQR_CTEST=${CMAKE_CTEST_COMMAND}
         -DMOQR_CMAKE=${CMAKE_COMMAND}
         -DMOQR_PROD_BIN=$<TARGET_FILE:test_relay_snapshot_cap>
@@ -425,7 +435,8 @@ if(MOQ_BUILD_TESTS)
     add_test(NAME relay_admin_broker COMMAND test_relay_admin_broker)
     set_tests_properties(relay_admin_broker PROPERTIES LABELS "relay;sansio")
 
-    if(TARGET moq-relay-bind-test-internals AND
+    if(TARGET moq::sim AND
+       TARGET moq-relay-bind-test-internals AND
        TARGET moq-relay-shard-test-internals)
         # Cross-shard authorization is a CLI composition test because it also
         # consumes the blocked-state renderer. The bind and shard test objects
@@ -466,7 +477,7 @@ if(TARGET moq::adapter-msquic-managed)
     add_executable(moq5-relay cli/main.c cli/admin_listen.c cli/cliargs.c cli/config.c cli/admin_listen_size.c cli/info_doc.c cli/shards_doc.c cli/versions.c
         cli/lanestats.c cli/logevent.c cli/servelog.c cli/snapshot.c cli/broker.c cli/conn_reap.c)
     target_include_directories(moq5-relay PRIVATE
-        cli ${CMAKE_SOURCE_DIR}/media/msf/vendor)
+        cli ${PROJECT_SOURCE_DIR}/media/msf/vendor)
     target_link_libraries(moq5-relay PRIVATE moqr-admin
         moq::adapter-msquic-managed)
     # The browser-facing listener is additive: the command keeps building and
@@ -494,7 +505,7 @@ if(TARGET moq::adapter-msquic-managed)
             cli/admin_listen_size.c cli/info_doc.c cli/shards_doc.c
             cli/snapshot.c)
         target_include_directories(test_relay_wt_cfg PRIVATE
-            cli tests ${CMAKE_SOURCE_DIR}/media/msf/vendor
+            cli tests ${PROJECT_SOURCE_DIR}/media/msf/vendor
             $<TARGET_PROPERTY:moq::adapter-wtquic-msquic-managed,INTERFACE_INCLUDE_DIRECTORIES>)
         target_compile_options(test_relay_wt_cfg PRIVATE
             -include ${CMAKE_CURRENT_SOURCE_DIR}/tests/wtcfg_substitute.h)
@@ -521,7 +532,7 @@ if(TARGET moq::adapter-msquic-managed)
             moq_write_consumer_context("${_wt_consumer_context}")
             add_test(NAME relay_wt_cfg_target_gating COMMAND ${MOQR_WIRE_BASH}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_wt_cfg_target_gating.sh
-                ${CMAKE_SOURCE_DIR}
+                ${PROJECT_SOURCE_DIR}
                 ${CMAKE_COMMAND}
                 "${wtquic_DIR}"
                 "${msquic_DIR}"
@@ -590,8 +601,8 @@ if(TARGET moq::adapter-msquic-managed)
         endif()
         add_test(NAME relay_install_surface COMMAND ${CMAKE_COMMAND}
             -DCMD=$<TARGET_FILE:moq5-relay>
-            -DSRCROOT=${CMAKE_SOURCE_DIR}
-            -DBUILDDIR=${CMAKE_BINARY_DIR}
+            -DSRCROOT=${PROJECT_SOURCE_DIR}
+            -DBUILDDIR=${PROJECT_BINARY_DIR}
             -DGUARD=${CMAKE_CURRENT_SOURCE_DIR}/tests/check_install_surface.sh
             -DBASH=${MOQR_WIRE_BASH}
             -DDEPLIB=${MOQR_INSTALL_SURFACE_DEPLIBS}
@@ -620,7 +631,7 @@ if(TARGET moq::adapter-msquic-managed)
         target_compile_definitions(moq-relay-verify PRIVATE
             MOQR_BIND_TESTING MOQR_VERIFY_SEAM)
         target_include_directories(moq-relay-verify PRIVATE
-            cli ${CMAKE_SOURCE_DIR}/media/msf/vendor)
+            cli ${PROJECT_SOURCE_DIR}/media/msf/vendor)
         target_link_libraries(moq-relay-verify PRIVATE moqr-admin
             moq::adapter-msquic-managed)
         if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
@@ -637,7 +648,7 @@ if(TARGET moq::adapter-msquic-managed)
             cli/versions.c cli/lanestats.c cli/logevent.c cli/servelog.c cli/snapshot.c cli/broker.c cli/conn_reap.c)
         target_compile_definitions(moq-relay-measure PRIVATE MOQR_VERIFY_SEAM)
         target_include_directories(moq-relay-measure PRIVATE
-            cli ${CMAKE_SOURCE_DIR}/media/msf/vendor)
+            cli ${PROJECT_SOURCE_DIR}/media/msf/vendor)
         target_link_libraries(moq-relay-measure PRIVATE moqr-admin
             moq::adapter-msquic-managed)
         if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
@@ -703,9 +714,9 @@ if(TARGET moq::adapter-msquic-managed)
         # tool the host happens to have, and on the clock, for a credential the
         # test never inspects.
         set(MOQR_TEST_CERT
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/tests/test_only_loopback_cert.pem)
+            ${PROJECT_SOURCE_DIR}/adapters/msquic/tests/test_only_loopback_cert.pem)
         set(MOQR_TEST_KEY
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/tests/test_only_loopback_key.pem)
+            ${PROJECT_SOURCE_DIR}/adapters/msquic/tests/test_only_loopback_key.pem)
         if(NOT EXISTS ${MOQR_TEST_CERT} OR NOT EXISTS ${MOQR_TEST_KEY})
             message(FATAL_ERROR
                 "the committed test-only certificate/key are missing: "
@@ -716,7 +727,9 @@ if(TARGET moq::adapter-msquic-managed)
         add_executable(test_relay_loopback tests/test_relay_loopback.c
             cli/config.c cli/admin_listen_size.c cli/info_doc.c cli/shards_doc.c cli/snapshot.c cli/conn_reap.c)
         target_include_directories(test_relay_loopback PRIVATE
-            cli ${CMAKE_SOURCE_DIR}/media/msf/vendor)
+            cli ${PROJECT_SOURCE_DIR}/media/msf/vendor
+            ${PROJECT_SOURCE_DIR}/tests/support
+            ${PROJECT_SOURCE_DIR}/adapters/msquic/tests)
         target_link_libraries(test_relay_loopback PRIVATE moqr-admin
             moq::adapter-msquic-managed moq-relay-inspect)
         if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
@@ -739,7 +752,10 @@ if(TARGET moq::adapter-msquic-managed)
                 cli/lanestats.c cli/logevent.c cli/servelog.c cli/snapshot.c cli/broker.c cli/conn_reap.c
                 cli/wtcfg.c)
             target_include_directories(test_relay_dual_loopback PRIVATE
-                cli ${CMAKE_SOURCE_DIR}/media/msf/vendor)
+                cli ${PROJECT_SOURCE_DIR}/media/msf/vendor
+                ${PROJECT_SOURCE_DIR}/tests/support
+                ${PROJECT_SOURCE_DIR}/adapters/msquic/tests
+                ${PROJECT_SOURCE_DIR}/adapters/wtquic/tests)
             target_compile_definitions(test_relay_dual_loopback PRIVATE
                 MOQR_PUMP_TESTING MOQR_DUAL_LISTENER)
             target_link_libraries(test_relay_dual_loopback PRIVATE moqr-admin
@@ -751,7 +767,9 @@ if(TARGET moq::adapter-msquic-managed)
             endif()
             # Capacity must describe the process serve will run: a dual
             # 1+1 config is the multi-shard composition, not the direct model.
-            if(MOQR_WIRE_BASH)
+            # Both checks drive moq-relay-verify, which exists only with the
+            # bind test objects (built alongside moq-sim).
+            if(MOQR_WIRE_BASH AND TARGET moq-relay-verify)
                 add_test(NAME relay_dual_capacity COMMAND ${MOQR_WIRE_BASH}
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_dual_capacity.sh
                     $<TARGET_FILE:moq5-relay>
@@ -794,6 +812,68 @@ if(TARGET moq::adapter-msquic-managed)
             set_tests_properties(relay_dual_loopback_wt_to_raw
                 PROPERTIES LABELS "relay" TIMEOUT 120)
         endif()
+        # A held draft-22 fill on a quiet track ends at its FILL_TIMEOUT
+        # deadline: the PRODUCTION serve compositions (one lane, several
+        # lanes, and the WebTransport facade of the dual listener) over real
+        # localhost QUIC, with nothing but the relay's own wait to end it.
+        set(MOQR_FILL_DEADLINE_SRCS
+            tests/test_relay_fill_deadline.c
+            tests/fill_deadline_cli_tu.c cli/admin_listen.c
+            cli/cliargs.c cli/config.c cli/admin_listen_size.c cli/info_doc.c cli/shards_doc.c cli/versions.c
+            cli/lanestats.c cli/logevent.c cli/servelog.c cli/snapshot.c cli/broker.c cli/conn_reap.c)
+        if(TARGET moq::adapter-wtquic-msquic-managed)
+            add_executable(test_relay_fill_deadline ${MOQR_FILL_DEADLINE_SRCS}
+                cli/wtcfg.c)
+            target_compile_definitions(test_relay_fill_deadline PRIVATE
+                MOQR_PUMP_TESTING MOQR_DUAL_LISTENER)
+            target_link_libraries(test_relay_fill_deadline PRIVATE moqr-admin
+                moq::adapter-msquic-managed moq::adapter-wtquic-msquic-managed
+                Threads::Threads)
+        else()
+            add_executable(test_relay_fill_deadline ${MOQR_FILL_DEADLINE_SRCS})
+            target_compile_definitions(test_relay_fill_deadline PRIVATE
+                MOQR_PUMP_TESTING)
+            target_link_libraries(test_relay_fill_deadline PRIVATE moqr-admin
+                moq::adapter-msquic-managed Threads::Threads)
+        endif()
+        target_include_directories(test_relay_fill_deadline PRIVATE
+            cli ${PROJECT_SOURCE_DIR}/media/msf/vendor)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_relay_fill_deadline PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME relay_fill_deadline_single
+            COMMAND test_relay_fill_deadline
+                ${MOQR_TEST_CERT} ${MOQR_TEST_KEY} single)
+        add_test(NAME relay_fill_deadline_setup_failures
+            COMMAND ${CMAKE_COMMAND}
+                -DTEST_EXE=$<TARGET_FILE:test_relay_fill_deadline>
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_fill_deadline_setup.cmake)
+        set_tests_properties(relay_fill_deadline_setup_failures PROPERTIES
+            LABELS "relay;tooling" TIMEOUT 30)
+        add_test(NAME relay_fill_deadline_lanes
+            COMMAND test_relay_fill_deadline
+                ${MOQR_TEST_CERT} ${MOQR_TEST_KEY} lanes)
+        # The fill subscriber's connection accepted before the priming one:
+        # its shard holds nothing of the track when the fill arrives.
+        add_test(NAME relay_fill_deadline_lanes_fill_first
+            COMMAND test_relay_fill_deadline
+                ${MOQR_TEST_CERT} ${MOQR_TEST_KEY} lanes_fill_first)
+        set_tests_properties(relay_fill_deadline_single
+            relay_fill_deadline_lanes relay_fill_deadline_lanes_fill_first
+            PROPERTIES TIMEOUT 60)
+        if(TARGET moq::adapter-wtquic-msquic-managed)
+            add_test(NAME relay_fill_deadline_dual_wt
+                COMMAND test_relay_fill_deadline
+                    ${MOQR_TEST_CERT} ${MOQR_TEST_KEY} dual_wt)
+            # Publisher on the raw listener, fill subscriber on WebTransport.
+            add_test(NAME relay_fill_deadline_dual_split
+                COMMAND test_relay_fill_deadline
+                    ${MOQR_TEST_CERT} ${MOQR_TEST_KEY} dual_split)
+            set_tests_properties(relay_fill_deadline_dual_wt
+                relay_fill_deadline_dual_split PROPERTIES TIMEOUT 60)
+        endif()
         add_test(NAME relay_loopback_same_d18
             COMMAND test_relay_loopback
                 ${MOQR_TEST_CERT}
@@ -808,6 +888,27 @@ if(TARGET moq::adapter-msquic-managed)
                 lanes_cross_d18)
         set_tests_properties(relay_loopback_cross_d18 PROPERTIES
             TIMEOUT 60)
+        add_test(NAME relay_loopback_same_d22
+            COMMAND test_relay_loopback
+                ${MOQR_TEST_CERT}
+                ${MOQR_TEST_KEY}
+                lanes_same_d22)
+        set_tests_properties(relay_loopback_same_d22 PROPERTIES
+            TIMEOUT 60)
+        add_test(NAME relay_loopback_cross_d22
+            COMMAND test_relay_loopback
+                ${MOQR_TEST_CERT}
+                ${MOQR_TEST_KEY}
+                lanes_cross_d22)
+        set_tests_properties(relay_loopback_cross_d22 PROPERTIES
+            TIMEOUT 60)
+        add_test(NAME relay_loopback_relay_d22
+            COMMAND test_relay_loopback
+                ${MOQR_TEST_CERT}
+                ${MOQR_TEST_KEY}
+                relay_d22)
+        set_tests_properties(relay_loopback_relay_d22 PROPERTIES
+            TIMEOUT 60)
 
         # Multi-version listener at the RELAY boundary: the test links the
         # production cli/versions.c mapping, so it exercises the same
@@ -816,7 +917,9 @@ if(TARGET moq::adapter-msquic-managed)
             tests/test_relay_multiversion.c cli/config.c cli/admin_listen_size.c cli/info_doc.c cli/shards_doc.c cli/versions.c
             cli/snapshot.c cli/conn_reap.c)
         target_include_directories(test_relay_multiversion PRIVATE
-            cli ${CMAKE_SOURCE_DIR}/media/msf/vendor)
+            cli ${PROJECT_SOURCE_DIR}/media/msf/vendor
+            ${PROJECT_SOURCE_DIR}/tests/support
+            ${PROJECT_SOURCE_DIR}/adapters/msquic/tests)
         target_link_libraries(test_relay_multiversion PRIVATE moqr-admin
             moq::adapter-msquic-managed moq-relay-inspect)
         if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
@@ -825,134 +928,139 @@ if(TARGET moq::adapter-msquic-managed)
                 $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
         endif()
 
-        # Every production nonzero-return branch of the lane pumps,
-        # activated one at a time through the REAL cli/main.c callbacks
-        # (main renamed away) over the sans-I/O facade.
-        # The production coordinator's generation lifecycle, driven directly
-        # through a seam over the real main.c objects: produce, freeze, take
-        # the token, dispatch by frozen demand, release. Built WITHOUT
-        # MOQR_BIND_TESTING so it exercises the normal coordinator.
-        add_executable(test_relay_coord_seam
-            tests/test_relay_coord_seam.c
-            tests/coord_seam_cli_tu.c cli/admin_listen.c
-            cli/cliargs.c cli/config.c cli/admin_listen_size.c cli/info_doc.c cli/shards_doc.c cli/versions.c cli/lanestats.c cli/logevent.c cli/servelog.c
-            cli/snapshot.c cli/broker.c cli/conn_reap.c
-            $<TARGET_OBJECTS:moq-relay-bind-test-internals>
-            $<TARGET_OBJECTS:moq-relay-shard-test-internals>
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/msquic_adapter.c
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/msquic_managed.c
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_managed.c
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_table.c)
-        target_include_directories(test_relay_coord_seam PRIVATE
-            cli ${CMAKE_SOURCE_DIR}/media/msf/vendor
-            ${CMAKE_SOURCE_DIR}/adapters/msquic
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/include
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/tests)
-        target_compile_definitions(test_relay_coord_seam PRIVATE
-            MOQ_MSQUIC_TESTING MOQ_BUILDING MOQR_PUMP_TESTING)
-        target_link_libraries(test_relay_coord_seam PRIVATE moqr-admin
-            msquic::msquic Threads::Threads)
-        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-            target_compile_options(test_relay_coord_seam PRIVATE
-                -Wall -Wextra -Wpedantic
-                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
-        endif()
-        add_test(NAME relay_coord_seam COMMAND test_relay_coord_seam)
-        set_tests_properties(relay_coord_seam PROPERTIES
-            LABELS "relay;sansio" TIMEOUT 60)
+        # These seams link the bind and shard test objects, which relay/tests
+        # builds only alongside moq-sim.
+        if(TARGET moq-relay-bind-test-internals AND
+           TARGET moq-relay-shard-test-internals)
+            # Every production nonzero-return branch of the lane pumps,
+            # activated one at a time through the REAL cli/main.c callbacks
+            # (main renamed away) over the sans-I/O facade.
+            # The production coordinator's generation lifecycle, driven directly
+            # through a seam over the real main.c objects: produce, freeze, take
+            # the token, dispatch by frozen demand, release. Built WITHOUT
+            # MOQR_BIND_TESTING so it exercises the normal coordinator.
+            add_executable(test_relay_coord_seam
+                tests/test_relay_coord_seam.c
+                tests/coord_seam_cli_tu.c cli/admin_listen.c
+                cli/cliargs.c cli/config.c cli/admin_listen_size.c cli/info_doc.c cli/shards_doc.c cli/versions.c cli/lanestats.c cli/logevent.c cli/servelog.c
+                cli/snapshot.c cli/broker.c cli/conn_reap.c
+                $<TARGET_OBJECTS:moq-relay-bind-test-internals>
+                $<TARGET_OBJECTS:moq-relay-shard-test-internals>
+                ${PROJECT_SOURCE_DIR}/adapters/msquic/msquic_adapter.c
+                ${PROJECT_SOURCE_DIR}/adapters/msquic/msquic_managed.c
+                ${PROJECT_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_managed.c
+                ${PROJECT_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_table.c)
+            target_include_directories(test_relay_coord_seam PRIVATE
+                cli ${PROJECT_SOURCE_DIR}/media/msf/vendor
+                ${PROJECT_SOURCE_DIR}/adapters/msquic
+                ${PROJECT_SOURCE_DIR}/adapters/msquic/include
+                ${PROJECT_SOURCE_DIR}/adapters/msquic/tests)
+            target_compile_definitions(test_relay_coord_seam PRIVATE
+                MOQ_MSQUIC_TESTING MOQ_BUILDING MOQR_PUMP_TESTING)
+            target_link_libraries(test_relay_coord_seam PRIVATE moqr-admin
+                msquic::msquic Threads::Threads)
+            if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+                target_compile_options(test_relay_coord_seam PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME relay_coord_seam COMMAND test_relay_coord_seam)
+            set_tests_properties(relay_coord_seam PROPERTIES
+                LABELS "relay;sansio" TIMEOUT 60)
 
-        add_executable(test_relay_admin_halt
-            tests/test_relay_admin_halt.c cli/admin_listen.c
-            cli/cliargs.c cli/config.c cli/admin_listen_size.c cli/info_doc.c cli/shards_doc.c cli/versions.c cli/lanestats.c cli/logevent.c cli/servelog.c
-            cli/snapshot.c cli/broker.c cli/conn_reap.c
-            $<TARGET_OBJECTS:moq-relay-bind-test-internals>
-            $<TARGET_OBJECTS:moq-relay-shard-test-internals>
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/msquic_adapter.c
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/msquic_managed.c
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_managed.c
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_table.c)
-        target_include_directories(test_relay_admin_halt PRIVATE
-            cli ${CMAKE_SOURCE_DIR}/media/msf/vendor
-            ${CMAKE_SOURCE_DIR}/adapters/msquic
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/include
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/tests)
-        target_compile_definitions(test_relay_admin_halt PRIVATE
-            MOQ_MSQUIC_TESTING MOQ_BUILDING MOQR_PUMP_TESTING)
-        target_link_libraries(test_relay_admin_halt PRIVATE moqr-admin
-            msquic::msquic Threads::Threads)
-        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-            target_compile_options(test_relay_admin_halt PRIVATE
-                -Wall -Wextra -Wpedantic
-                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
-        endif()
-        add_test(NAME relay_admin_halt COMMAND test_relay_admin_halt)
-        set_tests_properties(relay_admin_halt PROPERTIES
-            LABELS "relay" TIMEOUT 120)
+            add_executable(test_relay_admin_halt
+                tests/test_relay_admin_halt.c cli/admin_listen.c
+                cli/cliargs.c cli/config.c cli/admin_listen_size.c cli/info_doc.c cli/shards_doc.c cli/versions.c cli/lanestats.c cli/logevent.c cli/servelog.c
+                cli/snapshot.c cli/broker.c cli/conn_reap.c
+                $<TARGET_OBJECTS:moq-relay-bind-test-internals>
+                $<TARGET_OBJECTS:moq-relay-shard-test-internals>
+                ${PROJECT_SOURCE_DIR}/adapters/msquic/msquic_adapter.c
+                ${PROJECT_SOURCE_DIR}/adapters/msquic/msquic_managed.c
+                ${PROJECT_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_managed.c
+                ${PROJECT_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_table.c)
+            target_include_directories(test_relay_admin_halt PRIVATE
+                cli ${PROJECT_SOURCE_DIR}/media/msf/vendor
+                ${PROJECT_SOURCE_DIR}/adapters/msquic
+                ${PROJECT_SOURCE_DIR}/adapters/msquic/include
+                ${PROJECT_SOURCE_DIR}/adapters/msquic/tests)
+            target_compile_definitions(test_relay_admin_halt PRIVATE
+                MOQ_MSQUIC_TESTING MOQ_BUILDING MOQR_PUMP_TESTING)
+            target_link_libraries(test_relay_admin_halt PRIVATE moqr-admin
+                msquic::msquic Threads::Threads)
+            if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+                target_compile_options(test_relay_admin_halt PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME relay_admin_halt COMMAND test_relay_admin_halt)
+            set_tests_properties(relay_admin_halt PROPERTIES
+                LABELS "relay" TIMEOUT 120)
 
-        # The same seam against the VERIFY coordinator: it must ride the
-        # identical generation lifecycle, not render and walk away.
-        add_executable(test_relay_coord_seam_verify
-            tests/test_relay_coord_seam.c
-            tests/coord_seam_cli_tu.c cli/admin_listen.c
-            cli/cliargs.c cli/config.c cli/admin_listen_size.c cli/info_doc.c cli/shards_doc.c cli/versions.c cli/lanestats.c cli/logevent.c cli/servelog.c
-            cli/snapshot.c cli/broker.c cli/conn_reap.c cli/blockedstats.c
-            $<TARGET_OBJECTS:moq-relay-bind-test-internals>
-            $<TARGET_OBJECTS:moq-relay-shard-test-internals>
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/msquic_adapter.c
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/msquic_managed.c
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_managed.c
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_table.c)
-        target_include_directories(test_relay_coord_seam_verify PRIVATE
-            cli ${CMAKE_SOURCE_DIR}/media/msf/vendor
-            ${CMAKE_SOURCE_DIR}/adapters/msquic
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/include
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/tests)
-        target_compile_definitions(test_relay_coord_seam_verify PRIVATE
-            MOQ_MSQUIC_TESTING MOQ_BUILDING
-            MOQR_PUMP_TESTING MOQR_BIND_TESTING)
-        target_link_libraries(test_relay_coord_seam_verify PRIVATE moqr-admin
-            msquic::msquic Threads::Threads)
-        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-            target_compile_options(test_relay_coord_seam_verify PRIVATE
-                -Wall -Wextra -Wpedantic
-                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
-        endif()
-        add_test(NAME relay_coord_seam_verify
-            COMMAND test_relay_coord_seam_verify)
-        set_tests_properties(relay_coord_seam_verify PROPERTIES
-            LABELS "relay;sansio" TIMEOUT 60)
+            # The same seam against the VERIFY coordinator: it must ride the
+            # identical generation lifecycle, not render and walk away.
+            add_executable(test_relay_coord_seam_verify
+                tests/test_relay_coord_seam.c
+                tests/coord_seam_cli_tu.c cli/admin_listen.c
+                cli/cliargs.c cli/config.c cli/admin_listen_size.c cli/info_doc.c cli/shards_doc.c cli/versions.c cli/lanestats.c cli/logevent.c cli/servelog.c
+                cli/snapshot.c cli/broker.c cli/conn_reap.c cli/blockedstats.c
+                $<TARGET_OBJECTS:moq-relay-bind-test-internals>
+                $<TARGET_OBJECTS:moq-relay-shard-test-internals>
+                ${PROJECT_SOURCE_DIR}/adapters/msquic/msquic_adapter.c
+                ${PROJECT_SOURCE_DIR}/adapters/msquic/msquic_managed.c
+                ${PROJECT_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_managed.c
+                ${PROJECT_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_table.c)
+            target_include_directories(test_relay_coord_seam_verify PRIVATE
+                cli ${PROJECT_SOURCE_DIR}/media/msf/vendor
+                ${PROJECT_SOURCE_DIR}/adapters/msquic
+                ${PROJECT_SOURCE_DIR}/adapters/msquic/include
+                ${PROJECT_SOURCE_DIR}/adapters/msquic/tests)
+            target_compile_definitions(test_relay_coord_seam_verify PRIVATE
+                MOQ_MSQUIC_TESTING MOQ_BUILDING
+                MOQR_PUMP_TESTING MOQR_BIND_TESTING)
+            target_link_libraries(test_relay_coord_seam_verify PRIVATE moqr-admin
+                msquic::msquic Threads::Threads)
+            if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+                target_compile_options(test_relay_coord_seam_verify PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME relay_coord_seam_verify
+                COMMAND test_relay_coord_seam_verify)
+            set_tests_properties(relay_coord_seam_verify PROPERTIES
+                LABELS "relay;sansio" TIMEOUT 60)
 
-        add_executable(test_relay_pump_branches
-            tests/test_relay_pump_branches.c
-            tests/pump_branches_cli_tu.c cli/admin_listen.c
-            cli/cliargs.c cli/config.c cli/admin_listen_size.c cli/info_doc.c cli/shards_doc.c cli/versions.c cli/lanestats.c cli/logevent.c cli/servelog.c
-            cli/snapshot.c cli/broker.c cli/conn_reap.c cli/blockedstats.c
-            $<TARGET_OBJECTS:moq-relay-bind-test-internals>
-            $<TARGET_OBJECTS:moq-relay-shard-test-internals>
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/msquic_adapter.c
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/msquic_managed.c
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_managed.c
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_table.c)
-        target_include_directories(test_relay_pump_branches PRIVATE
-            cli ${CMAKE_SOURCE_DIR}/media/msf/vendor
-            ${CMAKE_SOURCE_DIR}/adapters/msquic
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/include
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/tests)
-        target_compile_definitions(test_relay_pump_branches PRIVATE
-            MOQ_MSQUIC_TESTING MOQ_BUILDING
-            MOQR_PUMP_TESTING MOQR_BIND_TESTING)
-        target_link_libraries(test_relay_pump_branches PRIVATE moqr-admin
-            msquic::msquic Threads::Threads)
-        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-            target_compile_options(test_relay_pump_branches PRIVATE
-                -Wall -Wextra -Wpedantic
-                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            add_executable(test_relay_pump_branches
+                tests/test_relay_pump_branches.c
+                tests/pump_branches_cli_tu.c cli/admin_listen.c
+                cli/cliargs.c cli/config.c cli/admin_listen_size.c cli/info_doc.c cli/shards_doc.c cli/versions.c cli/lanestats.c cli/logevent.c cli/servelog.c
+                cli/snapshot.c cli/broker.c cli/conn_reap.c cli/blockedstats.c
+                $<TARGET_OBJECTS:moq-relay-bind-test-internals>
+                $<TARGET_OBJECTS:moq-relay-shard-test-internals>
+                ${PROJECT_SOURCE_DIR}/adapters/msquic/msquic_adapter.c
+                ${PROJECT_SOURCE_DIR}/adapters/msquic/msquic_managed.c
+                ${PROJECT_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_managed.c
+                ${PROJECT_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_table.c)
+            target_include_directories(test_relay_pump_branches PRIVATE
+                cli ${PROJECT_SOURCE_DIR}/media/msf/vendor
+                ${PROJECT_SOURCE_DIR}/adapters/msquic
+                ${PROJECT_SOURCE_DIR}/adapters/msquic/include
+                ${PROJECT_SOURCE_DIR}/adapters/msquic/tests)
+            target_compile_definitions(test_relay_pump_branches PRIVATE
+                MOQ_MSQUIC_TESTING MOQ_BUILDING
+                MOQR_PUMP_TESTING MOQR_BIND_TESTING)
+            target_link_libraries(test_relay_pump_branches PRIVATE moqr-admin
+                msquic::msquic Threads::Threads)
+            if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+                target_compile_options(test_relay_pump_branches PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME relay_pump_branches
+                COMMAND test_relay_pump_branches)
+            set_tests_properties(relay_pump_branches PROPERTIES
+                LABELS "relay;sansio"
+                TIMEOUT 30)
         endif()
-        add_test(NAME relay_pump_branches
-            COMMAND test_relay_pump_branches)
-        set_tests_properties(relay_pump_branches PROPERTIES
-            LABELS "relay;sansio"
-            TIMEOUT 30)
 
         # The thread/bell boundary, once: real doorbells over the fake
         # table, barrier-ordered, condvar-completed. The only timed wait
@@ -960,15 +1068,15 @@ if(TARGET moq::adapter-msquic-managed)
         add_executable(test_relay_lane_boundary
             tests/test_relay_lane_boundary.c
             cli/conn_reap.c
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/msquic_adapter.c
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/msquic_managed.c
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_managed.c
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_table.c)
+            ${PROJECT_SOURCE_DIR}/adapters/msquic/msquic_adapter.c
+            ${PROJECT_SOURCE_DIR}/adapters/msquic/msquic_managed.c
+            ${PROJECT_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_managed.c
+            ${PROJECT_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_table.c)
         target_include_directories(test_relay_lane_boundary PRIVATE
             cli
-            ${CMAKE_SOURCE_DIR}/adapters/msquic
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/include
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/tests)
+            ${PROJECT_SOURCE_DIR}/adapters/msquic
+            ${PROJECT_SOURCE_DIR}/adapters/msquic/include
+            ${PROJECT_SOURCE_DIR}/adapters/msquic/tests)
         target_compile_definitions(test_relay_lane_boundary PRIVATE
             MOQ_MSQUIC_TESTING MOQ_BUILDING)
         target_link_libraries(test_relay_lane_boundary PRIVATE moq::relay
@@ -990,15 +1098,15 @@ if(TARGET moq::adapter-msquic-managed)
         add_executable(test_relay_lane_lifecycle
             tests/test_relay_lane_lifecycle.c
             cli/conn_reap.c
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/msquic_adapter.c
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/msquic_managed.c
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_managed.c
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_table.c)
+            ${PROJECT_SOURCE_DIR}/adapters/msquic/msquic_adapter.c
+            ${PROJECT_SOURCE_DIR}/adapters/msquic/msquic_managed.c
+            ${PROJECT_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_managed.c
+            ${PROJECT_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_table.c)
         target_include_directories(test_relay_lane_lifecycle PRIVATE
             cli
-            ${CMAKE_SOURCE_DIR}/adapters/msquic
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/include
-            ${CMAKE_SOURCE_DIR}/adapters/msquic/tests)
+            ${PROJECT_SOURCE_DIR}/adapters/msquic
+            ${PROJECT_SOURCE_DIR}/adapters/msquic/include
+            ${PROJECT_SOURCE_DIR}/adapters/msquic/tests)
         target_compile_definitions(test_relay_lane_lifecycle PRIVATE
             MOQ_MSQUIC_TESTING MOQ_BUILDING)
         target_link_libraries(test_relay_lane_lifecycle PRIVATE moq::relay
@@ -1020,6 +1128,22 @@ if(TARGET moq::adapter-msquic-managed)
                 ${MOQR_TEST_KEY})
         set_tests_properties(relay_multiversion PROPERTIES TIMEOUT 180
             LABELS "relay;loopback")
+        # The same run while IPv4-only sockets hold much of the ephemeral
+        # range (tests/support/port_shadow.c): the relay listener is created on
+        # port 0, which the MsQuic facade picks so IPv4 clients reach it
+        # (adapters/common/moq_listen_port.h).
+        if(NOT WIN32)
+            add_test(NAME relay_multiversion_port_shadow
+                COMMAND $<TARGET_FILE:moq_port_shadow> --
+                    $<TARGET_FILE:test_relay_multiversion>
+                    ${MOQR_TEST_CERT}
+                    ${MOQR_TEST_KEY})
+            # Every port-shadow test holds thousands of IPv4 ports for its run; two at
+            # once can exhaust the ephemeral range, so they share one resource lock.
+            set_tests_properties(relay_multiversion_port_shadow PROPERTIES
+                TIMEOUT 240
+                RESOURCE_LOCK ipv4_port_shadow)
+        endif()
     endif()
 endif()
 
@@ -1124,17 +1248,17 @@ if(TARGET moq::adapter-msquic-managed AND TARGET moq-relay-shard-test-internals)
         cli/snapshot.c cli/broker.c cli/conn_reap.c cli/blockedstats.c
         $<TARGET_OBJECTS:moq-relay-bind-test-internals>
         $<TARGET_OBJECTS:moq-relay-shard-test-internals>
-        ${CMAKE_SOURCE_DIR}/adapters/msquic/msquic_adapter.c
-        ${CMAKE_SOURCE_DIR}/adapters/msquic/msquic_managed.c
-        ${CMAKE_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_managed.c
-        ${CMAKE_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_table.c)
+        ${PROJECT_SOURCE_DIR}/adapters/msquic/msquic_adapter.c
+        ${PROJECT_SOURCE_DIR}/adapters/msquic/msquic_managed.c
+        ${PROJECT_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_managed.c
+        ${PROJECT_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_table.c)
     target_include_directories(test_relay_seedx_scripts PRIVATE
         cli tests ${MOQR_LIBRARY_TEST_DIR}
-        ${CMAKE_SOURCE_DIR}/media/msf/vendor
-        ${CMAKE_SOURCE_DIR}/adapters/msquic
-        ${CMAKE_SOURCE_DIR}/adapters/msquic/include
-        ${CMAKE_SOURCE_DIR}/adapters/msquic/tests
-        ${CMAKE_SOURCE_DIR}/tests/support)
+        ${PROJECT_SOURCE_DIR}/media/msf/vendor
+        ${PROJECT_SOURCE_DIR}/adapters/msquic
+        ${PROJECT_SOURCE_DIR}/adapters/msquic/include
+        ${PROJECT_SOURCE_DIR}/adapters/msquic/tests
+        ${PROJECT_SOURCE_DIR}/tests/support)
     target_compile_definitions(test_relay_seedx_scripts PRIVATE
         MOQ_MSQUIC_TESTING MOQ_BUILDING
         MOQR_PUMP_TESTING MOQR_BIND_TESTING)
@@ -1155,16 +1279,16 @@ if(TARGET moq::adapter-msquic-managed AND TARGET moq-relay-shard-test-internals)
         cli/snapshot.c cli/broker.c cli/conn_reap.c cli/blockedstats.c
         $<TARGET_OBJECTS:moq-relay-bind-test-internals>
         $<TARGET_OBJECTS:moq-relay-shard-test-internals>
-        ${CMAKE_SOURCE_DIR}/adapters/msquic/msquic_adapter.c
-        ${CMAKE_SOURCE_DIR}/adapters/msquic/msquic_managed.c
-        ${CMAKE_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_managed.c
-        ${CMAKE_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_table.c)
+        ${PROJECT_SOURCE_DIR}/adapters/msquic/msquic_adapter.c
+        ${PROJECT_SOURCE_DIR}/adapters/msquic/msquic_managed.c
+        ${PROJECT_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_managed.c
+        ${PROJECT_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_table.c)
     target_include_directories(test_relay_mixed_draft PRIVATE
-        cli tests ${CMAKE_SOURCE_DIR}/media/msf/vendor
-        ${CMAKE_SOURCE_DIR}/adapters/msquic
-        ${CMAKE_SOURCE_DIR}/adapters/msquic/include
-        ${CMAKE_SOURCE_DIR}/adapters/msquic/tests
-        ${CMAKE_SOURCE_DIR}/tests/support)
+        cli tests ${PROJECT_SOURCE_DIR}/media/msf/vendor
+        ${PROJECT_SOURCE_DIR}/adapters/msquic
+        ${PROJECT_SOURCE_DIR}/adapters/msquic/include
+        ${PROJECT_SOURCE_DIR}/adapters/msquic/tests
+        ${PROJECT_SOURCE_DIR}/tests/support)
     target_compile_definitions(test_relay_mixed_draft PRIVATE
         MOQ_MSQUIC_TESTING MOQ_BUILDING
         MOQR_PUMP_TESTING MOQR_BIND_TESTING)
@@ -1204,17 +1328,17 @@ if(TARGET moq::adapter-msquic-managed AND TARGET moq-relay-shard-test-internals)
         cli/snapshot.c cli/broker.c cli/conn_reap.c cli/blockedstats.c
         $<TARGET_OBJECTS:moq-relay-bind-test-internals>
         $<TARGET_OBJECTS:moq-relay-shard-test-internals>
-        ${CMAKE_SOURCE_DIR}/adapters/msquic/msquic_adapter.c
-        ${CMAKE_SOURCE_DIR}/adapters/msquic/msquic_managed.c
-        ${CMAKE_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_managed.c
-        ${CMAKE_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_table.c)
+        ${PROJECT_SOURCE_DIR}/adapters/msquic/msquic_adapter.c
+        ${PROJECT_SOURCE_DIR}/adapters/msquic/msquic_managed.c
+        ${PROJECT_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_managed.c
+        ${PROJECT_SOURCE_DIR}/adapters/msquic/tests/support/fake_msq_table.c)
     target_include_directories(test_relay_sched_explore PRIVATE
         cli tests ${MOQR_LIBRARY_TEST_DIR}
-        ${CMAKE_SOURCE_DIR}/media/msf/vendor
-        ${CMAKE_SOURCE_DIR}/adapters/msquic
-        ${CMAKE_SOURCE_DIR}/adapters/msquic/include
-        ${CMAKE_SOURCE_DIR}/adapters/msquic/tests
-        ${CMAKE_SOURCE_DIR}/tests/support)
+        ${PROJECT_SOURCE_DIR}/media/msf/vendor
+        ${PROJECT_SOURCE_DIR}/adapters/msquic
+        ${PROJECT_SOURCE_DIR}/adapters/msquic/include
+        ${PROJECT_SOURCE_DIR}/adapters/msquic/tests
+        ${PROJECT_SOURCE_DIR}/tests/support)
     target_compile_definitions(test_relay_sched_explore PRIVATE
         MOQ_MSQUIC_TESTING MOQ_BUILDING
         MOQR_PUMP_TESTING MOQR_BIND_TESTING)
@@ -1245,7 +1369,7 @@ endif()
 # sansio (exact deterministic), boundary (irreducible physical surface, run
 # once each), and tooling (deterministic tool selftests).
 set(MOQR_TESTS_SANSIO
-    relay_boundary relay_lane_stats
+    relay_boundary relay_lane_stats relay_lane_deadlines
     relay_blocked_stats relay_verify_seam relay_cli_config
     relay_serve_version_wiring relay_reap_wiring relay_test_inventory
     relay_signal_order
@@ -1258,8 +1382,11 @@ set(MOQR_TESTS_SANSIO
     relay_sched_cli_units relay_sched_close_feed
     relay_multipub relay_readmission)
 set(MOQR_TESTS_BOUNDARY
-    relay_lane_boundary relay_multiversion relay_loopback_same_d18
-    relay_loopback_cross_d18)
+    relay_lane_boundary relay_multiversion relay_multiversion_port_shadow
+    relay_loopback_same_d18 relay_loopback_cross_d18 relay_loopback_same_d22
+    relay_loopback_cross_d22 relay_loopback_relay_d22 relay_fill_deadline_single
+    relay_fill_deadline_lanes relay_fill_deadline_dual_wt
+    relay_fill_deadline_lanes_fill_first relay_fill_deadline_dual_split)
 set(MOQR_TESTS_TOOLING
     shard_saturation_aggregator_selftest
     shard_saturation_aggregator_rejects_unknown_flag

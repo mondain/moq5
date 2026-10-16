@@ -8,6 +8,7 @@
 
 #include "bridge_conformance_pair.h"
 #include "held_bridge_driver.h"
+#include "../unit/test_binding_support.h"
 #include <moq/moq.h>
 #include <moq/transport_bridge.h>
 #include <stdlib.h>
@@ -62,7 +63,17 @@ static bool deliver_ops(bridge_pair_ctx_t *ctx,
 
         case FAKE_OP_WRITE: {
             moq_result_t rc;
-            if (is_bidi_stream(o->stream_id)) {
+            /* With a unidirectional control channel the bridge recognises
+             * the peer's control stream itself and every bidi stream is a
+             * request stream; the first-bidi-is-control rule below applies
+             * only to the bidi control channel of draft-16. */
+            bool bidi_control =
+                !moq_transport_bridge_uses_uni_control(to_bridge);
+            if (is_bidi_stream(o->stream_id) && !bidi_control) {
+                rc = moq_transport_bridge_on_peer_bidi_bytes(
+                    to_bridge, o->stream_id,
+                    o->data, o->data_len, o->fin, ctx->now);
+            } else if (is_bidi_stream(o->stream_id)) {
                 if (from_is_client) {
                     if (ctx->client_control_sid == UINT64_MAX)
                         ctx->client_control_sid = o->stream_id;
@@ -106,6 +117,9 @@ static bool deliver_ops(bridge_pair_ctx_t *ctx,
         }
 
         case FAKE_OP_RESET:
+        case FAKE_OP_RESET_AT:
+            /* Writes are delivered in order ahead of it, so a reliable reset
+             * reaches the peer exactly like a plain one here. */
             held_bridge_reset(
                 to_bridge, o->stream_id, o->error_code, ctx->now);
             delivered = true;
@@ -374,19 +388,32 @@ moq_adapter_pair_t bridge_conformance_create(void)
     bridge_pair_ctx_t *bp = (bridge_pair_ctx_t *)calloc(1, sizeof(*bp));
     if (!bp) return pair;
 
+    /* Both sessions take the version MOQ_SIM_VERSION names, or the session
+     * default when it is unset, so the conformance flows run under every
+     * profile the way the simpair scenarios do. */
+    moq_version_t version = 0;
+    {
+        const char *env = getenv("MOQ_SIM_VERSION");
+        if (env && *env) version = (moq_version_t)strtoul(env, NULL, 10);
+    }
+
     moq_session_cfg_t ccfg;
     moq_session_cfg_init_sized(&ccfg, sizeof(ccfg), moq_alloc_default(), MOQ_PERSPECTIVE_CLIENT);
     ccfg.send_request_capacity = true;
     ccfg.initial_request_capacity = 64;
+    ccfg.version = version;
 
     moq_session_cfg_t scfg;
     moq_session_cfg_init_sized(&scfg, sizeof(scfg), moq_alloc_default(), MOQ_PERSPECTIVE_SERVER);
     scfg.send_request_capacity = true;
     scfg.initial_request_capacity = 64;
     scfg.goaway_timeout_us = 1000;
+    scfg.version = version;
 
     if (moq_session_create(&ccfg, 0, &bp->client_session) < 0) goto fail;
     if (moq_session_create(&scfg, 0, &bp->server_session) < 0) goto fail;
+    if (test_bind_if_required(bp->client_session) < 0) goto fail;
+    if (test_bind_if_required(bp->server_session) < 0) goto fail;
 
     bp->client_control_sid = UINT64_MAX;
     bp->server_control_sid = UINT64_MAX;
@@ -418,6 +445,8 @@ moq_adapter_pair_t bridge_conformance_create(void)
         MOQ_ADAPTER_PAIR_CAP_VIRTUAL_TIME |
         MOQ_ADAPTER_PAIR_CAP_OPENED_BIDI_COUNT |
         MOQ_ADAPTER_PAIR_CAP_INJECT_BIDI_FIN;
+    if (moq_transport_bridge_uses_uni_control(bp->server_bridge))
+        pair.capabilities |= MOQ_ADAPTER_PAIR_CAP_UNI_CONTROL;
     pair.ctx = bp;
     return pair;
 

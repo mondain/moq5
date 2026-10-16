@@ -11,6 +11,15 @@
 #include <moq/control_d18.h>
 #include "test_support.h"
 #include "../../core/src/session/session_internal.h"
+#include <stdlib.h>
+
+/* The v0 record ends at `authority`, with struct_size first. */
+_Static_assert(MOQ_D18_SETUP_OPTS_V0_SIZE ==
+    offsetof(moq_d18_setup_opts_t, authority) + sizeof(moq_bytes_t), "v0 end");
+_Static_assert(offsetof(moq_d18_setup_opts_t, struct_size) == 0, "size leads");
+#if UINTPTR_MAX == UINT64_MAX
+_Static_assert(MOQ_D18_SETUP_OPTS_V0_SIZE == 696, "LP64 v0 floor");
+#endif
 
 static int failures = 0;
 
@@ -73,10 +82,10 @@ int main(void)
         moq_buf_writer_t w;
         moq_buf_writer_init(&w, buf, sizeof(buf));
         moq_d18_setup_opts_t o;
-        memset(&o, 0, sizeof(o));
+        moq_d18_setup_opts_init(&o);
         o.has_max_auth_token_cache_size = true;
         o.max_auth_token_cache_size = 100;
-        MOQ_TEST_CHECK_EQ_INT((int)moq_d18_encode_setup_opts(&w, &o), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d18_encode_setup_opts(&w, &o, sizeof(o)), (int)MOQ_OK);
         size_t n = moq_buf_writer_offset(&w);
         MOQ_TEST_CHECK(n >= 4);
         /* 16-bit Length is the 2 bytes before the payload; payload is exactly
@@ -91,7 +100,7 @@ int main(void)
     {
         uint8_t p[] = { 0x04, 0x64 };
         moq_d18_setup_opts_t o;
-        MOQ_TEST_CHECK_EQ_INT((int)moq_d18_decode_setup_opts(p, sizeof(p), &o),
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d18_decode_setup_opts(p, sizeof(p), &o, sizeof(o)),
                               (int)MOQ_OK);
         MOQ_TEST_CHECK(o.has_max_auth_token_cache_size);
         MOQ_TEST_CHECK_EQ_U64(o.max_auth_token_cache_size, 100);
@@ -102,7 +111,7 @@ int main(void)
     {
         uint8_t p[] = { 0x04, 0x40, 0x64 };
         moq_d18_setup_opts_t o;
-        moq_result_t rc = moq_d18_decode_setup_opts(p, sizeof(p), &o);
+        moq_result_t rc = moq_d18_decode_setup_opts(p, sizeof(p), &o, sizeof(o));
         MOQ_TEST_CHECK(rc < 0 ||
                        !(o.has_max_auth_token_cache_size &&
                          o.max_auth_token_cache_size == 100));
@@ -126,17 +135,278 @@ int main(void)
         moq_buf_write_raw(&w, (const uint8_t *)"q", 1);
         moq_d18_setup_opts_t o;
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_d18_decode_setup_opts(p, moq_buf_writer_offset(&w), &o),
+            (int)moq_d18_decode_setup_opts(p, moq_buf_writer_offset(&w), &o, sizeof(o)),
             (int)MOQ_OK);
         MOQ_TEST_CHECK(o.has_path && o.has_authority);
         MOQ_TEST_CHECK_EQ_U64(o.max_auth_token_cache_size, 100);
+        MOQ_TEST_CHECK(o.path.len == 2 && memcmp(o.path.data, "ab", 2) == 0);
+        MOQ_TEST_CHECK(o.authority.len == 1 && o.authority.data[0] == 'x');
+        /* Decoded values borrow from the payload. */
+        MOQ_TEST_CHECK(o.path.data == p + 2 && o.authority.data == p + 8);
+    }
+
+    /* 1d'. Encode PATH and AUTHORITY (§10.3.1.1, §10.3.1.2): the moqt URI
+     * moqt://127.0.0.1:31000/moq?interop=1 gives PATH "/moq?interop=1" (the
+     * path-abempty, "?" and the query) and AUTHORITY "127.0.0.1:31000". Type
+     * 0x2F00 is the two-byte vi64 af 00; PATH is the first option (delta
+     * 0x01), AUTHORITY follows (delta 0x05 - 0x01 = 0x04); each odd type
+     * carries a vi64 Length; the payload is 2 + 14 + 2 + 15 = 33 bytes. */
+    {
+        static const uint8_t want[] = {
+            0xaf, 0x00, 0x00, 0x21,
+            0x01, 0x0e, '/','m','o','q','?','i','n','t','e','r','o','p','=','1',
+            0x04, 0x0f, '1','2','7','.','0','.','0','.','1',':','3','1','0','0','0',
+        };
+        uint8_t buf[64];
+        moq_buf_writer_t w;
+        moq_buf_writer_init(&w, buf, sizeof(buf));
+        moq_d18_setup_opts_t o;
+        moq_d18_setup_opts_init(&o);
+        o.has_path = true;
+        o.path = (moq_bytes_t){ (const uint8_t *)"/moq?interop=1", 14 };
+        o.has_authority = true;
+        o.authority = (moq_bytes_t){ (const uint8_t *)"127.0.0.1:31000", 15 };
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d18_encode_setup_opts(&w, &o, sizeof(o)), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_SIZE(moq_buf_writer_offset(&w), sizeof(want));
+        MOQ_TEST_CHECK(memcmp(buf, want, sizeof(want)) == 0);
+        moq_d18_setup_opts_t d;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d18_decode_setup_opts(want + 4,
+                              sizeof(want) - 4, &d, sizeof(d)), (int)MOQ_OK);
+        MOQ_TEST_CHECK(d.has_path && d.path.len == 14 &&
+                       memcmp(d.path.data, "/moq?interop=1", 14) == 0);
+        MOQ_TEST_CHECK(d.has_authority && d.authority.len == 15 &&
+                       memcmp(d.authority.data, "127.0.0.1:31000", 15) == 0);
+    }
+
+    /* 1d''. Every option this side sends, in ascending type order with each
+     * type a delta from the previous one: PATH "/p" (delta 1), a USE_VALUE
+     * token of type 7 and value "t" (0x03, delta 2; Alias Type 3, Token Type
+     * 7, value), MAX_AUTH_TOKEN_CACHE_SIZE 100 (0x04, delta 1, vi64 0x64),
+     * AUTHORITY "h" (0x05, delta 1). An explicitly empty PATH is a present
+     * option with a zero Length. */
+    {
+        static const uint8_t want[] = {
+            0xaf, 0x00, 0x00, 0x0e,
+            0x01, 0x02, '/', 'p',
+            0x02, 0x03, 0x03, 0x07, 't',
+            0x01, 0x64,
+            0x01, 0x01, 'h',
+        };
+        uint8_t buf[64];
+        moq_buf_writer_t w;
+        moq_buf_writer_init(&w, buf, sizeof(buf));
+        moq_d18_setup_opts_t o;
+        moq_d18_setup_opts_init(&o);
+        o.has_path = true;
+        o.path = (moq_bytes_t){ (const uint8_t *)"/p", 2 };
+        o.auth_token_count = 1;
+        o.auth_tokens[0].alias_type = MOQ_AUTH_TOKEN_USE_VALUE;
+        o.auth_tokens[0].token_type = 7;
+        o.auth_tokens[0].token_value = (moq_bytes_t){ (const uint8_t *)"t", 1 };
+        o.has_max_auth_token_cache_size = true;
+        o.max_auth_token_cache_size = 100;
+        o.has_authority = true;
+        o.authority = (moq_bytes_t){ (const uint8_t *)"h", 1 };
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d18_encode_setup_opts(&w, &o, sizeof(o)), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_SIZE(moq_buf_writer_offset(&w), sizeof(want));
+        MOQ_TEST_CHECK(memcmp(buf, want, sizeof(want)) == 0);
+
+        static const uint8_t empty_path[] = {
+            0xaf, 0x00, 0x00, 0x05, 0x01, 0x00, 0x04, 0x01, 'h',
+        };
+        o.path = (moq_bytes_t){ NULL, 0 };
+        o.auth_token_count = 0;
+        o.has_max_auth_token_cache_size = false;
+        moq_buf_writer_init(&w, buf, sizeof(buf));
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d18_encode_setup_opts(&w, &o, sizeof(o)), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_SIZE(moq_buf_writer_offset(&w), sizeof(empty_path));
+        MOQ_TEST_CHECK(memcmp(buf, empty_path, sizeof(empty_path)) == 0);
+
+        /* A value with a length but no bytes is refused before anything is
+         * written; so is a writer too short for the whole message. */
+        o.authority = (moq_bytes_t){ NULL, 1 };
+        moq_buf_writer_init(&w, buf, sizeof(buf));
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d18_encode_setup_opts(&w, &o, sizeof(o)), (int)MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK_EQ_SIZE(moq_buf_writer_offset(&w), 0);
+        o.authority = (moq_bytes_t){ (const uint8_t *)"h", 1 };
+        moq_buf_writer_init(&w, buf, sizeof(empty_path) - 1);
+        MOQ_TEST_CHECK(moq_d18_encode_setup_opts(&w, &o, sizeof(o)) < 0);
+        MOQ_TEST_CHECK_EQ_SIZE(moq_buf_writer_offset(&w), 0);
+    }
+
+    /* 1d-sized. The sized record at the codec boundary. A payload carrying
+     * every option with a value is decoded into allocations of exactly the
+     * caller's size: nothing is written past it, struct_size says what was
+     * written, a failure leaves a cleared record, and the encoder reads
+     * nothing past the caller's struct_size. Heap allocations of the exact
+     * size let ASan see any overrun. */
+    {
+        static const uint8_t full[] = {
+            0x01, 0x02, '/', 'p',                    /* PATH "/p" */
+            0x02, 0x03, 0x03, 0x07, 't',             /* token USE_VALUE 7 "t" */
+            0x01, 0x64,                              /* cache size 100 */
+            0x01, 0x01, 'h',                         /* AUTHORITY "h" */
+        };
+        const size_t v0 = MOQ_D18_SETUP_OPTS_V0_SIZE;
+        uint8_t *raw;
+
+        /* Below the floor: refused, nothing written. */
+        raw = malloc(v0);
+        MOQ_TEST_CHECK(raw != NULL);
+        if (raw) {
+            memset(raw, 0xa5, v0);
+            MOQ_TEST_CHECK_EQ_INT((int)moq_d18_decode_setup_opts(full, sizeof(full),
+                (moq_d18_setup_opts_t *)(void *)raw, v0 - 1), (int)MOQ_ERR_INVAL);
+            bool untouched = true;
+            for (size_t i = 0; i < v0; i++) untouched &= raw[i] == 0xa5;
+            MOQ_TEST_CHECK(untouched);
+            MOQ_TEST_CHECK_EQ_INT((int)moq_d18_decode_setup_opts(full, sizeof(full),
+                NULL, v0), (int)MOQ_ERR_INVAL);
+            free(raw);
+        }
+
+        /* Exactly the v0 prefix, in an allocation of that size. */
+        raw = malloc(v0);
+        MOQ_TEST_CHECK(raw != NULL);
+        if (raw) {
+            moq_d18_setup_opts_t *o = (moq_d18_setup_opts_t *)(void *)raw;
+            MOQ_TEST_CHECK_EQ_INT((int)moq_d18_decode_setup_opts(full, sizeof(full),
+                o, v0), (int)MOQ_OK);
+            MOQ_TEST_CHECK_EQ_U64(o->struct_size, v0);
+            MOQ_TEST_CHECK(o->has_path && o->path.len == 2 &&
+                           memcmp(o->path.data, "/p", 2) == 0);
+            MOQ_TEST_CHECK(o->has_authority && o->authority.len == 1 &&
+                           o->authority.data[0] == 'h');
+            MOQ_TEST_CHECK_EQ_SIZE(o->auth_token_count, 1);
+            MOQ_TEST_CHECK_EQ_U64(o->max_auth_token_cache_size, 100);
+            /* The same record re-encodes to the same bytes through the
+             * public encoder, reading only its v0 size. */
+            uint8_t buf[64];
+            moq_buf_writer_t w;
+            moq_buf_writer_init(&w, buf, sizeof(buf));
+            MOQ_TEST_CHECK_EQ_INT((int)moq_d18_encode_setup_opts(&w, o, v0), (int)MOQ_OK);
+            MOQ_TEST_CHECK(moq_buf_writer_offset(&w) == 4 + sizeof(full) &&
+                           buf[2] == 0 && buf[3] == sizeof(full) &&
+                           memcmp(buf + 4, full, sizeof(full)) == 0);
+            free(raw);
+        }
+
+        /* A caller from a future, larger layout: exactly the fields this
+         * library knows are written, the size stamped, the rest untouched. */
+        const size_t future = sizeof(moq_d18_setup_opts_t) + 32;
+        raw = malloc(future);
+        MOQ_TEST_CHECK(raw != NULL);
+        if (raw) {
+            memset(raw, 0x5a, future);
+            moq_d18_setup_opts_t *o = (moq_d18_setup_opts_t *)(void *)raw;
+            MOQ_TEST_CHECK_EQ_INT((int)moq_d18_decode_setup_opts(full, sizeof(full),
+                o, future), (int)MOQ_OK);
+            MOQ_TEST_CHECK_EQ_U64(o->struct_size, sizeof(moq_d18_setup_opts_t));
+            bool tail = true;
+            for (size_t i = sizeof(moq_d18_setup_opts_t); i < future; i++)
+                tail &= raw[i] == 0x5a;
+            MOQ_TEST_CHECK(tail);
+            /* Encoding from it: a struct_size within the allocation is
+             * fine; one claiming more than the allocation, or less than v0,
+             * is refused with the writer untouched. */
+            uint8_t buf[64];
+            moq_buf_writer_t w;
+            moq_buf_writer_init(&w, buf, sizeof(buf));
+            o->struct_size = (uint32_t)future;
+            MOQ_TEST_CHECK_EQ_INT((int)moq_d18_encode_setup_opts(&w, o, future), (int)MOQ_OK);
+            MOQ_TEST_CHECK(moq_buf_writer_offset(&w) == 4 + sizeof(full) &&
+                           memcmp(buf + 4, full, sizeof(full)) == 0);
+            moq_buf_writer_init(&w, buf, sizeof(buf));
+            MOQ_TEST_CHECK_EQ_INT((int)moq_d18_encode_setup_opts(&w, o, future - 1),
+                                  (int)MOQ_ERR_INVAL);
+            MOQ_TEST_CHECK_EQ_SIZE(moq_buf_writer_offset(&w), 0);
+            o->struct_size = (uint32_t)(v0 - 1);
+            MOQ_TEST_CHECK_EQ_INT((int)moq_d18_encode_setup_opts(&w, o, future),
+                                  (int)MOQ_ERR_INVAL);
+            o->struct_size = (uint32_t)v0;
+            MOQ_TEST_CHECK_EQ_INT((int)moq_d18_encode_setup_opts(&w, o, v0 - 1),
+                                  (int)MOQ_ERR_INVAL);
+            MOQ_TEST_CHECK_EQ_SIZE(moq_buf_writer_offset(&w), 0);
+            free(raw);
+        }
+
+        /* A failed decode clears the caller's record (stamped), never
+         * leaving a partial result, and writes nothing past its size. */
+        raw = malloc(v0 + 16);
+        MOQ_TEST_CHECK(raw != NULL);
+        if (raw) {
+            memset(raw, 0xa5, v0 + 16);
+            static const uint8_t dup[] = { 0x01, 0x01, 'a', 0x00, 0x01, 'b' };
+            moq_d18_setup_opts_t *o = (moq_d18_setup_opts_t *)(void *)raw;
+            MOQ_TEST_CHECK_EQ_INT((int)moq_d18_decode_setup_opts(dup, sizeof(dup),
+                o, v0), (int)MOQ_ERR_PROTO);
+            MOQ_TEST_CHECK_EQ_U64(o->struct_size, v0);
+            MOQ_TEST_CHECK(!o->has_path && !o->has_authority &&
+                           o->auth_token_count == 0 && o->path.len == 0);
+            bool canary = true;
+            for (size_t i = v0; i < v0 + 16; i++) canary &= raw[i] == 0xa5;
+            MOQ_TEST_CHECK(canary);
+            free(raw);
+        }
+
+        /* init_sized clears and stamps only what it is given, inside a real
+         * typed record between guards, inspected byte by byte: below the
+         * size of struct_size nothing at all is written; from there exactly
+         * `size` bytes are cleared and stamped. */
+        static const size_t sizes[] = { 0, 1, 2, 3, 4, 8, 9,
+                                        MOQ_D18_SETUP_OPTS_V0_SIZE,
+                                        sizeof(moq_d18_setup_opts_t),
+                                        sizeof(moq_d18_setup_opts_t) + 64 };
+        for (size_t k = 0; k < sizeof(sizes) / sizeof(sizes[0]); k++) {
+            struct init_guard {
+                unsigned char        before[16];
+                moq_d18_setup_opts_t rec;
+                unsigned char        after[16];
+            } g;
+            memset(&g, 0xa5, sizeof(g));
+            moq_d18_setup_opts_init_sized(&g.rec, sizes[k]);
+            const unsigned char *bytes = (const unsigned char *)&g;
+            size_t rec_at = offsetof(struct init_guard, rec);
+            size_t written = sizes[k] < sizeof(g.rec.struct_size) ? 0
+                           : sizes[k] < sizeof(g.rec) ? sizes[k] : sizeof(g.rec);
+            bool exact = true;
+            for (size_t i = 0; i < sizeof(g); i++) {
+                bool inside = i >= rec_at && i < rec_at + written;
+                bool in_stamp = inside && i < rec_at + sizeof(g.rec.struct_size);
+                if (!inside) exact &= bytes[i] == 0xa5;
+                else if (!in_stamp) exact &= bytes[i] == 0;
+            }
+            MOQ_TEST_CHECK(exact);
+            if (written) {
+                uint32_t stamped;
+                memcpy(&stamped, bytes + rec_at, sizeof(stamped));
+                MOQ_TEST_CHECK_EQ_U64(stamped, written);
+            }
+        }
+        moq_d18_setup_opts_init_sized(NULL, sizeof(moq_d18_setup_opts_t));
+        /* The plain form stamps the caller's own sizeof. */
+        {
+            moq_d18_setup_opts_t rec;
+            memset(&rec, 0xa5, sizeof(rec));
+            moq_d18_setup_opts_init(&rec);
+            MOQ_TEST_CHECK_EQ_U64(rec.struct_size, sizeof(rec));
+            MOQ_TEST_CHECK(!rec.has_path && rec.auth_token_count == 0);
+        }
+
+        /* No record at all is a SETUP with no options. */
+        uint8_t buf[8];
+        moq_buf_writer_t w;
+        moq_buf_writer_init(&w, buf, sizeof(buf));
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d18_encode_setup_opts(&w, NULL, 0), (int)MOQ_OK);
+        MOQ_TEST_CHECK(moq_buf_writer_offset(&w) == 4 && buf[0] == 0xaf &&
+                       buf[1] == 0 && buf[2] == 0 && buf[3] == 0);
     }
 
     /* 1e. Duplicate known non-repeatable option closes. */
     {
         uint8_t p[] = { 0x04, 0x01, 0x00, 0x02 };   /* MAX=1, dup MAX=2 */
         moq_d18_setup_opts_t o;
-        MOQ_TEST_CHECK_EQ_INT((int)moq_d18_decode_setup_opts(p, sizeof(p), &o),
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d18_decode_setup_opts(p, sizeof(p), &o, sizeof(o)),
                               (int)MOQ_ERR_PROTO);
     }
 
@@ -149,7 +419,7 @@ int main(void)
         put_vi64(&w, 0x10000);              /* length 65536: over cap */
         moq_d18_setup_opts_t o;
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_d18_decode_setup_opts(p, moq_buf_writer_offset(&w), &o),
+            (int)moq_d18_decode_setup_opts(p, moq_buf_writer_offset(&w), &o, sizeof(o)),
             (int)MOQ_ERR_PROTO);
     }
 
@@ -157,7 +427,7 @@ int main(void)
     {
         uint8_t p[] = { 0x03, 0x01, 0x09 };   /* token option, len 1, alias_type 9 */
         moq_d18_setup_opts_t o;
-        MOQ_TEST_CHECK_EQ_INT((int)moq_d18_decode_setup_opts(p, sizeof(p), &o),
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d18_decode_setup_opts(p, sizeof(p), &o, sizeof(o)),
                               (int)MOQ_D18_ERR_KVP_FORMAT);
     }
 
@@ -174,7 +444,7 @@ int main(void)
         moq_buf_write_raw(&w, (const uint8_t *)"alpha", 5);
         moq_d18_setup_opts_t o;
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_d18_decode_setup_opts(p, moq_buf_writer_offset(&w), &o),
+            (int)moq_d18_decode_setup_opts(p, moq_buf_writer_offset(&w), &o, sizeof(o)),
             (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_SIZE(o.auth_token_count, 1);
         MOQ_TEST_CHECK_EQ_U64(o.auth_tokens[0].alias, 1);
@@ -491,7 +761,7 @@ int main(void)
                 MOQ_TEST_CHECK_EQ_HEX(d[n - 1], 0x64);
                 moq_d18_setup_opts_t o;
                 MOQ_TEST_CHECK_EQ_INT(
-                    (int)moq_d18_decode_setup_opts(d + (n - 2), 2, &o),
+                    (int)moq_d18_decode_setup_opts(d + (n - 2), 2, &o, sizeof(o)),
                     (int)MOQ_OK);
                 MOQ_TEST_CHECK_EQ_U64(o.max_auth_token_cache_size, 100);
                 found = true;

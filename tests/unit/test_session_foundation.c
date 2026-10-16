@@ -1,6 +1,32 @@
 #include "test_session_support.h"
 #include "test_deadline_support.h"
 
+/* Whether `s` queued a REQUEST_ERROR for `request_id` on its control
+ * stream; its code goes to *code. Drains the action queue. */
+static bool took_d16_request_error(moq_session_t *s, uint64_t request_id, uint64_t *code)
+{
+    bool found = false;
+    moq_action_t a;
+    while (moq_session_poll_actions(s, &a, 1) > 0) {
+        if (a.kind == MOQ_ACTION_SEND_CONTROL) {
+            moq_buf_reader_t r;
+            moq_buf_reader_init(&r, a.u.send_control.data, a.u.send_control.len);
+            moq_control_envelope_t env;
+            while (moq_control_decode_envelope(&r, &env) == MOQ_OK) {
+                moq_d16_request_error_t e;
+                if (env.msg_type == 0x05 &&
+                    moq_d16_decode_request_error(env.payload, env.payload_len, &e) == MOQ_OK &&
+                    e.request_id == request_id) {
+                    found = true;
+                    *code = e.error_code;
+                }
+            }
+        }
+        moq_action_cleanup(&a);
+    }
+    return found;
+}
+
 int main(void)
 {
     int failures = 0;
@@ -1491,11 +1517,10 @@ int main(void)
 
     /* == GOAWAY: peer SUBSCRIBE after local GOAWAY is refused ========= */
     {
-        /* After we send GOAWAY (§10.4) the peer must not open new requests.
-         * session_is_active() still includes DRAINING, so the inbound
-         * request initiators need an explicit local-GOAWAY gate -- otherwise
-         * a fresh SUBSCRIBE still allocates request state and emits an app
-         * event. */
+        /* After our GOAWAY the peer SHOULD NOT open new requests (§9.4); one
+         * that crossed it is refused with a REQUEST_ERROR -- draft-16
+         * registers no GOING_AWAY code, so INTERNAL_ERROR -- and the session
+         * stays up. No SUBSCRIBE_REQUEST surfaces. */
         test_alloc_state_t alloc_state = {0};
         moq_alloc_t alloc = test_allocator(&alloc_state);
 
@@ -1514,20 +1539,17 @@ int main(void)
             MOQ_BYTES_LITERAL("t"), NULL, 0) == MOQ_OK);
         moq_session_on_control_bytes(sv, msg, moq_buf_writer_offset(&w), 0);
 
-        /* Refused as a protocol violation: no SUBSCRIBE_REQUEST surfaced. */
-        MOQ_TEST_CHECK(moq_session_state(sv) == MOQ_SESS_CLOSED);
+        MOQ_TEST_CHECK(moq_session_state(sv) == MOQ_SESS_DRAINING);
         moq_event_t ev;
-        bool saw_sub_req = false, saw_closed = false;
+        bool saw_sub_req = false;
         while (moq_session_poll_events(sv, &ev, 1) == 1) {
             if (ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST) saw_sub_req = true;
-            if (ev.kind == MOQ_EVENT_SESSION_CLOSED) {
-                saw_closed = true;
-                MOQ_TEST_CHECK(ev.u.closed.code == 0x3);
-            }
             moq_event_cleanup(&ev);
         }
         MOQ_TEST_CHECK(!saw_sub_req);
-        MOQ_TEST_CHECK(saw_closed);
+        uint64_t code = 99;
+        MOQ_TEST_CHECK(took_d16_request_error(sv, 0, &code));
+        MOQ_TEST_CHECK(code == MOQ_REQUEST_ERROR_INTERNAL_ERROR);
 
         moq_session_destroy(c);
         moq_session_destroy(sv);
@@ -1554,19 +1576,17 @@ int main(void)
             == MOQ_OK);
         moq_session_on_control_bytes(sv, msg, moq_buf_writer_offset(&w), 0);
 
-        MOQ_TEST_CHECK(moq_session_state(sv) == MOQ_SESS_CLOSED);
+        MOQ_TEST_CHECK(moq_session_state(sv) == MOQ_SESS_DRAINING);
         moq_event_t ev;
-        bool saw_ns_pub = false, saw_closed = false;
+        bool saw_ns_pub = false;
         while (moq_session_poll_events(sv, &ev, 1) == 1) {
             if (ev.kind == MOQ_EVENT_NAMESPACE_PUBLISHED) saw_ns_pub = true;
-            if (ev.kind == MOQ_EVENT_SESSION_CLOSED) {
-                saw_closed = true;
-                MOQ_TEST_CHECK(ev.u.closed.code == 0x3);
-            }
             moq_event_cleanup(&ev);
         }
         MOQ_TEST_CHECK(!saw_ns_pub);
-        MOQ_TEST_CHECK(saw_closed);
+        uint64_t code = 99;
+        MOQ_TEST_CHECK(took_d16_request_error(sv, 0, &code));
+        MOQ_TEST_CHECK(code == MOQ_REQUEST_ERROR_INTERNAL_ERROR);
 
         moq_session_destroy(c);
         moq_session_destroy(sv);
@@ -1575,9 +1595,9 @@ int main(void)
 
     /* == GOAWAY: peer FETCH / PUBLISH / TRACK_STATUS after GOAWAY ===== */
     {
-        /* The whole D16 control-channel request-initiator class must reject
-         * new peer requests after our local GOAWAY -- not just SUBSCRIBE and
-         * PUBLISH_NAMESPACE. */
+        /* The whole D16 control-channel request-initiator class refuses new
+         * peer requests after our local GOAWAY with a REQUEST_ERROR -- not
+         * just SUBSCRIBE and PUBLISH_NAMESPACE. */
         for (int which = 0; which < 3; which++) {
             test_alloc_state_t alloc_state = {0};
             moq_alloc_t alloc = test_allocator(&alloc_state);
@@ -1622,19 +1642,17 @@ int main(void)
 
             moq_session_on_control_bytes(sv, msg, moq_buf_writer_offset(&w), 0);
 
-            MOQ_TEST_CHECK(moq_session_state(sv) == MOQ_SESS_CLOSED);
+            MOQ_TEST_CHECK(moq_session_state(sv) == MOQ_SESS_DRAINING);
             moq_event_t ev;
-            bool saw_req = false, saw_closed = false;
+            bool saw_req = false;
             while (moq_session_poll_events(sv, &ev, 1) == 1) {
                 if (ev.kind == refused_event) saw_req = true;
-                if (ev.kind == MOQ_EVENT_SESSION_CLOSED) {
-                    saw_closed = true;
-                    MOQ_TEST_CHECK(ev.u.closed.code == 0x3);
-                }
                 moq_event_cleanup(&ev);
             }
             MOQ_TEST_CHECK(!saw_req);
-            MOQ_TEST_CHECK(saw_closed);
+            uint64_t code = 99;
+            MOQ_TEST_CHECK(took_d16_request_error(sv, 0, &code));
+            MOQ_TEST_CHECK(code == MOQ_REQUEST_ERROR_INTERNAL_ERROR);
 
             moq_session_destroy(c);
             moq_session_destroy(sv);
@@ -2354,7 +2372,9 @@ int main(void)
         MOQ_TEST_CHECK(as.balance == 0);
     }
 
-    /* == Timer: inbound GOAWAY arms deadline =========================== */
+    /* == Timer: inbound GOAWAY arms no deadline ========================
+     * GOAWAY_TIMEOUT is the sender's close code; a receiver configured with
+     * a drain timeout neither arms it nor closes itself. */
     {
         test_alloc_state_t as = {0};
         moq_alloc_t alloc = test_allocator(&as);
@@ -2373,7 +2393,9 @@ int main(void)
         moq_event_cleanup(&ev);
 
         MOQ_TEST_CHECK(moq_session_state(c) == MOQ_SESS_DRAINING);
-        MOQ_TEST_CHECK(moq_session_next_deadline_us(c) == 5000);
+        MOQ_TEST_CHECK(moq_session_next_deadline_us(c) == UINT64_MAX);
+        MOQ_TEST_CHECK(moq_session_tick(c, 1000000) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_state(c) == MOQ_SESS_DRAINING);
 
         moq_action_t acts[16]; size_t na;
         while ((na = moq_session_poll_actions(sv, acts, 16)) > 0)
@@ -3408,27 +3430,18 @@ int main(void)
         MOQ_TEST_CHECK(test_get_session_sg_deadline(sv) == 1000100);
 
         /* Feed UNSUBSCRIBE. With max_actions=2 and 1 slot used (sg2
-         * header), the first RESET_DATA fits (slot 2). Then the
-         * second RESET_DATA hits action_queue_full → WOULD_BLOCK. */
+         * header), the first RESET_DATA fits (slot 2) and the second is
+         * owed on its stream; the cancel completes at once. */
         uint8_t unsub_buf[64];
         moq_buf_writer_t uw;
         moq_buf_writer_init(&uw, unsub_buf, sizeof(unsub_buf));
         moq_d16_encode_varint_msg(&uw, MOQ_D16_UNSUBSCRIBE, 0);
         moq_result_t rc = moq_session_on_control_bytes(sv, unsub_buf,
             moq_buf_writer_offset(&uw), 0);
-        MOQ_TEST_CHECK(rc == MOQ_ERR_WOULD_BLOCK);
-
-        /* sg1 was reset and its deadline cleared. sg2 still armed.
-         * Session deadline should reflect sg2 only. */
-        MOQ_TEST_CHECK(test_get_session_sg_deadline(sv) == 1000200);
-
-        /* Drain and retry. */
-        while ((na = moq_session_poll_actions(sv, acts, 16)) > 0)
-            for (size_t i = 0; i < na; i++) moq_action_cleanup(&acts[i]);
-        rc = moq_session_process_pending(sv, 0);
         MOQ_TEST_CHECK(rc == MOQ_OK);
 
-        /* Both cleared now. */
+        /* Both deadlines are cleared: a stream that owes its reset is no
+         * longer timed. */
         MOQ_TEST_CHECK(test_get_session_sg_deadline(sv) == UINT64_MAX);
 
         while (moq_session_poll_events(sv, &ev, 1) == 1) moq_event_cleanup(&ev);

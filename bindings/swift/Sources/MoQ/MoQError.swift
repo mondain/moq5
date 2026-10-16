@@ -13,6 +13,11 @@ public enum MoQError: Error, Sendable, Hashable {
     case requestBlocked
     case abiMismatch
     case goaway
+    /// The session's draft has no wire form for the request (a fill, a
+    /// location filter form, a state notification); nothing was sent.
+    public static let unsupported = MoQError.unknown(MOQ_ERR_UNSUPPORTED)
+    /// A permanent implementation limit, not retryable backpressure.
+    public static let limit = MoQError.unknown(MOQ_ERR_LIMIT)
     case `internal`
     case unknown(Int32)
 }
@@ -33,6 +38,7 @@ extension MoQError {
         case MOQ_ERR_REQUEST_BLOCKED: return .requestBlocked
         case MOQ_ERR_ABI_MISMATCH:   return .abiMismatch
         case MOQ_ERR_GOAWAY:         return .goaway
+        case MOQ_ERR_UNSUPPORTED:    return .unsupported
         case MOQ_ERR_INTERNAL:       return .internal
         default:                     return .unknown(rc)
         }

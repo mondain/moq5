@@ -13,6 +13,7 @@
 
 #include "../common/moq_alpn.h"
 #include "../common/moq_setup_tokens.h"
+#include "../common/moq_adapter_binding.h"
 #include "../common/moq_pq_stream_backlog.h"
 #include "pico_wt_adapter.h"
 
@@ -110,7 +111,9 @@ struct moq_pico_wt_managed {
     /* Copied config. */
     moq_perspective_t  perspective;
     char              *host;
-    char              *sni;
+    char              *sni;            /* TLS server name only */
+    const char        *authority;      /* client CONNECT :authority, in
+                                          target_bytes */
     char              *path;
     char              *wt_protocols;   /* offer (client) / supported (server);
                                         * NULL = legacy no-negotiation */
@@ -144,6 +147,12 @@ struct moq_pico_wt_managed {
         bool                 retired;    /* complete, and freed by h3zero */
     }                  early_streams[MOQ_PWM_EARLY_MAX_STREAMS];
     bool               early_ended;      /* CONNECT answered: buffer closed */
+
+    /* The client's connection target (copied bytes); a server binds each
+     * session with the identity its CONNECT named instead. */
+    moq_connection_target_t target;
+    uint8_t           *target_bytes;
+    size_t             target_bytes_len;
 
     /* Owned transport. */
     picoquic_quic_t   *quic;
@@ -205,6 +214,9 @@ struct moq_pico_wt_managed {
     size_t            test_ev_overflow;
     unsigned          test_connect_enqueued;     /* deferred CONNECT queued */
     unsigned          test_connect_left_pending; /* still pending after SETTINGS */
+    char              test_connect_authority[256]; /* server: last CONNECT */
+    char              test_connect_sni[256];       /* server: its TLS SNI */
+    char              test_connect_path[256];      /* server: its :path */
 #endif
 };
 
@@ -653,6 +665,25 @@ static void pwm_early_replay(moq_pico_wt_managed_t *m, picoquic_cnx_t *cnx,
     m->early_ended = true;
 }
 
+/* The transport facts of an established WebTransport session: the handshake
+ * is complete, QUIC DATAGRAM support follows each side's transport
+ * parameters, and sending datagrams additionally needs the peer's HTTP/3
+ * datagram setting (h3zero advertises the local one whenever the local
+ * QUIC parameter is set). */
+static uint32_t wt_binding_facts(picoquic_cnx_t *cnx, const h3zero_callback_ctx_t *h3)
+{
+    picoquic_tp_t const *local = picoquic_get_transport_parameters(cnx, 1);
+    picoquic_tp_t const *remote = picoquic_get_transport_parameters(cnx, 0);
+    uint32_t supported = MOQ_BINDING_HANDSHAKE_COMPLETE;
+    bool local_dg = local && local->max_datagram_frame_size > 0;
+    bool peer_dg = remote && remote->max_datagram_frame_size > 0;
+    bool peer_h3_dg = h3 && h3->settings.settings_received && h3->settings.h3_datagram;
+    if (local_dg) supported |= MOQ_BINDING_LOCAL_QUIC_DATAGRAM | MOQ_BINDING_DATAGRAM_RECEIVE;
+    if (peer_dg) supported |= MOQ_BINDING_PEER_QUIC_DATAGRAM;
+    if (peer_dg && peer_h3_dg) supported |= MOQ_BINDING_DATAGRAM_SEND;
+    return supported;
+}
+
 /* -- WT client control-stream callback (network thread) ------------- */
 
 static int managed_client_wt_cb(picoquic_cnx_t *cnx, uint8_t *bytes,
@@ -660,7 +691,6 @@ static int managed_client_wt_cb(picoquic_cnx_t *cnx, uint8_t *bytes,
     h3zero_stream_ctx_t *stream_ctx, void *app_ctx)
 {
     moq_pico_wt_managed_t *m = (moq_pico_wt_managed_t *)app_ctx;
-    (void)bytes; (void)length;
 
     if (event == picohttp_callback_connecting)
         return 0;
@@ -789,6 +819,17 @@ static int managed_client_wt_cb(picoquic_cnx_t *cnx, uint8_t *bytes,
      * refuse locally (reliable-reset was never actually negotiated). */
     conn->endpoint_ctx.reset_stream_at_synthesized = m->reset_stream_at_synthesized;
 
+    /* A profile that must be told how it is carried is bound before its
+     * first SETUP byte: inside a WebTransport session, with this
+     * connection's facts and the CONNECT's target. */
+    if (moq_adapter_bind_session(session, MOQ_BINDING_WEBTRANSPORT_H3,
+                                 MOQ_BINDING_FACTS_ALL,
+                                 wt_binding_facts(cnx, m->h3_ctx),
+                                 &m->target) != MOQ_OK) {
+        moq_pico_wt_conn_destroy(conn);
+        moq_session_destroy(session);
+        goto fail;
+    }
     /* A SETUP that cannot be queued (its buffer cannot be allocated, or it
      * cannot fit the send arena) leaves an IDLE session that never
      * establishes. The facade still takes ownership of the session and the
@@ -889,6 +930,29 @@ static int managed_server_wt_cb(picoquic_cnx_t *cnx, uint8_t *bytes,
         return moq_pico_wt_callback(cnx, bytes, length, event,
                                     stream_ctx, app_ctx);
 
+#if defined(MOQ_PICO_WT_TESTING)
+    /* TEST-ONLY: what the client's CONNECT and handshake named. */
+    {
+        size_t alen = stream_ctx->ps.stream_state.header.authority_length;
+        if (alen >= sizeof(m->test_connect_authority))
+            alen = sizeof(m->test_connect_authority) - 1;
+        if (alen)
+            memcpy(m->test_connect_authority,
+                   stream_ctx->ps.stream_state.header.authority, alen);
+        m->test_connect_authority[alen] = '\0';
+        size_t plen = stream_ctx->ps.stream_state.header.path_length;
+        if (plen >= sizeof(m->test_connect_path))
+            plen = sizeof(m->test_connect_path) - 1;
+        if (plen)
+            memcpy(m->test_connect_path,
+                   stream_ctx->ps.stream_state.header.path, plen);
+        m->test_connect_path[plen] = '\0';
+        const char *sni = picoquic_tls_get_sni(cnx);
+        snprintf(m->test_connect_sni, sizeof(m->test_connect_sni), "%s",
+                 sni ? sni : "");
+    }
+#endif
+
     /* One active connection: refuse a second CONNECT. (Callbacks are
      * serialized on the single network thread, so this is race-free.)
      * Returning -1 on picohttp_callback_connect makes h3zero answer with
@@ -947,11 +1011,29 @@ static int managed_server_wt_cb(picoquic_cnx_t *cnx, uint8_t *bytes,
     }
     managed_arm_keep_alive(m, cnx);
 
-    /* Start the server session: uni-control-pair profiles (draft-18) send
-     * their own SETUP from start; a draft-16 server defines start as
-     * MOQ_ERR_WRONG_STATE (the client initiates), the draft-neutral no-op. */
+    /* Bind a profile that requires it with the identity the client's
+     * CONNECT named (:authority and :path), then start the server session:
+     * uni-control-pair profiles send their own SETUP from start; a draft-16
+     * server defines start as MOQ_ERR_WRONG_STATE (the client initiates),
+     * the draft-neutral no-op. */
     {
-        moq_result_t src = moq_session_start(session, now);
+        moq_connection_target_t named;
+        memset(&named, 0, sizeof(named));
+        named.struct_size = (uint32_t)sizeof(named);
+        named.target_present = MOQ_BINDING_TARGET_COMPLETE;
+        named.authority.data = stream_ctx->ps.stream_state.header.authority;
+        named.authority.len = stream_ctx->ps.stream_state.header.authority_length;
+        named.path_query.data = stream_ctx->ps.stream_state.header.path;
+        named.path_query.len = stream_ctx->ps.stream_state.header.path_length;
+        moq_result_t src = moq_adapter_bind_session(
+            session, MOQ_BINDING_WEBTRANSPORT_H3, MOQ_BINDING_FACTS_ALL,
+            wt_binding_facts(cnx, h3), &named);
+        if (src != MOQ_OK) {
+            moq_pico_wt_conn_destroy(conn);
+            moq_session_destroy(session);
+            goto fail;
+        }
+        src = moq_session_start(session, now);
         if (src != MOQ_OK && src != MOQ_ERR_WRONG_STATE) {
             moq_pico_wt_conn_destroy(conn);
             moq_session_destroy(session);
@@ -1251,6 +1333,14 @@ _Static_assert(offsetof(moq_pico_wt_managed_cfg_t, setup_auth_tokens) >=
                 ~(size_t)(_Alignof(moq_pico_wt_managed_cfg_t) - 1u)),
                "setup_auth_tokens must start past the previous sizeof");
 
+/* target starts at or past the sizeof of the layout that ended at
+ * setup_auth_token_count, so an old caller's tail padding is never read. */
+_Static_assert(offsetof(moq_pico_wt_managed_cfg_t, target) >=
+               ((offsetof(moq_pico_wt_managed_cfg_t, setup_auth_token_count) + sizeof(size_t) +
+                 _Alignof(moq_pico_wt_managed_cfg_t) - 1u) &
+                ~(size_t)(_Alignof(moq_pico_wt_managed_cfg_t) - 1u)),
+               "target must start past the previous sizeof");
+
 void moq_pico_wt_managed_cfg_init_sized(moq_pico_wt_managed_cfg_t *cfg,
                                         size_t cfg_size)
 {
@@ -1282,7 +1372,13 @@ static void free_strings(moq_pico_wt_managed_t *m)
         m->alloc.free(m->wt_protocols, strlen(m->wt_protocols) + 1,
                       m->alloc.ctx);
     m->host = m->sni = m->path = NULL;
+    m->authority = NULL;
     m->wt_protocols = NULL;
+    if (m->target_bytes)
+        m->alloc.free(m->target_bytes, m->target_bytes_len, m->alloc.ctx);
+    m->target_bytes = NULL;
+    m->target_bytes_len = 0;
+    memset(&m->target, 0, sizeof(m->target));
     moq_setup_tokens_free(&m->alloc, &m->setup_tokens);
 }
 
@@ -1325,10 +1421,14 @@ moq_result_t moq_pico_wt_managed_create(
     m->perspective = persp;
     m->port = port;
 
-    /* path for both; host + sni for the client. */
-    m->path = dup_str(&m->alloc,
-        (CFG_HAS(cfg, path) && cfg->path) ? cfg->path : "/moq");
-    bool dup_ok = (m->path != NULL);
+    /* The server's route path; the client's comes from its CONNECT
+     * identity below. */
+    const char *cfg_path = (CFG_HAS(cfg, path) && cfg->path) ? cfg->path : NULL;
+    bool dup_ok = true;
+    if (persp == MOQ_PERSPECTIVE_SERVER) {
+        m->path = dup_str(&m->alloc, cfg_path ? cfg_path : "/moq");
+        dup_ok = m->path != NULL;
+    }
     if (persp == MOQ_PERSPECTIVE_CLIENT) {
         m->host = dup_str(&m->alloc, host);
         /* Choose the SNI / verified server name. An explicit cfg->sni always
@@ -1362,16 +1462,30 @@ moq_result_t moq_pico_wt_managed_create(
         m->sni = dup_str(&m->alloc, sni_src);
         dup_ok = dup_ok && m->host && m->sni;
     }
-    if (CFG_HAS(cfg, wt_protocols) && cfg->wt_protocols &&
-        cfg->wt_protocols[0] != '\0') {
-        m->wt_protocols = dup_str(&m->alloc, cfg->wt_protocols);
-        dup_ok = dup_ok && m->wt_protocols;
+    /* One CONNECT identity: the explicit target, else host:port and the
+     * configured path; the CONNECT sends exactly what the session binds
+     * (moq_adapter_wt_client_target). A server binds each session with the
+     * identity its CONNECT named instead. */
+    if (persp == MOQ_PERSPECTIVE_CLIENT) {
+        const char *connect_path = NULL;
+        moq_result_t trc = moq_adapter_wt_client_target(
+            &m->alloc, CFG_HAS(cfg, target) ? cfg->target : NULL, host, port,
+            cfg_path, "/moq", &m->target, &m->target_bytes,
+            &m->target_bytes_len, &m->authority, &connect_path);
+        if (trc == MOQ_ERR_INVAL) {
+            free_strings(m);
+            m->alloc.free(m, sizeof(*m), m->alloc.ctx);
+            return MOQ_ERR_INVAL;
+        }
+        if (trc == MOQ_OK) m->path = dup_str(&m->alloc, connect_path);
+        dup_ok = dup_ok && trc == MOQ_OK && m->path != NULL;
     }
     if (CFG_HAS(cfg, setup_auth_token_count) && cfg->setup_auth_token_count > 0) {
-        /* Sessions take the default send arena; nothing else this profile set
-         * sends in SETUP grows with the configuration. */
+        /* Sessions take the default send arena; the target is not sent over
+         * WebTransport but is counted, which only tightens the bound. */
         moq_result_t src = moq_setup_tokens_fit(cfg->setup_auth_tokens,
-                cfg->setup_auth_token_count, 0, MOQ_SETUP_TOKENS_DEFAULT_ARENA)
+                cfg->setup_auth_token_count, m->target_bytes_len,
+                MOQ_SETUP_TOKENS_DEFAULT_ARENA)
             ? moq_setup_tokens_copy(&m->alloc, cfg->setup_auth_tokens,
                                     cfg->setup_auth_token_count, &m->setup_tokens)
             : MOQ_ERR_INVAL;
@@ -1382,11 +1496,29 @@ moq_result_t moq_pico_wt_managed_create(
         }
         dup_ok = dup_ok && src == MOQ_OK;
     }
+    if (CFG_HAS(cfg, wt_protocols) && cfg->wt_protocols &&
+        cfg->wt_protocols[0] != '\0') {
+        m->wt_protocols = dup_str(&m->alloc, cfg->wt_protocols);
+        dup_ok = dup_ok && m->wt_protocols;
+    }
     if (!dup_ok) {
         free_strings(m);
         m->alloc.free(m, sizeof(*m), m->alloc.ctx);
         return MOQ_ERR_NOMEM;
     }
+#if !defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) || PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION < 1
+    /* Draft-22 needs exact STOP and ACK-through-FIN stream outcomes, which
+     * this picoquic does not report, so the attach would refuse its session.
+     * An offer naming it is refused here instead of being negotiated and then
+     * closed without a reason. */
+    if (m->wt_protocols &&
+        wt_offer_contains(m->wt_protocols,
+                          moq_alpn_for_version(MOQ_VERSION_DRAFT_22))) {
+        free_strings(m);
+        m->alloc.free(m, sizeof(*m), m->alloc.ctx);
+        return MOQ_ERR_UNSUPPORTED;
+    }
+#endif
 
     if (CFG_HAS(cfg, send_request_capacity))
         m->send_request_capacity = cfg->send_request_capacity;
@@ -1500,7 +1632,7 @@ moq_result_t moq_pico_wt_managed_create(
         if (prc != 0) goto fail_configure;
 
         picowt_set_transport_parameters(m->cnx);
-        if (picowt_connect(m->cnx, m->h3_ctx, m->ctrl_ctx, m->sni,
+        if (picowt_connect(m->cnx, m->h3_ctx, m->ctrl_ctx, m->authority,
                            m->path, managed_client_wt_cb, m,
                            m->wt_protocols) != 0)
             goto fail_configure;
@@ -1922,6 +2054,19 @@ unsigned moq_pico_wt_managed_test_connect_enqueued(moq_pico_wt_managed_t *m)
 
 unsigned moq_pico_wt_managed_test_connect_left_pending(moq_pico_wt_managed_t *m)
 { return m ? m->test_connect_left_pending : 0; }
+
+const char *moq_pico_wt_managed_test_connect_authority(moq_pico_wt_managed_t *m)
+{ return m ? m->test_connect_authority : ""; }
+
+const char *moq_pico_wt_managed_test_connect_sni(moq_pico_wt_managed_t *m)
+{ return m ? m->test_connect_sni : ""; }
+
+const char *moq_pico_wt_managed_test_connect_path(moq_pico_wt_managed_t *m)
+{ return m ? m->test_connect_path : ""; }
+
+const moq_connection_target_t *moq_pico_wt_managed_test_target(
+    moq_pico_wt_managed_t *m)
+{ return m ? &m->target : NULL; }
 
 void moq_pico_wt_managed_test_detach_conn(moq_pico_wt_managed_t *m)
 {

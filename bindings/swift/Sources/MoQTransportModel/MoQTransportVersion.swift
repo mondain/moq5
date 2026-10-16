@@ -21,8 +21,11 @@
 ///
 /// The draft decides the integer encoding of object-property
 /// Key-Value-Pairs (draft-ietf-moq-transport-16 section 1.4 versus
-/// draft-ietf-moq-transport-18 section 1.4.1), which is why media code
-/// needs it and why there is no default.
+/// draft-ietf-moq-transport-18 section 1.4.1 and -22 section 8.3) and the
+/// LOC revision whose property ids are in force (LOC-01 on 16 and 18,
+/// LOC-04 on 22), which is why media code needs it and why there is no
+/// default.
+/// The legacy case set is fixed. Use `WireVersion` to opt into newer drafts.
 public enum MoQTransportVersion: Sendable, Hashable, CaseIterable {
     case draft16
     case draft18
@@ -34,4 +37,31 @@ public enum MoQTransportVersion: Sendable, Hashable, CaseIterable {
         case .draft18: return 18
         }
     }
+}
+
+/// Extensible wire-version token. Unknown values are preserved and must be
+/// checked against the native operation's supported versions.
+public struct WireVersion: RawRepresentable, Sendable, Hashable {
+    public let rawValue: UInt32
+    public init(rawValue: UInt32) { self.rawValue = rawValue }
+    public static let draft16 = WireVersion(rawValue: 16)
+    public static let draft18 = WireVersion(rawValue: 18)
+    public static let draft22 = WireVersion(rawValue: 22)
+
+    public init(_ version: MoQTransportVersion) {
+        switch version {
+        case .draft16: self = .draft16
+        case .draft18: self = .draft18
+        }
+    }
+
+    public var legacyVersion: MoQTransportVersion? {
+        switch self {
+        case .draft16: return .draft16
+        case .draft18: return .draft18
+        default: return nil
+        }
+    }
+
+    public var draftNumber: Int { Int(rawValue) }
 }

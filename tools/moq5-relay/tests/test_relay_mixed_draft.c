@@ -50,6 +50,7 @@ static int g_failures;
 
 #define D16 MOQ_VERSION_DRAFT_16
 #define D18 MOQ_VERSION_DRAFT_18
+#define D22 MOQ_VERSION_DRAFT_22
 
 /* Stream-through forwarding (the production CLI configuration): the reset arms
  * need a downstream object that is already BEGUN when the upstream stream dies,
@@ -73,10 +74,10 @@ typedef struct rig {
 static const char *
 alpn_of(moq_version_t v)
 {
-    return v == D16 ? "moqt-16" : "moqt-18";
+    return v == D16 ? "moqt-16" : v == D18 ? "moqt-18" : "moqt-22";
 }
 
-/* A listener offering BOTH drafts: each accepted connection negotiates its own
+/* A listener offering every draft: each accepted connection negotiates its own
  * version from its ALPN, which is what makes a mixed topology real rather than
  * simulated. */
 static bool
@@ -108,9 +109,10 @@ mixed_rig_up_auth(rig_t *r, moqr_authorize_fn authorize)
     }
     r->ctx = moqr_test_mk_serve_ctx(r->bind, r->core, r->trace);
 
-    static moq_version_t vers[2];
+    static moq_version_t vers[3];
     vers[0] = D16;
     vers[1] = D18;
+    vers[2] = D22;
 
     moq_msquic_managed_cfg_t scfg;
 
@@ -126,7 +128,7 @@ mixed_rig_up_auth(rig_t *r, moqr_authorize_fn authorize)
     scfg.version = 0;              /* no exact version: the list decides */
     scfg.streaming_objects = g_rig_streaming;
     scfg.versions = vers;
-    scfg.version_count = 2;
+    scfg.version_count = 3;
     scfg.lane_count = 1;
     scfg.max_connections = 4;
     scfg.on_lane_pump = moqr_test_single_pump();
@@ -1549,6 +1551,17 @@ main(void)
     /* Codes both drafts agree on, and same-draft verbatim including an
      * unknown extension. */
     (void)run_reset_forward("rs_cancelled_d16_to_d18", D16, D18, 0x1u, 0x1u);
+
+    /* Draft-22 peers on the same listener -- a session the relay binds to its
+     * connection before it starts -- forward objects and reset codes to and
+     * from draft-18 and among themselves: the registries agree on these
+     * numbers, and draft-22's GOING_AWAY degrades to draft-16's generic
+     * CANCELLED exactly as draft-18's does. */
+    (void)run_reset_forward("rs_cancelled_d22_to_d22", D22, D22, 0x1u, 0x1u);
+    (void)run_reset_forward("rs_cancelled_d22_to_d18", D22, D18, 0x1u, 0x1u);
+    (void)run_reset_forward("rs_cancelled_d18_to_d22", D18, D22, 0x1u, 0x1u);
+    (void)run_reset_forward("rs_unknown_obj_d22_to_d16", D22, D16, 0x6u, 0x4u);
+    (void)run_reset_forward("rs_going_away_d22_to_d16", D22, D16, 0x4u, 0x1u);
     (void)run_reset_forward("rs_unknown_same_draft", D18, D18, 0x4242u,
                             0x4242u);
     (void)run_reset_forward("rs_unknown_cross_draft", D18, D16, 0x4242u, 0x0u);

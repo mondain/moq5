@@ -36,6 +36,14 @@ yet active, or ended) are dropped, never fatal. Both wtquic backends
 (MsQuic and Network.framework) implement the datagram send; the MsQuic
 facade enables datagram receive through wtquic's default tuning.
 
+Buffer return is not delivery completion. When the WT session advertises the
+local-unidirectional ACK-through-FIN/resettable contract, the adapter enables
+it before sending and reports commitment only from `on_stream_send_committed`.
+Pending FIN streams remain resettable until their terminal outcome. STOP,
+reset and teardown never become successful commitment; a closed callback is
+not an ACK. Other backend modes remain unqualified for commitment reporting.
+This capability does not imply reliable-prefix reset support.
+
 **Status: experimental, opt-in, default-OFF.** The picoquic adapters
 remain the default transports.
 
@@ -48,7 +56,7 @@ These names look alike; they identify different things. Keep them distinct:
 | **msquic** | Direct MoQ over **raw QUIC** using Microsoft's MsQuic. A concrete transport backend, selected via the service backend enum `MOQ_TRANSPORT_BACKEND_MSQUIC`. |
 | **wtquic** | The **backend-neutral** attach bridge (`<moq/wtquic.h>`, `moq_wtquic_conn_*`) over the wtquic core. Not itself a transport backend — a session's actual backend is chosen underneath it — so it is deliberately **not** a backend enum value: bare `wtquic` names no upstream transport. |
 | **wtquic-network** | WebTransport over Apple's **Network.framework** (wtquic's `network` component). The managed facade is `<moq/wtquic_network_managed.h>` / `moq_wtquic_network_managed_*`; selected via `MOQ_TRANSPORT_BACKEND_WTQUIC_NETWORK` (Swift `.wtquicNetwork`). |
-| **wtquic-msquic** | WebTransport over **MsQuic** (wtquic's `msquic` component). The managed facade is `<moq/wtquic_msquic_managed.h>` / `moq_wtquic_msquic_managed_*` (target `moq::adapter-wtquic-msquic-managed`, package `libmoq-wtquic-msquic-managed`, build option `MOQ_BUILD_WTQUIC_MSQUIC_MANAGED`); selected via the service backend enum `MOQ_TRANSPORT_BACKEND_WTQUIC_MSQUIC`. Cross-platform wherever wtquic's MsQuic component builds; client-only; full multi-version WT-Protocol negotiation. Distinct from **msquic** (direct raw QUIC, no WebTransport) and **wtquic-network** (WebTransport over Network.framework). |
+| **wtquic-msquic** | WebTransport over **MsQuic** (wtquic's `msquic` component). The managed facade is `<moq/wtquic_msquic_managed.h>` / `moq_wtquic_msquic_managed_*` (target `moq::adapter-wtquic-msquic-managed`, package `libmoq-wtquic-msquic-managed`, build option `MOQ_BUILD_WTQUIC_MSQUIC_MANAGED`); selected via the service backend enum `MOQ_TRANSPORT_BACKEND_WTQUIC_MSQUIC`, where the service endpoint uses it as a client; the facade also accepts connections as a server (the relay's WebTransport listener uses it that way). Cross-platform wherever wtquic's MsQuic component builds; full multi-version WT-Protocol negotiation. Distinct from **msquic** (direct raw QUIC, no WebTransport) and **wtquic-network** (WebTransport over Network.framework). |
 
 The selectors above are the committed C backend enum
 (`MOQ_TRANSPORT_BACKEND_*` in `<moq/endpoint.h>`); there is no committed CLI
@@ -62,6 +70,9 @@ backend); libmoq does not rename them.
 ## Building
 
 wtquic must be installed and discoverable as a CMake package. The
+current integration candidate needs the reviewed CONNECT-metadata and
+ACK-through-FIN WT APIs; its private qualified prefix is required until the
+separately owned dependency release updates the setup pin. The
 standard path is the pinned setup script, which clones, builds and
 installs wtquic (at a known-good commit) into `.deps/wtquic-ci/` and
 prints the configure inputs:
@@ -115,11 +126,15 @@ links that backend's own `.pc` (e.g. `wtquic-msquic`). CMake is the fully
 supported consumer path.
 
 The public header is `<moq/wtquic.h>`; wiring, threading and session
-ownership are documented there. In short: create the MoQ session and
-the adapter conn, hand `moq_wtquic_conn_events()` (with the conn as
-user context) to `wtq_msquic_client_connect` or
-`wtq_msquic_listener_start`, and drive the session from the adapter
-hook, which runs on wtquic's transport worker. That worker is the only
+ownership are documented there. Create the MoQ session and a bootstrap callback
+context first. On WT establishment, set `cfg.wt_session`, create the adapter,
+and forward establishment and all subsequent events through the complete
+`moq_wtquic_conn_events()` table with the adapter as its user argument. The
+bootstrap table must also forward `on_stream_send_committed`; omitting it
+cannot be replaced by forwarding send-buffer completion. Keep the bootstrap
+context alive through provider quiescence, including refusal or failure before
+adapter creation. Drive the session from the adapter hook on wtquic's transport
+worker. That worker is the only
 thread that may make `moq_session_*` calls; the application thread
 communicates through its own synchronization and reads results the
 hook recorded. The MoQ session must outlive the conn, and the conn is

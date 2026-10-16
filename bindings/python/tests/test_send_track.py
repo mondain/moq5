@@ -267,7 +267,8 @@ class SendTrackGatedBase(SendTrackFixtureBase):
             config.codec, config.bitrate, config.timescale, config.init_data,
             config.role, config.lang, config.is_live, config.width,
             config.height, config.framerate_millis, config.samplerate,
-            config.channel_config, config.track_duration_ms)
+            config.channel_config, config.track_duration_ms,
+            config.track_properties, config.dynamic_groups)
 
     def sender_handle(self, sender):
         """The prepared retention layer: the sender's own capsule. Ownership
@@ -1067,7 +1068,7 @@ class SendTrackCancellationTests(SendTrackGatedBase):
                     _native.send_track_activate(
                         handle, int(moq5.MediaType.VIDEO),
                         int(moq5.Packaging.RAW), b"av01", "not-an-int",
-                        0, b"", b"", b"", True, 0, 0, 0, 0, b"", None)
+                        0, b"", b"", b"", True, 0, 0, 0, 0, b"", None, b"", False)
                 except TypeError as error:
                     kept = error
                 gc.collect()

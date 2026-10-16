@@ -35,6 +35,8 @@ void moq_wtquic_msquic_managed_public_probe_cxx(void)
      * result -- no lane, token, or size parameter may creep in */
     moq_result_t (*f_ack)(moq_wtquic_msquic_managed_conn_t *) =
         moq_wtquic_msquic_managed_conn_ack_terminal;
+    moq_result_t (*f_flush)(const moq_wtquic_msquic_managed_t *) =
+        moq_wtquic_msquic_managed_poll_flush;
 
     volatile moq_result_t r;
     volatile bool b;
@@ -87,6 +89,7 @@ void moq_wtquic_msquic_managed_public_probe_cxx(void)
     u16 = moq_wtquic_msquic_managed_port(m);
     r = moq_wtquic_msquic_managed_wake(m);
     r = moq_wtquic_msquic_managed_wait(m, 0);
+    r = f_flush(m);
     b = moq_wtquic_msquic_managed_is_fatal(m);
     u64 = moq_wtquic_msquic_managed_fatal_code(m);
     b = moq_wtquic_msquic_managed_is_closed(m);

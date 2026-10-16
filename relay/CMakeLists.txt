@@ -116,7 +116,12 @@ endforeach()
 
 if(MOQ_BUILD_RELAY_RUNTIME AND
    (MOQ_BUILD_TESTS OR MOQ_BUILD_RELAY_TOOL OR MOQ_BUILD_BENCHMARKS))
-    add_library(moq-relay-inspect OBJECT src/shard/moqr_shards.c)
+    # The inspected shard and binding form one private implementation boundary;
+    # shared-library consumers cannot resolve their hidden metadata helpers.
+    add_library(moq-relay-inspect OBJECT
+        src/shard/moqr_shards.c src/bind/moqr_bind.c)
+    set_target_properties(moq-relay-inspect PROPERTIES
+        C_VISIBILITY_PRESET hidden POSITION_INDEPENDENT_CODE ON)
     target_include_directories(moq-relay-inspect PUBLIC
         "${CMAKE_CURRENT_SOURCE_DIR}/private")
     target_compile_definitions(moq-relay-inspect PUBLIC

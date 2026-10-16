@@ -230,10 +230,15 @@ callback.
 These FETCHes are rejected:
 
 - standalone FETCH without authorization (see above) → `UNAUTHORIZED`
+- unknown track (authorized requests only) → `DOES_NOT_EXIST`
+- a track with nothing published, or a start past its Largest Object →
+  `INVALID_RANGE` (draft-18 and draft-22 require both; draft-16 requires the
+  start-past-Largest case, and the no-object answer there is library policy;
+  an ended track included)
 - range omits object 0 or any retained object → `NOT_SUPPORTED` (a partial
   range cannot reconstruct the catalog from the independent base + deltas)
-- unknown / ended / non-retained track (authorized requests only) →
-  `DOES_NOT_EXIST`
+- ended or non-retained track whose range starts within what was published
+  → `DOES_NOT_EXIST` (the cache no longer holds those objects)
 - retained location not encodable as a fetch End Location → `INTERNAL_ERROR`
 
 Standalone support is deliberately narrow: it is still origin-local, still

@@ -276,11 +276,11 @@ static void jf_hook_capture(const moq_session_t *s, void *vctx, void *vst)
     moq_request_endpoint_t ep =
         request_registry_find_by_streamref(s, ctx->fref);
     if (ep.kind == MOQ_REQ_SUBSCRIPTION) {
-        st->stage_recv_len = s->subs[ep.slot].req_recv_len;
-        st->stage_recv_fin = s->subs[ep.slot].req_recv_fin;
+        st->stage_recv_len = s->subs[ep.slot].rs.recv_len;
+        st->stage_recv_fin = s->subs[ep.slot].rs.recv_fin;
     } else if (ep.kind == MOQ_REQ_FETCH) {
-        st->stage_recv_len = s->fetches[ep.slot].req_recv_len;
-        st->stage_recv_fin = s->fetches[ep.slot].req_recv_fin;
+        st->stage_recv_len = s->fetches[ep.slot].rs.recv_len;
+        st->stage_recv_fin = s->fetches[ep.slot].rs.recv_fin;
     }
     st->send_len = s->send_len;
 }
@@ -617,6 +617,59 @@ int main(void)
         }
         MOQ_TEST_CHECK(got);
         MOQ_TEST_CHECK_EQ_INT(count_pending_joins(s), 0);
+        moq_session_destroy(s);
+    }
+
+    /* == Pending-subscribe Joining FETCH with the fetch pool full ======== *
+     *  Buffering the join needs a fetch slot. With none free the join is
+     *  refused on its own bidi -- REQUEST_ERROR EXCESSIVE_LOAD, "The responder
+     *  is overloaded and cannot process the request at this time" (§10.6),
+     *  retryable at once, with FIN (§3.3.2) -- and the session stays up. */
+    {
+        moq_session_t *s = make_server();
+        MOQ_TEST_CHECK(s != NULL);
+        (void)feed_pending_subscribe(s, moq_stream_ref_from_u64(0x7101), 0, true);
+        size_t cap = s->fetch_cap;
+        s->fetch_cap = 0;
+        uint8_t fb[160];
+        size_t fn = make_join_fetch(fb, sizeof(fb), 2, 0, 2 /*relative*/, 3, false);
+        moq_stream_ref_t fref = moq_stream_ref_from_u64(0x7102);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_bidi_stream_bytes(s, fref, fb, fn,
+                                                                    false, 1),
+                              (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
+        MOQ_TEST_CHECK_EQ_INT(count_pending_joins(s), 0);
+        bool refused = false;
+        moq_action_t a;
+        while (moq_session_poll_actions(s, &a, 1) > 0) {
+            MOQ_TEST_CHECK(a.kind != MOQ_ACTION_CLOSE_SESSION);
+            if (a.kind == MOQ_ACTION_SEND_BIDI_STREAM &&
+                a.u.send_bidi_stream.stream_ref._v == fref._v) {
+                moq_buf_reader_t rr;
+                moq_buf_reader_init(&rr, a.u.send_bidi_stream.data,
+                                    a.u.send_bidi_stream.len);
+                moq_control_envelope_t env;
+                moq_d18_request_error_t er;
+                if (moq_d18_decode_envelope(&rr, &env) == MOQ_OK &&
+                    env.msg_type == MOQ_D18_REQUEST_ERROR &&
+                    moq_d18_decode_request_error(env.payload, env.payload_len,
+                                                 &er) == MOQ_OK) {
+                    MOQ_TEST_CHECK_EQ_U64(er.error_code,
+                                          MOQ_REQUEST_ERROR_EXCESSIVE_LOAD);
+                    MOQ_TEST_CHECK_EQ_U64(er.retry_interval, 1);
+                    MOQ_TEST_CHECK(a.u.send_bidi_stream.fin);
+                    refused = true;
+                }
+            }
+            moq_action_cleanup(&a);
+        }
+        MOQ_TEST_CHECK(refused);
+        /* The requester's FIN on the refused bidi is absorbed. */
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_bidi_stream_bytes(s, fref, NULL, 0,
+                                                                    true, 2),
+                              (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
+        s->fetch_cap = cap;
         moq_session_destroy(s);
     }
 
@@ -1255,7 +1308,7 @@ int main(void)
             MOQ_TEST_CHECK_EQ_INT((int)s->subs[stage_slot].state,
                                   (int)MOQ_SUB_RECVING_REQUEST);
             uint32_t gen_before = s->subs[stage_slot].generation;
-            MOQ_TEST_CHECK(s->subs[stage_slot].req_recv_len > 0);
+            MOQ_TEST_CHECK(s->subs[stage_slot].rs.recv_len > 0);
             fp_map_snap_t m0;
             fp_map_capture(&fs, &m0);
 
@@ -1277,8 +1330,8 @@ int main(void)
                                   (int)MOQ_SUB_FREE);
             MOQ_TEST_CHECK_EQ_U64(s->subs[stage_slot].generation,
                                   gen_before + 1);
-            MOQ_TEST_CHECK_EQ_SIZE(s->subs[stage_slot].req_recv_len, 0u);
-            MOQ_TEST_CHECK(!s->subs[stage_slot].req_recv_fin);
+            MOQ_TEST_CHECK_EQ_SIZE(s->subs[stage_slot].rs.recv_len, 0u);
+            MOQ_TEST_CHECK(!s->subs[stage_slot].rs.recv_fin);
             failures += fp_map_equals(&fs, &m0, "join-frag");
             failures += hooks.check(s, hooks.ctx, &h_pre);
             moq_event_t ev;

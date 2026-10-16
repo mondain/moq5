@@ -1,0 +1,4 @@
+# picotls patches LibMoQ applies, in order. Read by
+# scripts/setup_picoquic_deps.sh and scripts/provider_patches.sh.
+0001-initialize-compiler-visible-scratch.patch
+0002-minicrypto-distinct-chacha20-object.patch

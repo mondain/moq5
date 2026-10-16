@@ -29,6 +29,7 @@
 #include <moq/mvfst.h>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 
 namespace quic {
@@ -70,6 +71,20 @@ namespace moq::mvfst {
  *
  * moq_rcbuf_t refcounts are intentionally non-atomic, so all
  * incref/decref must be confined to a single thread.
+ *
+ * Transport binding: a session whose wire profile requires one
+ * (moq_session_binding_requirements() != 0, e.g. draft-22) must be bound
+ * by the attaching caller with moq_session_bind_transport() before
+ * moq_session_start(): kind MOQ_BINDING_RAW_QUIC, the handshake-complete
+ * fact once the socket reports the peer's transport parameters
+ * (getPeerTransportParams()), QUIC DATAGRAM support from the local
+ * transport settings (receive) and the peer's max_datagram_frame_size
+ * (send), and the connection target -- the client's authority and
+ * path/query, the server's accept_uri policy. A profile without
+ * requirements (draft-16, draft-18) accepts the same binding optionally,
+ * with no facts needed: a client connecting to a moqt URI binds its target
+ * before moq_session_start() so its setup names it. The adapter itself never
+ * binds or starts the session; the managed facade in <moq/mvfst.h> does.
  */
 class MOQ_API adapter {
 public:
@@ -115,6 +130,18 @@ public:
      * service() after any moq_session_t API that may queue actions.
      */
     bool has_pending() const noexcept;
+
+    /*
+     * Runs `fn` on the EventBase thread when the socket reports its
+     * handshake complete (onTransportReady), before the adapter services
+     * the session or delivers any inbound stream. This is where an attaching
+     * caller binds a session whose profile requires a transport binding
+     * (moq_session_bind_transport) and starts it: the peer's transport
+     * parameters are known here and no byte has reached the session yet.
+     * At most one hook; a later call replaces it. Not invoked if the
+     * handshake already completed before it was set.
+     */
+    void on_transport_ready(std::function<void()> fn);
 
 private:
     struct impl;

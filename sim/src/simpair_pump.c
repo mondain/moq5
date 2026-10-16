@@ -48,10 +48,8 @@ void sim_stream_map_remove(moq_simpair_t *sp, uint64_t sender_ref,
                            moq_perspective_t sender)
 {
     int slot = sim_stream_map_find(sp, sender_ref, sender);
-    if (slot >= 0) {
-        sp->stream_map[slot].active = false;
-        sp->stream_map[slot].generation++;
-    }
+    if (slot >= 0)
+        sim_stream_slot_retire(sp, slot);
 }
 
 /* -- Bidi stream map ----------------------------------------------- */
@@ -124,7 +122,7 @@ moq_result_t pump_direction(moq_simpair_t *sp,
                         if (sp->stream_map[j].active &&
                             sp->stream_map[j].receiver_ref == stop_ref &&
                             sp->stream_map[j].sender != from) {
-                            sp->stream_map[j].active = false;
+                            sim_stream_slot_deactivate(sp, j);
                             break;
                         }
                     }
@@ -136,6 +134,8 @@ moq_result_t pump_direction(moq_simpair_t *sp,
             if (actions[i].kind == MOQ_ACTION_SEND_CONTROL ||
                 actions[i].kind == MOQ_ACTION_OPEN_UNI_CONTROL ||
                 actions[i].kind == MOQ_ACTION_SEND_UNI_CONTROL) {
+                if (actions[i].kind != MOQ_ACTION_SEND_CONTROL)
+                    sp->ctrl_uni_pair[sim_side(to)] = true;
                 /* A unidirectional control-channel pair carries the same control
                  * bytes as a single bidirectional control channel; route both
                  * through the control delivery path so either control topology
@@ -331,7 +331,7 @@ moq_result_t pump_direction(moq_simpair_t *sp,
                     if (dslot >= 0) {
                         sp->stream_map[dslot].generation++;
                         if (map_created)
-                            sp->stream_map[dslot].active = false;
+                            sim_stream_slot_deactivate(sp, dslot);
                     }
                     moq_action_cleanup(&actions[i]);
                     for (size_t j = i + 1; j < n; j++)
@@ -415,8 +415,7 @@ moq_result_t pump_direction(moq_simpair_t *sp,
                         sp, to_session, peer_ref, bdata, blen, bopen_fin,
                         *delivered - 1, bslot, from, to);
                     if (rc < 0) {
-                        sp->bidi_map[bslot].active = false;
-                        sp->bidi_map[bslot].generation++;
+                        sim_bidi_slot_retire(sp, bslot);
                         moq_action_cleanup(&actions[i]);
                         for (size_t j = i + 1; j < n; j++)
                             moq_action_cleanup(&actions[j]);
@@ -575,11 +574,8 @@ moq_result_t pump_direction(moq_simpair_t *sp,
             else if (actions[i].kind == MOQ_ACTION_SEND_DATAGRAM) {
                 const uint8_t *dgdata = actions[i].u.send_datagram.data;
                 size_t dglen = actions[i].u.send_datagram.len;
-                moq_bytes_t bytes = { dgdata, dglen };
-                moq_result_t rc = moq_session_on_datagram(
-                    to_session, dgdata, dglen, sp->now_us);
-                trace_input(sp, MOQ_SIM_INPUT_DATAGRAM, from, to,
-                            bytes, rc, SIM_INPUT_DETAIL_NONE);
+                moq_result_t rc = sim_datagram_input(
+                    sp, to_session, dgdata, dglen, from, to);
                 if (rc < 0) {
                     moq_action_cleanup(&actions[i]);
                     for (size_t j = i + 1; j < n; j++)
@@ -706,8 +702,8 @@ moq_result_t pump_direction(moq_simpair_t *sp,
 
     /* Close injection: feed a malformed control envelope (unknown
      * message type 0xFF, zero-length payload) to the target session.
-     * This triggers close_with_error(0x3, "unknown control message
-     * type") through the real public input path. */
+     * Use the target's framing: D16 QUIC varint, D18/D22 vi64. Both
+     * envelopes trigger a protocol close (0x3) through public input. */
     if (sp->fault_enabled && sp->fault_per_mille > 0 &&
         (sp->fault_flags & MOQ_SIM_FAULT_INJECT_CLOSE) &&
         moq_session_state(to_session) != MOQ_SESS_CLOSED) {
@@ -715,12 +711,21 @@ moq_result_t pump_direction(moq_simpair_t *sp,
         x ^= sp->step * 0x9E3779B97F4A7C15ULL;
         x ^= (uint64_t)from * 0x517CC1B727220A95ULL;
         if ((sim_mix64(x) % 1000) < sp->fault_per_mille) {
-            static const uint8_t bad_msg[4] = {
+            static const uint8_t bad_d16[4] = {
                 0x40, 0xFF,   /* QUIC varint 255 (unknown type) */
                 0x00, 0x00    /* uint16 payload length = 0 */
             };
+            static const uint8_t bad_vi64[4] = {
+                0x80, 0xFF,   /* vi64 255 (unknown type) */
+                0x00, 0x00    /* uint16 payload length = 0 */
+            };
+            moq_version_t version = moq_session_version(to_session);
+            const uint8_t *bad_msg =
+                (version == MOQ_VERSION_DRAFT_18 ||
+                 version == MOQ_VERSION_DRAFT_22) ? bad_vi64 : bad_d16;
+            size_t bad_len = sizeof(bad_d16);
             moq_result_t rc = moq_session_on_control_bytes(
-                to_session, bad_msg, sizeof(bad_msg), sp->now_us);
+                to_session, bad_msg, bad_len, sp->now_us);
 
             moq_sim_trace_record_t r;
             memset(&r, 0, sizeof(r));
@@ -734,13 +739,13 @@ moq_result_t pump_direction(moq_simpair_t *sp,
             r.action_kind = MOQ_ACTION_CLOSE_SESSION;
             r.code = 0x3;
             r.bytes.data = bad_msg;
-            r.bytes.len = sizeof(bad_msg);
+            r.bytes.len = bad_len;
             r.result = rc;
             trace_record(sp, &r);
 
             trace_input(sp, MOQ_SIM_INPUT_CONTROL_BYTES,
                         from, to,
-                        (moq_bytes_t){ bad_msg, sizeof(bad_msg) }, rc,
+                        (moq_bytes_t){ bad_msg, bad_len }, rc,
                         SIM_INPUT_DETAIL_NONE);
 
             (*delivered)++;

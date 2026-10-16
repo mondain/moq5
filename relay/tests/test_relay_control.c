@@ -18,6 +18,7 @@
 #include <string.h>
 
 #include "../../tests/unit/test_support.h"
+#include "../src/core/retrieve_internal.h"
 
 /* These control tests assert delivery ordering at a single fixed instant;
  * they do not advance a clock. A retire triggered here (range completion /
@@ -29,6 +30,7 @@
 typedef struct ca {
     moq_alloc_t vt;
     long allocs, frees, live;
+    bool fail_next;
 } ca_t;
 /* An upstream terminal arrives in some connection's draft; these rigs speak
  * draft-16 unless a case says otherwise. */
@@ -69,6 +71,10 @@ rd_wire(uint64_t code)
 static void *ca_a(size_t n, void *c)
 {
     ca_t *a = c;
+    if (a->fail_next) {
+        a->fail_next = false;
+        return NULL;
+    }
     void *p = malloc(n);
     if (p) {
         a->allocs++;
@@ -410,6 +416,667 @@ test_filters_and_range(void)
     moqr_core_destroy(c);
     MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
     MOQ_TEST_PASS("filters_and_range");
+    return failures;
+}
+
+/* A replaced filter is resolved as the request's own would be and bounds what
+ * the cursor has not yet passed: a raised start narrows delivery, a lowered
+ * start keeps the current one (nothing passed is revisited), the end is
+ * replaced freely and a bounded window still retires on completion. A parked
+ * subscription remembers the replacement and resolves it at upstream
+ * acceptance. Argument errors leave the subscription untouched; a retired
+ * handle is stale. */
+static int
+test_largest_object_successor(uint64_t largest_object, bool deferred, bool update)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, NULL);
+    MOQ_TEST_CHECK(c != NULL);
+    if (c == NULL) return failures;
+    moqr_binding_t pub, b;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 1, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 2, &b) == MOQR_OK);
+    moq_bytes_t nsb[2];
+    moqr_ns_t ns = NS2(nsb, "largest", "successor");
+    MOQ_TEST_CHECK(moqr_core_announce(c, pub, ns) == MOQR_OK);
+    moqr_track_t track;
+    moqr_intent_t its[8];
+    if (!deferred) {
+        MOQ_TEST_CHECK(moqr_core_publish_open(c, pub, ns, B("t"), 5, &track) == MOQR_OK);
+        MOQ_TEST_CHECK_EQ_SIZE(drain(c, its, 8), 1u);
+        MOQ_TEST_CHECK(its[0].kind == MOQR_INTENT_ACCEPT_PUBLISH);
+        MOQ_TEST_CHECK(ing(c, &a, track, 5, 0, largest_object, 128) == MOQR_OK);
+    }
+    moqr_subscribe_req_t rq;
+    moqr_subscribe_req_init(&rq);
+    rq.ns = ns;
+    rq.name = B("t");
+    rq.filter.type = update ? MOQR_FILTER_ABSOLUTE_START : MOQR_FILTER_LARGEST_OBJECT;
+    moqr_sub_t sub;
+    MOQ_TEST_CHECK(moqr_core_subscribe(c, b, &rq, &sub) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_SIZE(drain(c, its, 8), 1u);
+    if (deferred) {
+        MOQ_TEST_CHECK(its[0].kind == MOQR_INTENT_UPSTREAM_SUBSCRIBE);
+        track = its[0].track;
+        moqr_sub_state_t state;
+        MOQ_TEST_CHECK(moqr_core_sub_state(c, sub, &state) == MOQR_OK &&
+                       state == MOQR_SUB_PARKED);
+    }
+    if (update) {
+        moqr_filter_t f = { .type = MOQR_FILTER_LARGEST_OBJECT };
+        MOQ_TEST_CHECK(moqr_core_sub_set_filter(c, sub, &f, CTRL_NOW) == MOQR_OK);
+    }
+    if (deferred) {
+        MOQ_TEST_CHECK(moqr_core_upstream_ok(c, track, its[0].track_gen, 9,
+                                            true, 5, largest_object) == MOQR_OK);
+        MOQ_TEST_CHECK_EQ_SIZE(drain(c, its, 8), 1u);
+        MOQ_TEST_CHECK(ing(c, &a, track, 5, 0, largest_object, 128) == MOQR_OK);
+    }
+    MOQ_TEST_CHECK(its[0].kind == MOQR_INTENT_ACCEPT_SUB && its[0].has_largest);
+    MOQ_TEST_CHECK(its[0].largest_group == 5 && its[0].largest_object == largest_object);
+
+    /* Neither retained Largest nor reordered lower objects pass. A subsequent
+     * lowered filter must preserve the resolved lower bound, even after carry. */
+    for (unsigned step = 0; step < 3; step++) {
+        if (step == 1) {
+            MOQ_TEST_CHECK(ing(c, &a, track, 5, 1, 1, 128) == MOQR_OK);
+        } else if (step == 2) {
+            moqr_filter_t f = { .type = MOQR_FILTER_ABSOLUTE_START };
+            MOQ_TEST_CHECK(moqr_core_sub_set_filter(c, sub, &f, CTRL_NOW) == MOQR_OK);
+            MOQ_TEST_CHECK(ing(c, &a, track, 5, 2, 0, 128) == MOQR_OK);
+        }
+        moqr_delivery_t d;
+        moqr_result_t rc = moqr_core_next_delivery(c, b, CTRL_NOW, &d);
+        MOQ_TEST_CHECK(rc == MOQR_DONE);
+        if (rc == MOQR_OK) {
+            MOQ_TEST_CHECK(moqr_core_delivery_done(c, b, MOQR_DELIVERY_DELIVERED,
+                                                   CTRL_NOW) == MOQR_OK);
+        }
+    }
+    unsigned delivered = largest_object < UINT64_MAX ? 2u : 1u;
+    for (unsigned i = 0; i < delivered; i++) {
+        uint64_t g = i + 1 == delivered ? 6 : 5;
+        uint64_t o = g == 6 ? 0 : largest_object + 1;
+        MOQ_TEST_CHECK(ing(c, &a, track, g, 0, o, 128) == MOQR_OK);
+        moqr_delivery_t d;
+        moqr_result_t rc = moqr_core_next_delivery(c, b, CTRL_NOW, &d);
+        MOQ_TEST_CHECK(rc == MOQR_OK);
+        if (rc == MOQR_OK) {
+            MOQ_TEST_CHECK(d.rec.group_id == g && d.rec.object_id == o);
+            MOQ_TEST_CHECK(moqr_core_delivery_done(c, b, MOQR_DELIVERY_DELIVERED,
+                                                   CTRL_NOW) == MOQR_OK);
+        }
+        MOQ_TEST_CHECK(moqr_core_next_delivery(c, b, CTRL_NOW, &d) == MOQR_DONE);
+    }
+    moqr_core_stats_t stats;
+    moqr_core_get_stats(c, &stats);
+    MOQ_TEST_CHECK_EQ_U64(stats.delivered_total, delivered);
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    printf("ORACLE largest_object_successor largest=%llu deferred=%u update=%u failures=%d\n",
+           (unsigned long long)largest_object, (unsigned)deferred, (unsigned)update, failures);
+    MOQ_TEST_PASS("largest_object_successor");
+    return failures;
+}
+
+static int
+test_sub_set_filter(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, NULL);
+    MOQ_TEST_CHECK(c != NULL);
+    moqr_binding_t pub, s1, s2;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 1, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 2, &s1) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 3, &s2) == MOQR_OK);
+    moq_bytes_t nsb[2];
+    MOQ_TEST_CHECK(moqr_core_announce(c, pub, NS2(nsb, "n", "s")) == MOQR_OK);
+    moqr_track_t track;
+    MOQ_TEST_CHECK(moqr_core_publish_open(c, pub, NS2(nsb, "n", "s"),
+                                          B("t"), 5, &track) == MOQR_OK);
+    moqr_intent_t its[8];
+    MOQ_TEST_CHECK_EQ_SIZE(drain(c, its, 8), (size_t)1);
+    for (uint64_t g = 1; g <= 2; g++) {
+        for (uint64_t o = 0; o < 3; o++) {
+            MOQ_TEST_CHECK(ing(c, &a, track, g, 0, o, 128) == MOQR_OK);
+        }
+    }
+
+    /* Active: Next Object admits nothing retained (start {2,3}). */
+    moqr_subscribe_req_t rq;
+    moqr_subscribe_req_init(&rq);
+    rq.ns = NS2(nsb, "n", "s");
+    rq.name = B("t");
+    rq.filter.type = MOQR_FILTER_LARGEST_OBJECT;
+    rq.cookie = 1;
+    moqr_sub_t sub;
+    MOQ_TEST_CHECK(moqr_core_subscribe(c, s1, &rq, &sub) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_SIZE(drain(c, its, 8), (size_t)1);
+    moqr_delivery_t d;
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, s1, CTRL_NOW, &d) == MOQR_DONE);
+
+    /* Argument errors change nothing. */
+    moqr_filter_t f = { .type = 9u };
+    MOQ_TEST_CHECK(moqr_core_sub_set_filter(c, sub, &f, CTRL_NOW) == MOQR_ERR_INVAL);
+    f = (moqr_filter_t){ .type = MOQR_FILTER_ABSOLUTE_RANGE, .start_group = 5,
+                         .end_group_delta = UINT64_MAX };
+    MOQ_TEST_CHECK(moqr_core_sub_set_filter(c, sub, &f, CTRL_NOW) == MOQR_ERR_INVAL);
+    MOQ_TEST_CHECK(moqr_core_sub_set_filter(c, sub, NULL, CTRL_NOW) == MOQR_ERR_INVAL);
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, s1, CTRL_NOW, &d) == MOQR_DONE);
+
+    /* A lowered start keeps the frontier: the passed retained records are not
+     * re-sent, a late arrival below the former start is not scheduled, and
+     * the live edge flows. */
+    f = (moqr_filter_t){ .type = MOQR_FILTER_ABSOLUTE_START, .start_group = 1,
+                         .start_object = 0 };
+    MOQ_TEST_CHECK(moqr_core_sub_set_filter(c, sub, &f, CTRL_NOW) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, s1, CTRL_NOW, &d) == MOQR_DONE);
+    MOQ_TEST_CHECK(ing(c, &a, track, 1, 1, 5, 128) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, s1, CTRL_NOW, &d) == MOQR_DONE);
+    MOQ_TEST_CHECK(ing(c, &a, track, 2, 0, 3, 128) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, s1, CTRL_NOW, &d) == MOQR_OK);
+    MOQ_TEST_CHECK(d.rec.group_id == 2 && d.rec.object_id == 3);
+    MOQ_TEST_CHECK(moqr_core_delivery_done(c, s1, MOQR_DELIVERY_DELIVERED,
+                                           CTRL_NOW) == MOQR_OK);
+
+    /* A raised start narrows: the rest of group 2 is skipped, group 3 is
+     * served. */
+    f = (moqr_filter_t){ .type = MOQR_FILTER_ABSOLUTE_START, .start_group = 3,
+                         .start_object = 0 };
+    MOQ_TEST_CHECK(moqr_core_sub_set_filter(c, sub, &f, CTRL_NOW) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, track, 2, 0, 4, 128) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, s1, CTRL_NOW, &d) == MOQR_DONE);
+    MOQ_TEST_CHECK(ing(c, &a, track, 3, 0, 0, 128) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, s1, CTRL_NOW, &d) == MOQR_OK);
+    MOQ_TEST_CHECK(d.rec.group_id == 3 && d.rec.object_id == 0);
+    MOQ_TEST_CHECK(moqr_core_delivery_done(c, s1, MOQR_DELIVERY_DELIVERED,
+                                           CTRL_NOW) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_SIZE(drain(c, its, 8), (size_t)0);   /* open-ended */
+
+    /* A bounded window ending at group 3 retires once group 4 arrives. */
+    f = (moqr_filter_t){ .type = MOQR_FILTER_ABSOLUTE_RANGE, .start_group = 3,
+                         .start_object = 0, .end_group_delta = 0 };
+    MOQ_TEST_CHECK(moqr_core_sub_set_filter(c, sub, &f, CTRL_NOW) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, track, 3, 0, 1, 128) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, s1, CTRL_NOW, &d) == MOQR_OK);
+    MOQ_TEST_CHECK(d.rec.group_id == 3 && d.rec.object_id == 1);
+    MOQ_TEST_CHECK(moqr_core_delivery_done(c, s1, MOQR_DELIVERY_DELIVERED,
+                                           CTRL_NOW) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, track, 4, 0, 0, 128) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, s1, CTRL_NOW, &d) == MOQR_DONE);
+    size_t n = drain(c, its, 8);
+    MOQ_TEST_CHECK_EQ_SIZE(n, (size_t)1);
+    MOQ_TEST_CHECK_EQ_U64(its[0].kind, MOQR_INTENT_SUB_DONE);
+    MOQ_TEST_CHECK(moqr_core_sub_set_filter(c, sub, &f, CTRL_NOW) ==
+                   MOQR_ERR_STALE_HANDLE);
+
+    /* Parked: the replacement is what resolves at upstream acceptance. */
+    MOQ_TEST_CHECK(moqr_core_announce(c, pub, NS2(nsb, "n", "p")) == MOQR_OK);
+    moqr_subscribe_req_init(&rq);
+    rq.ns = NS2(nsb, "n", "p");
+    rq.name = B("t");
+    rq.filter.type = MOQR_FILTER_LARGEST_OBJECT;
+    rq.cookie = 2;
+    moqr_sub_t parked;
+    MOQ_TEST_CHECK(moqr_core_subscribe(c, s2, &rq, &parked) == MOQR_OK);
+    n = drain(c, its, 8);
+    MOQ_TEST_CHECK_EQ_SIZE(n, (size_t)1);
+    MOQ_TEST_CHECK_EQ_U64(its[0].kind, MOQR_INTENT_UPSTREAM_SUBSCRIBE);
+    moqr_track_t ptrack = its[0].track;
+    uint64_t pgen = its[0].track_gen;
+    moqr_sub_state_t st;
+    MOQ_TEST_CHECK(moqr_core_sub_state(c, parked, &st) == MOQR_OK &&
+                   st == MOQR_SUB_PARKED);
+    f = (moqr_filter_t){ .type = MOQR_FILTER_ABSOLUTE_START, .start_group = 1,
+                         .start_object = 0 };
+    MOQ_TEST_CHECK(moqr_core_sub_set_filter(c, parked, &f, CTRL_NOW) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_upstream_ok(c, ptrack, pgen, 9, true, 2, 2) == MOQR_OK);
+    n = drain(c, its, 8);
+    MOQ_TEST_CHECK_EQ_SIZE(n, (size_t)1);
+    MOQ_TEST_CHECK_EQ_U64(its[0].kind, MOQR_INTENT_ACCEPT_SUB);
+    /* Group 1 arrives below Largest {2,2}: Next Object would skip it; the
+     * replaced absolute start admits it. */
+    MOQ_TEST_CHECK(ing(c, &a, ptrack, 1, 0, 0, 128) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, s2, CTRL_NOW, &d) == MOQR_OK);
+    MOQ_TEST_CHECK(d.rec.group_id == 1 && d.rec.object_id == 0);
+    MOQ_TEST_CHECK(moqr_core_delivery_done(c, s2, MOQR_DELIVERY_DELIVERED,
+                                           CTRL_NOW) == MOQR_OK);
+
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("sub_set_filter");
+    return failures;
+}
+
+/* Count the deliveries pending for a binding, checking each is at or past
+ * group `from`; every one is consumed. */
+static size_t
+drain_deliveries_from(moqr_core_t *c, moqr_binding_t b, uint64_t from,
+                      int *pf)
+{
+    int failures = 0;
+    size_t n = 0;
+    moqr_delivery_t d;
+    while (moqr_core_next_delivery(c, b, CTRL_NOW, &d) == MOQR_OK) {
+        MOQ_TEST_CHECK(d.rec.group_id >= from);
+        n++;
+        MOQ_TEST_CHECK(moqr_core_delivery_done(c, b, MOQR_DELIVERY_DELIVERED,
+                                               CTRL_NOW) == MOQR_OK);
+    }
+    *pf += failures;
+    return n;
+}
+
+/* A relative start at any depth (the draft-22 relative Location Filter):
+ * StartGroup N starts at {Largest Object.Group + 1 - N, 0}, clamped at group
+ * 0, so a filter reaching before the track's first group serves all that is
+ * retained. A parked subscription resolves it against the Largest its
+ * upstream reports. The track's Largest is readable from its handle. */
+static int
+test_relative_start(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, NULL);
+    MOQ_TEST_CHECK(c != NULL);
+    moqr_binding_t pub, s1;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 1, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 2, &s1) == MOQR_OK);
+    moq_bytes_t nsb[2];
+    MOQ_TEST_CHECK(moqr_core_announce(c, pub, NS2(nsb, "n", "s")) == MOQR_OK);
+    moqr_track_t track;
+    MOQ_TEST_CHECK(moqr_core_publish_open(c, pub, NS2(nsb, "n", "s"),
+                                          B("t"), 5, &track) == MOQR_OK);
+    moqr_intent_t its[8];
+    MOQ_TEST_CHECK_EQ_SIZE(drain(c, its, 8), (size_t)1);
+    moqr_track_t tk = its[0].track;
+    uint64_t tgen = its[0].track_gen;
+    bool has = true;
+    uint64_t lg = 7, lo = 7;
+    MOQ_TEST_CHECK(moqr_core_track_largest(c, tk, tgen, &has, &lg, &lo) ==
+                   MOQR_OK);
+    MOQ_TEST_CHECK(!has && lg == 0 && lo == 0);
+    for (uint64_t g = 0; g <= 3; g++) {
+        for (uint64_t o = 0; o < 3; o++) {
+            MOQ_TEST_CHECK(ing(c, &a, track, g, 0, o, 128) == MOQR_OK);
+        }
+    }
+    MOQ_TEST_CHECK(moqr_core_track_largest(c, tk, tgen, &has, &lg, &lo) ==
+                   MOQR_OK);
+    MOQ_TEST_CHECK(has && lg == 3 && lo == 2);
+    MOQ_TEST_CHECK(moqr_core_track_largest(c, tk, tgen + 1, &has, &lg, &lo) ==
+                   MOQR_ERR_STALE_HANDLE);
+    MOQ_TEST_CHECK(moqr_core_track_largest(c, tk, tgen, NULL, &lg, &lo) ==
+                   MOQR_ERR_INVAL);
+
+    /* Largest {3,2}: N=0 starts at {4,0}; N=2 at {2,0}; N=4 at {0,0}; N=9
+     * reaches before group 0 and is clamped there. */
+    static const struct { uint64_t n, from; size_t count; } cases[4] = {
+        { 0, 4, 0 }, { 2, 2, 6 }, { 4, 0, 12 }, { 9, 0, 12 },
+    };
+    for (int i = 0; i < 4; i++) {
+        moqr_subscribe_req_t rq;
+        moqr_subscribe_req_init(&rq);
+        rq.ns = NS2(nsb, "n", "s");
+        rq.name = B("t");
+        rq.filter.type = MOQR_FILTER_RELATIVE_START;
+        rq.filter.start_group = cases[i].n;
+        rq.cookie = 10u + (uint64_t)i;
+        moqr_sub_t sub;
+        MOQ_TEST_CHECK(moqr_core_subscribe(c, s1, &rq, &sub) == MOQR_OK);
+        MOQ_TEST_CHECK_EQ_SIZE(drain(c, its, 8), (size_t)1);
+        MOQ_TEST_CHECK(its[0].kind == MOQR_INTENT_ACCEPT_SUB);
+        MOQ_TEST_CHECK_EQ_SIZE(drain_deliveries_from(c, s1, cases[i].from,
+                                                     &failures),
+                               cases[i].count);
+        MOQ_TEST_CHECK(moqr_core_unsubscribe(c, sub, 10) == MOQR_OK);
+        (void)drain(c, its, 8);
+    }
+
+    /* Parked: StartGroup 2 resolves at upstream acceptance against the
+     * Largest {5,0} the upstream reports, so the start is {4,0}. A group-3
+     * arrival is below it; group 4 is delivered. */
+    MOQ_TEST_CHECK(moqr_core_announce(c, pub, NS2(nsb, "n", "p")) == MOQR_OK);
+    moqr_subscribe_req_t rq;
+    moqr_subscribe_req_init(&rq);
+    rq.ns = NS2(nsb, "n", "p");
+    rq.name = B("t");
+    rq.filter.type = MOQR_FILTER_RELATIVE_START;
+    rq.filter.start_group = 2;
+    rq.cookie = 20;
+    moqr_sub_t parked;
+    MOQ_TEST_CHECK(moqr_core_subscribe(c, s1, &rq, &parked) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_SIZE(drain(c, its, 8), (size_t)1);
+    MOQ_TEST_CHECK_EQ_U64(its[0].kind, MOQR_INTENT_UPSTREAM_SUBSCRIBE);
+    moqr_track_t ptrack = its[0].track;
+    uint64_t pgen = its[0].track_gen;
+    MOQ_TEST_CHECK(moqr_core_upstream_ok(c, ptrack, pgen, 9, true, 5, 0) ==
+                   MOQR_OK);
+    MOQ_TEST_CHECK_EQ_SIZE(drain(c, its, 8), (size_t)1);
+    MOQ_TEST_CHECK_EQ_U64(its[0].kind, MOQR_INTENT_ACCEPT_SUB);
+    MOQ_TEST_CHECK(ing(c, &a, ptrack, 3, 0, 0, 128) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, ptrack, 4, 0, 0, 128) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_SIZE(drain_deliveries_from(c, s1, 4, &failures),
+                           (size_t)1);
+
+    /* The type range is enforced: one past RELATIVE_START is refused. */
+    moqr_subscribe_req_init(&rq);
+    rq.ns = NS2(nsb, "n", "s");
+    rq.name = B("t");
+    rq.filter.type = MOQR_FILTER_RELATIVE_START + 1u;
+    moqr_sub_t bad;
+    MOQ_TEST_CHECK(moqr_core_subscribe(c, s1, &rq, &bad) == MOQR_ERR_INVAL);
+
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("relative_start");
+    return failures;
+}
+
+/* Location-filter forms the draft-22 binding maps onto the relay filter model:
+ * a relative start one group back (the current group) resolves to
+ * {Largest Object.Group, 0}, and a bounded range on a subscription that holds
+ * at its end keeps the subscription established and idle rather than retiring
+ * it with PUBLISH_DONE. The track-key query is what lets a fill locate the
+ * retained log from a subscription handle alone. */
+static int
+test_current_group_and_range_hold(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, NULL);
+    MOQ_TEST_CHECK(c != NULL);
+    moqr_binding_t pub, s1;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 1, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 2, &s1) == MOQR_OK);
+    moq_bytes_t nsb[2];
+    MOQ_TEST_CHECK(moqr_core_announce(c, pub, NS2(nsb, "n", "s")) == MOQR_OK);
+    moqr_track_t track;
+    MOQ_TEST_CHECK(moqr_core_publish_open(c, pub, NS2(nsb, "n", "s"),
+                                          B("t"), 5, &track) == MOQR_OK);
+    moqr_intent_t its[8];
+    MOQ_TEST_CHECK_EQ_SIZE(drain(c, its, 8), (size_t)1);
+    for (uint64_t g = 0; g <= 1; g++) {
+        for (uint64_t o = 0; o < 3; o++) {
+            MOQ_TEST_CHECK(ing(c, &a, track, g, 0, o, 128) == MOQR_OK);
+        }
+    }
+
+    /* CURRENT_GROUP_START with Largest Object {1,2}: starts at {1,0}, so
+     * group 0 is not delivered and all of group 1 is. */
+    moqr_subscribe_req_t rq;
+    moqr_subscribe_req_init(&rq);
+    rq.ns = NS2(nsb, "n", "s");
+    rq.name = B("t");
+    rq.filter.type = MOQR_FILTER_CURRENT_GROUP_START;
+    rq.cookie = 1;
+    moqr_sub_t cur_sub;
+    MOQ_TEST_CHECK(moqr_core_subscribe(c, s1, &rq, &cur_sub) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_SIZE(drain(c, its, 8), (size_t)1);
+    MOQ_TEST_CHECK(its[0].kind == MOQR_INTENT_ACCEPT_SUB &&
+                   its[0].has_largest && its[0].largest_group == 1 &&
+                   its[0].largest_object == 2);
+    moqr_delivery_t d;
+    size_t got_n = 0;
+    for (;;) {
+        moqr_result_t rc = moqr_core_next_delivery(c, s1, CTRL_NOW, &d);
+        if (rc != MOQR_OK) {
+            break;
+        }
+        MOQ_TEST_CHECK_EQ_U64(d.rec.group_id, 1);
+        MOQ_TEST_CHECK_EQ_U64(d.rec.object_id, got_n);
+        got_n++;
+        MOQ_TEST_CHECK(moqr_core_delivery_done(
+                           c, s1, MOQR_DELIVERY_DELIVERED, CTRL_NOW) == MOQR_OK);
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(got_n, (size_t)3);
+    /* The subscription's track identity is reachable from its handle. */
+    moqr_track_t st;
+    uint64_t sgen = 0;
+    MOQ_TEST_CHECK(moqr_core_sub_track(c, cur_sub, &st, &sgen) == MOQR_OK);
+    moqr_ns_t kns;
+    moq_bytes_t kparts[4];
+    moq_bytes_t kname;
+    MOQ_TEST_CHECK(moqr_core_track_key(c, st, sgen, kparts, 4, &kns, &kname) ==
+                   MOQR_OK);
+    MOQ_TEST_CHECK_EQ_SIZE(kns.count, (size_t)2);
+    MOQ_TEST_CHECK(kns.count == 2 && kns.parts[0].len == 1 &&
+                   kns.parts[0].data[0] == 'n' && kns.parts[1].len == 1 &&
+                   kns.parts[1].data[0] == 's');
+    MOQ_TEST_CHECK(kname.len == 1 && kname.data[0] == 't');
+    /* Too little part storage is refused, and a stale generation too. */
+    MOQ_TEST_CHECK(moqr_core_track_key(c, st, sgen, kparts, 1, &kns, &kname) ==
+                   MOQR_ERR_CAPACITY);
+    MOQ_TEST_CHECK(moqr_core_track_key(c, st, sgen + 1, kparts, 4, &kns,
+                                       &kname) == MOQR_ERR_STALE_HANDLE);
+    MOQ_TEST_CHECK(moqr_core_unsubscribe(c, cur_sub, 10) == MOQR_OK);
+
+    /* A held range: group 0 only. Both retained objects deliver, the range is
+     * then exhausted, and NO SUB_DONE follows: the subscription stays live
+     * until the subscriber ends it. */
+    moqr_subscribe_req_init(&rq);
+    rq.ns = NS2(nsb, "n", "s");
+    rq.name = B("t");
+    rq.filter.type = MOQR_FILTER_ABSOLUTE_RANGE;
+    rq.filter.start_group = 0;
+    rq.filter.start_object = 1;
+    rq.filter.end_group_delta = 0;
+    rq.range_end_holds = true;
+    rq.cookie = 2;
+    moqr_sub_t held;
+    MOQ_TEST_CHECK(moqr_core_subscribe(c, s1, &rq, &held) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_SIZE(drain(c, its, 8), (size_t)1);
+    got_n = 0;
+    for (;;) {
+        moqr_result_t rc = moqr_core_next_delivery(c, s1, CTRL_NOW, &d);
+        if (rc != MOQR_OK) {
+            break;
+        }
+        MOQ_TEST_CHECK_EQ_U64(d.rec.group_id, 0);
+        got_n++;
+        MOQ_TEST_CHECK(moqr_core_delivery_done(
+                           c, s1, MOQR_DELIVERY_DELIVERED, CTRL_NOW) == MOQR_OK);
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(got_n, (size_t)2);   /* {0,1} and {0,2} */
+    MOQ_TEST_CHECK_EQ_SIZE(drain(c, its, 8), (size_t)0);
+    /* Later live-edge ingest past the range changes nothing for it. */
+    MOQ_TEST_CHECK(ing(c, &a, track, 2, 0, 0, 128) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, s1, CTRL_NOW, &d) == MOQR_DONE);
+    MOQ_TEST_CHECK_EQ_SIZE(drain(c, its, 8), (size_t)0);
+    MOQ_TEST_CHECK(moqr_core_unsubscribe(c, held, 11) == MOQR_OK);
+
+    /* The same range without the hold retires with SUB_DONE, as before. */
+    rq.range_end_holds = false;
+    rq.cookie = 3;
+    moqr_sub_t ending;
+    MOQ_TEST_CHECK(moqr_core_subscribe(c, s1, &rq, &ending) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_SIZE(drain(c, its, 8), (size_t)1);
+    while (moqr_core_next_delivery(c, s1, CTRL_NOW, &d) == MOQR_OK) {
+        MOQ_TEST_CHECK(moqr_core_delivery_done(
+                           c, s1, MOQR_DELIVERY_DELIVERED, CTRL_NOW) == MOQR_OK);
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(drain(c, its, 8), (size_t)1);
+    MOQ_TEST_CHECK_EQ_U64(its[0].kind, MOQR_INTENT_SUB_DONE);
+    MOQ_TEST_CHECK(moqr_core_unsubscribe(c, ending, 12) ==
+                   MOQR_ERR_STALE_HANDLE);
+
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("current_group_and_range_hold");
+    return failures;
+}
+
+
+/* The sizeof of the request layout that ends at `forward`: what a caller built
+ * before range_end_holds was appended allocates and passes as struct_size. */
+#define SUB_REQ_SIZE_THROUGH_FORWARD                                          \
+    ((offsetof(moqr_subscribe_req_t, forward) + sizeof(bool) +                \
+      _Alignof(moqr_subscribe_req_t) - 1) /                                   \
+     _Alignof(moqr_subscribe_req_t) * _Alignof(moqr_subscribe_req_t))
+
+/* A caller built before range_end_holds was appended: its struct ends at
+ * forward and struct_size is that layout's sizeof. The field it never had
+ * -- set true in current storage past struct_size, and poison in the tail
+ * padding of an exact heap block -- is never read: the bounded range retires
+ * the subscription with SUB_DONE once delivered, as for any request without
+ * the field. */
+static int
+test_range_hold_old_caller(void)
+{
+    int failures = 0;
+    const size_t end = offsetof(moqr_subscribe_req_t, forward) + sizeof(bool);
+    const size_t old = SUB_REQ_SIZE_THROUGH_FORWARD;
+    MOQ_TEST_CHECK(offsetof(moqr_subscribe_req_t, range_end_holds) >= old);
+    for (int view = 0; view < 2; view++) {
+        ca_t a;
+        ca_init(&a);
+        moqr_core_t *c = mkcore(&a, NULL);
+        MOQ_TEST_CHECK(c != NULL);
+        moqr_binding_t pub, s1;
+        MOQ_TEST_CHECK(moqr_core_binding_open(c, 1, &pub) == MOQR_OK);
+        MOQ_TEST_CHECK(moqr_core_binding_open(c, 2, &s1) == MOQR_OK);
+        moq_bytes_t nsb[2];
+        MOQ_TEST_CHECK(moqr_core_announce(c, pub, NS2(nsb, "n", "s")) == MOQR_OK);
+        moqr_track_t track;
+        MOQ_TEST_CHECK(moqr_core_publish_open(c, pub, NS2(nsb, "n", "s"),
+                                              B("t"), 5, &track) == MOQR_OK);
+        moqr_intent_t its[8];
+        MOQ_TEST_CHECK_EQ_SIZE(drain(c, its, 8), (size_t)1);
+        for (uint64_t o = 0; o < 3; o++) {
+            MOQ_TEST_CHECK(ing(c, &a, track, 0, 0, o, 128) == MOQR_OK);
+        }
+        /* Group 1 exists, so group 0 -- the whole range -- is complete. */
+        MOQ_TEST_CHECK(ing(c, &a, track, 1, 0, 0, 128) == MOQR_OK);
+
+        moqr_subscribe_req_t rq;
+        memset(&rq, 0, sizeof(rq));
+        rq.struct_size = (uint32_t)old;
+        rq.ns = NS2(nsb, "n", "s");
+        rq.name = B("t");
+        rq.filter.type = MOQR_FILTER_ABSOLUTE_RANGE;
+        rq.filter.start_group = 0;
+        rq.filter.start_object = 1;
+        rq.filter.end_group_delta = 0;
+        rq.subscriber_priority = 128;
+        rq.cookie = 1;
+        rq.forward = true;
+        rq.range_end_holds = true;
+        unsigned char *blk = NULL;
+        const moqr_subscribe_req_t *req = &rq;
+        if (view == 0) {
+            blk = malloc(old);
+            MOQ_TEST_CHECK(blk != NULL);
+            if (blk == NULL) {
+                moqr_core_destroy(c);
+                continue;
+            }
+            memcpy(blk, &rq, end);
+            memset(blk + end, 0x01, old - end);
+            req = (const moqr_subscribe_req_t *)(const void *)blk;
+        }
+        moqr_sub_t sub;
+        MOQ_TEST_CHECK(moqr_core_subscribe(c, s1, req, &sub) == MOQR_OK);
+        free(blk);
+        MOQ_TEST_CHECK_EQ_SIZE(drain(c, its, 8), (size_t)1);
+        moqr_delivery_t d;
+        size_t got_n = 0;
+        while (moqr_core_next_delivery(c, s1, CTRL_NOW, &d) == MOQR_OK) {
+            got_n++;
+            MOQ_TEST_CHECK(moqr_core_delivery_done(
+                               c, s1, MOQR_DELIVERY_DELIVERED, CTRL_NOW) == MOQR_OK);
+        }
+        MOQ_TEST_CHECK_EQ_SIZE(got_n, (size_t)2);   /* {0,1} and {0,2} */
+        size_t n = drain(c, its, 8);
+        MOQ_TEST_CHECK_EQ_SIZE(n, (size_t)1);
+        if (n == 1) {
+            MOQ_TEST_CHECK_EQ_U64(its[0].kind, MOQR_INTENT_SUB_DONE);
+        }
+        MOQ_TEST_CHECK(moqr_core_unsubscribe(c, sub, 12) == MOQR_ERR_STALE_HANDLE);
+        moqr_core_destroy(c);
+        MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    }
+    MOQ_TEST_PASS("range_hold_old_caller");
+    return failures;
+}
+
+/* The initializer symbol -- what a caller built before range_end_holds was
+ * appended reaches -- clears and stamps only the layout through forward and
+ * sets the request defaults (Largest Object filter, priority 128, forward),
+ * never writing past that caller's storage. The header's macro gives a
+ * caller built against the current layout the whole struct. */
+static int
+test_subscribe_req_init_old_caller(void)
+{
+    int failures = 0;
+    const size_t old = SUB_REQ_SIZE_THROUGH_FORWARD;
+    union {
+        moqr_subscribe_req_t r;
+        unsigned char b[sizeof(moqr_subscribe_req_t) + 16];
+    } u;
+    memset(&u, 0xA5, sizeof(u));
+    (moqr_subscribe_req_init)(&u.r);
+    MOQ_TEST_CHECK_EQ_U64(u.r.struct_size, old);
+    MOQ_TEST_CHECK(u.r.filter.type == MOQR_FILTER_LARGEST_OBJECT);
+    MOQ_TEST_CHECK_EQ_U64(u.r.subscriber_priority, 128);
+    MOQ_TEST_CHECK(u.r.forward);
+    MOQ_TEST_CHECK_EQ_U64(u.r.cookie, 0);
+    size_t past = 0;
+    for (size_t i = old; i < sizeof(u); i++) {
+        past += u.b[i] != 0xA5;
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(past, (size_t)0);
+    /* An exact block of the old size: ASan reports any write past it. */
+    void *blk = malloc(old);
+    MOQ_TEST_CHECK(blk != NULL);
+    if (blk != NULL) {
+        (moqr_subscribe_req_init)((moqr_subscribe_req_t *)blk);
+        uint32_t stamped_size = 0;
+        memcpy(&stamped_size, blk, sizeof(stamped_size));
+        MOQ_TEST_CHECK_EQ_U64(stamped_size, old);
+        free(blk);
+    }
+
+    /* A caller built against the current header reaches the whole struct
+     * through the macro: everything cleared, the same defaults, the hold
+     * absent. */
+    memset(&u, 0xA5, sizeof(u));
+    moqr_subscribe_req_init(&u.r);
+    MOQ_TEST_CHECK_EQ_U64(u.r.struct_size, sizeof(moqr_subscribe_req_t));
+    MOQ_TEST_CHECK(u.r.filter.type == MOQR_FILTER_LARGEST_OBJECT);
+    MOQ_TEST_CHECK_EQ_U64(u.r.subscriber_priority, 128);
+    MOQ_TEST_CHECK(u.r.forward);
+    MOQ_TEST_CHECK(!u.r.range_end_holds);
+    MOQ_TEST_CHECK_EQ_U64(u.r._reserved_range_end_holds, 0);
+    past = 0;
+    for (size_t i = sizeof(moqr_subscribe_req_t); i < sizeof(u); i++) {
+        past += u.b[i] != 0xA5;
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(past, (size_t)0);
+    /* The sized form never exceeds the size it is given, and refuses one
+     * too short to hold the defaults. */
+    memset(&u, 0xA5, sizeof(u));
+    moqr_subscribe_req_init_sized(&u.r, old);
+    MOQ_TEST_CHECK_EQ_U64(u.r.struct_size, old);
+    MOQ_TEST_CHECK(u.r.forward);
+    past = 0;
+    for (size_t i = old; i < sizeof(u); i++) {
+        past += u.b[i] != 0xA5;
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(past, (size_t)0);
+    memset(&u, 0xA5, sizeof(u));
+    moqr_subscribe_req_init_sized(&u.r, old - 1);
+    past = 0;
+    for (size_t i = 0; i < sizeof(u); i++) {
+        past += u.b[i] != 0xA5;
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(past, (size_t)0);
+    MOQ_TEST_PASS("subscribe_req_init_old_caller");
     return failures;
 }
 
@@ -1304,6 +1971,110 @@ test_auth_canonical_verdict(void)
 
     MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
     MOQ_TEST_PASS("auth_canonical_verdict");
+    return failures;
+}
+
+/* The sizeof of the park-request layout through sub_group_order: what a
+ * caller built before sub_forward_off was appended allocates and passes. */
+#define PARK_REQ_SIZE_THROUGH_GROUP_ORDER                                    \
+    ((offsetof(moqr_park_req_t, sub_group_order) + sizeof(uint32_t) +        \
+      _Alignof(moqr_park_req_t) - 1) /                                       \
+     _Alignof(moqr_park_req_t) * _Alignof(moqr_park_req_t))
+
+/* A parked SUBSCRIBE keeps the Forward State it asked for through park and
+ * resolve, read and written only within the caller's stated size: the
+ * unsized entry points are the layout through sub_group_order, so a caller
+ * built against it has nothing read past its request and nothing written
+ * past its view, and its request resumes forwarding as before. */
+static int
+test_parked_forward(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_relay_cfg_t cfg;
+    moqr_core_relay_cfg_init_sized(&cfg, sizeof(cfg), &a.vt);
+    cfg.log_budget.max_groups = 4;
+    cfg.log_budget.max_bytes = 1 << 20;
+    cfg.max_parked = 4;
+    cfg.parked_bytes = 4096;
+    moqr_core_t *c = NULL;
+    MOQ_TEST_CHECK(moqr_core_create(&cfg, &c) == MOQR_OK);
+    const size_t old = PARK_REQ_SIZE_THROUGH_GROUP_ORDER;
+    MOQ_TEST_CHECK(offsetof(moqr_park_req_t, sub_forward_off) >= old);
+
+    moq_bytes_t nsb[2];
+    moqr_park_req_t req;
+    memset(&req, 0, sizeof(req));
+    req.action = MOQR_AUTH_SUBSCRIBE;
+    req.binding_cookie = 100;
+    req.session_cookie = 555;
+    req.ns = NS2(nsb, "live", "cam");
+    req.name = B("video");
+    req.sub_filter_type = 2;
+    req.sub_forward_off = true;
+
+    /* Sized: carried through. A size short of the layout through
+     * sub_group_order is refused with nothing parked. */
+    MOQ_TEST_CHECK(moqr_core_park_sized(c, &req, old - 1, 1, 1) == MOQR_ERR_INVAL);
+    MOQ_TEST_CHECK(moqr_core_park_sized(c, &req, sizeof(req), 1, 1) == MOQR_OK);
+    moqr_park_req_t view;
+    moqr_auth_verdict_t vd;
+    const moqr_auth_verdict_t allow = { .decision = MOQR_AUTH_ALLOW,
+                                        .reason = MOQR_AUTH_REASON_OK };
+    MOQ_TEST_CHECK(moqr_core_auth_begin_resolve_sized(c, 1, &allow, 1, &vd, &view,
+                                                      old - 1) == MOQR_ERR_INVAL);
+    MOQ_TEST_CHECK(vd.decision == MOQR_AUTH_DENY);
+    memset(&view, 0, sizeof(view));
+    MOQ_TEST_CHECK(moqr_core_auth_begin_resolve_sized(c, 1, &allow, 1, &vd, &view,
+                                                      sizeof(view)) == MOQR_OK);
+    MOQ_TEST_CHECK(view.sub_forward_off);
+    MOQ_TEST_CHECK(view.session_cookie == 555 && view.sub_filter_type == 2);
+    moqr_core_auth_finish_resolve(c, 1);
+
+    /* The layout through sub_group_order, from an exact heap block whose
+     * bytes past it would say Forward 0 if they were read. */
+    unsigned char *blk = malloc(sizeof(req));
+    MOQ_TEST_CHECK(blk != NULL);
+    if (blk != NULL) {
+        memcpy(blk, &req, old);
+        memset(blk + old, 0x01, sizeof(req) - old);
+        MOQ_TEST_CHECK(moqr_core_park(c, (const moqr_park_req_t *)(void *)blk, 2,
+                                      1) == MOQR_OK);
+        MOQ_TEST_CHECK(moqr_core_park_sized(c, (const moqr_park_req_t *)(void *)blk,
+                                            old, 3, 1) == MOQR_OK);
+        free(blk);
+    }
+    for (uint64_t t = 2; t <= 3; t++) {
+        memset(&view, 0, sizeof(view));
+        MOQ_TEST_CHECK(moqr_core_auth_begin_resolve_sized(c, t, &allow, 1, &vd,
+                                                          &view, sizeof(view)) ==
+                       MOQR_OK);
+        MOQ_TEST_CHECK(!view.sub_forward_off);   /* forwarding, as before */
+        moqr_core_auth_finish_resolve(c, t);
+    }
+
+    /* The unsized resolve writes nothing past the layout it knows, into
+     * storage poisoned past it. */
+    MOQ_TEST_CHECK(moqr_core_park_sized(c, &req, sizeof(req), 4, 1) == MOQR_OK);
+    union {
+        moqr_park_req_t v;
+        unsigned char b[sizeof(moqr_park_req_t)];
+    } u;
+    memset(&u, 0xA5, sizeof(u));
+    MOQ_TEST_CHECK(moqr_core_auth_begin_resolve(c, 4, &allow, 1, &vd, &u.v) ==
+                   MOQR_OK);
+    MOQ_TEST_CHECK(u.v.session_cookie == 555);
+    size_t touched = 0;
+    for (size_t i = old; i < sizeof(u); i++) {
+        touched += u.b[i] != 0xA5;
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(touched, 0);
+    moqr_core_auth_finish_resolve(c, 4);
+
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("parked_forward");
     return failures;
 }
 
@@ -3762,11 +4533,15 @@ static int
 test_capacity_gpos_oracle(void)
 {
     int failures = 0;
-    /* The documented stride: group_id + idx[] + emitted[] + seal-ack words,
-     * 8-aligned (mirrors gpos_stride_for; the oracle breaks if either side
-     * drifts). */
+    /* The documented stride: header + idx[] + emitted[] + owed-cause
+     * indexes + seal-ack words + gap words + lifetime words, 8-aligned
+     * (mirrors gpos_stride_for; the oracle breaks if either side drifts). */
+    typedef struct gpos_header_doc {
+        bool occupied;
+        uint64_t group_id;
+    } gpos_header_doc_t;
 #define STRIDE_DOC(L) \
-    ((8u + 8u * (L) + 4u * (((L) + 31u) / 32u) + 7u) & ~7u)
+    ((sizeof(gpos_header_doc_t) + 12u * (L) + 3u * 4u * (((L) + 31u) / 32u) + 7u) & ~(uint64_t)7u)
     uint64_t sub_delta[2] = { 0, 0 };
     uint64_t cap_struct[2] = { 0, 0 };
     for (int k = 0; k < 2; k++) {
@@ -4602,16 +5377,22 @@ test_root_full_track_name_core(void)
     moqr_fetch_plan_t plan;
     memset(&plan, 0, sizeof(plan));
     moqr_result_t frc = moqr_core_fetch_open(c, sub, &fq, 1000, &fh, &plan);
-    /* Exact expected outcome for THIS state: the root track exists but holds no
-     * object yet, so admission is a decided REJECT carried on an OK return --
-     * not a hard error, and not the validator refusing the shape. Pinning both
-     * halves means CAPACITY/NOMEM/WRONG_STATE can no longer pass as acceptance. */
+    /* Exact expected outcome for THIS state: the root track's only Object is
+     * still arriving, and an Object counts as published from its first byte
+     * (draft-22 3.1.4), so it is the Largest Object and the whole-group-0
+     * range is accepted through it -- carried on an OK return, not a hard
+     * error and not the validator refusing the shape. Pinning both halves
+     * means CAPACITY/NOMEM/WRONG_STATE can no longer pass as acceptance. */
     MOQ_TEST_CHECK(frc == MOQR_OK);
-    MOQ_TEST_CHECK_EQ_U64((uint64_t)plan.admit, (uint64_t)MOQR_FETCH_REJECT);
-    /* The whole contract for this decision, not just the verdict: the empty
-     * track rejects with INVALID_RANGE and hands back no usable handle. */
-    MOQ_TEST_CHECK_EQ_U64((uint64_t)plan.error_code, 0x11u);
-    MOQ_TEST_CHECK(!moqr_fetch_is_valid(fh));
+    MOQ_TEST_CHECK_EQ_U64((uint64_t)plan.admit, (uint64_t)MOQR_FETCH_ACCEPT);
+    MOQ_TEST_CHECK_EQ_U64(plan.end_group, 0);
+    MOQ_TEST_CHECK_EQ_U64(plan.end_object, 1);
+    MOQ_TEST_CHECK(moqr_fetch_is_valid(fh));
+    /* The range includes that Object in full: nothing is served until it
+     * is whole. */
+    moqr_fetch_item_t fit;
+    MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, 1000, &fit) == MOQR_ERR_WOULD_BLOCK);
+    MOQ_TEST_CHECK(moqr_core_fetch_close(c, fh) == MOQR_OK);
 
     /* An empty TRACK NAME is permitted by both drafts. Paired here with the
      * root namespace, whose complete Full Track Name is draft-18 only -- the
@@ -5939,6 +6720,2308 @@ test_verdict_revoke_terminal_defaults_none(void)
     return failures;
 }
 
+static int
+location_expect(moqr_core_t *c, moqr_binding_t b, uint64_t g, uint64_t sg,
+                uint64_t o)
+{
+    int failures = 0;
+    moqr_delivery_t d;
+    memset(&d, 0, sizeof(d));
+    moqr_result_t rc = moqr_core_next_delivery(c, b, CTRL_NOW, &d);
+    MOQ_TEST_CHECK(rc == MOQR_OK);
+    if (rc == MOQR_OK) {
+        MOQ_TEST_CHECK(d.notice == MOQR_DELIVERY_NOTICE_NONE);
+        MOQ_TEST_CHECK_EQ_U64(d.rec.group_id, g);
+        MOQ_TEST_CHECK_EQ_U64(d.rec.subgroup_id, sg);
+        MOQ_TEST_CHECK_EQ_U64(d.rec.object_id, o);
+        MOQ_TEST_CHECK(moqr_core_delivery_done(c, b, MOQR_DELIVERY_DELIVERED,
+                                               CTRL_NOW) == MOQR_OK);
+    }
+    return failures;
+}
+
+static int
+location_idle(moqr_core_t *c, moqr_binding_t b)
+{
+    int failures = 0;
+    moqr_delivery_t d;
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, b, CTRL_NOW, &d) == MOQR_DONE);
+    return failures;
+}
+
+static int
+location_subscribe(moqr_core_t *c, moqr_binding_t b,
+                   const moq_location_filter_cfg_t *loc, moqr_sub_t *sub)
+{
+    int failures = 0;
+    moq_bytes_t nsb[2];
+    moqr_subscribe_req_t rq;
+    moqr_subscribe_req_init(&rq);
+    rq.ns = NS2(nsb, "demo", "cam");
+    rq.name = B("video");
+    rq.range_end_holds = true;
+    rq.location = loc;
+    /* The selected semantic input is authoritative over inactive legacy data. */
+    rq.filter.type = (moqr_filter_type_t)0;
+    MOQ_TEST_CHECK(moqr_core_subscribe(c, b, &rq, sub) == MOQR_OK);
+    moqr_intent_t its[8];
+    size_t n = drain(c, its, 8);
+    MOQ_TEST_CHECK_EQ_SIZE(n, 1);
+    if (n == 1) MOQ_TEST_CHECK(its[0].kind == MOQR_INTENT_ACCEPT_SUB);
+    return failures;
+}
+
+static int
+test_location_history(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, NULL);
+    moqr_binding_t pub, b[3];
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 1, &pub) == MOQR_OK);
+    for (uint32_t i = 0; i < 3; i++) {
+        MOQ_TEST_CHECK(moqr_core_binding_open(c, i + 2, &b[i]) == MOQR_OK);
+    }
+    moqr_sub_t s[3];
+    moqr_track_t t = chunked_sub_setup(c, pub, b[0], &s[0]);
+    moq_location_filter_cfg_t loc;
+    moq_location_filter_cfg_init(&loc);
+    loc.kind = MOQ_LOCATION_FILTER_ABSOLUTE_START;
+    loc.start_group = 8;
+    MOQ_TEST_CHECK(moqr_core_sub_set_location_filter(c, s[0], &loc, CTRL_NOW) == MOQR_OK);
+    failures += location_subscribe(c, b[1], &loc, &s[1]);
+    failures += location_subscribe(c, b[2], &loc, &s[2]);
+    MOQ_TEST_CHECK(ing(c, &a, t, 5, 0, 0, 128) == MOQR_OK);
+    /* Do not scan first: replacement must remember exclusions even behind a
+     * blocked/paused cursor. NONE, NEXT, and no replacement are distinct. */
+    loc.kind = MOQ_LOCATION_FILTER_NONE;
+    MOQ_TEST_CHECK(moqr_core_sub_set_location_filter(c, s[0], &loc, CTRL_NOW) == MOQR_OK);
+    loc.kind = MOQ_LOCATION_FILTER_NEXT_OBJECT;
+    MOQ_TEST_CHECK(moqr_core_sub_set_location_filter(c, s[1], &loc, CTRL_NOW) == MOQR_OK);
+    for (uint32_t i = 0; i < 3; i++) failures += location_idle(c, b[i]);
+    /* New traffic below Largest is not backlog. Only NONE admits it. */
+    MOQ_TEST_CHECK(ing(c, &a, t, 4, 1, 0, 128) == MOQR_OK);
+    failures += location_expect(c, b[0], 4, 1, 0);
+    failures += location_idle(c, b[1]);
+    failures += location_idle(c, b[2]);
+    MOQ_TEST_CHECK(ing(c, &a, t, 6, 0, 0, 128) == MOQR_OK);
+    failures += location_expect(c, b[0], 6, 0, 0);
+    failures += location_expect(c, b[1], 6, 0, 0);
+    failures += location_idle(c, b[2]);
+    /* Lower a future start without replay, then accept a new object in the
+     * same open subgroup: actual indices, not the old start, govern history. */
+    loc.kind = MOQ_LOCATION_FILTER_ABSOLUTE_START;
+    loc.start_group = 6;
+    MOQ_TEST_CHECK(moqr_core_sub_set_location_filter(c, s[2], &loc, CTRL_NOW) == MOQR_OK);
+    failures += location_idle(c, b[2]);
+    MOQ_TEST_CHECK(ing(c, &a, t, 6, 0, 1, 128) == MOQR_OK);
+    for (uint32_t i = 0; i < 3; i++) {
+        failures += location_expect(c, b[i], 6, 0, 1);
+        failures += location_idle(c, b[i]);
+    }
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("location_history_none_next_omission");
+    return failures;
+}
+
+static int
+test_location_object_end(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, NULL);
+    moqr_binding_t pub, prime, b;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 1, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 2, &prime) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 3, &b) == MOQR_OK);
+    moqr_sub_t s, ps;
+    moqr_track_t t = chunked_sub_setup(c, pub, prime, &ps);
+    for (uint64_t o = 0; o < 4; o++) {
+        MOQ_TEST_CHECK(ing(c, &a, t, 5, 0, o, 128) == MOQR_OK);
+    }
+    moq_location_filter_cfg_t loc;
+    moq_location_filter_cfg_init(&loc);
+    loc.kind = MOQ_LOCATION_FILTER_OBJECT_END;
+    loc.start_group = loc.end_group = 5;
+    loc.start_object = 1;
+    loc.end_object = 2;
+    failures += location_subscribe(c, b, &loc, &s);
+    failures += location_expect(c, b, 5, 0, 1);
+    failures += location_expect(c, b, 5, 0, 2);
+    failures += location_idle(c, b);
+    loc.end_object = UINT64_MAX;
+    MOQ_TEST_CHECK(moqr_core_sub_set_location_filter(c, s, &loc, CTRL_NOW) == MOQR_OK);
+    failures += location_idle(c, b);   /* excluded retained object 3 stays out */
+    MOQ_TEST_CHECK(ing(c, &a, t, 5, 0, 4, 128) == MOQR_OK);
+    failures += location_expect(c, b, 5, 0, 4);
+    moqr_result_t max_rc = ing(c, &a, t, 5, 0, UINT64_MAX, 128);
+    printf("ORACLE location_object_end MAX ingest=%d (expected %d)\n",
+           (int)max_rc, (int)MOQR_OK);
+    MOQ_TEST_CHECK(max_rc == MOQR_OK);
+    if (max_rc == MOQR_OK) failures += location_expect(c, b, 5, 0, UINT64_MAX);
+    /* An equal-group reverse-object window is valid and empty. */
+    loc.start_object = 2;
+    loc.end_object = 1;
+    MOQ_TEST_CHECK(moqr_core_sub_set_location_filter(c, s, &loc, CTRL_NOW) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, t, 5, 1, 6, 128) == MOQR_OK);
+    failures += location_idle(c, b);
+    loc.kind = MOQ_LOCATION_FILTER_NONE;
+    MOQ_TEST_CHECK(moqr_core_sub_set_location_filter(c, s, &loc, CTRL_NOW) == MOQR_OK);
+    failures += location_idle(c, b);
+    MOQ_TEST_CHECK(ing(c, &a, t, 5, 1, 7, 128) == MOQR_OK);
+    failures += location_expect(c, b, 5, 1, 7);
+    moqr_intent_t its[8];
+    MOQ_TEST_CHECK_EQ_SIZE(drain(c, its, 8), 0);   /* never a range terminal */
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("location_object_end_max_empty_extension");
+    return failures;
+}
+
+static int
+test_full_width_fetch_progress(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, NULL);
+    moqr_binding_t pub, b;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 1, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 2, &b) == MOQR_OK);
+    moqr_sub_t s;
+    moqr_track_t t = chunked_sub_setup(c, pub, b, &s);
+    MOQ_TEST_CHECK(ing(c, &a, t, 5, 0, UINT64_MAX - 1, 128) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, t, 5, 0, UINT64_MAX, 128) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, t, 6, 0, 0, 128) == MOQR_OK);
+    for (int across = 0; across < 2; across++) {
+        moq_bytes_t nsb[2];
+        moqr_fetch_req_t rq;
+        moqr_fetch_req_init(&rq);
+        rq.ns = NS2(nsb, "demo", "cam");
+        rq.name = B("video");
+        rq.start_group = 5;
+        rq.start_object = UINT64_MAX - 1;
+        rq.end_group = across ? 6 : 5;
+        rq.end_object = across ? 1 : 0;
+        moqr_fetch_t f = MOQR_FETCH_INVALID;
+        moqr_fetch_plan_t plan;
+        MOQ_TEST_CHECK(moqr_core_fetch_open(c, b, &rq, CTRL_NOW, &f, &plan) == MOQR_OK);
+        MOQ_TEST_CHECK(plan.admit == MOQR_FETCH_ACCEPT);
+        const uint64_t groups[] = { 5, 5, 6 };
+        const uint64_t objects[] = { UINT64_MAX - 1, UINT64_MAX, 0 };
+        for (int i = 0; i < 2 + across; i++) {
+            moqr_fetch_item_t item;
+            memset(&item, 0, sizeof(item));
+            MOQ_TEST_CHECK(moqr_core_fetch_peek(c, f, CTRL_NOW, &item) == MOQR_OK);
+            MOQ_TEST_CHECK(item.kind == MOQR_FETCH_ITEM_OBJECT);
+            MOQ_TEST_CHECK_EQ_U64(item.rec.group_id, groups[i]);
+            MOQ_TEST_CHECK_EQ_U64(item.rec.object_id, objects[i]);
+            MOQ_TEST_CHECK(moqr_core_fetch_commit(c, f) == MOQR_OK);
+        }
+        moqr_fetch_item_t item;
+        MOQ_TEST_CHECK(moqr_core_fetch_peek(c, f, CTRL_NOW, &item) == MOQR_OK);
+        MOQ_TEST_CHECK(item.kind == MOQR_FETCH_ITEM_END);
+        MOQ_TEST_CHECK(moqr_core_fetch_close(c, f) == MOQR_OK);
+    }
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("full_width_fetch_progress");
+    return failures;
+}
+
+static int
+test_full_width_fetch_status(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, NULL);
+    moqr_binding_t pub, b;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 1, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 2, &b) == MOQR_OK);
+    moqr_sub_t s;
+    moqr_track_t t = chunked_sub_setup(c, pub, b, &s);
+    moqr_log_append_desc_t d;
+    moqr_log_append_desc_init(&d);
+    d.group_id = 5;
+    d.object_id = UINT64_MAX;
+    d.status = MOQR_OBJ_END_OF_GROUP;
+    MOQ_TEST_CHECK(moqr_core_ingest(c, t, &d) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, t, 6, 0, 0, 128) == MOQR_OK);
+    for (int across = 0; across < 2; across++) {
+        moq_bytes_t nsb[2];
+        moqr_fetch_req_t rq;
+        moqr_fetch_req_init(&rq);
+        rq.ns = NS2(nsb, "demo", "cam");
+        rq.name = B("video");
+        rq.start_group = 5;
+        rq.start_object = UINT64_MAX;
+        rq.end_group = across ? 6 : 5;
+        rq.end_object = across ? 1 : 0;
+        rq.report_gaps = true;
+        rq.report_unknown = true;
+        moqr_fetch_t f = MOQR_FETCH_INVALID;
+        moqr_fetch_plan_t plan;
+        MOQ_TEST_CHECK(moqr_core_fetch_open(c, b, &rq, CTRL_NOW, &f, &plan) == MOQR_OK);
+        MOQ_TEST_CHECK(plan.admit == MOQR_FETCH_ACCEPT);
+        moqr_fetch_item_t item;
+        MOQ_TEST_CHECK(moqr_core_fetch_peek(c, f, CTRL_NOW, &item) == MOQR_OK);
+        if (across) {
+            MOQ_TEST_CHECK(item.kind == MOQR_FETCH_ITEM_OBJECT);
+            MOQ_TEST_CHECK_EQ_U64(item.rec.group_id, 6);
+            MOQ_TEST_CHECK_EQ_U64(item.rec.object_id, 0);
+            MOQ_TEST_CHECK(moqr_core_fetch_commit(c, f) == MOQR_OK);
+            MOQ_TEST_CHECK(moqr_core_fetch_peek(c, f, CTRL_NOW, &item) == MOQR_OK);
+        }
+        MOQ_TEST_CHECK(item.kind == MOQR_FETCH_ITEM_END);
+        MOQ_TEST_CHECK(moqr_core_fetch_close(c, f) == MOQR_OK);
+    }
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("full_width_fetch_status");
+    return failures;
+}
+
+static int
+test_location_argument_failures(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, NULL);
+    moqr_binding_t pub, b;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 1, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 2, &b) == MOQR_OK);
+    moqr_sub_t s;
+    moqr_track_t t = chunked_sub_setup(c, pub, b, &s);
+    moq_location_filter_cfg_t loc;
+    moq_location_filter_cfg_init(&loc);
+    loc.kind = MOQ_LOCATION_FILTER_ABSOLUTE_START;
+    loc.start_group = 8;
+    long before = a.live;
+    a.fail_next = true;
+    MOQ_TEST_CHECK(moqr_core_sub_set_location_filter(c, s, &loc, CTRL_NOW) == MOQR_ERR_NOMEM);
+    MOQ_TEST_CHECK(!a.fail_next && a.live == before);
+    MOQ_TEST_CHECK(moqr_core_sub_set_location_filter(NULL, s, &loc, CTRL_NOW) == MOQR_ERR_INVAL);
+    MOQ_TEST_CHECK(moqr_core_sub_set_location_filter(c, s, NULL, CTRL_NOW) == MOQR_ERR_INVAL);
+    MOQ_TEST_CHECK(moqr_core_sub_set_location_filter(c, MOQR_SUB_INVALID, &loc, CTRL_NOW) == MOQR_ERR_STALE_HANDLE);
+    /* Exactly short storage, not just a short stamp on a full object. */
+    uint32_t *short_cfg = malloc(sizeof(*short_cfg));
+    MOQ_TEST_CHECK(short_cfg != NULL);
+    if (short_cfg != NULL) {
+        *short_cfg = sizeof(*short_cfg);
+        MOQ_TEST_CHECK(moqr_core_sub_set_location_filter(c, s,
+            (const moq_location_filter_cfg_t *)(const void *)short_cfg,
+            CTRL_NOW) == MOQR_ERR_INVAL);
+        free(short_cfg);
+    }
+    loc.kind = UINT32_MAX;
+    MOQ_TEST_CHECK(moqr_core_sub_set_location_filter(c, s, &loc, CTRL_NOW) == MOQR_ERR_INVAL);
+    loc.kind = MOQ_LOCATION_FILTER_OBJECT_END;
+    loc.end_group = 7;
+    MOQ_TEST_CHECK(moqr_core_sub_set_location_filter(c, s, &loc, CTRL_NOW) == MOQR_ERR_INVAL);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, (int)before);
+    MOQ_TEST_CHECK(ing(c, &a, t, 5, 0, 0, 128) == MOQR_OK);
+    failures += location_expect(c, b, 5, 0, 0);   /* unchanged old window */
+    MOQ_TEST_CHECK(moqr_core_unsubscribe(c, s, CTRL_NOW) == MOQR_OK);
+    loc.kind = MOQ_LOCATION_FILTER_NONE;
+    MOQ_TEST_CHECK(moqr_core_sub_set_location_filter(c, s, &loc, CTRL_NOW) == MOQR_ERR_STALE_HANDLE);
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("location_argument_failures_pre_effect");
+    return failures;
+}
+
+static int
+test_location_parked_copy(void)
+{
+    int failures = 0;
+    for (int update = 0; update < 2; update++) {
+        ca_t a;
+        ca_init(&a);
+        moqr_core_t *c = mkcore(&a, NULL);
+        moqr_binding_t pub, b;
+        MOQ_TEST_CHECK(moqr_core_binding_open(c, 1, &pub) == MOQR_OK);
+        MOQ_TEST_CHECK(moqr_core_binding_open(c, 2, &b) == MOQR_OK);
+        moq_bytes_t nsb[2];
+        MOQ_TEST_CHECK(moqr_core_announce(c, pub, NS2(nsb, "demo", "cam")) == MOQR_OK);
+        moq_location_filter_cfg_t loc;
+        moq_location_filter_cfg_init(&loc);
+        loc.kind = MOQ_LOCATION_FILTER_RELATIVE_GROUP;
+        loc.relative_group_offset = 2;
+        moqr_subscribe_req_t rq;
+        moqr_subscribe_req_init(&rq);
+        rq.ns = NS2(nsb, "demo", "cam");
+        rq.name = B("video");
+        rq.location = update ? NULL : &loc;
+        moqr_sub_t s;
+        MOQ_TEST_CHECK(moqr_core_subscribe(c, b, &rq, &s) == MOQR_OK);
+        if (update) {
+            MOQ_TEST_CHECK(moqr_core_sub_set_location_filter(c, s, &loc, CTRL_NOW) == MOQR_OK);
+        }
+        memset(&loc, 0xA5, sizeof(loc));   /* borrowed storage no longer live */
+        moqr_intent_t its[8];
+        size_t n = drain(c, its, 8);
+        MOQ_TEST_CHECK_EQ_SIZE(n, 1);
+        if (n == 1) {
+            MOQ_TEST_CHECK(its[0].kind == MOQR_INTENT_UPSTREAM_SUBSCRIBE);
+            moqr_track_t t = its[0].track;
+            MOQ_TEST_CHECK(moqr_core_upstream_ok(c, t, its[0].track_gen,
+                                                 17, true, 5, 9) == MOQR_OK);
+            MOQ_TEST_CHECK_EQ_SIZE(drain(c, its, 8), 1);
+            MOQ_TEST_CHECK(ing(c, &a, t, 3, 0, 0, 128) == MOQR_OK);
+            MOQ_TEST_CHECK(ing(c, &a, t, 4, 0, 0, 128) == MOQR_OK);
+            failures += location_expect(c, b, 4, 0, 0);
+            failures += location_idle(c, b);
+            /* Active resolution uses the current Largest too, not admission. */
+            moq_location_filter_cfg_init(&loc);
+            loc.kind = MOQ_LOCATION_FILTER_RELATIVE_GROUP;
+            loc.relative_group_offset = 0;
+            MOQ_TEST_CHECK(moqr_core_sub_set_location_filter(c, s, &loc, CTRL_NOW) == MOQR_OK);
+            MOQ_TEST_CHECK(ing(c, &a, t, 5, 0, 0, 128) == MOQR_OK);
+            failures += location_idle(c, b);
+            MOQ_TEST_CHECK(ing(c, &a, t, 6, 0, 0, 128) == MOQR_OK);
+            failures += location_expect(c, b, 6, 0, 0);
+        }
+        moqr_core_destroy(c);
+        MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    }
+    MOQ_TEST_PASS("location_parked_copy_relative_resolution");
+    return failures;
+}
+
+/* A separately compiled old layout, including all old trailing padding. */
+typedef struct location_old_req {
+    uint32_t struct_size;
+    moqr_ns_t ns;
+    moq_bytes_t name;
+    moqr_filter_t filter;
+    uint8_t subscriber_priority;
+    moqr_group_order_t group_order;
+    uint64_t cookie;
+    bool forward;
+    uint32_t reserved_range;
+    bool range_end_holds;
+} location_old_req_t;
+
+static int
+test_location_request_prefix(void)
+{
+    int failures = 0;
+    const size_t old_size = sizeof(location_old_req_t);
+    const size_t old_end = offsetof(location_old_req_t, range_end_holds) + sizeof(bool);
+    MOQ_TEST_CHECK(offsetof(moqr_subscribe_req_t, location) >= old_size);
+    for (int mode = 0; mode < 3; mode++) {
+        ca_t a;
+        ca_init(&a);
+        moqr_core_t *c = mkcore(&a, NULL);
+        moqr_binding_t pub, prime, b;
+        MOQ_TEST_CHECK(moqr_core_binding_open(c, 1, &pub) == MOQR_OK);
+        MOQ_TEST_CHECK(moqr_core_binding_open(c, 2, &prime) == MOQR_OK);
+        MOQ_TEST_CHECK(moqr_core_binding_open(c, 3, &b) == MOQR_OK);
+        moqr_sub_t ps, s;
+        moqr_track_t t = chunked_sub_setup(c, pub, prime, &ps);
+        for (uint64_t o = 0; o < 3; o++) {
+            MOQ_TEST_CHECK(ing(c, &a, t, 5, 0, o, 128) == MOQR_OK);
+        }
+        MOQ_TEST_CHECK(ing(c, &a, t, 6, 0, 0, 128) == MOQR_OK);
+        /* Exact old storage; full current storage with an old stamp; and a
+         * stamp covering all but the last pointer byte must all ignore it. */
+        size_t n = mode == 0 ? old_size : sizeof(moqr_subscribe_req_t) + 16;
+        unsigned char *raw = malloc(n);
+        MOQ_TEST_CHECK(raw != NULL);
+        if (raw == NULL) {
+            moqr_core_destroy(c);
+            continue;
+        }
+        memset(raw, 0xA5, n);
+        moqr_subscribe_req_t *rq = (moqr_subscribe_req_t *)(void *)raw;
+        moqr_subscribe_req_init_sized(rq, old_size);
+        MOQ_TEST_CHECK_EQ_U64(rq->struct_size, old_size);
+        for (size_t i = old_size; i < n; i++) MOQ_TEST_CHECK(raw[i] == 0xA5);
+        memset(raw + old_end, 0xA5, n - old_end);
+        if (mode == 2) {
+            rq->struct_size = (uint32_t)(offsetof(moqr_subscribe_req_t, location) +
+                                         sizeof(rq->location) - 1);
+        }
+        moq_bytes_t nsb[2];
+        rq->ns = NS2(nsb, "demo", "cam");
+        rq->name = B("video");
+        rq->filter.type = MOQR_FILTER_ABSOLUTE_RANGE;
+        rq->filter.start_group = 5;
+        rq->filter.start_object = 1;
+        rq->filter.end_group_delta = 0;
+        rq->range_end_holds = true;
+        MOQ_TEST_CHECK(moqr_core_subscribe(c, b, rq, &s) == MOQR_OK);
+        for (size_t i = old_end; i < n; i++) MOQ_TEST_CHECK(raw[i] == 0xA5);
+        free(raw);
+        moqr_intent_t its[8];
+        MOQ_TEST_CHECK_EQ_SIZE(drain(c, its, 8), 1);
+        failures += location_expect(c, b, 5, 0, 1);
+        failures += location_expect(c, b, 5, 0, 2);
+        failures += location_idle(c, b);
+        MOQ_TEST_CHECK_EQ_SIZE(drain(c, its, 8), 0);   /* old hold flag intact */
+        MOQ_TEST_CHECK(moqr_core_unsubscribe(c, s, CTRL_NOW) == MOQR_OK);
+        moqr_core_destroy(c);
+        MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    }
+    MOQ_TEST_PASS("location_request_old_extent_poison_partial_pointer");
+    return failures;
+}
+
+static int
+test_location_chunk_ownership(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, NULL);
+    moqr_binding_t pub, b;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 1, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 2, &b) == MOQR_OK);
+    moqr_sub_t s;
+    moqr_track_t t = chunked_sub_setup(c, pub, b, &s);
+    moq_location_filter_cfg_t loc;
+    moq_location_filter_cfg_init(&loc);
+    MOQ_TEST_CHECK(moqr_core_sub_set_location_filter(c, s, &loc, CTRL_NOW) == MOQR_OK);
+    MOQ_TEST_CHECK(open_rec(c, t, 5, 0, 0, 40) == MOQR_OK);
+    MOQ_TEST_CHECK(append1(c, &a, t, 5, 0, 0, 20, 0xA0) == MOQR_OK);
+    moqr_delivery_t d;
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, b, CTRL_NOW, &d) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_delivery_note_emitted(c, b, 1, CTRL_NOW) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_delivery_done(c, b, MOQR_DELIVERY_WOULD_BLOCK,
+                                           CTRL_NOW) == MOQR_OK);
+    loc.kind = MOQ_LOCATION_FILTER_ABSOLUTE_START;
+    loc.start_group = 8;
+    MOQ_TEST_CHECK(moqr_core_sub_set_location_filter(c, s, &loc, CTRL_NOW) == MOQR_OK);
+    /* A begun held record survives narrowing, including its pinned payload. */
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, b, CTRL_NOW, &d) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(d.rec.group_id, 5);
+    MOQ_TEST_CHECK_EQ_U64(d.rec.object_id, 0);
+    MOQ_TEST_CHECK(moqr_core_delivery_done(c, b, MOQR_DELIVERY_STALLED,
+                                           CTRL_NOW) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_sub_set_forward(c, s, false, CTRL_NOW) == MOQR_OK);
+    MOQ_TEST_CHECK(append1(c, &a, t, 5, 0, 0, 20, 0xA1) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_complete_record(c, t, 5, 0, 0) == MOQR_OK);
+    failures += location_idle(c, b);
+    MOQ_TEST_CHECK(moqr_core_sub_set_forward(c, s, true, CTRL_NOW) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, b, CTRL_NOW, &d) == MOQR_OK);
+    MOQ_TEST_CHECK(d.rec.obj_state == MOQR_OBJ_COMPLETE);
+    MOQ_TEST_CHECK_EQ_U64(d.rec.group_id, 5);
+    MOQ_TEST_CHECK_EQ_U64(d.rec.chunk_count, 2);
+    const moq_rcbuf_t *chunk = NULL;
+    uint64_t len = 0;
+    MOQ_TEST_CHECK(moqr_core_delivery_chunk(c, b, 0, &chunk, &len) == MOQR_DONE);
+    MOQ_TEST_CHECK(moqr_core_delivery_chunk(c, b, 1, &chunk, &len) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(len, 20);
+    if (chunk != NULL) MOQ_TEST_CHECK(moq_rcbuf_data(chunk)[0] == 0xA1);
+    MOQ_TEST_CHECK(moqr_core_delivery_done(c, b, MOQR_DELIVERY_DELIVERED,
+                                           CTRL_NOW) == MOQR_OK);
+    loc.kind = MOQ_LOCATION_FILTER_NONE;
+    MOQ_TEST_CHECK(moqr_core_sub_set_location_filter(c, s, &loc, CTRL_NOW) == MOQR_OK);
+    failures += location_idle(c, b);
+
+    /* An unbegun hold is released and excluded, never resurrected by NONE. */
+    MOQ_TEST_CHECK(open_rec(c, t, 6, 0, 0, 20) == MOQR_OK);
+    MOQ_TEST_CHECK(append1(c, &a, t, 6, 0, 0, 20, 0xB0) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, b, CTRL_NOW, &d) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_delivery_done(c, b, MOQR_DELIVERY_WOULD_BLOCK,
+                                           CTRL_NOW) == MOQR_OK);
+    loc.kind = MOQ_LOCATION_FILTER_ABSOLUTE_START;
+    MOQ_TEST_CHECK(moqr_core_sub_set_location_filter(c, s, &loc, CTRL_NOW) == MOQR_OK);
+    loc.kind = MOQ_LOCATION_FILTER_NONE;
+    MOQ_TEST_CHECK(moqr_core_sub_set_location_filter(c, s, &loc, CTRL_NOW) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_complete_record(c, t, 6, 0, 0) == MOQR_OK);
+    failures += location_idle(c, b);
+
+    /* Begun with zero chunks still owes a reset, even narrowed and paused. */
+    MOQ_TEST_CHECK(open_rec(c, t, 7, 0, 0, 40) == MOQR_OK);
+    MOQ_TEST_CHECK(append1(c, &a, t, 7, 0, 0, 20, 0xC0) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, b, CTRL_NOW, &d) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_delivery_note_emitted(c, b, 0, CTRL_NOW) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_delivery_done(c, b, MOQR_DELIVERY_WOULD_BLOCK,
+                                           CTRL_NOW) == MOQR_OK);
+    loc.kind = MOQ_LOCATION_FILTER_ABSOLUTE_START;
+    MOQ_TEST_CHECK(moqr_core_sub_set_location_filter(c, s, &loc, CTRL_NOW) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_sub_set_forward(c, s, false, CTRL_NOW) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_abandon_record(c, t, 7, 0, 0, rd_wire(0x77)) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, b, CTRL_NOW, &d) == MOQR_OK);
+    MOQ_TEST_CHECK(d.rec.obj_state == MOQR_OBJ_ABANDONED && d.rec.group_id == 7);
+    MOQ_TEST_CHECK(moqr_core_delivery_done(c, b, MOQR_DELIVERY_ABANDONED,
+                                           CTRL_NOW) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_seal_subgroup(c, t, 5, 0) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, b, CTRL_NOW, &d) == MOQR_OK);
+    MOQ_TEST_CHECK(d.notice == MOQR_DELIVERY_NOTICE_SEAL && d.rec.group_id == 5);
+    MOQ_TEST_CHECK(moqr_core_delivery_done(c, b, MOQR_DELIVERY_DELIVERED,
+                                           CTRL_NOW) == MOQR_OK);
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("location_chunk_ownership_pause_reset_seal");
+    return failures;
+}
+
+static int
+test_location_capacity_reuse(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_relay_cfg_t cfg;
+    moqr_core_relay_cfg_init_sized(&cfg, sizeof(cfg), &a.vt);
+    cfg.log_budget.max_groups = 2;
+    cfg.log_max_objects_per_group = 3;
+    cfg.log_max_subgroups = 2;
+    moqr_core_t *c = NULL;
+    MOQ_TEST_CHECK(moqr_core_create(&cfg, &c) == MOQR_OK);
+    moqr_binding_t pub, b;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 1, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 2, &b) == MOQR_OK);
+    moqr_sub_t s;
+    moqr_track_t t = chunked_sub_setup(c, pub, b, &s);
+    moq_location_filter_cfg_t loc;
+    moq_location_filter_cfg_init(&loc);
+    loc.kind = MOQ_LOCATION_FILTER_ABSOLUTE_START;
+    loc.start_group = UINT64_MAX;
+    long before = a.live;
+    MOQ_TEST_CHECK(moqr_core_sub_set_location_filter(c, s, &loc, CTRL_NOW) == MOQR_OK);
+    moqr_log_cfg_t lc;
+    moqr_log_cfg_init_sized(&lc, sizeof(lc), &a.vt);
+    lc.budget = cfg.log_budget;
+    lc.max_objects_per_group = cfg.log_max_objects_per_group;
+    lc.max_subgroups_per_group = cfg.log_max_subgroups;
+    moqr_log_capacity_t cap;
+    moqr_log_capacity_describe(&lc, &cap);
+    /* The fixed journal has 4096 slots even when only six records fit in
+     * these retained groups. History is indexed by journal slot, not live cap. */
+    const uint64_t journal_slots = 4096;
+    MOQ_TEST_CHECK_EQ_U64(cap.max_records, 6);
+    uint64_t bits = journal_slots / 8u;
+    MOQ_TEST_CHECK_EQ_U64((uint64_t)(a.live - before), bits);
+    before = a.live;
+    for (uint32_t i = 0; i < 128; i++) {
+        MOQ_TEST_CHECK(moqr_core_sub_set_location_filter(c, s, &loc, CTRL_NOW) == MOQR_OK);
+    }
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, (int)before);
+    /* Fill one complete journal window with excluded records, then reuse its
+     * first slot under NONE. An old exclusion must not alias the new arrival. */
+    for (uint64_t g = 0; g < journal_slots; g++) {
+        MOQ_TEST_CHECK(ing(c, &a, t, g, 0, 0, 128) == MOQR_OK);
+    }
+    loc.kind = MOQ_LOCATION_FILTER_NONE;
+    MOQ_TEST_CHECK(moqr_core_sub_set_location_filter(c, s, &loc, CTRL_NOW) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, t, journal_slots, 0, 0, 128) == MOQR_OK);
+    failures += location_expect(c, b, journal_slots, 0, 0);
+    failures += location_idle(c, b);
+    moqr_core_capacity_t model;
+    moqr_core_capacity_describe(&cfg, &model);
+    MOQ_TEST_CHECK((uint64_t)a.live <= model.structure_bytes + model.payload_bytes);
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("location_capacity_and_journal_reuse");
+    return failures;
+}
+
+static int
+full_width_notice(moqr_core_t *c, moqr_binding_t b, bool seal,
+                  uint64_t group, uint64_t subgroup)
+{
+    int failures = 0;
+    moqr_delivery_t d;
+    moqr_result_t rc = moqr_core_next_delivery(c, b, CTRL_NOW, &d);
+    MOQ_TEST_CHECK(rc == MOQR_OK);
+    if (rc == MOQR_OK) {
+        MOQ_TEST_CHECK(d.notice == (seal ? MOQR_DELIVERY_NOTICE_SEAL
+                                         : MOQR_DELIVERY_NOTICE_EVICT_WATERMARK));
+        if (seal) {
+            MOQ_TEST_CHECK_EQ_U64(d.rec.group_id, group);
+            MOQ_TEST_CHECK_EQ_U64(d.rec.subgroup_id, subgroup);
+        }
+        MOQ_TEST_CHECK(moqr_core_delivery_done(c, b, MOQR_DELIVERY_DELIVERED,
+                                               CTRL_NOW) == MOQR_OK);
+    }
+    return failures;
+}
+
+/* A high group stays distinct when a lower retained group claims a position,
+ * and survives index rebuilding when that lower group is evicted. */
+static int
+test_full_width_gpos(uint64_t high)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore_groups(&a, 2);
+    MOQ_TEST_CHECK(c != NULL);
+    if (c == NULL) return failures;
+    moqr_binding_t pub, b;
+    moqr_track_t t;
+    moqr_sub_t s;
+    gpos_setup(c, &pub, &b, &t, &s, &failures);
+    MOQ_TEST_CHECK(ing(c, &a, t, high, 3, 0, 128) == MOQR_OK);
+    failures += location_expect(c, b, high, 3, 0);
+    MOQ_TEST_CHECK(moqr_core_seal_subgroup(c, t, high, 3) == MOQR_OK);
+    failures += full_width_notice(c, b, true, high, 3);
+    failures += location_idle(c, b);
+
+    MOQ_TEST_CHECK(ing(c, &a, t, 1, 0, 0, 128) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, t, high, 7, 1, 128) == MOQR_OK);
+    failures += location_expect(c, b, 1, 0, 0);
+    failures += location_expect(c, b, high, 7, 1);
+    MOQ_TEST_CHECK(moqr_core_seal_subgroup(c, t, high, 7) == MOQR_OK);
+    failures += full_width_notice(c, b, true, high, 7);
+    failures += location_idle(c, b);
+
+    MOQ_TEST_CHECK(ing(c, &a, t, 2, 0, 0, 128) == MOQR_OK);
+    failures += full_width_notice(c, b, false, 0, 0);
+    failures += location_expect(c, b, 2, 0, 0);
+    MOQ_TEST_CHECK(moqr_core_seal_subgroup(c, t, 2, 0) == MOQR_OK);
+    failures += full_width_notice(c, b, true, 2, 0);
+    /* Reused positions must not inherit a seal, or lose either high-group ack. */
+    MOQ_TEST_CHECK(moqr_core_seal_subgroup(c, t, high, 3) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_seal_subgroup(c, t, high, 7) == MOQR_OK);
+    failures += location_idle(c, b);
+    moqr_core_stats_t st;
+    moqr_core_get_stats(c, &st);
+    MOQ_TEST_CHECK_EQ_U64(st.delivered_total, 4);
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    printf("ORACLE full_width_gpos high=%llu failures=%d\n",
+           (unsigned long long)high, failures);
+    MOQ_TEST_PASS("full_width_gpos");
+    return failures;
+}
+
+static int
+test_full_width_begun(uint64_t group, bool abandon)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore_groups(&a, 4);
+    MOQ_TEST_CHECK(c != NULL);
+    if (c == NULL) return failures;
+    moqr_binding_t pub, b;
+    moqr_track_t t;
+    moqr_sub_t s;
+    gpos_setup(c, &pub, &b, &t, &s, &failures);
+    MOQ_TEST_CHECK(open_rec(c, t, group, 3, UINT64_MAX, 40) == MOQR_OK);
+    MOQ_TEST_CHECK(append1(c, &a, t, group, 3, UINT64_MAX, 20, 0xA0) == MOQR_OK);
+    moqr_delivery_t d;
+    moqr_result_t rc = moqr_core_next_delivery(c, b, CTRL_NOW, &d);
+    MOQ_TEST_CHECK(rc == MOQR_OK);
+    if (rc == MOQR_OK) {
+        MOQ_TEST_CHECK(d.rec.obj_state == MOQR_OBJ_OPEN);
+        MOQ_TEST_CHECK(moqr_core_delivery_done(c, b, MOQR_DELIVERY_STALLED,
+                                               CTRL_NOW) == MOQR_OK);
+    }
+    MOQ_TEST_CHECK(ing(c, &a, t, 1, 0, 0, 128) == MOQR_OK);
+    failures += location_expect(c, b, 1, 0, 0);
+    if (group >= UINT64_MAX - 1) {
+        /* Becoming beyond-last must not strand an already begun object. */
+        if (group < UINT64_MAX) {
+            MOQ_TEST_CHECK(ing(c, &a, t, UINT64_MAX, 0, UINT64_MAX, 128) == MOQR_OK);
+        }
+        moqr_filter_t f = { .type = abandon ? MOQR_FILTER_LARGEST_OBJECT
+                                            : MOQR_FILTER_NEXT_GROUP_START };
+        MOQ_TEST_CHECK(moqr_core_sub_set_filter(c, s, &f, CTRL_NOW) == MOQR_OK);
+    }
+    if (abandon) {
+        MOQ_TEST_CHECK(moqr_core_abandon_record(c, t, group, 3, UINT64_MAX,
+                                               rd_wire(0x77)) == MOQR_OK);
+    } else {
+        MOQ_TEST_CHECK(append1(c, &a, t, group, 3, UINT64_MAX, 20, 0xA1) == MOQR_OK);
+        MOQ_TEST_CHECK(moqr_core_complete_record(c, t, group, 3, UINT64_MAX) == MOQR_OK);
+    }
+    rc = moqr_core_next_delivery(c, b, CTRL_NOW, &d);
+    MOQ_TEST_CHECK(rc == MOQR_OK);
+    if (rc == MOQR_OK) {
+        MOQ_TEST_CHECK_EQ_U64(d.rec.group_id, group);
+        MOQ_TEST_CHECK_EQ_U64(d.rec.subgroup_id, 3);
+        MOQ_TEST_CHECK_EQ_U64(d.rec.object_id, UINT64_MAX);
+        MOQ_TEST_CHECK(!d.evicted_reset);
+        MOQ_TEST_CHECK(d.rec.obj_state == (abandon ? MOQR_OBJ_ABANDONED
+                                                  : MOQR_OBJ_COMPLETE));
+        if (abandon) {
+            MOQ_TEST_CHECK(d.rec.reset.tag == MOQR_CODE_WIRE_D16);
+            MOQ_TEST_CHECK_EQ_U64(d.rec.reset.value, 0x77);
+        } else {
+            const moq_rcbuf_t *chunk = NULL;
+            uint64_t len = 0;
+            MOQ_TEST_CHECK(moqr_core_delivery_chunk(c, b, 0, &chunk, &len) == MOQR_DONE);
+            MOQ_TEST_CHECK(moqr_core_delivery_chunk(c, b, 1, &chunk, &len) == MOQR_OK);
+            MOQ_TEST_CHECK_EQ_U64(len, 20);
+            if (chunk != NULL) MOQ_TEST_CHECK(moq_rcbuf_data(chunk)[0] == 0xA1);
+        }
+        MOQ_TEST_CHECK(moqr_core_delivery_done(c, b, abandon ? MOQR_DELIVERY_ABANDONED
+                                                           : MOQR_DELIVERY_DELIVERED,
+                                               CTRL_NOW) == MOQR_OK);
+    }
+    MOQ_TEST_CHECK(moqr_core_seal_subgroup(c, t, group, 3) == MOQR_OK);
+    failures += full_width_notice(c, b, true, group, 3);
+    failures += location_idle(c, b);
+    moqr_core_stats_t st;
+    moqr_core_get_stats(c, &st);
+    MOQ_TEST_CHECK_EQ_U64(st.delivered_total, abandon ? 1 : 2);
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    printf("ORACLE full_width_begun group=%llu abandon=%u failures=%d\n",
+           (unsigned long long)group, (unsigned)abandon, failures);
+    MOQ_TEST_PASS("full_width_begun");
+    return failures;
+}
+
+static int
+test_full_width_evict_reset(uint64_t group)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore_groups(&a, 1);
+    MOQ_TEST_CHECK(c != NULL);
+    if (c == NULL) return failures;
+    moqr_binding_t pub, b;
+    moqr_track_t t;
+    moqr_sub_t s;
+    gpos_setup(c, &pub, &b, &t, &s, &failures);
+    MOQ_TEST_CHECK(open_rec(c, t, group, 3, 0, 40) == MOQR_OK);
+    MOQ_TEST_CHECK(append1(c, &a, t, group, 3, 0, 20, 0xA0) == MOQR_OK);
+    moqr_delivery_t d;
+    moqr_result_t rc = moqr_core_next_delivery(c, b, CTRL_NOW, &d);
+    MOQ_TEST_CHECK(rc == MOQR_OK);
+    if (rc == MOQR_OK) {
+        MOQ_TEST_CHECK(moqr_core_delivery_done(c, b, MOQR_DELIVERY_STALLED,
+                                               CTRL_NOW) == MOQR_OK);
+    }
+    MOQ_TEST_CHECK(ing(c, &a, t, group + 1, 7, 0, 128) == MOQR_OK);
+    rc = moqr_core_next_delivery(c, b, CTRL_NOW, &d);
+    MOQ_TEST_CHECK(rc == MOQR_OK);
+    if (rc == MOQR_OK) {
+        MOQ_TEST_CHECK(d.evicted_reset && d.rec.obj_state == MOQR_OBJ_ABANDONED);
+        MOQ_TEST_CHECK_EQ_U64(d.rec.group_id, group);
+        MOQ_TEST_CHECK(moqr_core_delivery_done(c, b, MOQR_DELIVERY_ABANDONED,
+                                               CTRL_NOW) == MOQR_OK);
+    }
+    failures += full_width_notice(c, b, false, 0, 0);
+    failures += location_expect(c, b, group + 1, 7, 0);
+    MOQ_TEST_CHECK(moqr_core_seal_subgroup(c, t, group + 1, 7) == MOQR_OK);
+    failures += full_width_notice(c, b, true, group + 1, 7);
+    failures += location_idle(c, b);
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    printf("ORACLE full_width_evict_reset group=%llu failures=%d\n",
+           (unsigned long long)group, failures);
+    MOQ_TEST_PASS("full_width_evict_reset");
+    return failures;
+}
+
+static int
+test_terminal_legacy_filter(moqr_filter_type_t type, bool deferred, bool update)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, NULL);
+    MOQ_TEST_CHECK(c != NULL);
+    if (c == NULL) return failures;
+    moqr_binding_t pub, b;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 1, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 2, &b) == MOQR_OK);
+    moq_bytes_t nsb[2];
+    moqr_ns_t ns = NS2(nsb, "terminal", "legacy");
+    MOQ_TEST_CHECK(moqr_core_announce(c, pub, ns) == MOQR_OK);
+    moqr_track_t t;
+    moqr_intent_t its[8];
+    if (!deferred) {
+        MOQ_TEST_CHECK(moqr_core_publish_open(c, pub, ns, B("t"), 5, &t) == MOQR_OK);
+        MOQ_TEST_CHECK_EQ_SIZE(drain(c, its, 8), 1);
+        MOQ_TEST_CHECK(ing(c, &a, t, UINT64_MAX, 0, UINT64_MAX, 128) == MOQR_OK);
+    }
+    moqr_subscribe_req_t rq;
+    moqr_subscribe_req_init(&rq);
+    rq.ns = ns;
+    rq.name = B("t");
+    rq.filter.type = update ? MOQR_FILTER_ABSOLUTE_START : type;
+    moqr_sub_t s;
+    MOQ_TEST_CHECK(moqr_core_subscribe(c, b, &rq, &s) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_SIZE(drain(c, its, 8), 1);
+    if (deferred) {
+        MOQ_TEST_CHECK(its[0].kind == MOQR_INTENT_UPSTREAM_SUBSCRIBE);
+        t = its[0].track;
+    }
+    if (update) {
+        moqr_filter_t f = { .type = type };
+        MOQ_TEST_CHECK(moqr_core_sub_set_filter(c, s, &f, CTRL_NOW) == MOQR_OK);
+    }
+    if (deferred) {
+        MOQ_TEST_CHECK(moqr_core_upstream_ok(c, t, its[0].track_gen, 9, true,
+                                            UINT64_MAX, UINT64_MAX) == MOQR_OK);
+        MOQ_TEST_CHECK_EQ_SIZE(drain(c, its, 8), 1);
+        MOQ_TEST_CHECK(ing(c, &a, t, UINT64_MAX, 0, UINT64_MAX, 128) == MOQR_OK);
+    }
+    MOQ_TEST_CHECK(its[0].kind == MOQR_INTENT_ACCEPT_SUB && its[0].has_largest);
+    MOQ_TEST_CHECK_EQ_U64(its[0].largest_group, UINT64_MAX);
+    MOQ_TEST_CHECK_EQ_U64(its[0].largest_object, UINT64_MAX);
+    for (unsigned step = 0; step < 3; step++) {
+        if (step == 1) {
+            MOQ_TEST_CHECK(ing(c, &a, t, 0, 0, 0, 128) == MOQR_OK);
+            MOQ_TEST_CHECK(ing(c, &a, t, UINT64_MAX, 1, 1, 128) == MOQR_OK);
+        } else if (step == 2) {
+            moqr_filter_t f = { .type = MOQR_FILTER_ABSOLUTE_START };
+            MOQ_TEST_CHECK(moqr_core_sub_set_filter(c, s, &f, CTRL_NOW) == MOQR_OK);
+            MOQ_TEST_CHECK(ing(c, &a, t, UINT64_MAX, 2, 0, 128) == MOQR_OK);
+        }
+        char dump[4096];
+        size_t written = 0;
+        MOQ_TEST_CHECK(moqr_core_route_dump_json(c, dump, sizeof(dump), &written) == MOQR_OK);
+        MOQ_TEST_CHECK(strstr(dump, "\"lag_groups\":0,") != NULL);
+        moqr_delivery_t d;
+        moqr_result_t rc = moqr_core_next_delivery(c, b, CTRL_NOW, &d);
+        MOQ_TEST_CHECK(rc == MOQR_DONE);
+        if (rc == MOQR_OK) {
+            MOQ_TEST_CHECK(moqr_core_delivery_done(c, b, MOQR_DELIVERY_DELIVERED,
+                                                   CTRL_NOW) == MOQR_OK);
+        }
+    }
+    /* Typed replacement is intentionally not the legacy monotonic mutator. */
+    moq_location_filter_cfg_t loc;
+    moq_location_filter_cfg_init(&loc);
+    loc.kind = MOQ_LOCATION_FILTER_NONE;
+    MOQ_TEST_CHECK(moqr_core_sub_set_location_filter(c, s, &loc, CTRL_NOW) == MOQR_OK);
+    failures += location_idle(c, b);
+    MOQ_TEST_CHECK(ing(c, &a, t, UINT64_MAX, 2, 2, 128) == MOQR_OK);
+    failures += location_expect(c, b, UINT64_MAX, 2, 2);
+    failures += location_idle(c, b);
+    moqr_core_stats_t st;
+    moqr_core_get_stats(c, &st);
+    MOQ_TEST_CHECK_EQ_U64(st.delivered_total, 1);
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    printf("ORACLE terminal_legacy_filter type=%u deferred=%u update=%u failures=%d\n",
+           (unsigned)type, (unsigned)deferred, (unsigned)update, failures);
+    MOQ_TEST_PASS("terminal_legacy_filter");
+    return failures;
+}
+
+static int
+test_terminal_unbegun_hold_and_relative(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, NULL);
+    MOQ_TEST_CHECK(c != NULL);
+    if (c == NULL) return failures;
+    moqr_binding_t pub, b;
+    moqr_track_t t;
+    moqr_sub_t s;
+    gpos_setup(c, &pub, &b, &t, &s, &failures);
+    MOQ_TEST_CHECK(open_rec(c, t, UINT64_MAX, 0, UINT64_MAX, 20) == MOQR_OK);
+    MOQ_TEST_CHECK(append1(c, &a, t, UINT64_MAX, 0, UINT64_MAX, 20, 0xA0) == MOQR_OK);
+    moqr_delivery_t d;
+    moqr_result_t rc = moqr_core_next_delivery(c, b, CTRL_NOW, &d);
+    MOQ_TEST_CHECK(rc == MOQR_OK);
+    if (rc == MOQR_OK) {
+        MOQ_TEST_CHECK(moqr_core_delivery_done(c, b, MOQR_DELIVERY_WOULD_BLOCK,
+                                               CTRL_NOW) == MOQR_OK);
+    }
+    moqr_filter_t f = { .type = MOQR_FILTER_NEXT_GROUP_START };
+    MOQ_TEST_CHECK(moqr_core_sub_set_filter(c, s, &f, CTRL_NOW) == MOQR_OK);
+    failures += location_idle(c, b);
+    MOQ_TEST_CHECK(moqr_core_complete_record(c, t, UINT64_MAX, 0, UINT64_MAX) == MOQR_OK);
+    failures += location_idle(c, b);
+    moq_location_filter_cfg_t loc;
+    moq_location_filter_cfg_init(&loc);
+    loc.kind = MOQ_LOCATION_FILTER_RELATIVE_GROUP;
+    loc.relative_group_offset = 0;
+    MOQ_TEST_CHECK(moqr_core_sub_set_location_filter(c, s, &loc, CTRL_NOW) == MOQR_OK);
+    failures += location_idle(c, b);
+    MOQ_TEST_CHECK(ing(c, &a, t, UINT64_MAX, 1, 0, 128) == MOQR_OK);
+    failures += location_expect(c, b, UINT64_MAX, 1, 0);
+    failures += location_idle(c, b);
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("terminal_unbegun_hold_and_relative_clamp");
+    return failures;
+}
+
+
+/* -- Graceful source finish: terminals come from the delivery scans --------- */
+
+/* Open a pushed track `name` under fin/t on `pub` and return its generation. */
+static moqr_track_t
+finish_push_track(moqr_core_t *c, moqr_binding_t pub, moq_bytes_t name,
+                  uint64_t cookie, uint64_t *gen)
+{
+    moq_bytes_t nsb[2];
+    moqr_track_t t;
+    memset(&t, 0, sizeof(t));
+    *gen = 0;
+    if (moqr_core_publish_open(c, pub, NS2(nsb, "fin", "t"), name, cookie,
+                               &t) != MOQR_OK) {
+        return t;
+    }
+    moqr_intent_t its[8];
+    size_t n = moqr_core_poll_intents(c, its, 8);
+    for (size_t i = 0; i < n; i++) {
+        if (its[i].kind == MOQR_INTENT_ACCEPT_PUBLISH) {
+            *gen = its[i].track_gen;
+        }
+    }
+    return t;
+}
+
+/* Subscribe binding `b` to fin/t `name` (an active pushed track) and drain the
+ * acceptance. */
+static moqr_sub_t
+finish_sub(moqr_core_t *c, moqr_binding_t b, moq_bytes_t name, uint64_t cookie,
+           uint8_t priority, bool forward)
+{
+    moq_bytes_t nsb[2];
+    moqr_subscribe_req_t rq;
+    moqr_subscribe_req_init(&rq);
+    rq.ns = NS2(nsb, "fin", "t");
+    rq.name = name;
+    rq.filter.type = MOQR_FILTER_ABSOLUTE_START;
+    rq.subscriber_priority = priority;
+    rq.forward = forward;
+    rq.cookie = cookie;
+    moqr_sub_t sh;
+    memset(&sh, 0, sizeof(sh));
+    (void)moqr_core_subscribe(c, b, &rq, &sh);
+    moqr_intent_t its[8];
+    (void)moqr_core_poll_intents(c, its, 8);
+    return sh;
+}
+
+/* Subscriptions on one binding whose sources finished while each still owes
+ * the close of subgroup (5, 3). Only one seal notice can win a delivery pass;
+ * a subscription whose seal loses must still have it delivered -- with its
+ * exact flavor and reset code -- before its terminal, and every subscription
+ * gets exactly one terminal, after its own close. A outranks B by subscriber
+ * priority. A binding scans its newest subscription first, so the order of
+ * subscribing decides whether B's losing seal is weighed after A's winning
+ * one (variants 0 and 2) or before it (variant 1). variant 0: B's reset seal
+ * is weighed after it lost. variant 1: B's reset seal is weighed first and
+ * displaced later in the pass. variant 2: as variant 0 with a clean FIN.
+ * variant 3: B alone, nothing competing. */
+static int
+test_finish_seal_holds_retirement(int variant)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, NULL);
+    MOQ_TEST_CHECK(c != NULL);
+    moqr_binding_t pub, sb;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 100, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 200, &sb) == MOQR_OK);
+    const bool with_a = variant != 3;
+    uint64_t gen_a = 0, gen_b = 0;
+    moqr_track_t ta = finish_push_track(c, pub, B("a"), 1, &gen_a);
+    moqr_track_t tb = finish_push_track(c, pub, B("b"), 2, &gen_b);
+    const uint64_t ca_ck = 11, cb_ck = 22;
+    if (variant == 1) {
+        (void)finish_sub(c, sb, B("a"), ca_ck, 1, true);
+        (void)finish_sub(c, sb, B("b"), cb_ck, 128, true);
+    } else {
+        (void)finish_sub(c, sb, B("b"), cb_ck, 128, true);
+        if (with_a) {
+            (void)finish_sub(c, sb, B("a"), ca_ck, 1, true);
+        }
+    }
+
+    if (with_a) {
+        MOQ_TEST_CHECK(ing(c, &a, ta, 5, 3, 0, 128) == MOQR_OK);
+    }
+    MOQ_TEST_CHECK(ing(c, &a, tb, 5, 3, 0, 128) == MOQR_OK);
+    for (int k = 0; k < (with_a ? 2 : 1); k++) {
+        moqr_delivery_t d;
+        MOQ_TEST_CHECK(moqr_core_next_delivery(c, sb, CTRL_NOW, &d) == MOQR_OK);
+        MOQ_TEST_CHECK_EQ_U64(d.notice, MOQR_DELIVERY_NOTICE_NONE);
+        MOQ_TEST_CHECK(moqr_core_delivery_done(c, sb, MOQR_DELIVERY_DELIVERED,
+                                               CTRL_NOW) == MOQR_OK);
+    }
+    const bool b_reset = variant != 2;
+    const moqr_reset_desc_t want = rd_wire(0x2A);
+    if (with_a) {
+        MOQ_TEST_CHECK(moqr_core_seal_subgroup(c, ta, 5, 3) == MOQR_OK);
+    }
+    if (b_reset) {
+        MOQ_TEST_CHECK(moqr_core_reset_subgroup(c, tb, 5, 3, want) == MOQR_OK);
+    } else {
+        MOQ_TEST_CHECK(moqr_core_seal_subgroup(c, tb, 5, 3) == MOQR_OK);
+    }
+    if (with_a) {
+        MOQ_TEST_CHECK(moqr_core_source_finish(c, ta, gen_a,
+                                               pd_local(MOQR_PD_TRACK_ENDED),
+                                               CTRL_NOW) == MOQR_OK);
+    }
+    MOQ_TEST_CHECK(moqr_core_source_finish(c, tb, gen_b,
+                                           pd_local(MOQR_PD_TRACK_ENDED),
+                                           CTRL_NOW) == MOQR_OK);
+
+    /* Per subscription: the pass that returned its seal, and the pass whose
+     * intents carried its terminal. */
+    int seal_pass[2] = { -1, -1 }, done_pass[2] = { -1, -1 };
+    int seals[2] = { 0, 0 }, dones[2] = { 0, 0 };
+    int first_seal = -1;
+    for (int pass = 0; pass < 8; pass++) {
+        moqr_delivery_t d;
+        moqr_result_t rc = moqr_core_next_delivery(c, sb, CTRL_NOW, &d);
+        if (rc == MOQR_OK) {
+            MOQ_TEST_CHECK_EQ_U64(d.notice, MOQR_DELIVERY_NOTICE_SEAL);
+            MOQ_TEST_CHECK_EQ_U64(d.rec.group_id, 5);
+            MOQ_TEST_CHECK_EQ_U64(d.rec.subgroup_id, 3);
+            int who = d.sub_cookie == cb_ck ? 1 : 0;
+            seals[who]++;
+            seal_pass[who] = pass;
+            if (first_seal < 0) {
+                first_seal = who;
+            }
+            if (who == 1 && b_reset) {
+                /* The upstream reset closes B's stream: never a FIN. */
+                MOQ_TEST_CHECK(d.seal_reset);
+                MOQ_TEST_CHECK(!d.subgroup_end);
+                MOQ_TEST_CHECK_EQ_U64(d.seal_reset_desc.tag, want.tag);
+                MOQ_TEST_CHECK_EQ_U64(d.seal_reset_desc.value, want.value);
+            } else {
+                MOQ_TEST_CHECK(!d.seal_reset);
+                MOQ_TEST_CHECK(d.subgroup_end);
+            }
+            MOQ_TEST_CHECK(moqr_core_delivery_done(c, sb, MOQR_DELIVERY_DELIVERED,
+                                                   CTRL_NOW) == MOQR_OK);
+        } else {
+            MOQ_TEST_CHECK(rc == MOQR_DONE);
+        }
+        moqr_intent_t its[8];
+        size_t n = moqr_core_poll_intents(c, its, 8);
+        for (size_t i = 0; i < n; i++) {
+            MOQ_TEST_CHECK_EQ_U64(its[i].kind, MOQR_INTENT_SUB_DONE);
+            if (its[i].kind != MOQR_INTENT_SUB_DONE) {
+                continue;
+            }
+            int who = its[i].cookie == cb_ck ? 1 : 0;
+            dones[who]++;
+            done_pass[who] = pass;
+        }
+        if (rc == MOQR_DONE && n == 0) {
+            break;
+        }
+    }
+    for (int w = with_a ? 0 : 1; w < 2; w++) {
+        MOQ_TEST_CHECK_EQ_INT(seals[w], 1);
+        MOQ_TEST_CHECK_EQ_INT(dones[w], 1);
+        MOQ_TEST_CHECK(seal_pass[w] >= 0 && done_pass[w] > seal_pass[w]);
+    }
+    MOQ_TEST_CHECK_EQ_INT(first_seal, with_a ? 0 : 1);
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS(variant == 0 ? "finish_losing_reset_seal_holds_retirement"
+                  : variant == 1 ? "finish_displaced_reset_seal_control"
+                  : variant == 2 ? "finish_losing_clean_seal_holds_retirement"
+                                 : "finish_lone_reset_seal_control");
+    return failures;
+}
+
+/* Finishing a source while the intent ring is full, with a paused (Forward=0)
+ * subscriber: the finish is still taken -- it queues no intent -- and the
+ * source is released at once, so a binding that drops its record of the
+ * source afterwards strands nothing. The paused subscriber's single terminal
+ * comes from its binding's delivery scan: while the ring is full the scan
+ * re-marks the binding instead of losing the retirement, and once the ring
+ * has room the next scan emits exactly one SUB_DONE. variant 1 is the
+ * immediate control: moqr_core_source_done refuses the same full ring with
+ * no state change, and after the ring drains it retires the subscriber in
+ * the call itself. variant 2 is the failed source whose immediate end cannot
+ * be queued (the relay's malformed-track path): the abort fallback releases
+ * the source at once, and the forwarding subscriber -- although its record is
+ * still retained -- is sent nothing more: its next scan with room emits its
+ * one terminal. */
+static int
+test_finish_full_intent_ring(int variant)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_relay_cfg_t cfg;
+    moqr_core_relay_cfg_init_sized(&cfg, sizeof(cfg), &a.vt);
+    cfg.log_budget.max_groups = 4;
+    cfg.log_budget.max_bytes = 1 << 20;
+    cfg.max_subs = 2;
+    cfg.max_tracks = 8;
+    cfg.max_ns_nodes = 3;
+    cfg.max_ns_subs = 1;
+    cfg.max_intents = 3;   /* the atomicity clamp keeps it at 3 */
+    moqr_core_t *c = NULL;
+    MOQ_TEST_CHECK(moqr_core_create(&cfg, &c) == MOQR_OK);
+    if (c == NULL) {
+        return failures;
+    }
+    moqr_binding_t pub, sb;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 100, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 300, &sb) == MOQR_OK);
+    uint64_t gen = 0;
+    moqr_track_t t = finish_push_track(c, pub, B("v"), 1, &gen);
+    moqr_sub_t held = finish_sub(c, sb, B("v"), 33, 128, variant == 2);
+    moqr_sub_state_t st;
+    MOQ_TEST_CHECK(moqr_core_sub_state(c, held, &st) == MOQR_OK);
+    MOQ_TEST_CHECK(st == MOQR_SUB_ACTIVE);
+    MOQ_TEST_CHECK(ing(c, &a, t, 0, 0, 0, 128) == MOQR_OK);
+
+    /* Fill the ring with unrelated acceptances until the core refuses. */
+    static const char *names[] = { "x0", "x1", "x2", "x3", "x4" };
+    int opened = 0;
+    bool full = false;
+    for (int k = 0; k < 5 && !full; k++) {
+        moq_bytes_t nsb[2];
+        moqr_track_t xt;
+        moqr_result_t rc = moqr_core_publish_open(
+            c, pub, NS2(nsb, "fin", "t"),
+            (moq_bytes_t){ (const uint8_t *)names[k], 2 }, 50u + (uint64_t)k, &xt);
+        if (rc == MOQR_ERR_WOULD_BLOCK) {
+            full = true;
+        } else {
+            MOQ_TEST_CHECK(rc == MOQR_OK);
+            opened++;
+        }
+    }
+    MOQ_TEST_CHECK(full);
+    MOQ_TEST_CHECK_EQ_INT(opened, 3);
+
+    moqr_intent_t its[8];
+    if (variant == 2) {
+        const moqr_pd_desc_t bad = pd_local(MOQR_PD_MALFORMED_TRACK);
+        MOQ_TEST_CHECK(moqr_core_source_done(c, t, gen, bad, CTRL_NOW) ==
+                       MOQR_ERR_WOULD_BLOCK);
+        uint64_t rdy[8];
+        (void)moqr_core_drain_ready(c, rdy, 8);
+        MOQ_TEST_CHECK(moqr_core_internal_source_abort(c, t, gen, bad) ==
+                       MOQR_OK);
+        /* Released at once: the failed generation is gone. */
+        MOQ_TEST_CHECK(moqr_core_source_done(c, t, gen, bad, CTRL_NOW) ==
+                       MOQR_ERR_STALE_HANDLE);
+        uint32_t nr = moqr_core_drain_ready(c, rdy, 8);
+        MOQ_TEST_CHECK(nr == 1 && rdy[0] == 300);
+        moqr_delivery_t d;
+        MOQ_TEST_CHECK(moqr_core_next_delivery(c, sb, CTRL_NOW, &d) == MOQR_DONE);
+        MOQ_TEST_CHECK(moqr_core_sub_state(c, held, &st) == MOQR_OK);
+        nr = moqr_core_drain_ready(c, rdy, 8);
+        MOQ_TEST_CHECK(nr == 1 && rdy[0] == 300);
+        MOQ_TEST_CHECK_EQ_SIZE(moqr_core_poll_intents(c, its, 8), (size_t)3);
+        MOQ_TEST_CHECK(moqr_core_next_delivery(c, sb, CTRL_NOW, &d) == MOQR_DONE);
+        size_t n = moqr_core_poll_intents(c, its, 8);
+        MOQ_TEST_CHECK_EQ_SIZE(n, (size_t)1);
+        MOQ_TEST_CHECK(n == 1 && its[0].kind == MOQR_INTENT_SUB_DONE &&
+                       its[0].cookie == 33);
+        MOQ_TEST_CHECK(n == 1 && pd_wire_for(its[0].pd, MOQ_VERSION_DRAFT_16) ==
+                       pd_wire_for(bad, MOQ_VERSION_DRAFT_16));
+        MOQ_TEST_CHECK(moqr_core_sub_state(c, held, &st) ==
+                       MOQR_ERR_STALE_HANDLE);
+        MOQ_TEST_CHECK(moqr_core_next_delivery(c, sb, CTRL_NOW, &d) == MOQR_DONE);
+        MOQ_TEST_CHECK_EQ_SIZE(moqr_core_poll_intents(c, its, 8), (size_t)0);
+    } else if (variant == 1) {
+        MOQ_TEST_CHECK(moqr_core_source_done(c, t, gen,
+                                             pd_local(MOQR_PD_TRACK_ENDED),
+                                             CTRL_NOW) == MOQR_ERR_WOULD_BLOCK);
+        MOQ_TEST_CHECK(moqr_core_sub_state(c, held, &st) == MOQR_OK);
+        MOQ_TEST_CHECK_EQ_SIZE(moqr_core_poll_intents(c, its, 8), (size_t)3);
+        MOQ_TEST_CHECK(moqr_core_source_done(c, t, gen,
+                                             pd_local(MOQR_PD_TRACK_ENDED),
+                                             CTRL_NOW) == MOQR_OK);
+        size_t n = moqr_core_poll_intents(c, its, 8);
+        MOQ_TEST_CHECK_EQ_SIZE(n, (size_t)1);
+        MOQ_TEST_CHECK(n == 1 && its[0].kind == MOQR_INTENT_SUB_DONE &&
+                       its[0].cookie == 33);
+        MOQ_TEST_CHECK(moqr_core_sub_state(c, held, &st) ==
+                       MOQR_ERR_STALE_HANDLE);
+    } else {
+        uint64_t rdy[8];
+        (void)moqr_core_drain_ready(c, rdy, 8);
+        MOQ_TEST_CHECK(moqr_core_source_finish(c, t, gen,
+                                               pd_local(MOQR_PD_TRACK_ENDED),
+                                               CTRL_NOW) == MOQR_OK);
+        /* Released at once: the finished generation is gone. */
+        MOQ_TEST_CHECK(moqr_core_source_finish(c, t, gen,
+                                               pd_local(MOQR_PD_TRACK_ENDED),
+                                               CTRL_NOW) ==
+                       MOQR_ERR_STALE_HANDLE);
+        uint32_t nr = moqr_core_drain_ready(c, rdy, 8);
+        MOQ_TEST_CHECK(nr == 1 && rdy[0] == 300);
+        /* Ring still full: the scan cannot retire it and keeps it marked. */
+        moqr_delivery_t d;
+        MOQ_TEST_CHECK(moqr_core_next_delivery(c, sb, CTRL_NOW, &d) == MOQR_DONE);
+        MOQ_TEST_CHECK(moqr_core_sub_state(c, held, &st) == MOQR_OK);
+        nr = moqr_core_drain_ready(c, rdy, 8);
+        MOQ_TEST_CHECK(nr == 1 && rdy[0] == 300);
+        size_t n = moqr_core_poll_intents(c, its, 8);
+        MOQ_TEST_CHECK_EQ_SIZE(n, (size_t)3);
+        for (size_t i = 0; i < n; i++) {
+            MOQ_TEST_CHECK(its[i].kind != MOQR_INTENT_SUB_DONE);
+        }
+        /* Room again: the next scan emits the one terminal. */
+        MOQ_TEST_CHECK(moqr_core_next_delivery(c, sb, CTRL_NOW, &d) == MOQR_DONE);
+        n = moqr_core_poll_intents(c, its, 8);
+        MOQ_TEST_CHECK_EQ_SIZE(n, (size_t)1);
+        MOQ_TEST_CHECK(n == 1 && its[0].kind == MOQR_INTENT_SUB_DONE &&
+                       its[0].cookie == 33);
+        MOQ_TEST_CHECK(n == 1 && pd_wire_for(its[0].pd, MOQ_VERSION_DRAFT_16) ==
+                       pd_wire_for(pd_local(MOQR_PD_TRACK_ENDED),
+                                   MOQ_VERSION_DRAFT_16));
+        MOQ_TEST_CHECK(moqr_core_sub_state(c, held, &st) ==
+                       MOQR_ERR_STALE_HANDLE);
+        MOQ_TEST_CHECK(moqr_core_next_delivery(c, sb, CTRL_NOW, &d) == MOQR_DONE);
+        MOQ_TEST_CHECK_EQ_SIZE(moqr_core_poll_intents(c, its, 8), (size_t)0);
+    }
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS(variant == 0 ? "finish_full_intent_ring"
+                  : variant == 1 ? "finish_full_intent_ring_immediate_control"
+                                 : "abort_full_intent_ring_releases_source");
+    return failures;
+}
+
+/* One delivery scan's observable outcome for the omission/range fixtures. */
+typedef struct omit_obs {
+    int records[2];           /* records delivered, per subscription */
+    int seals[2];             /* seal notices, per subscription */
+    int seal_pass[2];
+    bool seal_reset[2];
+    bool seal_fin[2];
+    moqr_reset_desc_t seal_desc[2];
+    int dones[2];
+    int done_pass[2];
+    moqr_pd_desc_t done_pd[2];
+    uint64_t last_object[2];  /* last record's object id */
+} omit_obs_t;
+
+/* Drive binding `sb` until it has nothing left, acknowledging every delivery,
+ * and record per-subscription records, seals and terminals (index 1 = cookie
+ * `ck1`, else 0). */
+static void
+omit_drive(moqr_core_t *c, moqr_binding_t sb, uint64_t ck1, omit_obs_t *o)
+{
+    memset(o, 0, sizeof(*o));
+    for (int w = 0; w < 2; w++) {
+        o->seal_pass[w] = -1;
+        o->done_pass[w] = -1;
+    }
+    for (int pass = 0; pass < 16; pass++) {
+        moqr_delivery_t d;
+        moqr_result_t rc = moqr_core_next_delivery(c, sb, CTRL_NOW, &d);
+        if (rc == MOQR_OK) {
+            int who = d.sub_cookie == ck1 ? 1 : 0;
+            if (d.notice == MOQR_DELIVERY_NOTICE_SEAL) {
+                o->seals[who]++;
+                o->seal_pass[who] = pass;
+                o->seal_reset[who] = d.seal_reset;
+                o->seal_fin[who] = d.subgroup_end;
+                o->seal_desc[who] = d.seal_reset_desc;
+            } else if (d.notice == MOQR_DELIVERY_NOTICE_NONE) {
+                o->records[who]++;
+                o->last_object[who] = d.rec.object_id;
+            }
+            (void)moqr_core_delivery_done(c, sb, MOQR_DELIVERY_DELIVERED,
+                                          CTRL_NOW);
+        }
+        moqr_intent_t its[8];
+        size_t n = moqr_core_poll_intents(c, its, 8);
+        for (size_t i = 0; i < n; i++) {
+            if (its[i].kind != MOQR_INTENT_SUB_DONE) {
+                continue;
+            }
+            int who = its[i].cookie == ck1 ? 1 : 0;
+            o->dones[who]++;
+            o->done_pass[who] = pass;
+            o->done_pd[who] = its[i].pd;
+        }
+        if (rc != MOQR_OK && n == 0) {
+            break;
+        }
+    }
+}
+
+/* A subscription paused (Forward=0) after it delivered Object 0 of a
+ * subgroup, whose Object 1 is then retained and whose source finishes: the
+ * suppressed Object 1 is never sent, so the downstream stream that carries
+ * Object 0 is incomplete and must end with a reset, never a FIN (draft-18
+ * section 11.4.3, draft-22 section 11.3.2), before exactly one terminal. A
+ * forwarding sibling on another track of the same binding is untouched.
+ * variant 1 is the control: the same sequence without the pause delivers
+ * Object 1, a FIN and then the terminal. */
+static int
+test_finish_paused_omitted_tail(int variant)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, NULL);
+    MOQ_TEST_CHECK(c != NULL);
+    moqr_binding_t pub, sb;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 100, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 200, &sb) == MOQR_OK);
+    uint64_t gen_p = 0, gen_h = 0;
+    moqr_track_t tp = finish_push_track(c, pub, B("p"), 1, &gen_p);
+    moqr_track_t th = finish_push_track(c, pub, B("h"), 2, &gen_h);
+    (void)gen_h;
+    const uint64_t ck_h = 11, ck_p = 22;
+    moqr_sub_t ps = finish_sub(c, sb, B("p"), ck_p, 128, true);
+    moqr_sub_t hs = finish_sub(c, sb, B("h"), ck_h, 128, true);
+
+    MOQ_TEST_CHECK(ing(c, &a, tp, 5, 3, 0, 128) == MOQR_OK);
+    moqr_delivery_t d;
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, sb, CTRL_NOW, &d) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(d.sub_cookie, ck_p);
+    MOQ_TEST_CHECK_EQ_U64(d.rec.object_id, 0);
+    MOQ_TEST_CHECK(moqr_core_delivery_done(c, sb, MOQR_DELIVERY_DELIVERED,
+                                           CTRL_NOW) == MOQR_OK);
+    if (variant == 0) {
+        MOQ_TEST_CHECK(moqr_core_sub_set_forward(c, ps, false, CTRL_NOW) ==
+                       MOQR_OK);
+    }
+    MOQ_TEST_CHECK(ing(c, &a, tp, 5, 3, 1, 128) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_seal_subgroup(c, tp, 5, 3) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_source_finish(c, tp, gen_p,
+                                           pd_local(MOQR_PD_TRACK_ENDED),
+                                           CTRL_NOW) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, th, 7, 0, 0, 128) == MOQR_OK);   /* sibling */
+
+    omit_obs_t o;
+    omit_drive(c, sb, ck_p, &o);
+    /* The paused-or-not subscription: exactly one close of (5, 3), then
+     * exactly one terminal after it. */
+    MOQ_TEST_CHECK_EQ_INT(o.seals[1], 1);
+    MOQ_TEST_CHECK_EQ_INT(o.dones[1], 1);
+    MOQ_TEST_CHECK(o.seal_pass[1] >= 0 && o.done_pass[1] > o.seal_pass[1]);
+    if (variant == 0) {
+        moqr_reset_desc_t want;
+        MOQ_TEST_CHECK(moqr_reset_desc_local(MOQR_RESET_CANCELLED, &want) ==
+                       MOQR_OK);
+        MOQ_TEST_CHECK_EQ_INT(o.records[1], 0);   /* Object 1 never sent */
+        MOQ_TEST_CHECK(o.seal_reset[1]);
+        MOQ_TEST_CHECK(!o.seal_fin[1]);
+        MOQ_TEST_CHECK_EQ_U64(o.seal_desc[1].tag, want.tag);
+        MOQ_TEST_CHECK_EQ_U64(o.seal_desc[1].value, want.value);
+    } else {
+        MOQ_TEST_CHECK_EQ_INT(o.records[1], 1);
+        MOQ_TEST_CHECK_EQ_U64(o.last_object[1], 1);
+        MOQ_TEST_CHECK(!o.seal_reset[1]);
+        MOQ_TEST_CHECK(o.seal_fin[1]);
+    }
+    /* The sibling got its record and is still established. */
+    MOQ_TEST_CHECK_EQ_INT(o.records[0], 1);
+    MOQ_TEST_CHECK_EQ_INT(o.dones[0], 0);
+    moqr_sub_state_t st;
+    MOQ_TEST_CHECK(moqr_core_sub_state(c, hs, &st) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_sub_state(c, ps, &st) == MOQR_ERR_STALE_HANDLE);
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS(variant == 0 ? "finish_paused_omitted_tail_resets"
+                               : "finish_forwarding_tail_control");
+    return failures;
+}
+
+/* A bounded draft-16/18 subscription (range_end_holds false: reaching the
+ * range end retires it with SUBSCRIPTION_ENDED) ending at group 5. Its group-5
+ * object is delivered, group 6 arrives (the range is exhausted), group 5's
+ * subgroup is then reset upstream and the source finishes before another
+ * scan. The owed reset closes the stream with the upstream code -- never a
+ * substituted FIN -- before the range terminal, and the terminal keeps the
+ * range-completion status. variant 1 is the control: the subgroup FINs and
+ * its close is delivered before group 6 arrives, and range completion alone
+ * ends the subscription. (A draft-22 subscription holds at its range end and
+ * never takes this branch.) */
+static int
+test_range_end_owed_reset_d18(int variant)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, NULL);
+    MOQ_TEST_CHECK(c != NULL);
+    moqr_binding_t pub, sb;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 100, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 200, &sb) == MOQR_OK);
+    uint64_t gen = 0;
+    moqr_track_t t = finish_push_track(c, pub, B("r"), 1, &gen);
+    moq_bytes_t nsb[2];
+    moqr_subscribe_req_t rq;
+    moqr_subscribe_req_init(&rq);
+    rq.ns = NS2(nsb, "fin", "t");
+    rq.name = B("r");
+    rq.filter.type = MOQR_FILTER_ABSOLUTE_RANGE;
+    rq.filter.start_group = 5;
+    rq.filter.start_object = 0;
+    rq.filter.end_group_delta = 0;
+    rq.cookie = 22;
+    moqr_sub_t rs;
+    MOQ_TEST_CHECK(moqr_core_subscribe(c, sb, &rq, &rs) == MOQR_OK);
+    moqr_intent_t its[8];
+    (void)moqr_core_poll_intents(c, its, 8);
+
+    MOQ_TEST_CHECK(ing(c, &a, t, 5, 3, 0, 128) == MOQR_OK);
+    moqr_delivery_t d;
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, sb, CTRL_NOW, &d) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(d.rec.object_id, 0);
+    MOQ_TEST_CHECK(moqr_core_delivery_done(c, sb, MOQR_DELIVERY_DELIVERED,
+                                           CTRL_NOW) == MOQR_OK);
+    const moqr_reset_desc_t want = rd_wire(0x2A);
+    if (variant == 1) {
+        MOQ_TEST_CHECK(moqr_core_seal_subgroup(c, t, 5, 3) == MOQR_OK);
+        MOQ_TEST_CHECK(moqr_core_next_delivery(c, sb, CTRL_NOW, &d) == MOQR_OK);
+        MOQ_TEST_CHECK_EQ_U64(d.notice, MOQR_DELIVERY_NOTICE_SEAL);
+        MOQ_TEST_CHECK(!d.seal_reset);
+        MOQ_TEST_CHECK(moqr_core_delivery_done(c, sb, MOQR_DELIVERY_DELIVERED,
+                                               CTRL_NOW) == MOQR_OK);
+        MOQ_TEST_CHECK(ing(c, &a, t, 6, 0, 0, 128) == MOQR_OK);
+    } else {
+        MOQ_TEST_CHECK(ing(c, &a, t, 6, 0, 0, 128) == MOQR_OK);
+        MOQ_TEST_CHECK(moqr_core_reset_subgroup(c, t, 5, 3, want) == MOQR_OK);
+        MOQ_TEST_CHECK(moqr_core_source_finish(c, t, gen,
+                                               pd_local(MOQR_PD_TRACK_ENDED),
+                                               CTRL_NOW) == MOQR_OK);
+    }
+
+    omit_obs_t o;
+    omit_drive(c, sb, 22, &o);
+    MOQ_TEST_CHECK_EQ_INT(o.records[1], 0);   /* group 6 is out of range */
+    MOQ_TEST_CHECK_EQ_INT(o.dones[1], 1);
+    if (variant == 0) {
+        MOQ_TEST_CHECK_EQ_INT(o.seals[1], 1);
+        MOQ_TEST_CHECK(o.seal_pass[1] >= 0 && o.done_pass[1] > o.seal_pass[1]);
+        MOQ_TEST_CHECK(o.seal_reset[1]);
+        MOQ_TEST_CHECK(!o.seal_fin[1]);
+        MOQ_TEST_CHECK_EQ_U64(o.seal_desc[1].tag, want.tag);
+        MOQ_TEST_CHECK_EQ_U64(o.seal_desc[1].value, want.value);
+    } else {
+        MOQ_TEST_CHECK_EQ_INT(o.seals[1], 0);
+    }
+    /* Range completion keeps its own status. */
+    MOQ_TEST_CHECK_EQ_U64(pd_wire_for(o.done_pd[1], MOQ_VERSION_DRAFT_18),
+                          pd_wire_for(pd_local(MOQR_PD_SUBSCRIPTION_ENDED),
+                                      MOQ_VERSION_DRAFT_18));
+    moqr_sub_state_t st;
+    MOQ_TEST_CHECK(moqr_core_sub_state(c, rs, &st) == MOQR_ERR_STALE_HANDLE);
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS(variant == 0 ? "d18_range_end_owed_reset_before_terminal"
+                               : "d18_range_end_completion_control");
+    return failures;
+}
+
+/* -- Subgroup stream terminals: expired tails and stream lifetimes ---------- */
+
+/* A whole record with payload byte `fill` that arrived at `now_us`. */
+static moqr_result_t
+ing_at(moqr_core_t *c, ca_t *a, moqr_track_t t, uint64_t g, uint64_t sg,
+       uint64_t o, uint64_t now_us, uint8_t fill)
+{
+    uint8_t buf[8];
+    memset(buf, fill, sizeof(buf));
+    moq_rcbuf_t *pl = NULL;
+    if (moq_rcbuf_create(&a->vt, buf, sizeof(buf), &pl) != 0) {
+        return MOQR_ERR_NOMEM;
+    }
+    moqr_log_append_desc_t d;
+    moqr_log_append_desc_init(&d);
+    d.group_id = g;
+    d.subgroup_id = sg;
+    d.object_id = o;
+    d.publisher_priority = 128;
+    d.payload = pl;
+    d.now_us = now_us;
+    moqr_result_t rc = moqr_core_ingest(c, t, &d);
+    if (rc != MOQR_OK) {
+        moq_rcbuf_decref(pl);
+    }
+    return rc;
+}
+
+/* The next delivery on `b` at `now` is a record of `object_id`: its stream
+ * marks (follows_gap and the reset owed to the stream it does not continue)
+ * are returned, and it is confirmed DELIVERED. */
+static int
+take_rec(moqr_core_t *c, moqr_binding_t b, uint64_t now, uint64_t object_id,
+         bool *follows_gap, moqr_reset_desc_t *gap_reset)
+{
+    int failures = 0;
+    moqr_delivery_t d;
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, b, now, &d) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(d.notice, MOQR_DELIVERY_NOTICE_NONE);
+    MOQ_TEST_CHECK_EQ_U64(d.rec.object_id, object_id);
+    bool props = false;
+    *follows_gap = false;
+    *gap_reset = moqr_reset_desc_none();
+    MOQ_TEST_CHECK(moqr_core_internal_delivery_flags(c, b, &props, follows_gap,
+                                                     gap_reset) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_delivery_done(c, b, MOQR_DELIVERY_DELIVERED, now) ==
+                   MOQR_OK);
+    return failures;
+}
+
+/* The next delivery on `b` at `now` is a SEAL notice for (5, 3) of the given
+ * flavor; it is acknowledged. */
+static int
+take_seal(moqr_core_t *c, moqr_binding_t b, uint64_t now, bool reset,
+          const char *what)
+{
+    int failures = 0;
+    moqr_delivery_t d;
+    moqr_result_t rc = moqr_core_next_delivery(c, b, now, &d);
+    if (rc != MOQR_OK || d.notice != MOQR_DELIVERY_NOTICE_SEAL ||
+        d.seal_reset != reset || d.subgroup_end == reset) {
+        fprintf(stderr, "FAIL %s: rc=%d notice=%u seal_reset=%d (want a %s seal)\n",
+                what, (int)rc, (unsigned)(rc == MOQR_OK ? d.notice : 0),
+                rc == MOQR_OK && d.seal_reset, reset ? "reset" : "clean");
+        failures++;
+        if (rc == MOQR_OK) {
+            (void)moqr_core_delivery_done(c, b, MOQR_DELIVERY_DELIVERED, now);
+        }
+        return failures;
+    }
+    MOQ_TEST_CHECK_EQ_U64(d.rec.group_id, 5);
+    MOQ_TEST_CHECK_EQ_U64(d.rec.subgroup_id, 3);
+    MOQ_TEST_CHECK(moqr_core_delivery_done(c, b, MOQR_DELIVERY_DELIVERED, now) ==
+                   MOQR_OK);
+    return failures;
+}
+
+/* MAX_CACHE_DURATION (draft-22 §10.3) with the subgroup's last object never
+ * started downstream: the object is omitted, so the stream that carried the
+ * earlier objects is incomplete and its terminal is a reset, not a FIN
+ * (§11.3.2), even when the upstream stream ended with a FIN. Controls: the
+ * same tail delivered in time ends with a FIN; a fresh object after the
+ * expired one continues on a new stream (follows_gap) whose own FIN is
+ * clean. */
+static int
+test_expired_tail_terminal(int variant)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, NULL);
+    MOQ_TEST_CHECK(c != NULL);
+    moqr_binding_t pub, s1;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 100, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 200, &s1) == MOQR_OK);
+    moqr_sub_t sub1;
+    moqr_track_t track = chunked_sub_setup(c, pub, s1, &sub1);
+    MOQ_TEST_CHECK(moqr_core_internal_set_max_cache_duration(c, track, true, 10) == MOQR_OK);
+
+    const uint64_t t0 = 100000;            /* arrival of the first objects */
+    const uint64_t late = t0 + 50000;      /* 50 ms later: past 10 ms      */
+    bool gap;
+    moqr_reset_desc_t gr;
+    MOQ_TEST_CHECK(ing_at(c, &a, track, 5, 3, 0, t0, 0xA0) == MOQR_OK);
+    failures += take_rec(c, s1, t0, 0, &gap, &gr);
+    MOQ_TEST_CHECK(!gap);
+    MOQ_TEST_CHECK(ing_at(c, &a, track, 5, 3, 1, t0, 0xA1) == MOQR_OK);
+    if (variant == 2) {
+        MOQ_TEST_CHECK(ing_at(c, &a, track, 5, 3, 2, late, 0xA2) == MOQR_OK);
+    }
+    MOQ_TEST_CHECK(moqr_core_seal_subgroup(c, track, 5, 3) == MOQR_OK);
+    if (variant == 1) {
+        /* In time: the tail is delivered and the FIN passes on. */
+        failures += take_rec(c, s1, t0, 1, &gap, &gr);
+        failures += take_seal(c, s1, t0, false, "tail delivered in time");
+    } else if (variant == 2) {
+        /* Object 1 expired, object 2 fresh: 2 starts a new stream. */
+        failures += take_rec(c, s1, late, 2, &gap, &gr);
+        MOQ_TEST_CHECK(gap);
+        failures += take_seal(c, s1, late, false, "fresh object after an expired one");
+    } else {
+        failures += take_seal(c, s1, late, true, "expired tail");
+    }
+    moqr_delivery_t d;
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, s1, late, &d) == MOQR_DONE);
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS(variant == 0 ? "expired_tail_terminal"
+                  : variant == 1 ? "expired_tail_terminal_in_time"
+                                 : "expired_tail_terminal_fresh_suffix");
+    return failures;
+}
+
+/* The same boundary with the subscriber's earlier downstream stream still
+ * open: it received Object 0 of the first upstream lifetime, which then ended
+ * with a RESET (0x7), and its window moved to start at {5, 2} before it took
+ * that terminal. The first record of the new lifetime (Object 1) is outside
+ * the window; Object 2 opens a new downstream stream, and the stream it does
+ * not continue ends as its upstream stream ended -- with the upstream reset,
+ * the same cause the unfiltered boundary carries. Then exactly one FIN. */
+static int
+test_filtered_reopen_open_stream(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, NULL);
+    MOQ_TEST_CHECK(c != NULL);
+    moqr_binding_t pub, s1, s2;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 100, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 200, &s1) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 300, &s2) == MOQR_OK);
+    moqr_sub_t sub1;
+    moqr_track_t track = chunked_sub_setup(c, pub, s1, &sub1);
+    moq_bytes_t nsb[2];
+    moqr_subscribe_req_t rq;
+    moqr_subscribe_req_init(&rq);
+    rq.ns = NS2(nsb, "demo", "cam");
+    rq.name = B("video");
+    rq.filter.type = MOQR_FILTER_ABSOLUTE_START;
+    rq.filter.start_group = 5;
+    rq.filter.start_object = 0;
+    rq.cookie = 35;
+    moqr_sub_t sub2;
+    MOQ_TEST_CHECK(moqr_core_subscribe(c, s2, &rq, &sub2) == MOQR_OK);
+    moqr_intent_t its[8];
+    (void)moqr_core_poll_intents(c, its, 8);
+    moqr_reset_desc_t up_reset;
+    MOQ_TEST_CHECK(moqr_reset_desc_wire(MOQ_VERSION_DRAFT_22, 0x7, &up_reset) == MOQR_OK);
+    bool gap;
+    moqr_reset_desc_t gr;
+    moqr_delivery_t d;
+    MOQ_TEST_CHECK(ing(c, &a, track, 5, 3, 0, 128) == MOQR_OK);
+    failures += take_rec(c, s2, CTRL_NOW, 0, &gap, &gr);
+    MOQ_TEST_CHECK(moqr_core_reset_subgroup(c, track, 5, 3, up_reset) == MOQR_OK);
+    moqr_filter_t f = { .type = MOQR_FILTER_ABSOLUTE_START, .start_group = 5,
+                        .start_object = 2 };
+    MOQ_TEST_CHECK(moqr_core_sub_set_filter(c, sub2, &f, CTRL_NOW) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, track, 5, 3, 1, 128) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, track, 5, 3, 2, 128) == MOQR_OK);
+    failures += take_rec(c, s2, CTRL_NOW, 2, &gap, &gr);
+    MOQ_TEST_CHECK(gap);                       /* a new downstream stream */
+    if (gr.tag != up_reset.tag || gr.value != up_reset.value) {
+        fprintf(stderr, "FAIL filtered reopen, open stream: old stream ends with reset "
+                "tag=%d value=%llu, want the upstream reset tag=%d value=%llu\n",
+                (int)gr.tag, (unsigned long long)gr.value, (int)up_reset.tag,
+                (unsigned long long)up_reset.value);
+        failures++;
+    }
+    MOQ_TEST_CHECK(moqr_core_seal_subgroup(c, track, 5, 3) == MOQR_OK);
+    failures += take_seal(c, s2, CTRL_NOW, false, "replacement stream FIN");
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, s2, CTRL_NOW, &d) == MOQR_DONE);
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("filtered_reopen_open_stream");
+    return failures;
+}
+
+/* Several boundaries passed over while the subscriber's downstream stream
+ * of the first lifetime is still open. It received Object 0 of lifetime A;
+ * its window then moved to start at {5, 3}. A ends with RESET 0x7 (or, in
+ * the control, with a FIN); lifetime B (Object 1) ends with RESET 0x8;
+ * lifetime C brings Objects 2 and 3. Objects 1 and 2 are outside the
+ * window. Object 3 opens a new downstream stream, and the stream it does not
+ * continue -- A's -- ends with A's cause: 0x7, never B's 0x8; after A's FIN,
+ * no upstream reset at all. Then exactly one FIN. */
+static int
+test_filtered_reopen_owed_cause(bool a_reset)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, NULL);
+    MOQ_TEST_CHECK(c != NULL);
+    moqr_binding_t pub, s1, s2;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 100, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 200, &s1) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 300, &s2) == MOQR_OK);
+    moqr_sub_t sub1;
+    moqr_track_t track = chunked_sub_setup(c, pub, s1, &sub1);
+    moq_bytes_t nsb[2];
+    moqr_subscribe_req_t rq;
+    moqr_subscribe_req_init(&rq);
+    rq.ns = NS2(nsb, "demo", "cam");
+    rq.name = B("video");
+    rq.filter.type = MOQR_FILTER_ABSOLUTE_START;
+    rq.filter.start_group = 5;
+    rq.filter.start_object = 0;
+    rq.cookie = 36;
+    moqr_sub_t sub2;
+    MOQ_TEST_CHECK(moqr_core_subscribe(c, s2, &rq, &sub2) == MOQR_OK);
+    moqr_intent_t its[8];
+    (void)moqr_core_poll_intents(c, its, 8);
+    moqr_reset_desc_t reset_a, reset_b;
+    MOQ_TEST_CHECK(moqr_reset_desc_wire(MOQ_VERSION_DRAFT_22, 0x7, &reset_a) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_reset_desc_wire(MOQ_VERSION_DRAFT_22, 0x8, &reset_b) == MOQR_OK);
+    bool gap;
+    moqr_reset_desc_t gr;
+    moqr_delivery_t d;
+    MOQ_TEST_CHECK(ing(c, &a, track, 5, 3, 0, 128) == MOQR_OK);
+    failures += take_rec(c, s2, CTRL_NOW, 0, &gap, &gr);
+    moqr_filter_t f = { .type = MOQR_FILTER_ABSOLUTE_START, .start_group = 5,
+                        .start_object = 3 };
+    MOQ_TEST_CHECK(moqr_core_sub_set_filter(c, sub2, &f, CTRL_NOW) == MOQR_OK);
+    if (a_reset)
+        MOQ_TEST_CHECK(moqr_core_reset_subgroup(c, track, 5, 3, reset_a) == MOQR_OK);
+    else
+        MOQ_TEST_CHECK(moqr_core_seal_subgroup(c, track, 5, 3) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, track, 5, 3, 1, 128) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_reset_subgroup(c, track, 5, 3, reset_b) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, track, 5, 3, 2, 128) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, track, 5, 3, 3, 128) == MOQR_OK);
+    failures += take_rec(c, s2, CTRL_NOW, 3, &gap, &gr);
+    MOQ_TEST_CHECK(gap);                       /* a new downstream stream */
+    bool ok = a_reset ? (gr.tag == reset_a.tag && gr.value == reset_a.value)
+                      : gr.tag == MOQR_CODE_NONE;
+    if (!ok) {
+        fprintf(stderr, "FAIL owed cause (%s): old stream ends with tag=%d value=%llu\n",
+                a_reset ? "A reset 0x7" : "A FIN", (int)gr.tag, (unsigned long long)gr.value);
+        failures++;
+    }
+    MOQ_TEST_CHECK(moqr_core_seal_subgroup(c, track, 5, 3) == MOQR_OK);
+    failures += take_seal(c, s2, CTRL_NOW, false, "replacement stream FIN");
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, s2, CTRL_NOW, &d) == MOQR_DONE);
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS(a_reset ? "filtered_reopen_owed_cause" : "filtered_reopen_owed_cause_fin");
+    return failures;
+}
+
+/* A subscriber of Track `track` whose window starts at {5, 0}. */
+static moqr_sub_t
+lifetime_sub(moqr_core_t *c, moqr_binding_t b, uint64_t cookie)
+{
+    moq_bytes_t nsb[2];
+    moqr_subscribe_req_t rq;
+    moqr_subscribe_req_init(&rq);
+    rq.ns = NS2(nsb, "demo", "cam");
+    rq.name = B("video");
+    rq.filter.type = MOQR_FILTER_ABSOLUTE_START;
+    rq.filter.start_group = 5;
+    rq.filter.start_object = 0;
+    rq.cookie = cookie;
+    moqr_sub_t sub = { 0 };
+    if (moqr_core_subscribe(c, b, &rq, &sub) != MOQR_OK) sub._opaque = 0;
+    moqr_intent_t its[8];
+    (void)moqr_core_poll_intents(c, its, 8);
+    return sub;
+}
+
+static bool desc_is(moqr_reset_desc_t d, const moqr_reset_desc_t *want)
+{
+    if (!want) return d.tag == MOQR_CODE_NONE;
+    return d.tag == want->tag && d.value == want->value;
+}
+
+/* The subscriber's stream of lifetime A (Object 0) is still open when the
+ * lifetime boundary after it is passed over because it expired (`mode` 0) or
+ * was abandoned before this subscriber began it (`mode` 1). A ended with
+ * RESET 0x7; the boundary's lifetime B ended with RESET 0x8; lifetime C's
+ * Object 2 arrives fresh. Delivering it ends A's stream with 0x7 -- the
+ * cause owed to the stream this subscriber has open -- not 0x8. */
+static int
+test_owed_cause_unbegun_skip(int mode)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, NULL);
+    MOQ_TEST_CHECK(c != NULL);
+    moqr_binding_t pub, s1, s2;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 100, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 200, &s1) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 300, &s2) == MOQR_OK);
+    moqr_sub_t sub1;
+    moqr_track_t track = chunked_sub_setup(c, pub, s1, &sub1);
+    MOQ_TEST_CHECK(lifetime_sub(c, s2, 37)._opaque != 0);
+    MOQ_TEST_CHECK(moqr_core_internal_set_max_cache_duration(c, track, true, 10) == MOQR_OK);
+    moqr_reset_desc_t ra, rb;
+    MOQ_TEST_CHECK(moqr_reset_desc_wire(MOQ_VERSION_DRAFT_22, 0x7, &ra) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_reset_desc_wire(MOQ_VERSION_DRAFT_22, 0x8, &rb) == MOQR_OK);
+    const uint64_t t0 = 100000, late = t0 + 50000;
+    bool gap;
+    moqr_reset_desc_t gr;
+    MOQ_TEST_CHECK(ing_at(c, &a, track, 5, 3, 0, t0, 0xA0) == MOQR_OK);
+    failures += take_rec(c, s2, t0, 0, &gap, &gr);
+    MOQ_TEST_CHECK(moqr_core_reset_subgroup(c, track, 5, 3, ra) == MOQR_OK);
+    if (mode == 0) {
+        MOQ_TEST_CHECK(ing_at(c, &a, track, 5, 3, 1, t0, 0xA1) == MOQR_OK);
+    } else {
+        MOQ_TEST_CHECK(open_rec(c, track, 5, 3, 1, 4) == MOQR_OK);
+        MOQ_TEST_CHECK(moqr_core_abandon_record(c, track, 5, 3, 1, rb) == MOQR_OK);
+    }
+    MOQ_TEST_CHECK(moqr_core_reset_subgroup(c, track, 5, 3, rb) == MOQR_OK);
+    MOQ_TEST_CHECK(ing_at(c, &a, track, 5, 3, 2, late, 0xA2) == MOQR_OK);
+    failures += take_rec(c, s2, late, 2, &gap, &gr);
+    MOQ_TEST_CHECK(gap);
+    if (!desc_is(gr, &ra)) {
+        fprintf(stderr, "FAIL owed cause after %s skip: tag=%d value=%llu, want 0x7\n",
+                mode == 0 ? "expired" : "abandoned", (int)gr.tag,
+                (unsigned long long)gr.value);
+        failures++;
+    }
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS(mode == 0 ? "owed_cause_expired_skip" : "owed_cause_abandoned_skip");
+    return failures;
+}
+
+/* Every record after the subscriber's open stream of lifetime A is outside
+ * its window, so A's stream is closed by a terminal notice alone. A ended
+ * with RESET 0x7 (or a FIN when `a_reset` is false); lifetime B, all of it
+ * outside the window, ends with a FIN (or RESET 0x8 when `b_reset`). The
+ * notice carries A's ending, whatever B's: re-peeking it before
+ * acknowledgement returns the same, and after acknowledgement nothing more
+ * is owed. */
+static int
+test_owed_cause_terminal_only(bool a_reset, bool b_reset)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, NULL);
+    MOQ_TEST_CHECK(c != NULL);
+    moqr_binding_t pub, s1, s2;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 100, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 200, &s1) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 300, &s2) == MOQR_OK);
+    moqr_sub_t sub1;
+    moqr_track_t track = chunked_sub_setup(c, pub, s1, &sub1);
+    moqr_sub_t sub2 = lifetime_sub(c, s2, 38);
+    MOQ_TEST_CHECK(sub2._opaque != 0);
+    moqr_reset_desc_t ra, rb;
+    MOQ_TEST_CHECK(moqr_reset_desc_wire(MOQ_VERSION_DRAFT_22, 0x7, &ra) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_reset_desc_wire(MOQ_VERSION_DRAFT_22, 0x8, &rb) == MOQR_OK);
+    bool gap;
+    moqr_reset_desc_t gr;
+    moqr_delivery_t d;
+    MOQ_TEST_CHECK(ing(c, &a, track, 5, 3, 0, 128) == MOQR_OK);
+    failures += take_rec(c, s2, CTRL_NOW, 0, &gap, &gr);
+    moqr_filter_t f = { .type = MOQR_FILTER_ABSOLUTE_START, .start_group = 5,
+                        .start_object = 10 };
+    MOQ_TEST_CHECK(moqr_core_sub_set_filter(c, sub2, &f, CTRL_NOW) == MOQR_OK);
+    if (a_reset)
+        MOQ_TEST_CHECK(moqr_core_reset_subgroup(c, track, 5, 3, ra) == MOQR_OK);
+    else
+        MOQ_TEST_CHECK(moqr_core_seal_subgroup(c, track, 5, 3) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, track, 5, 3, 1, 128) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, track, 5, 3, 2, 128) == MOQR_OK);
+    if (b_reset)
+        MOQ_TEST_CHECK(moqr_core_reset_subgroup(c, track, 5, 3, rb) == MOQR_OK);
+    else
+        MOQ_TEST_CHECK(moqr_core_seal_subgroup(c, track, 5, 3) == MOQR_OK);
+    for (int peek = 0; peek < 2; peek++) {
+        moqr_result_t rc = moqr_core_next_delivery(c, s2, CTRL_NOW, &d);
+        bool ok = rc == MOQR_OK && d.notice == MOQR_DELIVERY_NOTICE_SEAL &&
+                  d.seal_reset == a_reset &&
+                  (!a_reset || desc_is(d.seal_reset_desc, &ra));
+        if (!ok) {
+            fprintf(stderr, "FAIL terminal-only (A %s, B %s) peek %d: rc=%d notice=%u "
+                    "reset=%d tag=%d value=%llu\n", a_reset ? "reset" : "FIN",
+                    b_reset ? "reset" : "FIN", peek, (int)rc,
+                    (unsigned)(rc == MOQR_OK ? d.notice : 0), rc == MOQR_OK && d.seal_reset,
+                    rc == MOQR_OK ? (int)d.seal_reset_desc.tag : -1,
+                    rc == MOQR_OK ? (unsigned long long)d.seal_reset_desc.value : 0ull);
+            failures++;
+            break;
+        }
+    }
+    MOQ_TEST_CHECK(moqr_core_delivery_done(c, s2, MOQR_DELIVERY_DELIVERED, CTRL_NOW) ==
+                   MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, s2, CTRL_NOW, &d) == MOQR_DONE);
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("owed_cause_terminal_only");
+    return failures;
+}
+
+/* A missing object belongs to the lifetime it was in. The subscriber's
+ * stream of lifetime A (Object 0) is still open. In `mode` 0 A ends with a
+ * FIN, lifetime B's boundary (Object 1) expires before this subscriber began
+ * it, and B ends with a FIN (or RESET 0x8 when `b_reset`), leaving no record
+ * to deliver: the terminal notice closes A's stream with A's clean FIN --
+ * B's missing object is not A's -- on two peeks, after a refused
+ * acknowledgement, and once acknowledged. In `mode` 1 A's own tail (Object
+ * 1) expires before A ends with a FIN: A's stream misses an object, so it is
+ * reset, never cleanly FINed. In `mode` 2 A's tail expires as in mode 1, and
+ * then lifetime B's boundary expires too before B ends with a FIN: A's own
+ * missing object still makes its end a reset, whatever B's expiry. */
+static int
+test_gap_lifetime(int mode, bool b_reset)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, NULL);
+    MOQ_TEST_CHECK(c != NULL);
+    moqr_binding_t pub, s1, s2;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 100, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 200, &s1) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 300, &s2) == MOQR_OK);
+    moqr_sub_t sub1;
+    moqr_track_t track = chunked_sub_setup(c, pub, s1, &sub1);
+    MOQ_TEST_CHECK(lifetime_sub(c, s2, 39)._opaque != 0);
+    MOQ_TEST_CHECK(moqr_core_internal_set_max_cache_duration(c, track, true, 10) == MOQR_OK);
+    moqr_reset_desc_t rb;
+    MOQ_TEST_CHECK(moqr_reset_desc_wire(MOQ_VERSION_DRAFT_22, 0x8, &rb) == MOQR_OK);
+    const uint64_t t0 = 100000, late = t0 + 50000;
+    bool gap;
+    moqr_reset_desc_t gr;
+    moqr_delivery_t d;
+    MOQ_TEST_CHECK(ing_at(c, &a, track, 5, 3, 0, t0, 0xA0) == MOQR_OK);
+    failures += take_rec(c, s2, t0, 0, &gap, &gr);
+    if (mode == 0) {
+        MOQ_TEST_CHECK(moqr_core_seal_subgroup(c, track, 5, 3) == MOQR_OK);
+        MOQ_TEST_CHECK(ing_at(c, &a, track, 5, 3, 1, t0, 0xA1) == MOQR_OK);
+        if (b_reset)
+            MOQ_TEST_CHECK(moqr_core_reset_subgroup(c, track, 5, 3, rb) == MOQR_OK);
+        else
+            MOQ_TEST_CHECK(moqr_core_seal_subgroup(c, track, 5, 3) == MOQR_OK);
+    } else {
+        MOQ_TEST_CHECK(ing_at(c, &a, track, 5, 3, 1, t0, 0xA1) == MOQR_OK);
+        MOQ_TEST_CHECK(moqr_core_seal_subgroup(c, track, 5, 3) == MOQR_OK);
+        if (mode == 2) {
+            MOQ_TEST_CHECK(ing_at(c, &a, track, 5, 3, 2, t0, 0xA2) == MOQR_OK);
+            MOQ_TEST_CHECK(moqr_core_seal_subgroup(c, track, 5, 3) == MOQR_OK);
+        }
+    }
+    const bool want_reset = mode != 0;
+    for (int step = 0; step < 3; step++) {
+        moqr_result_t rc = moqr_core_next_delivery(c, s2, late, &d);
+        bool ok = rc == MOQR_OK && d.notice == MOQR_DELIVERY_NOTICE_SEAL &&
+                  d.seal_reset == want_reset;
+        if (!ok) {
+            fprintf(stderr, "FAIL gap lifetime (mode %d, B %s) step %d: rc=%d notice=%u "
+                    "reset=%d tag=%d\n", mode, b_reset ? "reset" : "FIN", step, (int)rc,
+                    (unsigned)(rc == MOQR_OK ? d.notice : 0), rc == MOQR_OK && d.seal_reset,
+                    rc == MOQR_OK ? (int)d.seal_reset_desc.tag : -1);
+            failures++;
+            break;
+        }
+        /* Step 1: the binding could not write it now. */
+        if (step == 1)
+            MOQ_TEST_CHECK(moqr_core_delivery_done(c, s2, MOQR_DELIVERY_WOULD_BLOCK, late) ==
+                           MOQR_OK);
+    }
+    MOQ_TEST_CHECK(moqr_core_delivery_done(c, s2, MOQR_DELIVERY_DELIVERED, late) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, s2, late, &d) == MOQR_DONE);
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS(mode == 0 ? "gap_lifetime_unopened_b"
+                  : mode == 1 ? "gap_lifetime_a_tail" : "gap_lifetime_a_tail_then_b");
+    return failures;
+}
+
+/* A record still arriving names the source that opened it: another source
+ * (another connection, or another request on the same one) is told the
+ * record is not its own, the opener is not, and once the record completes
+ * nobody is. A record that names no opener refuses no source. */
+static int
+test_open_record_opener(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, NULL);
+    MOQ_TEST_CHECK(c != NULL);
+    moqr_binding_t pub, s1;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 100, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 200, &s1) == MOQR_OK);
+    moqr_sub_t sub1;
+    moqr_track_t track = chunked_sub_setup(c, pub, s1, &sub1);
+    MOQ_TEST_CHECK(open_rec(c, track, 4, 0, 0, 2) == MOQR_OK);
+    MOQ_TEST_CHECK(!moqr_core_internal_open_by_other(c, track, 4, 0, 0, 2, 77));
+    MOQ_TEST_CHECK(moqr_core_internal_set_opener(c, track, 4, 0, 0, 1, 77) == MOQR_OK);
+    MOQ_TEST_CHECK(!moqr_core_internal_open_by_other(c, track, 4, 0, 0, 1, 77));
+    MOQ_TEST_CHECK(moqr_core_internal_open_by_other(c, track, 4, 0, 0, 1, 78));
+    MOQ_TEST_CHECK(moqr_core_internal_open_by_other(c, track, 4, 0, 0, 2, 77));
+    MOQ_TEST_CHECK(append1(c, &a, track, 4, 0, 0, 2, 0x31) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_complete_record(c, track, 4, 0, 0) == MOQR_OK);
+    MOQ_TEST_CHECK(!moqr_core_internal_open_by_other(c, track, 4, 0, 0, 2, 77));
+    MOQ_TEST_CHECK(moqr_core_internal_set_opener(c, track, 4, 0, 0, 1, 77) ==
+                   MOQR_ERR_WRONG_STATE);
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("open_record_opener");
+    return failures;
+}
+
+/* A subscriber whose window starts at {5, 2} has acknowledged the terminal of
+ * Subgroup {5, 3}'s first upstream stream, which carried only Object 0, before
+ * its window. The subgroup reopens on a new upstream stream with Object 1,
+ * also before the window, then Object 2, which the subscriber receives on a
+ * new stream. The new stream's FIN reaches it exactly once: passing over the
+ * new stream's first record leaves the old acknowledgement behind, and is no
+ * missing object, so the terminal is a FIN, not a reset. */
+static int
+test_filtered_reopen_boundary(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, NULL);
+    MOQ_TEST_CHECK(c != NULL);
+    moqr_binding_t pub, s1, s2;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 100, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 200, &s1) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 300, &s2) == MOQR_OK);
+    moqr_sub_t sub1;
+    moqr_track_t track = chunked_sub_setup(c, pub, s1, &sub1);
+    moq_bytes_t nsb[2];
+    moqr_subscribe_req_t rq;
+    moqr_subscribe_req_init(&rq);
+    rq.ns = NS2(nsb, "demo", "cam");
+    rq.name = B("video");
+    rq.filter.type = MOQR_FILTER_ABSOLUTE_START;
+    rq.filter.start_group = 5;
+    rq.filter.start_object = 2;
+    rq.cookie = 34;
+    moqr_sub_t sub2;
+    MOQ_TEST_CHECK(moqr_core_subscribe(c, s2, &rq, &sub2) == MOQR_OK);
+    moqr_intent_t its[8];
+    (void)moqr_core_poll_intents(c, its, 8);
+    moqr_reset_desc_t up_reset;
+    MOQ_TEST_CHECK(moqr_reset_desc_wire(MOQ_VERSION_DRAFT_22, 0x7, &up_reset) == MOQR_OK);
+    bool gap;
+    moqr_reset_desc_t gr;
+    moqr_delivery_t d;
+    MOQ_TEST_CHECK(ing(c, &a, track, 5, 3, 0, 128) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_reset_subgroup(c, track, 5, 3, up_reset) == MOQR_OK);
+    failures += take_seal(c, s2, CTRL_NOW, true, "first lifetime's terminal");
+    MOQ_TEST_CHECK(ing(c, &a, track, 5, 3, 1, 128) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, track, 5, 3, 2, 128) == MOQR_OK);
+    failures += take_rec(c, s2, CTRL_NOW, 2, &gap, &gr);
+    MOQ_TEST_CHECK(gap);                       /* a new downstream stream */
+    MOQ_TEST_CHECK(moqr_core_seal_subgroup(c, track, 5, 3) == MOQR_OK);
+    failures += take_seal(c, s2, CTRL_NOW, false, "replacement stream FIN");
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, s2, CTRL_NOW, &d) == MOQR_DONE);
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("filtered_reopen_boundary");
+    return failures;
+}
+
+/* One subgroup, two upstream stream lifetimes (draft-22 §11.3.2: a relay that
+ * does not know whether an Object is the next one "MUST reset the Subgroup
+ * stream and open a new one"). The first lifetime ends with a RESET; the
+ * subgroup reopens on a new upstream stream that later FINs.
+ *   variant 0: a subscriber that took the old reset gets the new stream's
+ *              objects on a new stream and then its FIN, exactly once;
+ *   variant 1: a subscriber that joins while the new stream is still open
+ *              gets the old objects, then the new ones on a new stream (the
+ *              old stream reset with the upstream code), and no terminal
+ *              until the new stream ends;
+ *   variant 2: the old stream's RESET arrives after the new stream's first
+ *              object was appended; objects appended after the reset start a
+ *              new stream, and the old one is never closed with a FIN. */
+static int
+test_subgroup_lifetimes(int variant)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, NULL);
+    MOQ_TEST_CHECK(c != NULL);
+    moqr_binding_t pub, s1, s2;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 100, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 200, &s1) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 300, &s2) == MOQR_OK);
+    moqr_sub_t sub1;
+    moqr_track_t track = chunked_sub_setup(c, pub, s1, &sub1);
+    moqr_reset_desc_t up_reset;
+    MOQ_TEST_CHECK(moqr_reset_desc_wire(MOQ_VERSION_DRAFT_22, 0x7, &up_reset) == MOQR_OK);
+    bool gap;
+    moqr_reset_desc_t gr;
+    moqr_delivery_t d;
+
+    MOQ_TEST_CHECK(ing(c, &a, track, 5, 3, 0, 128) == MOQR_OK);
+    failures += take_rec(c, s1, CTRL_NOW, 0, &gap, &gr);
+    if (variant == 2) {
+        /* The new stream's first object lands before the old stream's reset. */
+        MOQ_TEST_CHECK(ing(c, &a, track, 5, 3, 1, 128) == MOQR_OK);
+        failures += take_rec(c, s1, CTRL_NOW, 1, &gap, &gr);
+        MOQ_TEST_CHECK(!gap);
+    }
+    MOQ_TEST_CHECK(moqr_core_reset_subgroup(c, track, 5, 3, up_reset) == MOQR_OK);
+    if (variant != 1) {
+        failures += take_seal(c, s1, CTRL_NOW, true, "old stream reset");
+    }
+    uint64_t next = variant == 2 ? 2 : 1;
+    MOQ_TEST_CHECK(ing(c, &a, track, 5, 3, next, 128) == MOQR_OK);
+    if (variant == 1) {
+        /* A late subscriber from the start while the new stream is open. */
+        moq_bytes_t nsb[2];
+        moqr_subscribe_req_t rq;
+        moqr_subscribe_req_init(&rq);
+        rq.ns = NS2(nsb, "demo", "cam");
+        rq.name = B("video");
+        rq.filter.type = MOQR_FILTER_ABSOLUTE_START;
+        rq.cookie = 33;
+        moqr_sub_t sub2;
+        MOQ_TEST_CHECK(moqr_core_subscribe(c, s2, &rq, &sub2) == MOQR_OK);
+        moqr_intent_t its[8];
+        (void)moqr_core_poll_intents(c, its, 8);
+        failures += take_rec(c, s2, CTRL_NOW, 0, &gap, &gr);
+        MOQ_TEST_CHECK(!gap);
+        failures += take_rec(c, s2, CTRL_NOW, 1, &gap, &gr);
+        if (!gap || gr.tag != up_reset.tag || gr.value != up_reset.value) {
+            fprintf(stderr, "FAIL late join: object 1 follows_gap=%d reset tag=%d value=%llu\n",
+                    gap, (int)gr.tag, (unsigned long long)gr.value);
+            failures++;
+        }
+        moqr_result_t rc = moqr_core_next_delivery(c, s2, CTRL_NOW, &d);
+        if (rc != MOQR_DONE) {
+            fprintf(stderr, "FAIL late join: a terminal (notice %u) while the new "
+                    "stream is open\n", (unsigned)(rc == MOQR_OK ? d.notice : 0));
+            failures++;
+            if (rc == MOQR_OK)
+                (void)moqr_core_delivery_done(c, s2, MOQR_DELIVERY_DELIVERED, CTRL_NOW);
+        }
+    }
+    failures += take_rec(c, s1, CTRL_NOW, next, &gap, &gr);
+    MOQ_TEST_CHECK(gap);
+    MOQ_TEST_CHECK(ing(c, &a, track, 5, 3, next + 1, 128) == MOQR_OK);
+    failures += take_rec(c, s1, CTRL_NOW, next + 1, &gap, &gr);
+    MOQ_TEST_CHECK(!gap);
+    MOQ_TEST_CHECK(moqr_core_seal_subgroup(c, track, 5, 3) == MOQR_OK);
+    failures += take_seal(c, s1, CTRL_NOW, false, "new stream FIN");
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, s1, CTRL_NOW, &d) == MOQR_DONE);
+    if (variant == 1) {
+        failures += take_rec(c, s2, CTRL_NOW, 2, &gap, &gr);
+        MOQ_TEST_CHECK(!gap);
+        failures += take_seal(c, s2, CTRL_NOW, false, "late subscriber new stream FIN");
+        MOQ_TEST_CHECK(moqr_core_next_delivery(c, s2, CTRL_NOW, &d) == MOQR_DONE);
+    }
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS(variant == 0 ? "subgroup_lifetimes_reopen"
+                  : variant == 1 ? "subgroup_lifetimes_late_join"
+                                 : "subgroup_lifetimes_delayed_reset");
+    return failures;
+}
+
+/* §7.1: "Object can transition from existing to not existing in cases where
+ * the object is no longer available." A retained Normal object followed by a
+ * status at the same Location saying it does not exist (End of Group or End
+ * of Track there) is that permitted transition, not a differing duplicate;
+ * a status first and an object after it, or a Normal copy with other bytes,
+ * still differ. */
+static int
+test_duplicate_permitted_update(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, NULL);
+    MOQ_TEST_CHECK(c != NULL);
+    moqr_binding_t pub, s1;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 100, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 200, &s1) == MOQR_OK);
+    moqr_sub_t sub1;
+    moqr_track_t track = chunked_sub_setup(c, pub, s1, &sub1);
+    MOQ_TEST_CHECK(ing(c, &a, track, 5, 3, 0, 128) == MOQR_OK);
+    moqr_log_append_desc_t d;
+    moqr_log_append_desc_init(&d);
+    d.group_id = 5;
+    d.subgroup_id = 3;
+    d.object_id = 0;
+    d.publisher_priority = 128;
+    d.now_us = 1;
+    d.status = MOQR_OBJ_END_OF_GROUP;
+    MOQ_TEST_CHECK_EQ_U64(moqr_core_internal_duplicate(c, track, &d), MOQR_LOG_DUP_UPDATE);
+    d.status = MOQR_OBJ_END_OF_TRACK;
+    MOQ_TEST_CHECK_EQ_U64(moqr_core_internal_duplicate(c, track, &d), MOQR_LOG_DUP_UPDATE);
+    /* Mode, Subgroup ID and priority stay strict for the update too. */
+    d.publisher_priority = 7;
+    MOQ_TEST_CHECK_EQ_U64(moqr_core_internal_duplicate(c, track, &d), MOQR_LOG_DUP_DIFFERS);
+    d.publisher_priority = 128;
+    d.subgroup_id = 4;
+    MOQ_TEST_CHECK_EQ_U64(moqr_core_internal_duplicate(c, track, &d), MOQR_LOG_DUP_DIFFERS);
+    d.subgroup_id = 3;
+    /* A Normal copy with other bytes differs. */
+    uint8_t other[64];
+    memset(other, 0x77, sizeof(other));
+    moq_rcbuf_t *pl = NULL;
+    MOQ_TEST_CHECK(moq_rcbuf_create(&a.vt, other, sizeof(other), &pl) == 0);
+    d.status = MOQR_OBJ_NORMAL;
+    d.payload = pl;
+    MOQ_TEST_CHECK_EQ_U64(moqr_core_internal_duplicate(c, track, &d), MOQR_LOG_DUP_DIFFERS);
+    moq_rcbuf_decref(pl);
+    /* A status retained first: a Normal object at it is not a permitted
+     * update. */
+    moqr_log_append_desc_t e;
+    moqr_log_append_desc_init(&e);
+    e.group_id = 6;
+    e.subgroup_id = 3;
+    e.object_id = 2;
+    e.publisher_priority = 128;
+    e.status = MOQR_OBJ_END_OF_GROUP;
+    e.now_us = 1;
+    MOQ_TEST_CHECK(moqr_core_ingest(c, track, &e) == MOQR_OK);
+    MOQ_TEST_CHECK(moq_rcbuf_create(&a.vt, other, 8, &pl) == 0);
+    e.status = MOQR_OBJ_NORMAL;
+    e.payload = pl;
+    MOQ_TEST_CHECK_EQ_U64(moqr_core_internal_duplicate(c, track, &e), MOQR_LOG_DUP_DIFFERS);
+    moq_rcbuf_decref(pl);
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("duplicate_permitted_update");
+    return failures;
+}
+
+/* A copy streamed in chunks is compared byte for byte with what is retained
+ * (draft-22 §7.1): equal declared lengths are not equal payloads. The
+ * metadata and length check says PENDING; each chunk is then compared at its
+ * offset against the retained bytes. Against a record still arriving, only
+ * the bytes it already holds can be compared. */
+static int
+test_duplicate_streamed_compare(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, NULL);
+    MOQ_TEST_CHECK(c != NULL);
+    moqr_binding_t pub, s1;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 100, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 200, &s1) == MOQR_OK);
+    moqr_sub_t sub1;
+    moqr_track_t track = chunked_sub_setup(c, pub, s1, &sub1);
+    /* Retained: a chunked COMPLETE record of 3 x 4 bytes (0x10,0x11,0x12). */
+    MOQ_TEST_CHECK(ing_chunked(c, &a, track, 5, 3, 0, 128, 3, 4, 0x10) == MOQR_OK);
+    moqr_log_append_desc_t d;
+    moqr_log_append_desc_init(&d);
+    d.group_id = 5;
+    d.subgroup_id = 3;
+    d.object_id = 0;
+    d.publisher_priority = 128;
+    d.obj_state = MOQR_OBJ_OPEN;
+    d.declared_len = 12;
+    d.now_us = 1;
+    MOQ_TEST_CHECK_EQ_U64(moqr_core_internal_duplicate(c, track, &d), MOQR_LOG_DUP_PENDING);
+    d.declared_len = 11;
+    MOQ_TEST_CHECK_EQ_U64(moqr_core_internal_duplicate(c, track, &d), MOQR_LOG_DUP_DIFFERS);
+    uint8_t same[6] = { 0x10, 0x10, 0x11, 0x11, 0x11, 0x11 };
+    uint8_t diff[6] = { 0x10, 0x10, 0x11, 0x11, 0x11, 0x99 };
+    MOQ_TEST_CHECK_EQ_U64(moqr_core_internal_duplicate_range(c, track, 5, 3, 0, 2,
+                                                             same, 6),
+                          MOQR_LOG_RANGE_EQUAL);
+    MOQ_TEST_CHECK_EQ_U64(moqr_core_internal_duplicate_range(c, track, 5, 3, 0, 2,
+                                                             diff, 6),
+                          MOQR_LOG_RANGE_DIFFERS);
+    MOQ_TEST_CHECK_EQ_U64(moqr_core_internal_duplicate_range(c, track, 5, 3, 0, 8,
+                                                             same, 6),
+                          MOQR_LOG_RANGE_DIFFERS);   /* past the payload */
+    /* A record still OPEN: only the bytes it holds compare. */
+    MOQ_TEST_CHECK(open_rec(c, track, 6, 3, 0, 8) == MOQR_OK);
+    MOQ_TEST_CHECK(append1(c, &a, track, 6, 3, 0, 4, 0x20) == MOQR_OK);
+    uint8_t held[4] = { 0x20, 0x20, 0x20, 0x20 };
+    MOQ_TEST_CHECK_EQ_U64(moqr_core_internal_duplicate_range(c, track, 6, 3, 0, 0,
+                                                             held, 4),
+                          MOQR_LOG_RANGE_EQUAL);
+    MOQ_TEST_CHECK_EQ_U64(moqr_core_internal_duplicate_range(c, track, 6, 3, 0, 2,
+                                                             held, 4),
+                          MOQR_LOG_RANGE_UNKNOWN);
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("duplicate_streamed_compare");
+    return failures;
+}
+
 int
 main(void)
 {
@@ -5950,6 +9033,42 @@ main(void)
     failures += test_shard_seams();
     failures += test_sub_state_seam();
     failures += test_filters_and_range();
+    const uint64_t largest_objects[] = { 2, UINT64_MAX - 1, UINT64_MAX };
+    for (size_t i = 0; i < sizeof(largest_objects) / sizeof(largest_objects[0]); i++) {
+        for (unsigned path = 0; path < 4; path++) {
+            failures += test_largest_object_successor(largest_objects[i],
+                                                      (path & 1u) != 0, (path & 2u) != 0);
+        }
+    }
+    failures += test_sub_set_filter();
+    failures += test_location_history();
+    failures += test_location_object_end();
+    failures += test_full_width_fetch_progress();
+    failures += test_full_width_fetch_status();
+    failures += test_location_argument_failures();
+    failures += test_location_parked_copy();
+    failures += test_location_request_prefix();
+    failures += test_location_chunk_ownership();
+    failures += test_location_capacity_reuse();
+    const uint64_t full_groups[] = { 10, UINT64_MAX - 1, UINT64_MAX };
+    for (size_t i = 0; i < sizeof(full_groups) / sizeof(full_groups[0]); i++) {
+        failures += test_full_width_gpos(full_groups[i]);
+        failures += test_full_width_begun(full_groups[i], false);
+        failures += test_full_width_begun(full_groups[i], true);
+    }
+    failures += test_full_width_evict_reset(5);
+    failures += test_full_width_evict_reset(UINT64_MAX - 1);
+    for (unsigned path = 0; path < 4; path++) {
+        failures += test_terminal_legacy_filter(MOQR_FILTER_LARGEST_OBJECT,
+                                               (path & 1u) != 0, (path & 2u) != 0);
+        failures += test_terminal_legacy_filter(MOQR_FILTER_NEXT_GROUP_START,
+                                               (path & 1u) != 0, (path & 2u) != 0);
+    }
+    failures += test_terminal_unbegun_hold_and_relative();
+    failures += test_current_group_and_range_hold();
+    failures += test_relative_start();
+    failures += test_range_hold_old_caller();
+    failures += test_subscribe_req_init_old_caller();
     failures += test_warm_linger_and_status();
     failures += test_stream_error_retire_linger();
     failures += test_ns_discovery_and_close();
@@ -5964,6 +9083,7 @@ main(void)
     failures += test_observability_counters();
     failures += test_auth_canonical_verdict();
     failures += test_parked_storage();
+    failures += test_parked_forward();
     failures += test_grant_storage();
     failures += test_revoke_sub();
     failures += test_grant_reval();
@@ -5999,6 +9119,16 @@ main(void)
     failures += test_source_failover_backpressure();
     failures += test_push_source_restart_resets_retained_generation();
     failures += test_push_source_survives_downstream_linger();
+    for (int v = 0; v < 4; v++) {
+        failures += test_finish_seal_holds_retirement(v);
+    }
+    for (int v = 0; v < 3; v++) {
+        failures += test_finish_full_intent_ring(v);
+    }
+    failures += test_finish_paused_omitted_tail(0);
+    failures += test_finish_paused_omitted_tail(1);
+    failures += test_range_end_owed_reset_d18(0);
+    failures += test_range_end_owed_reset_d18(1);
     failures += test_root_full_track_name_core();
     failures += test_empty_namespace_field_rejected_core();
     failures += test_invalid_abandon_record_no_mutation();
@@ -6009,6 +9139,26 @@ main(void)
     failures += test_held_abandon_release_terminal();
     failures += test_begun_ledger_seam_fail_closed();
     failures += test_verdict_revoke_terminal_defaults_none();
+    for (int v = 0; v < 3; v++) {
+        failures += test_expired_tail_terminal(v);
+        failures += test_subgroup_lifetimes(v);
+    }
+    failures += test_filtered_reopen_boundary();
+    failures += test_open_record_opener();
+    failures += test_filtered_reopen_open_stream();
+    failures += test_filtered_reopen_owed_cause(true);
+    failures += test_filtered_reopen_owed_cause(false);
+    failures += test_owed_cause_unbegun_skip(0);
+    failures += test_owed_cause_unbegun_skip(1);
+    for (int ar = 0; ar < 2; ar++)
+        for (int br = 0; br < 2; br++)
+            failures += test_owed_cause_terminal_only(ar != 0, br != 0);
+    failures += test_gap_lifetime(0, false);
+    failures += test_gap_lifetime(0, true);
+    failures += test_gap_lifetime(1, false);
+    failures += test_gap_lifetime(2, false);
+    failures += test_duplicate_permitted_update();
+    failures += test_duplicate_streamed_compare();
     return failures == 0 ? 0 : 1; /* exit status truncates to 8 bits */
 
 

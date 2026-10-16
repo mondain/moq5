@@ -14,7 +14,11 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 STABLE_HEADERS=(
     core/include/moq/moq.h
     core/include/moq/session.h
+    core/include/moq/transport_binding.h
+    core/include/moq/connection_target.h
     core/include/moq/types.h
+    core/include/moq/location.h
+    core/include/moq/fill.h
     core/include/moq/rcbuf.h
     core/include/moq/export.h
     core/include/moq/version.h
@@ -136,6 +140,17 @@ echo "Scanning stable docs..."
 for f in "${STABLE_DOCS[@]}"; do
     check_file "$f"
 done
+
+echo "Scanning installed core headers for same-build interfaces..."
+# moq_core_internal_* symbols are exported for the relay built beside the
+# core (core/src/spi/core_spi.h) and must never be declared by a header the
+# core installs.
+spi_hits=$(grep -rn 'moq_core_internal_' "$ROOT/core/include" 2>/dev/null || true)
+if [ -n "$spi_hits" ]; then
+    echo "VIOLATION: same-build interface declared by an installed header:"
+    echo "$spi_hits" | sed 's/^/  /'
+    violations=$((violations + 1))
+fi
 
 echo ""
 if [ "$violations" -gt 0 ]; then

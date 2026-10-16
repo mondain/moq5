@@ -216,9 +216,68 @@ static int deferred_discard_owed_stop(int mode)
     return failures;
 }
 
-int main(void)
+static int d16_full_width_location(void)
 {
     int failures = 0;
+    /* D16 sections5.1.2/9.9: request0, namespace(a), track(b), one filter.
+     * Expected bytes are literal, not produced by the codec under test. */
+    static const uint8_t absolute[] = {
+        0x03, 0x00, 0x1a, 0x00, 0x01, 0x01, 'a', 0x01, 'b',
+        0x01, 0x21, 0x11, 0x03,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    };
+    static const uint8_t range[] = {
+        0x03, 0x00, 0x22, 0x00, 0x01, 0x01, 'a', 0x01, 'b',
+        0x01, 0x21, 0x19, 0x04,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    };
+    for (unsigned row = 0; row < 2; row++) {
+        test_alloc_state_t ledger = {0};
+        moq_alloc_t alloc = test_allocator(&ledger);
+        moq_session_t *client = NULL, *server = NULL;
+        establish_pair(&alloc, 10, 10, &client, &server, NULL, NULL);
+        MOQ_TEST_CHECK(client && server);
+        if (!client || !server) {
+            moq_session_destroy(client); moq_session_destroy(server);
+            MOQ_TEST_CHECK(ledger.balance == 0);
+            continue;
+        }
+        MOQ_TEST_CHECK(moq_session_version(client) == MOQ_VERSION_DRAFT_16);
+        moq_bytes_t ns[] = {MOQ_BYTES_LITERAL("a")};
+        moq_subscribe_cfg_t cfg;
+        moq_subscribe_cfg_init(&cfg);
+        cfg.track_namespace = (moq_namespace_t){ns, 1};
+        cfg.track_name = MOQ_BYTES_LITERAL("b");
+        cfg.filter = row ? MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE : MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
+        cfg.start_group = cfg.start_object = cfg.end_group = UINT64_C(0x3fffffffffffffff);
+        moq_subscription_t handle = MOQ_SUBSCRIPTION_INVALID;
+        MOQ_TEST_CHECK(moq_session_subscribe(client, &cfg, 1000, &handle) == MOQ_OK);
+        moq_action_t action;
+        size_t count = moq_session_poll_actions(client, &action, 1);
+        MOQ_TEST_CHECK(count == 1);
+        if (count == 1) {
+            MOQ_TEST_CHECK(action.kind == MOQ_ACTION_SEND_CONTROL);
+            if (action.kind == MOQ_ACTION_SEND_CONTROL) {
+                const uint8_t *expected = row ? range : absolute;
+                size_t size = row ? sizeof(range) : sizeof(absolute);
+                MOQ_TEST_CHECK(action.u.send_control.len == size);
+                if (action.u.send_control.len == size)
+                    MOQ_TEST_CHECK(memcmp(action.u.send_control.data, expected, size) == 0);
+            }
+            moq_action_cleanup(&action);
+        }
+        moq_session_destroy(client); moq_session_destroy(server);
+        MOQ_TEST_CHECK(ledger.balance == 0);
+    }
+    return failures;
+}
+
+int main(void)
+{
+    int failures = d16_full_width_location();
     /* ============================================================== */
     /* SUBSCRIBE / SUBSCRIBE_OK                                       */
     /* ============================================================== */
@@ -2333,52 +2392,37 @@ int main(void)
               for (size_t i = 0; i < na; i++) moq_action_cleanup(&acts[i]);
         }
 
-        /* Feed UNSUBSCRIBE. With max_actions=1, first RESET_DATA fills
-         * the queue; second RESET cannot be queued → WOULD_BLOCK. */
+        /* Feed UNSUBSCRIBE. With max_actions=1, the first RESET_DATA fills
+         * the queue and the second is owed on its stream: the cancel itself
+         * completes at once. */
         uint8_t ubuf[16]; moq_buf_writer_t uw;
         moq_buf_writer_init(&uw, ubuf, sizeof(ubuf));
         moq_d16_encode_varint_msg(&uw, MOQ_D16_UNSUBSCRIBE, 0);
         moq_result_t rc = moq_session_on_control_bytes(sv, ubuf,
             moq_buf_writer_offset(&uw), 0);
-        MOQ_TEST_CHECK(rc == MOQ_ERR_WOULD_BLOCK);
-        MOQ_TEST_CHECK(moq_session_state(sv) != MOQ_SESS_CLOSED);
-
-        /* No UNSUBSCRIBED event before retry. */
-        MOQ_TEST_CHECK(moq_session_poll_events(sv, &ev, 1) == 0);
-
-        /* Drain exactly one RESET action. */
-        {
-            moq_action_t acts[4]; size_t na;
-            na = moq_session_poll_actions(sv, acts, 4);
-            MOQ_TEST_CHECK(na == 1);
-            MOQ_TEST_CHECK(acts[0].kind == MOQ_ACTION_RESET_DATA);
-            MOQ_TEST_CHECK(acts[0].u.reset_data.error_code == 0x1);
-            moq_action_cleanup(&acts[0]);
-        }
-
-        /* Retry via process_pending — second reset + event. */
-        rc = moq_session_process_pending(sv, 0);
         MOQ_TEST_CHECK(rc == MOQ_OK);
         MOQ_TEST_CHECK(moq_session_state(sv) != MOQ_SESS_CLOSED);
-
-        /* Second RESET action queued. */
-        {
-            moq_action_t acts[4]; size_t na;
-            na = moq_session_poll_actions(sv, acts, 4);
-            MOQ_TEST_CHECK(na >= 1);
-            bool found_reset = false;
-            for (size_t i = 0; i < na; i++) {
-                if (acts[i].kind == MOQ_ACTION_RESET_DATA)
-                    found_reset = true;
-                moq_action_cleanup(&acts[i]);
-            }
-            MOQ_TEST_CHECK(found_reset);
-        }
 
         /* UNSUBSCRIBED event emitted. */
         MOQ_TEST_CHECK(moq_session_poll_events(sv, &ev, 1) == 1);
         MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_UNSUBSCRIBED);
         moq_event_cleanup(&ev);
+
+        /* The first RESET, then -- once that poll freed the slot -- the owed
+         * second one. */
+        {
+            moq_action_t acts[4]; size_t na;
+            size_t resets = 0;
+            while ((na = moq_session_poll_actions(sv, acts, 4)) > 0)
+                for (size_t i = 0; i < na; i++) {
+                    if (acts[i].kind == MOQ_ACTION_RESET_DATA) {
+                        resets++;
+                        MOQ_TEST_CHECK(acts[i].u.reset_data.error_code == 0x1);
+                    }
+                    moq_action_cleanup(&acts[i]);
+                }
+            MOQ_TEST_CHECK(resets == 2);
+        }
 
         /* Handle is stale. */
         moq_subgroup_handle_t sg3;
@@ -4527,10 +4571,17 @@ int main(void)
         moq_accept_subscribe_cfg_init(&acc);
         static const uint8_t bad[] = { 0x30, 0x02 };   /* value 2: violation */
         acc.track_properties = (moq_bytes_t){ bad, 2 };
+        /* This side never states it: refused before anything is sent. */
         MOQ_TEST_CHECK_EQ_INT(moq_session_accept_subscribe(sv,
-            ev.u.subscribe_request.sub, &acc, 0), MOQ_OK);
+            ev.u.subscribe_request.sub, &acc, 0), MOQ_ERR_INVAL);
         moq_event_cleanup(&ev);
-        pump_actions_to_peer(sv, c, 0);
+        /* A peer that does is a protocol violation. */
+        uint8_t wire[64];
+        moq_buf_writer_t w;
+        moq_buf_writer_init(&w, wire, sizeof(wire));
+        MOQ_TEST_CHECK_EQ_INT(moq_d16_encode_subscribe_ok(&w, 0, 1, NULL, 0, bad, sizeof(bad)),
+                              MOQ_OK);
+        (void)moq_session_on_control_bytes(c, wire, moq_buf_writer_offset(&w), 0);
         MOQ_TEST_CHECK(moq_session_state(c) == MOQ_SESS_CLOSED);
         MOQ_TEST_CHECK_EQ_SIZE(moq_session_poll_events(c, &ev, 1), 1);
         MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_SESSION_CLOSED);
@@ -6188,13 +6239,15 @@ int main(void)
         MOQ_TEST_CHECK(alloc_state.balance == 0);
     }
 
-    /* == A locally stopped stream's FIN is not a completed stream ========= *
+    /* == A locally stopped stream's FIN counts the stream as processed ==== *
      * A subscriber-role subscription with a small object-payload limit. One
      * subgroup stream carries an object over the limit: the session STOPs it
-     * and keeps the entry until the peer's FIN. That FIN releases the entry
-     * and is remembered as the transport stream's end, but it must not count
-     * toward the subscription's processed streams (§9.8 Stream Count); a
-     * genuine stream completing with its FIN still counts. */
+     * and keeps the entry, with its binding, until the peer's FIN. That FIN
+     * releases the entry, is remembered as the transport stream's end, and
+     * counts the stream toward the subscription's processed streams (the
+     * Stream Count gate): the publisher counted the stream it opened, and
+     * nothing more arrives on it. No SUBGROUP_FINISHED is surfaced for it. A
+     * genuine stream completing with its FIN counts exactly once too. */
     {
         test_alloc_state_t alloc_state = {0};
         moq_alloc_t alloc = test_allocator(&alloc_state);
@@ -6252,15 +6305,18 @@ int main(void)
         for (size_t i = 0; i < c->rx_cap; i++)
             if (c->rx_streams[i].active && c->rx_streams[i].stream_ref._v == REF_A) rslot = (int)i;
         MOQ_TEST_CHECK(rslot >= 0 && c->rx_streams[rslot].parse_state == MOQ_RX_STOPPED);
+        MOQ_TEST_CHECK(rslot >= 0 && moq_subscription_eq(c->rx_streams[rslot].sub, sub_h));
         MOQ_TEST_CHECK_EQ_U64(c->subs[sslot].processed_stream_count, 0u);
+        { moq_event_t e2; while (moq_session_poll_events(c, &e2, 1) > 0) moq_event_cleanup(&e2); }
 
-        /* Its FIN releases the entry: remembered as the stream's end, not a
-         * processed stream. */
+        /* Its FIN releases the entry: remembered as the stream's end and
+         * counted as a processed stream, with no completion event. */
         size_t fin_before = c->rx_fin_count;
         MOQ_TEST_CHECK(moq_session_on_data_bytes(c, moq_stream_ref_from_u64(REF_A), NULL, 0, true, 1002) == MOQ_OK);
         MOQ_TEST_CHECK(!c->rx_streams[rslot].active);
         MOQ_TEST_CHECK_EQ_SIZE(c->rx_fin_count, fin_before + 1);
-        MOQ_TEST_CHECK_EQ_U64(c->subs[sslot].processed_stream_count, 0u);
+        MOQ_TEST_CHECK_EQ_U64(c->subs[sslot].processed_stream_count, 1u);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_poll_events(c, &ev, 1), 0);
         MOQ_TEST_CHECK(moq_subscription_is_valid(sub_h) && sub_resolve_handle(c, sub_h) == sslot);
 
         /* Stream B: a genuine stream (object within the limit) completing
@@ -6276,7 +6332,7 @@ int main(void)
             moq_event_cleanup(&ev);
         }
         MOQ_TEST_CHECK_EQ_INT(objs, 1);
-        MOQ_TEST_CHECK_EQ_U64(c->subs[sslot].processed_stream_count, 1u);
+        MOQ_TEST_CHECK_EQ_U64(c->subs[sslot].processed_stream_count, 2u);
         MOQ_TEST_CHECK_EQ_SIZE(c->rx_fin_count, fin_before + 2);
         MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(c), (int)MOQ_SESS_ESTABLISHED);
 

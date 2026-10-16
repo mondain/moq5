@@ -14,6 +14,7 @@
 
 #include "log_internal.h"
 
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,6 +29,7 @@ typedef struct count_alloc {
     long        frees;
     long        live_bytes;
     long        peak_bytes;
+    unsigned    fail_after;
 } count_alloc_t;
 
 /* An upstream terminal arrives in some connection's draft; these rigs speak
@@ -47,6 +49,9 @@ static void *
 ca_alloc(size_t size, void *ctx)
 {
     count_alloc_t *ca = ctx;
+    if (ca->fail_after != 0 && --ca->fail_after == 0) {
+        return NULL;
+    }
     void *p = malloc(size);
     if (p != NULL) {
         ca->allocs++;
@@ -1301,12 +1306,440 @@ test_chunk_byte_accounting_eviction(void)
     return failures;
 }
 
+/* A group's final object id is known from END_OF_GROUP evidence -- the status
+ * object, the bit on a datagram, or the bit on the header of a subgroup that
+ * ended with a FIN -- and from an END_OF_TRACK status object; never from a
+ * FIN alone or from a subgroup that ended with a reset. */
+static int
+test_group_final(void)
+{
+    int failures = 0;
+    count_alloc_t ca;
+    ca_init(&ca);
+    moqr_log_t *log = mklog(&ca, 8, 1 << 20, NULL);
+    MOQ_TEST_CHECK(log != NULL);
+    uint64_t fin = 77;
+
+    /* 0: objects, FIN, no END_OF_GROUP evidence: unknown. */
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 0, 0, 0, 8, false,
+                              MOQR_OBJ_NORMAL, false) == MOQR_OK);
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 0, 0, 1, 8, false,
+                              MOQR_OBJ_NORMAL, false) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_log_seal_subgroup(log, 0, 0) == MOQR_OK);
+    MOQ_TEST_CHECK(!moqr_log_group_final(log, 0, &fin));
+    MOQ_TEST_CHECK_EQ_U64(fin, 77);
+    /* 1: an END_OF_GROUP status object at 3 is the final. */
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 1, 0, 0, 8, false,
+                              MOQR_OBJ_NORMAL, false) == MOQR_OK);
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 1, 0, 3, 0, false,
+                              MOQR_OBJ_END_OF_GROUP, false) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_log_group_final(log, 1, &fin));
+    MOQ_TEST_CHECK_EQ_U64(fin, 3);
+    /* 2: a datagram carrying the bit is the final. */
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 2, 0, 4, 8, true,
+                              MOQR_OBJ_NORMAL, true) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_log_group_final(log, 2, &fin));
+    MOQ_TEST_CHECK_EQ_U64(fin, 4);
+    /* 3: the header bit resolves only at the subgroup's FIN, to its last
+     * object. */
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 3, 0, 0, 8, true,
+                              MOQR_OBJ_NORMAL, false) == MOQR_OK);
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 3, 0, 2, 8, true,
+                              MOQR_OBJ_NORMAL, false) == MOQR_OK);
+    MOQ_TEST_CHECK(!moqr_log_group_final(log, 3, NULL));
+    MOQ_TEST_CHECK(moqr_log_seal_subgroup(log, 3, 0) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_log_group_final(log, 3, &fin));
+    MOQ_TEST_CHECK_EQ_U64(fin, 2);
+    /* 4: the header bit on a subgroup that ended with a reset says nothing. */
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 4, 0, 0, 8, true,
+                              MOQR_OBJ_NORMAL, false) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_log_reset_subgroup(log, 4, 0,
+                                           moqr_reset_desc_none()) ==
+                   MOQR_OK);
+    MOQ_TEST_CHECK(!moqr_log_group_final(log, 4, &fin));
+    /* 5: END_OF_TRACK ends its group too. */
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 5, 0, 0, 8, false,
+                              MOQR_OBJ_NORMAL, false) == MOQR_OK);
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 5, 0, 1, 0, false,
+                              MOQR_OBJ_END_OF_TRACK, false) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_log_group_final(log, 5, &fin));
+    MOQ_TEST_CHECK_EQ_U64(fin, 1);
+    /* An absent group and a NULL log know nothing. */
+    MOQ_TEST_CHECK(!moqr_log_group_final(log, 9, &fin));
+    MOQ_TEST_CHECK(!moqr_log_group_final(NULL, 1, &fin));
+    /* An evicted group is gone with its final. */
+    MOQ_TEST_CHECK(moqr_log_evict_groups(log, 2) == 2);
+    MOQ_TEST_CHECK(!moqr_log_group_final(log, 1, &fin));
+
+    moqr_log_destroy(log);
+    MOQ_TEST_CHECK_EQ_INT((int)ca.live_bytes, 0);
+    MOQ_TEST_PASS("group_final");
+    return failures;
+}
+
+/* Refused records must leave both owned references and every retained group
+ * intact, even when their bytes would otherwise evict an unrelated group. */
+static int
+full_width_refusal(moqr_log_t *log, count_alloc_t *ca, uint64_t object,
+                  bool datagram, bool eog, moqr_obj_status_t status)
+{
+    int failures = 0;
+    static const uint8_t bytes[400] = { 0 };
+    moqr_log_append_desc_t d;
+    moqr_log_append_desc_init(&d);
+    d.group_id = 11;
+    d.subgroup_id = 9;
+    d.object_id = object;
+    d.datagram_pref = datagram;
+    d.end_of_group = eog;
+    d.status = status;
+    d.now_us = 1000;
+    g_release_count = 0;
+    if (status == MOQR_OBJ_NORMAL) {
+        MOQ_TEST_CHECK(moq_rcbuf_wrap(&ca->vt, bytes, sizeof(bytes),
+            count_release, NULL, &d.payload) == 0);
+    }
+    MOQ_TEST_CHECK(moq_rcbuf_wrap(&ca->vt, bytes, 1,
+        count_release, NULL, &d.properties) == 0);
+    moqr_log_stats_t before, after;
+    moqr_log_get_stats(log, &before);
+    moqr_result_t rc = moqr_log_append(log, &d);
+    MOQ_TEST_CHECK(rc == MOQR_ERR_INVAL);
+    MOQ_TEST_CHECK_EQ_INT(g_release_count, 0);
+    if (rc != MOQR_OK) {
+        if (d.payload != NULL) MOQ_TEST_CHECK(moq_rcbuf_refcount(d.payload) == 1);
+        MOQ_TEST_CHECK(moq_rcbuf_refcount(d.properties) == 1);
+        moq_rcbuf_decref(d.payload);
+        moq_rcbuf_decref(d.properties);
+        MOQ_TEST_CHECK_EQ_INT(g_release_count, status == MOQR_OBJ_NORMAL ? 2 : 1);
+    }
+    moqr_log_get_stats(log, &after);
+    MOQ_TEST_CHECK_EQ_U64(after.record_count, before.record_count);
+    MOQ_TEST_CHECK_EQ_U64(after.retained_bytes, before.retained_bytes);
+    MOQ_TEST_CHECK_EQ_U64(after.group_count, before.group_count);
+    MOQ_TEST_CHECK_EQ_U64(after.evicted_groups_total, before.evicted_groups_total);
+    MOQ_TEST_CHECK(!after.end_of_track);
+    moqr_record_view_t v;
+    MOQ_TEST_CHECK(moqr_log_read_rec(log, 10, 0, 0, &v) == MOQR_OK);
+    STEP_CHECK(log);
+    return failures;
+}
+
+static int
+test_full_width_identity(void)
+{
+    int failures = 0;
+    for (int datagram = 0; datagram < 2; datagram++) {
+        count_alloc_t ca;
+        ca_init(&ca);
+        moqr_log_t *log = mklog(&ca, 4, 1000, NULL);
+        MOQ_TEST_CHECK(log != NULL);
+        MOQ_TEST_CHECK(append_obj(log, &ca.vt, 10, 0, 0, 400, false,
+            MOQR_OBJ_NORMAL, false) == MOQR_OK);
+        MOQ_TEST_CHECK(append_obj(log, &ca.vt, 11, 1, UINT64_MAX - 1, 8,
+            true, MOQR_OBJ_NORMAL, false) == MOQR_OK);
+        moqr_result_t rc = append_obj(log, &ca.vt, 11, 0, UINT64_MAX, 400,
+            false, MOQR_OBJ_NORMAL, datagram != 0);
+        printf("ORACLE full_width_identity datagram=%d MAX ingest=%d\n",
+               datagram, (int)rc);
+        MOQ_TEST_CHECK(rc == MOQR_OK);
+        moqr_obj_status_t status;
+        MOQ_TEST_CHECK(moqr_log_object_status(log, 11, UINT64_MAX, &status, NULL));
+        MOQ_TEST_CHECK(moqr_log_seal_subgroup(log, 11, 1) == MOQR_ERR_INVAL);
+        MOQ_TEST_CHECK(!moqr_log_group_final(log, 11, NULL));
+        failures += full_width_refusal(log, &ca, UINT64_MAX, false, false,
+                                      MOQR_OBJ_NORMAL);
+        failures += full_width_refusal(log, &ca, UINT64_MAX, true, false,
+                                      MOQR_OBJ_NORMAL);
+        failures += full_width_refusal(log, &ca, UINT64_MAX - 2, true, true,
+                                      MOQR_OBJ_NORMAL);
+        failures += full_width_refusal(log, &ca, UINT64_MAX - 2, false, false,
+                                      MOQR_OBJ_END_OF_GROUP);
+        failures += full_width_refusal(log, &ca, UINT64_MAX - 2, false, false,
+                                      MOQR_OBJ_END_OF_TRACK);
+        /* New lower datagrams are valid; MAX is not a blanket ordering floor. */
+        MOQ_TEST_CHECK(append_obj(log, &ca.vt, 11, 0, 7, 8, false,
+            MOQR_OBJ_NORMAL, true) == MOQR_OK);
+        uint64_t last = 0;
+        MOQ_TEST_CHECK(moqr_log_group_last(log, 11, &last));
+        MOQ_TEST_CHECK_EQ_U64(last, UINT64_MAX);
+        STEP_CHECK(log);
+        moqr_log_destroy(log);
+        MOQ_TEST_CHECK_EQ_INT((int)ca.live_bytes, 0);
+    }
+    MOQ_TEST_PASS("full_width_identity");
+    return failures;
+}
+
+static int
+test_full_width_final(void)
+{
+    int failures = 0;
+    /* Ordinary FIN and header-EOG RESET remain unknown. The other four
+     * sources declare a final, including the full-width value itself. */
+    for (int path = 0; path < 6; path++) {
+        count_alloc_t ca;
+        ca_init(&ca);
+        moqr_log_t *log = mklog(&ca, 2, 1 << 20, NULL);
+        MOQ_TEST_CHECK(log != NULL);
+        moqr_obj_status_t st = path == 1 ? MOQR_OBJ_END_OF_GROUP :
+                               path == 5 ? MOQR_OBJ_END_OF_TRACK : MOQR_OBJ_NORMAL;
+        bool eog = path >= 2 && path <= 4;
+        moqr_result_t rc = append_obj(log, &ca.vt, 11, 0, UINT64_MAX,
+            st == MOQR_OBJ_NORMAL ? 8 : 0, eog, st, path == 2);
+        printf("ORACLE full_width_final path=%d MAX ingest=%d\n", path, (int)rc);
+        MOQ_TEST_CHECK(rc == MOQR_OK);
+        uint64_t final = 77;
+        if (path == 0 || path == 3 || path == 4) {
+            MOQ_TEST_CHECK(!moqr_log_group_final(log, 11, &final));
+            MOQ_TEST_CHECK_EQ_U64(final, 77);
+            if (path == 4) {
+                MOQ_TEST_CHECK(moqr_log_reset_subgroup(log, 11, 0,
+                    rd_wire(0)) == MOQR_OK);
+            } else {
+                MOQ_TEST_CHECK(moqr_log_seal_subgroup(log, 11, 0) == MOQR_OK);
+            }
+        }
+        bool known = path != 0 && path != 4;
+        MOQ_TEST_CHECK(moqr_log_group_final(log, 11, &final) == known);
+        MOQ_TEST_CHECK_EQ_U64(final, known ? UINT64_MAX : 77);
+        MOQ_TEST_CHECK(append_obj(log, &ca.vt, 11, 1, UINT64_MAX - 1, 8,
+            false, MOQR_OBJ_NORMAL, false) == MOQR_OK);
+        MOQ_TEST_CHECK(append_obj(log, &ca.vt, 11, 2, UINT64_MAX - 2, 0,
+            false, MOQR_OBJ_END_OF_GROUP, false) == MOQR_ERR_INVAL);
+        if (path == 5) {
+            moqr_log_stats_t stats;
+            moqr_log_get_stats(log, &stats);
+            MOQ_TEST_CHECK(stats.end_of_track);
+            MOQ_TEST_CHECK_EQ_U64(log->final_track_object_id, UINT64_MAX);
+            MOQ_TEST_CHECK(append_obj(log, &ca.vt, 12, 0, 0, 8, false,
+                MOQR_OBJ_NORMAL, false) == MOQR_ERR_INVAL);
+        }
+        STEP_CHECK(log);
+        moqr_log_destroy(log);
+        MOQ_TEST_CHECK_EQ_INT((int)ca.live_bytes, 0);
+    }
+    MOQ_TEST_PASS("full_width_final");
+    return failures;
+}
+
+static int
+test_full_width_reuse(void)
+{
+    int failures = 0;
+    count_alloc_t ca;
+    ca_init(&ca);
+    moqr_log_t *log = mklog(&ca, 2, 1 << 20, NULL);
+    MOQ_TEST_CHECK(log != NULL);
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 1, 0, UINT64_MAX, 0, false,
+        MOQR_OBJ_END_OF_GROUP, false) == MOQR_OK);
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 3, 0, UINT64_MAX, 8, false,
+        MOQR_OBJ_NORMAL, true) == MOQR_OK);
+    /* Evict 1, insert 2 ahead of 3: both slot reuse and memmove must carry
+     * exactly the right presence bits. */
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 2, 0, UINT64_MAX, 0, false,
+        MOQR_OBJ_END_OF_GROUP, false) == MOQR_OK);
+    uint64_t final = 77;
+    MOQ_TEST_CHECK(!moqr_log_group_final(log, 1, &final));
+    MOQ_TEST_CHECK(moqr_log_group_final(log, 2, &final));
+    MOQ_TEST_CHECK_EQ_U64(final, UINT64_MAX);
+    MOQ_TEST_CHECK(!moqr_log_group_final(log, 3, NULL));
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 3, 1, UINT64_MAX, 8, false,
+        MOQR_OBJ_NORMAL, false) == MOQR_ERR_INVAL);
+    MOQ_TEST_CHECK(moqr_log_evict_groups(log, 2) == 2);
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 4, 0, UINT64_MAX - 1, 0, false,
+        MOQR_OBJ_END_OF_GROUP, false) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_log_group_final(log, 4, &final));
+    MOQ_TEST_CHECK_EQ_U64(final, UINT64_MAX - 1);
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 4, 1, UINT64_MAX, 8, false,
+        MOQR_OBJ_NORMAL, true) == MOQR_ERR_INVAL);
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 5, 0, UINT64_MAX, 8, false,
+        MOQR_OBJ_NORMAL, false) == MOQR_OK);
+    MOQ_TEST_CHECK(!moqr_log_group_final(log, 5, NULL));
+    STEP_CHECK(log);
+    moqr_log_destroy(log);
+    MOQ_TEST_CHECK_EQ_INT((int)ca.live_bytes, 0);
+    MOQ_TEST_PASS("full_width_reuse");
+    return failures;
+}
+
+static int
+test_full_width_allocation_failure(void)
+{
+    int failures = 0;
+    /* Fail each activation allocation and the first vector allocation; a
+     * refused append must not leave MAX present or publish a group final. */
+    for (unsigned fail = 1; fail <= 3; fail++) {
+        count_alloc_t ca;
+        ca_init(&ca);
+        moqr_log_t *log = mklog(&ca, 4, 1 << 20, NULL);
+        MOQ_TEST_CHECK(log != NULL);
+        MOQ_TEST_CHECK(append_obj(log, &ca.vt, 12, 0, 0, 8, false,
+            MOQR_OBJ_NORMAL, false) == MOQR_OK);
+        moqr_log_append_desc_t d;
+        moqr_log_append_desc_init(&d);
+        d.group_id = 11;
+        d.object_id = UINT64_MAX;
+        d.datagram_pref = true;
+        d.end_of_group = true;
+        d.payload = mkbuf(&ca.vt, 8, 1);
+        ca.fail_after = fail;
+        MOQ_TEST_CHECK(moqr_log_append(log, &d) == MOQR_ERR_NOMEM);
+        MOQ_TEST_CHECK(ca.fail_after == 0);
+        ca.fail_after = 0;
+        MOQ_TEST_CHECK(moq_rcbuf_refcount(d.payload) == 1);
+        MOQ_TEST_CHECK(!moqr_log_object_status(log, 11, UINT64_MAX, NULL, NULL));
+        MOQ_TEST_CHECK(!moqr_log_group_final(log, 11, NULL));
+        moqr_record_view_t v;
+        MOQ_TEST_CHECK(moqr_log_read_rec(log, 12, 0, 0, &v) == MOQR_OK);
+        STEP_CHECK(log);
+        moqr_result_t rc = moqr_log_append(log, &d);
+        MOQ_TEST_CHECK(rc == MOQR_OK);
+        if (rc != MOQR_OK) moq_rcbuf_decref(d.payload);
+        uint64_t final = 0;
+        MOQ_TEST_CHECK(moqr_log_group_final(log, 11, &final));
+        MOQ_TEST_CHECK_EQ_U64(final, UINT64_MAX);
+        STEP_CHECK(log);
+        moqr_log_destroy(log);
+        MOQ_TEST_CHECK_EQ_INT((int)ca.live_bytes, 0);
+    }
+    MOQ_TEST_PASS("full_width_allocation_failure");
+    return failures;
+}
+
+/* The descriptor as a binary built before any field was appended to it
+ * declares it: it allocates exactly this sizeof and calls the exported
+ * initializer symbol on it. */
+typedef struct old_append_desc {
+    uint32_t          struct_size;
+    uint64_t          group_id;
+    uint64_t          subgroup_id;
+    uint64_t          object_id;
+    uint8_t           publisher_priority;
+    moqr_obj_status_t status;
+    bool              datagram_pref;
+    bool              end_of_group;
+    moq_rcbuf_t      *payload;
+    moq_rcbuf_t      *properties;
+    uint64_t          now_us;
+    moqr_obj_state_t  obj_state;
+    uint64_t          declared_len;
+} old_append_desc_t;
+
+_Static_assert(sizeof(old_append_desc_t) ==
+               ((offsetof(moqr_log_append_desc_t, declared_len) + sizeof(uint64_t) +
+                 _Alignof(moqr_log_append_desc_t) - 1u) /
+                _Alignof(moqr_log_append_desc_t) * _Alignof(moqr_log_append_desc_t)),
+               "the old descriptor is the current one through declared_len");
+
+#define OLD_DESC_GUARD 16u
+
+/* The exported symbol on that caller's storage stamps the old sizeof and
+ * writes nothing past it; the log appends the old caller's record with every
+ * appended field clear. The macro gives a current caller the whole struct. */
+static int
+test_append_desc_old_caller(void)
+{
+    int failures = 0;
+    struct { old_append_desc_t d; unsigned char guard[OLD_DESC_GUARD]; } w;
+    memset(&w, 0xA5, sizeof(w));
+    (moqr_log_append_desc_init)((moqr_log_append_desc_t *)(void *)&w.d);
+    MOQ_TEST_CHECK_EQ_U64(w.d.struct_size, sizeof(old_append_desc_t));
+    size_t past = 0;
+    for (size_t i = 0; i < OLD_DESC_GUARD; i++)
+        if (w.guard[i] != 0xA5) past = i + 1;
+    if (past) {
+        fprintf(stderr, "FAIL: moqr_log_append_desc_init wrote %zu byte(s) "
+                "past the caller's descriptor\n", past);
+        failures++;
+    }
+
+    count_alloc_t ca;
+    ca_init(&ca);
+    moqr_log_t *log = mklog(&ca, 4, 1 << 20, NULL);
+    MOQ_TEST_CHECK(log != NULL);
+    old_append_desc_t *old = malloc(sizeof(*old));
+    MOQ_TEST_CHECK(old != NULL);
+    if (log && old) {
+        (moqr_log_append_desc_init)((moqr_log_append_desc_t *)(void *)old);
+        old->group_id = 3;
+        old->publisher_priority = 128;
+        old->now_us = 1;
+        MOQ_TEST_CHECK(moqr_log_append(log,
+                           (const moqr_log_append_desc_t *)(const void *)old) == MOQR_OK);
+        moqr_cursor_t cur = MOQR_CURSOR_INVALID;
+        MOQ_TEST_CHECK(moqr_log_cursor_open(log, MOQR_CURSOR_FROM_OLDEST, &cur) == MOQR_OK);
+        moqr_record_view_t v;
+        bool skipped = true;
+        MOQ_TEST_CHECK(moqr_log_cursor_next(log, cur, &v, &skipped) == MOQR_OK);
+        MOQ_TEST_CHECK_EQ_U64(v.group_id, 3);
+        MOQ_TEST_CHECK(!v.first_object);
+    }
+    free(old);
+    if (log) moqr_log_destroy(log);
+    MOQ_TEST_CHECK_EQ_INT((int)ca.live_bytes, 0);
+
+    moqr_log_append_desc_t cur_desc;
+    memset(&cur_desc, 0xA5, sizeof(cur_desc));
+    moqr_log_append_desc_init(&cur_desc);
+    MOQ_TEST_CHECK_EQ_U64(cur_desc.struct_size, sizeof(cur_desc));
+    MOQ_TEST_CHECK(!cur_desc.first_object && !cur_desc.subgroup_properties);
+    MOQ_TEST_PASS("append_desc_old_caller");
+    return failures;
+}
+
+/* first_object is an appended descriptor field: a full-size descriptor
+ * records the mark and the view reports it; a descriptor whose struct_size
+ * ends at declared_len is still accepted and records the mark clear, even
+ * when its storage past that size says otherwise; a shorter one is refused. */
+static int
+test_first_object_desc_prefix(void)
+{
+    int failures = 0;
+    count_alloc_t ca;
+    ca_init(&ca);
+    moqr_log_t *log = mklog(&ca, 4, 1 << 20, NULL);
+    MOQ_TEST_CHECK(log != NULL);
+    const size_t prior = offsetof(moqr_log_append_desc_t, declared_len) +
+                         sizeof(uint64_t);
+    for (uint64_t o = 0; o < 3; o++) {
+        moqr_log_append_desc_t d;
+        moqr_log_append_desc_init(&d);
+        d.group_id = 7;
+        d.object_id = o;
+        d.publisher_priority = 128;
+        d.first_object = true;
+        d.now_us = 1;
+        if (o == 1) d.struct_size = (uint32_t)prior;
+        if (o == 2) d.struct_size = (uint32_t)(prior - 1);
+        MOQ_TEST_CHECK(moqr_log_append(log, &d) ==
+                       (o == 2 ? MOQR_ERR_INVAL : MOQR_OK));
+    }
+    moqr_cursor_t cur = MOQR_CURSOR_INVALID;
+    MOQ_TEST_CHECK(moqr_log_cursor_open(log, MOQR_CURSOR_FROM_OLDEST,
+                                        &cur) == MOQR_OK);
+    for (uint64_t o = 0; o < 2; o++) {
+        moqr_record_view_t v;
+        bool skipped = true;
+        MOQ_TEST_CHECK(moqr_log_cursor_next(log, cur, &v, &skipped) ==
+                       MOQR_OK);
+        MOQ_TEST_CHECK_EQ_U64(v.object_id, o);
+        MOQ_TEST_CHECK(v.first_object == (o == 0));
+    }
+    moqr_log_destroy(log);
+    MOQ_TEST_CHECK_EQ_INT((int)ca.live_bytes, 0);
+    MOQ_TEST_PASS("first_object_desc_prefix");
+    return failures;
+}
+
 int
 main(void)
 {
     int failures = 0;
     failures += test_append_and_cursor_roundtrip();
     failures += test_cursor_generation_exhaustion();
+    failures += test_first_object_desc_prefix();
+    failures += test_append_desc_old_caller();
     failures += test_ordering_rules();
     failures += test_final_evidence_preflight();
     failures += test_final_evidence_atomicity();
@@ -1324,6 +1757,11 @@ main(void)
     failures += test_chunk_ordering_and_dup();
     failures += test_chunk_capacity();
     failures += test_chunk_byte_accounting_eviction();
+    failures += test_group_final();
+    failures += test_full_width_identity();
+    failures += test_full_width_final();
+    failures += test_full_width_reuse();
+    failures += test_full_width_allocation_failure();
     failures += g_failures_capacity;
     return failures == 0 ? 0 : 1; /* exit status truncates to 8 bits */
 }

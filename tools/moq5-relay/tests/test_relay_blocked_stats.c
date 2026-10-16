@@ -3,8 +3,8 @@
  * RELAY_BLOCKED_V0 record (cli/blockedstats). Pure logic, no transport — the
  * relay owns this schema; the gauntlet parses records the relay emits. The
  * live LIVE-only aggregate lifecycle / overflow behaviour is proven against a
- * real bind in test_relay_session_binding.c; here we prove only the wire
- * grammar and the acceptance rules over the plain row struct.
+ * real bind in test_relay_session_binding_delivery.c; here we prove only the
+ * wire grammar and the acceptance rules over the plain row struct.
  */
 
 #include "../cli/blockedstats.h"

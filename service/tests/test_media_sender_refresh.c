@@ -56,6 +56,15 @@ bool moq_media_receiver_test_poll(moq_media_receiver_t *r,
                                   moq_media_track_event_kind_t *kind,
                                   moq_media_track_t **track);
 size_t moq_media_receiver_test_track_count(const moq_media_receiver_t *r);
+uint64_t moq_media_receiver_test_catalog_drops(const moq_media_receiver_t *r);
+bool moq_media_receiver_test_is_fatal(const moq_media_receiver_t *r);
+
+/* Catalog-build seams for the shared-init rows (media_sender.c). */
+moq_media_sender_t *moq_media_sender_test_new(void);
+void moq_media_sender_test_set_companion(moq_media_sender_t *s,
+                                         moq_media_companion_profile_t profile);
+moq_result_t moq_media_sender_test_build_catalog(moq_media_sender_t *s,
+                                                 moq_rcbuf_t **out);
 
 /* ======================================================================== *
  *  Config / ABI resolution (no endpoint, no network)
@@ -1074,6 +1083,135 @@ static void test_receiver_late_bootstrap(void)
     MOQ_TEST_PASS("receiver_late_bootstrap");
 }
 
+/* -- Shared init references survive removal -------------------------- */
+
+static moq_media_track_t *init_track(moq_media_sender_t *s, const char *name,
+                                     moq_media_packaging_t packaging,
+                                     const uint8_t *init, size_t init_len)
+{
+    moq_media_track_cfg_t tc;
+    moq_media_track_cfg_init(&tc);
+    tc.name = (moq_bytes_t){ (const uint8_t *)name, strlen(name) };
+    tc.packaging = packaging;
+    tc.bitrate = 64000;
+    tc.is_live = true;
+    tc.media_type = MOQ_MEDIA_TYPE_VIDEO;
+    tc.codec = MOQ_BYTES_LITERAL("av01");
+    tc.init_data = (moq_bytes_t){ init, init_len };
+    moq_media_track_t *t = NULL;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_add_track(s, &tc, &t),
+                          (int)MOQ_OK);
+    return t;
+}
+
+/* Build the sender's independent catalog, check it carries `want` (each a
+ * literal fragment), and feed it to the receiver as `group`. */
+static void ship_catalog(moq_media_sender_t *s, moq_media_receiver_t *r,
+                         uint64_t group, const char *const *want, size_t nwant)
+{
+    moq_rcbuf_t *j = NULL;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_test_build_catalog(s, &j),
+                          (int)MOQ_OK);
+    if (!j) return;
+    char buf[2048];
+    size_t n = moq_rcbuf_len(j);
+    MOQ_TEST_CHECK(n < sizeof(buf));
+    if (n < sizeof(buf)) {
+        memcpy(buf, moq_rcbuf_data(j), n); buf[n] = '\0';
+        for (size_t i = 0; i < nwant; i++) {
+            if (!strstr(buf, want[i]))
+                printf("  missing %s in %s\n", want[i], buf);
+            MOQ_TEST_CHECK(strstr(buf, want[i]) != NULL);
+        }
+        moq_media_receiver_test_ingest(r, group, 0, buf, n);
+    }
+    moq_rcbuf_decref(j);
+}
+
+/* Tally the receiver's track events since the last call. */
+static void count_events(moq_media_receiver_t *r, int *added, int *removed)
+{
+    *added = *removed = 0;
+    moq_media_track_event_kind_t k; moq_media_track_t *t;
+    while (moq_media_receiver_test_poll(r, &k, &t)) {
+        if (k == MOQ_MEDIA_TRACK_ADDED) (*added)++;
+        if (k == MOQ_MEDIA_TRACK_REMOVED) (*removed)++;
+    }
+}
+
+/* Tracks A and B carry identical init bytes and share A's initDataList
+ * entry. Removing A leaves B's initRef unchanged (MSF-01 5.3: a surviving
+ * tuple's attributes are immutable), so the receiver adopts the next
+ * independent catalog as a plain removal. A new track that reuses the removed
+ * name with different init bytes gets its own id, never A's. Covered for
+ * CMAF on both companions and for RAW (LOC) on the draft-22 companion. */
+static void test_shared_init_ref_survives_removal(
+    moq_media_packaging_t packaging, bool d22)
+{
+    static const uint8_t x[] = { 0x00, 0x00, 0x00, 0x18 };   /* "AAAAGA==" */
+    static const uint8_t y[] = { 0x01, 0x42, 0xe0, 0x1e };   /* "AULgHg==" */
+    moq_media_sender_t *s = moq_media_sender_test_new();
+    MOQ_TEST_CHECK(s != NULL);
+    if (!s) return;
+    if (d22)
+        moq_media_sender_test_set_companion(s,
+            MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC);
+    moq_media_receiver_t *r = moq_media_receiver_test_new(false);
+    MOQ_TEST_CHECK(r != NULL);
+    if (!r) { moq_media_sender_test_free(s); return; }
+
+    moq_media_track_t *a = init_track(s, "A", packaging, x, sizeof(x));
+    (void)init_track(s, "B", packaging, x, sizeof(x));
+    static const char *const g0[] = {
+        "\"name\":\"A\"", "\"name\":\"B\"",
+        "\"initDataList\":[{\"id\":\"A\",\"type\":\"inline\","
+        "\"data\":\"AAAAGA==\"}]",
+    };
+    ship_catalog(s, r, 0, g0, 3);
+    int added, removed;
+    count_events(r, &added, &removed);
+    MOQ_TEST_CHECK_EQ_INT(added, 2);
+
+    MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_remove_track(s, a),
+                          (int)MOQ_OK);
+    static const char *const g1[] = {
+        "\"name\":\"B\"", "\"initRef\":\"A\"",
+        "\"initDataList\":[{\"id\":\"A\",\"type\":\"inline\","
+        "\"data\":\"AAAAGA==\"}]",
+    };
+    ship_catalog(s, r, 1, g1, 3);
+    count_events(r, &added, &removed);
+    MOQ_TEST_CHECK_EQ_INT(added, 0);
+    MOQ_TEST_CHECK_EQ_INT(removed, 1);
+    MOQ_TEST_CHECK_EQ_U64(moq_media_receiver_test_catalog_drops(r), 0);
+    MOQ_TEST_CHECK(!moq_media_receiver_test_is_fatal(r));
+    /* Handles outlive removal: A's stays, inert. */
+    MOQ_TEST_CHECK_EQ_U64((uint64_t)moq_media_receiver_test_track_count(r), 2);
+
+    /* The removed name comes back with other init bytes: "A" still names x
+     * (B's entry), so the new track's entry is "A~1". */
+    (void)init_track(s, "A", packaging, y, sizeof(y));
+    static const char *const g2[] = {
+        "\"name\":\"B\"", "\"initRef\":\"A\"", "\"initRef\":\"A~1\"",
+        "{\"id\":\"A\",\"type\":\"inline\",\"data\":\"AAAAGA==\"}",
+        "{\"id\":\"A~1\",\"type\":\"inline\",\"data\":\"AULgHg==\"}",
+    };
+    ship_catalog(s, r, 2, g2, 5);
+    count_events(r, &added, &removed);
+    MOQ_TEST_CHECK_EQ_INT(added, 1);
+    MOQ_TEST_CHECK_EQ_INT(removed, 0);
+    MOQ_TEST_CHECK_EQ_U64(moq_media_receiver_test_catalog_drops(r), 0);
+    MOQ_TEST_CHECK(!moq_media_receiver_test_is_fatal(r));
+    MOQ_TEST_CHECK_EQ_U64((uint64_t)moq_media_receiver_test_track_count(r), 3);
+
+    moq_media_receiver_test_free(r);
+    moq_media_sender_test_free(s);
+    MOQ_TEST_PASS(packaging == MOQ_MEDIA_PACKAGING_CMAF
+        ? (d22 ? "shared_init_ref_survives_removal.d22_cmaf"
+               : "shared_init_ref_survives_removal.legacy_cmaf")
+        : "shared_init_ref_survives_removal.d22_raw");
+}
+
 int main(void)
 {
     test_cfg_default_interval();
@@ -1082,6 +1220,9 @@ int main(void)
     test_cfg_poisoned_tail();
     test_receiver_refresh_dedup();
     test_receiver_late_bootstrap();
+    test_shared_init_ref_survives_removal(MOQ_MEDIA_PACKAGING_CMAF, false);
+    test_shared_init_ref_survives_removal(MOQ_MEDIA_PACKAGING_CMAF, true);
+    test_shared_init_ref_survives_removal(MOQ_MEDIA_PACKAGING_RAW, true);
     for (int vi = 0; vi < 2; vi++) {
         moq_version_t ver = vi ? MOQ_VERSION_DRAFT_18 : MOQ_VERSION_DRAFT_16;
         test_refresh_publish_demand(ver);

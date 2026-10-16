@@ -4,6 +4,7 @@
 #include <moq/control_d18.h>
 #include <moq/buf.h>
 #include "test_support.h"
+#include "test_binding_support.h"
 #include "../support/held_bridge_driver.h"
 #include "../../core/src/session/session_internal.h"
 #include "../../core/src/session/session_transport.h"
@@ -3647,13 +3648,13 @@ static int p7_check_live(const moq_session_t *s, moq_stream_ref_t ref,
     if (e->request_id != p7_want_request_id) {
         fprintf(stderr, "FINBR %s: request id\n", what); bad++;
     }
-    if (e->request_stream_ref._v != ref._v) {
+    if (e->rs.ref._v != ref._v) {
         fprintf(stderr, "FINBR %s: owner ref\n", what); bad++;
     }
     /* The transferred FIN -- this family's carrier is the durable latch. */
-    if ((e->req_recv_fin ? 1 : 0) != p7_want_fin) {
+    if ((e->rs.recv_fin ? 1 : 0) != p7_want_fin) {
         fprintf(stderr, "FINBR %s: FIN latch %d, expected %d\n", what,
-                e->req_recv_fin ? 1 : 0, p7_want_fin);
+                e->rs.recv_fin ? 1 : 0, p7_want_fin);
         bad++;
     }
     if (p7_pool_busy(s) != 1) {
@@ -5367,8 +5368,10 @@ static void p7_expect_after_call_prepare(txs_snapshot_t *snap)
  * by an absence check that a stale value also satisfies. */
 typedef struct p7_free_expect {
     uint32_t        generation;
-    const uint8_t  *req_recv_buf;
-    size_t          req_recv_cap;
+    struct {
+        const uint8_t  * recv_buf;
+        size_t recv_cap;
+    } rs;
 } p7_free_expect_t;
 
 static int p7_check_free_record(const moq_session_t *s, int slot,
@@ -5390,18 +5393,18 @@ static int p7_check_free_record(const moq_session_t *s, int slot,
 } while (0)
     P7_FREE_EQ("state", (int)e->state, (int)MOQ_TS_FREE);
     P7_FREE_EQ("generation", e->generation, w->generation);
-    P7_FREE_EQ("req_recv_cap", e->req_recv_cap, w->req_recv_cap);
+    P7_FREE_EQ("req_recv_cap", e->rs.recv_cap, w->rs.recv_cap);
     /* Everything the memset zeroes. */
     P7_FREE_EQ("role", (int)e->role, 0);
     P7_FREE_EQ("handle", e->handle._opaque, 0);
     P7_FREE_EQ("request_id", e->request_id, 0);
-    P7_FREE_EQ("request_stream_ref", e->request_stream_ref._v, 0);
-    P7_FREE_EQ("req_recv_len", e->req_recv_len, 0);
-    P7_FREE_EQ("req_recv_fin", e->req_recv_fin ? 1 : 0, 0);
+    P7_FREE_EQ("request_stream_ref", e->rs.ref._v, 0);
+    P7_FREE_EQ("req_recv_len", e->rs.recv_len, 0);
+    P7_FREE_EQ("req_recv_fin", e->rs.recv_fin ? 1 : 0, 0);
     P7_FREE_EQ("goaway_sent", e->goaway_sent ? 1 : 0, 0);
     P7_FREE_EQ("track_id_len", e->track_id_len, 0);
 #undef P7_FREE_EQ
-    if (e->req_recv_buf != w->req_recv_buf) {
+    if (e->rs.recv_buf != w->rs.recv_buf) {
         fprintf(stderr, "AXIS4 %s: free record req_recv_buf pointer\n", what);
         bad++;
     }
@@ -5539,8 +5542,8 @@ static int test_p7_retirement_idempotence_and_reuse(void)
      * ingress rather than adopted from the record the free produces. */
     const int slot_pre = r.want_slot;
     MOQ_TEST_CHECK(slot_pre >= 0 && (size_t)slot_pre < r.tp.server->ts_cap);
-    const uint8_t *pre_recv_buf = r.tp.server->track_statuses[slot_pre].req_recv_buf;
-    const size_t   pre_recv_cap = r.tp.server->track_statuses[slot_pre].req_recv_cap;
+    const uint8_t *pre_recv_buf = r.tp.server->track_statuses[slot_pre].rs.recv_buf;
+    const size_t   pre_recv_cap = r.tp.server->track_statuses[slot_pre].rs.recv_cap;
 
     failures += run_fin_bridge(&f, &r);
 
@@ -5554,8 +5557,8 @@ static int test_p7_retirement_idempotence_and_reuse(void)
      * the freed entry. */
     p7_free_expect_t want_free;
     want_free.generation   = moq_handle_generation(retired_handle) + 1u;
-    want_free.req_recv_buf = pre_recv_buf;
-    want_free.req_recv_cap = pre_recv_cap;
+    want_free.rs.recv_buf = pre_recv_buf;
+    want_free.rs.recv_cap = pre_recv_cap;
     failures += p7_check_free_record(r.tp.server, slot, &want_free,
                                      "first retirement");
 
@@ -5941,13 +5944,13 @@ static int p3_check_live(const moq_session_t *s, moq_stream_ref_t ref,
     if (e->request_id != 0) {
         fprintf(stderr, "FINBR %s: request id\n", what); bad++;
     }
-    if (e->request_stream_ref._v != ref._v) {
+    if (e->rs.ref._v != ref._v) {
         fprintf(stderr, "FINBR %s: owner ref\n", what); bad++;
     }
     /* RETAINED class: the FIN is held by the BRIDGE, so the owner's own latch
      * must still be clear. This says nothing about where a future marker
      * lives -- only that the durable latch has not been set behind our back. */
-    if (e->req_recv_fin) {
+    if (e->rs.recv_fin) {
         fprintf(stderr, "FINBR %s: owner latch set on a retained ingress\n",
                 what);
         bad++;
@@ -7165,11 +7168,13 @@ typedef struct nob_blk_snap {
     size_t   ns_len;
     uint8_t  ns_bytes[64];            /* deep copy of the canonical namespace */
     bool     ns_overflow;            /* ns_id_len exceeded the capture buffer */
-    size_t   req_recv_cap;
-    size_t   req_recv_len;
-    bool     req_recv_fin;
+    struct {
+        size_t recv_cap;
+        size_t recv_len;
+        bool recv_fin;
+        const uint8_t * recv_buf;
+    } rs;
     bool     handoff_fin_pending;
-    const uint8_t *req_recv_buf;     /* pointer identity */
 } nob_blk_snap_t;
 
 /* Origin-4 GOAWAY New Session URI: 36 bytes, sized so the encoded REQUEST_GOAWAY
@@ -7247,11 +7252,11 @@ static int nob_check_seed(test_pair_t *tp, const nob_run_t *r,
         (int)e->role != (int)MOQ_SUB_ROLE_PUBLISHER ||
         e->request_id != 0 ||
         e->generation != r->seed_gen ||
-        e->request_stream_ref._v != r->seed_ref._v ||
-        e->req_recv_fin ||
-        e->req_recv_len != r->seed_fed ||
-        !e->req_recv_buf ||
-        memcmp(e->req_recv_buf, r->seed_bytes, r->seed_fed) != 0) {
+        e->rs.ref._v != r->seed_ref._v ||
+        e->rs.recv_fin ||
+        e->rs.recv_len != r->seed_fed ||
+        !e->rs.recv_buf ||
+        memcmp(e->rs.recv_buf, r->seed_bytes, r->seed_fed) != 0) {
         fprintf(stderr, "NOB %s: seed owner record changed\n", what);
         bad++;
     }
@@ -7434,11 +7439,11 @@ static int nob_blk_capture(test_pair_t *tp, const nob_run_t *r,
         snap->ns_overflow = true;
     else if (e->ns_id_buf && e->ns_id_len)
         memcpy(snap->ns_bytes, e->ns_id_buf, e->ns_id_len);
-    snap->req_recv_cap = e->req_recv_cap;
-    snap->req_recv_len = e->req_recv_len;
-    snap->req_recv_fin = e->req_recv_fin;
+    snap->rs.recv_cap = e->rs.recv_cap;
+    snap->rs.recv_len = e->rs.recv_len;
+    snap->rs.recv_fin = e->rs.recv_fin;
     snap->handoff_fin_pending = e->handoff_fin_pending;
-    snap->req_recv_buf = e->req_recv_buf;
+    snap->rs.recv_buf = e->rs.recv_buf;
     return 0;
 }
 
@@ -7461,13 +7466,13 @@ static int nob_blk_check(test_pair_t *tp, const nob_run_t *r,
         e->generation != r->blk_gen ||
         e->handle._opaque != r->blk_handle ||
         e->request_id != r->blk_rid ||
-        e->request_stream_ref._v != r->blk_ref._v ||
+        e->rs.ref._v != r->blk_ref._v ||
         !e->goaway_sent ||
         e->handoff_fin_pending != snap->handoff_fin_pending ||
-        e->req_recv_cap != snap->req_recv_cap ||
-        e->req_recv_len != snap->req_recv_len ||
-        e->req_recv_fin != snap->req_recv_fin ||
-        e->req_recv_buf != snap->req_recv_buf) {
+        e->rs.recv_cap != snap->rs.recv_cap ||
+        e->rs.recv_len != snap->rs.recv_len ||
+        e->rs.recv_fin != snap->rs.recv_fin ||
+        e->rs.recv_buf != snap->rs.recv_buf) {
         fprintf(stderr, "NOB %s: blocker owner record changed\n", what);
         bad++;
     }
@@ -7613,7 +7618,7 @@ static int nob_added_edge_ok(const moq_session_t *server, const og_edge_t *f,
     if (f->kind == MOQ_REQ_SUBSCRIPTION) {
         if (f->slot < 0 || (size_t)f->slot >= server->sub_cap ||
             server->subs[f->slot].state == MOQ_SUB_FREE ||
-            server->subs[f->slot].request_stream_ref._v != target_ref) {
+            server->subs[f->slot].rs.ref._v != target_ref) {
             if (!og_quiet)
                 fprintf(stderr, "NOB %s: added edge's owner does not carry the"
                         " target identity\n", what);
@@ -7727,7 +7732,7 @@ static int nob_rid_allowance_selfcheck(void)
     int owner_slot = -1;
     for (size_t i = 0; i < tp.server->sub_cap; i++)
         if (tp.server->subs[i].state != MOQ_SUB_FREE &&
-            tp.server->subs[i].request_stream_ref._v == owner_ref._v) {
+            tp.server->subs[i].rs.ref._v == owner_ref._v) {
             owner_slot = (int)i;
             break;
         }
@@ -8097,9 +8102,9 @@ static int run_nob_case(const nob_case_t *c)
                     MOQ_TEST_CHECK_EQ_SIZE(moq_buf_reader_remaining(&rr),
                                            (size_t)0);
                     moq_d18_setup_opts_t opts;
-                    memset(&opts, 0, sizeof(opts));
+                    moq_d18_setup_opts_init(&opts);
                     if (moq_d18_decode_setup_opts(env.payload, env.payload_len,
-                                                  &opts) != MOQ_OK) {
+                                                  &opts, sizeof(opts)) != MOQ_OK) {
                         fprintf(stderr, "NOB %s: SETUP body did not decode\n",
                                 what);
                         failures++;
@@ -8685,9 +8690,11 @@ static int run_nob_case(const nob_case_t *c)
                     (int)moq_d18_decode_request_error(env.payload,
                                                       env.payload_len, &er),
                     (int)MOQ_OK);
+                /* Local capacity: EXCESSIVE_LOAD, retryable at once
+                 * (draft-18 §10.6). */
                 MOQ_TEST_CHECK_EQ_U64(
-                    er.error_code, (uint64_t)MOQ_REQUEST_ERROR_INTERNAL_ERROR);
-                MOQ_TEST_CHECK_EQ_U64(er.retry_interval, (uint64_t)0);
+                    er.error_code, (uint64_t)MOQ_REQUEST_ERROR_EXCESSIVE_LOAD);
+                MOQ_TEST_CHECK_EQ_U64(er.retry_interval, (uint64_t)1);
                 MOQ_TEST_CHECK(er.reason.len == 17 && er.reason.data &&
                                memcmp(er.reason.data, "request pool full",
                                       17) == 0);
@@ -8922,9 +8929,9 @@ static int exh_setup(test_pair_t *tp, uint32_t server_send_buf,
             !ep.has_stream_ref || ep.stream_ref._v != sref._v ||
             (int)tp->server->subs[ep.slot].state !=
                 (int)MOQ_SUB_RECVING_REQUEST ||
-            tp->server->subs[ep.slot].req_recv_len != seed_len ||
-            !tp->server->subs[ep.slot].req_recv_buf ||
-            memcmp(tp->server->subs[ep.slot].req_recv_buf, seed,
+            tp->server->subs[ep.slot].rs.recv_len != seed_len ||
+            !tp->server->subs[ep.slot].rs.recv_buf ||
+            memcmp(tp->server->subs[ep.slot].rs.recv_buf, seed,
                    seed_len) != 0) {
             fprintf(stderr, "EXH setup: seed owner not the declared receiver\n");
             test_pair_destroy(tp); return -1;
@@ -13026,9 +13033,11 @@ static int test_hol_retention_releases_owned_payload_once(void)
         moq_rcbuf_decref(held);
         held_bridge_destroy(f.tp.server_bridge);
         f.tp.server_bridge = NULL;
+        /* Bridges first: each session outlives its bridge. */
+        held_bridge_destroy(f.tp.client_bridge);
+        f.tp.client_bridge = NULL;
         moq_session_destroy(f.tp.client);
         moq_session_destroy(f.tp.server);
-        held_bridge_destroy(f.tp.client_bridge);
 
         if (acct.live_blocks != 0 || acct.live_bytes != 0 || acct.negative) {
             fprintf(stderr, "RCONCE[%d]: live=%lld blocks %lld bytes "
@@ -13124,9 +13133,11 @@ static int test_hol_initial_retention_failure_is_fatal_not_silent(void)
 
     held_bridge_destroy(f.tp.server_bridge);
     f.tp.server_bridge = NULL;
+    /* Bridges first: each session outlives its bridge. */
+    held_bridge_destroy(f.tp.client_bridge);
+    f.tp.client_bridge = NULL;
     moq_session_destroy(f.tp.client);
     moq_session_destroy(f.tp.server);
-    held_bridge_destroy(f.tp.client_bridge);
 
     if (acct.live_blocks != 0 || acct.live_bytes != 0 || acct.negative) {
         fprintf(stderr, "RETAIN0: live=%lld blocks %lld bytes negative=%d\n",
@@ -13212,9 +13223,11 @@ static int test_hol_retention_failure_is_fatal_not_silent(void)
 
     held_bridge_destroy(f.tp.server_bridge);
     f.tp.server_bridge = NULL;
+    /* Bridges first: each session outlives its bridge. */
+    held_bridge_destroy(f.tp.client_bridge);
+    f.tp.client_bridge = NULL;
     moq_session_destroy(f.tp.client);
     moq_session_destroy(f.tp.server);
-    held_bridge_destroy(f.tp.client_bridge);
 
     /* released exactly once: no leak, and no negative balance */
     if (acct.live_blocks != 0 || acct.live_bytes != 0 || acct.negative) {
@@ -13272,9 +13285,11 @@ static int test_hol_owned_payload_conservation(void)
 
     held_bridge_destroy(f.tp.server_bridge);
     f.tp.server_bridge = NULL;
+    /* Bridges first: each session outlives its bridge. */
+    held_bridge_destroy(f.tp.client_bridge);
+    f.tp.client_bridge = NULL;
     moq_session_destroy(f.tp.client);
     moq_session_destroy(f.tp.server);
-    held_bridge_destroy(f.tp.client_bridge);
 
     if (acct.live_blocks != 0 || acct.live_bytes != 0 || acct.negative) {
         fprintf(stderr, "HOL owned-payload: live=%lld blocks %lld bytes "
@@ -13805,6 +13820,148 @@ static int test_priority_survives_closed_subgroup(bool fail, bool legacy, bool d
     return failures;
 }
 
+/* A draft-22 pair: the subgroup's delivery timer runs from its FIN and awaits
+ * the transport's commit report. */
+static int d22_pair_init(test_pair_t *tp)
+{
+    memset(tp, 0, sizeof(*tp));
+    moq_session_cfg_t ccfg;
+    moq_session_cfg_init_sized(&ccfg, sizeof(ccfg), moq_alloc_default(), MOQ_PERSPECTIVE_CLIENT);
+    ccfg.version = MOQ_VERSION_DRAFT_22;
+    ccfg.send_request_capacity = true;
+    ccfg.initial_request_capacity = 10;
+    moq_session_cfg_t scfg;
+    moq_session_cfg_init_sized(&scfg, sizeof(scfg), moq_alloc_default(), MOQ_PERSPECTIVE_SERVER);
+    scfg.version = MOQ_VERSION_DRAFT_22;
+    scfg.send_request_capacity = true;
+    scfg.initial_request_capacity = 10;
+    if (moq_session_create(&ccfg, 0, &tp->client) < 0) return -1;
+    if (moq_session_create(&scfg, 0, &tp->server) < 0) { moq_session_destroy(tp->client); return -1; }
+    if (test_bind_if_required(tp->client) < 0 || test_bind_if_required(tp->server) < 0) {
+        moq_session_destroy(tp->server); moq_session_destroy(tp->client); return -1;
+    }
+    held_endpoint_init(&tp->client_ep, 1000, 2000);
+    held_endpoint_init(&tp->server_ep, 3000, 4000);
+    moq_transport_bridge_cfg_t bcfg;
+    moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
+    if (held_bridge_create(&bcfg, tp->client, &tp->client_ep.vtable, &tp->client_ep, &tp->client_bridge) < 0) {
+        moq_session_destroy(tp->server); moq_session_destroy(tp->client); return -1;
+    }
+    if (held_bridge_create(&bcfg, tp->server, &tp->server_ep.vtable, &tp->server_ep, &tp->server_bridge) < 0) {
+        held_bridge_destroy(tp->client_bridge);
+        moq_session_destroy(tp->server); moq_session_destroy(tp->client); return -1;
+    }
+    return 0;
+}
+
+/* Open a subgroup on `sub`, write one object and FIN it at `now`; service the
+ * server bridge and return the transport stream id the fake endpoint opened. */
+static uint64_t fin_one_subgroup(test_pair_t *tp, moq_subscription_t sub, uint64_t group, uint64_t now)
+{
+    moq_subgroup_cfg_t sc;
+    moq_subgroup_cfg_init(&sc);
+    sc.group_id = group;
+    sc.publisher_priority = 19;
+    moq_subgroup_handle_t sg;
+    if (moq_session_open_subgroup(tp->server, sub, &sc, now, &sg) != MOQ_OK) return UINT64_MAX;
+    moq_rcbuf_t *p = NULL;
+    moq_rcbuf_create(moq_alloc_default(), (const uint8_t *)"o", 1, &p);
+    moq_result_t wrc = moq_session_write_object(tp->server, sg, 0, p, now);
+    moq_rcbuf_decref(p);
+    if (wrc != MOQ_OK) return UINT64_MAX;
+    if (moq_session_close_subgroup(tp->server, sg, now) != MOQ_OK) return UINT64_MAX;
+    fake_endpoint_clear_ops(&tp->server_ep);
+    held_bridge_service(tp->server_bridge, now);
+    uint64_t sid = UINT64_MAX; bool fin = false;
+    for (size_t i = 0; i < tp->server_ep.count; i++) {
+        const fake_op_t *o = &tp->server_ep.ops[i];
+        if (o->kind == FAKE_OP_OPEN_UNI) sid = o->stream_id;
+        if (o->kind == FAKE_OP_WRITE && o->stream_id == sid && o->fin) fin = true;
+    }
+    return fin ? sid : UINT64_MAX;
+}
+
+/* With MOQ_TRANSPORT_CAP_COMMIT_REPORT a FIN'd local data stream stays
+ * mapped until the adapter reports it committed, which stops the session's
+ * FIN-started subgroup timer; when the timer fires first, its RESET reaches
+ * the transport on that stream. Without the capability the stream is
+ * retired as its FIN is written, and the report is a no-op. */
+static int test_local_uni_fin_awaits_commit(void)
+{
+    int failures = 0;
+    test_pair_t tp;
+    if (d22_pair_init(&tp) != 0) { MOQ_TEST_CHECK(false); return failures; }
+    MOQ_TEST_CHECK(moq_session_start(tp.client, 0) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_session_start(tp.server, 0) == MOQ_OK);
+    priority_pump(&tp, true, 0);
+    MOQ_TEST_CHECK(moq_session_state(tp.server) == MOQ_SESS_ESTABLISHED);
+    tp.server_ep.vtable.capabilities |= MOQ_TRANSPORT_CAP_COMMIT_REPORT;
+
+    moq_bytes_t part = MOQ_BYTES_LITERAL("timers");
+    moq_subscribe_cfg_t cfg;
+    moq_subscribe_cfg_init(&cfg);
+    cfg.track_namespace = (moq_namespace_t){ &part, 1 };
+    cfg.track_name = MOQ_BYTES_LITERAL("v");
+    cfg.filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
+    moq_subscription_t csub;
+    MOQ_TEST_CHECK(moq_session_subscribe(tp.client, &cfg, 0, &csub) == MOQ_OK);
+    priority_pump(&tp, true, 0);
+    moq_event_t ev;
+    moq_subscription_t sub = MOQ_SUBSCRIPTION_INVALID;
+    while (moq_session_poll_events(tp.server, &ev, 1) > 0) {
+        if (ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST) sub = ev.u.subscribe_request.sub;
+        moq_event_cleanup(&ev);
+    }
+    MOQ_TEST_CHECK(moq_subscription_is_valid(sub));
+    /* SUBGROUP_DELIVERY_TIMEOUT 100 ms as a Track Property (type 0x06). */
+    static const uint8_t props[] = { 0x06, 0x64 };
+    moq_accept_subscribe_cfg_t acc;
+    moq_accept_subscribe_cfg_init(&acc);
+    acc.track_properties = (moq_bytes_t){ props, sizeof(props) };
+    MOQ_TEST_CHECK(moq_session_accept_subscribe(tp.server, sub, &acc, 0) == MOQ_OK);
+    priority_pump(&tp, true, 0);
+    fake_endpoint_clear_ops(&tp.server_ep);
+
+    /* Committed before the timer: the mapping is released and no reset follows. */
+    uint64_t sid = fin_one_subgroup(&tp, sub, 0, 0);
+    MOQ_TEST_CHECK(sid != UINT64_MAX);
+    bridge_stream_entry_t *e = bridge_find_by_id(tp.server_bridge, sid);
+    MOQ_TEST_CHECK(e != NULL && e->local_send_closed && e->awaiting_commit);
+    MOQ_TEST_CHECK(moq_session_next_deadline_us(tp.server) == 100000);
+    MOQ_TEST_CHECK(moq_transport_bridge_on_local_stream_committed(tp.server_bridge, sid, 50000) == MOQ_OK);
+    MOQ_TEST_CHECK(bridge_find_by_id(tp.server_bridge, sid) == NULL);
+    MOQ_TEST_CHECK(moq_session_next_deadline_us(tp.server) == UINT64_MAX);
+    MOQ_TEST_CHECK(moq_session_tick(tp.server, 200000) == MOQ_OK);
+    fake_endpoint_clear_ops(&tp.server_ep);
+    held_bridge_service(tp.server_bridge, 200000);
+    MOQ_TEST_CHECK(fake_endpoint_count_kind(&tp.server_ep, FAKE_OP_RESET) == 0);
+    /* A second report for the same stream changes nothing. */
+    MOQ_TEST_CHECK(moq_transport_bridge_on_local_stream_committed(tp.server_bridge, sid, 200000) == MOQ_OK);
+
+    /* The timer fires first: the stream is still mapped, so the RESET with
+     * DELIVERY_TIMEOUT reaches the transport and retires it. */
+    uint64_t sid2 = fin_one_subgroup(&tp, sub, 1, 300000);
+    MOQ_TEST_CHECK(sid2 != UINT64_MAX && sid2 != sid);
+    MOQ_TEST_CHECK(bridge_find_by_id(tp.server_bridge, sid2) != NULL);
+    MOQ_TEST_CHECK(moq_session_tick(tp.server, 400000) == MOQ_OK);
+    fake_endpoint_clear_ops(&tp.server_ep);
+    held_bridge_service(tp.server_bridge, 400000);
+    const fake_op_t *reset = fake_endpoint_find(&tp.server_ep, FAKE_OP_RESET);
+    MOQ_TEST_CHECK(reset != NULL && reset->stream_id == sid2 &&
+                   reset->error_code == MOQ_RESET_DELIVERY_TIMEOUT);
+    MOQ_TEST_CHECK(bridge_find_by_id(tp.server_bridge, sid2) == NULL);
+
+    /* Without the capability the FIN retires the stream at once. */
+    tp.server_ep.vtable.capabilities &= ~(uint32_t)MOQ_TRANSPORT_CAP_COMMIT_REPORT;
+    uint64_t sid3 = fin_one_subgroup(&tp, sub, 2, 500000);
+    MOQ_TEST_CHECK(sid3 != UINT64_MAX);
+    MOQ_TEST_CHECK(bridge_find_by_id(tp.server_bridge, sid3) == NULL);
+    MOQ_TEST_CHECK(moq_transport_bridge_on_local_stream_committed(tp.server_bridge, sid3, 500000) == MOQ_OK);
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(tp.server_bridge));
+    test_pair_destroy(&tp);
+    return failures;
+}
+
 /* Exercise the transport recorder itself under actual admission pressure.
  * The raw one-byte FETCH header occupies the only receive slot. The real
  * publisher's second response must survive copied chunks plus separate FIN. */
@@ -13913,6 +14070,1179 @@ static int test_held_driver_replay(bool rcbuf)
     return failures;
 }
 
+/* -- Held peer request streams (MOQ_TRANSPORT_CAP_HOLD_BIDI_INPUT) ------ *
+ *
+ * White-box rows on a draft-22 server session whose every stream mapping is
+ * occupied (two mappings, two hold records), with both control channels
+ * mapped so no entry is reserved for either. A new peer request stream finds no
+ * mapping: it is held, offered oldest first when a mapping frees, refused
+ * for the adapter to cancel when every record is in use, and cancelled with
+ * EXCESSIVE_LOAD when it reaches the five-second hold age. The hold age is
+ * reported through the session's next deadline, which a direct session tick
+ * does not consume. */
+
+typedef struct {
+    moq_session_t          *s;
+    fake_endpoint_t         ep;
+    moq_transport_bridge_t *b;
+} hb_rig_t;
+
+static int hb_open_ver(hb_rig_t *r, moq_version_t ver, bool hold_bidi,
+                       bool native_abort)
+{
+    memset(r, 0, sizeof(*r));
+    moq_session_cfg_t cfg;
+    moq_session_cfg_init_sized(&cfg, sizeof(cfg), moq_alloc_default(),
+                               MOQ_PERSPECTIVE_SERVER);
+    cfg.version = ver;
+    if (moq_session_create(&cfg, 0, &r->s) < 0) return -1;
+    if (test_bind_if_required(r->s) < 0) { moq_session_destroy(r->s); return -1; }
+    held_endpoint_init(&r->ep, 100, 200);
+    if (hold_bidi) r->ep.vtable.capabilities |= MOQ_TRANSPORT_CAP_HOLD_BIDI_INPUT;
+    if (native_abort) fake_endpoint_enable_abort(&r->ep);
+    moq_transport_bridge_cfg_t bcfg;
+    moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
+    bcfg.max_streams = 2;
+    bcfg.max_pending = 2;
+    if (held_bridge_create(&bcfg, r->s, &r->ep.vtable, &r->ep, &r->b) < 0) {
+        moq_session_destroy(r->s);
+        return -1;
+    }
+    r->b->peer_ctrl_uni_open = true;
+    r->b->peer_ctrl_uni_stream_id = 3;
+    r->b->local_ctrl_uni_open = true;
+    r->b->local_ctrl_uni_stream_id = 11;
+    for (uint32_t i = 0; i < r->b->max_streams; i++) {
+        bridge_stream_entry_t *e = &r->b->streams[i];
+        memset(e, 0, sizeof(*e));
+        e->active = true;
+        e->transport_id = 900 + i;
+        e->kind = BRIDGE_STREAM_UNI;
+        e->origin = BRIDGE_ORIGIN_PEER;
+        e->ref = moq_stream_ref_from_u64(BRIDGE_INBOUND_REF_BASE + 0x900 + i);
+    }
+    return 0;
+}
+
+static int hb_open(hb_rig_t *r, bool hold_bidi, bool native_abort)
+{
+    return hb_open_ver(r, MOQ_VERSION_DRAFT_22, hold_bidi, native_abort);
+}
+
+static void hb_close(hb_rig_t *r)
+{
+    held_bridge_destroy(r->b);     /* the bridge goes before its session */
+    moq_session_destroy(r->s);
+}
+
+static moq_result_t hb_bidi(hb_rig_t *r, uint64_t id, uint64_t now)
+{
+    static const uint8_t req[3] = { 0x01, 0x02, 0x03 };
+    return moq_transport_bridge_on_peer_bidi_bytes(r->b, id, req, sizeof(req),
+                                                   false, now);
+}
+
+static size_t hb_ops(const fake_endpoint_t *ep, fake_op_kind_t kind,
+                     uint64_t id, uint64_t code)
+{
+    size_t n = 0;
+    for (size_t i = 0; i < ep->count; i++)
+        if (ep->ops[i].kind == kind && ep->ops[i].stream_id == id &&
+            ep->ops[i].error_code == code)
+            n++;
+    return n;
+}
+
+static int test_hold_bidi_records_fifo_and_expiry(void)
+{
+    int failures = 0;
+    const uint64_t age = 5000000;
+    hb_rig_t r;
+    if (hb_open(&r, true, false) < 0) { MOQ_TEST_CHECK(false); return failures; }
+
+    /* Held, not mapped; the hold age is the session's next deadline. */
+    MOQ_TEST_CHECK(hb_bidi(&r, 2001, 1000) == MOQ_ERR_INPUT_NOT_CONSUMED);
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_has_pending(r.b, 2001));
+    MOQ_TEST_CHECK(moq_transport_bridge_find_ref(r.b, 2001)._v == 0);
+    MOQ_TEST_CHECK(moq_session_next_deadline_us(r.s) == 1000 + age);
+    MOQ_TEST_CHECK(hb_bidi(&r, 2002, 2000) == MOQ_ERR_INPUT_NOT_CONSUMED);
+    /* Every record in use: refused for the adapter to cancel, nothing
+     * recorded and no endpoint call. */
+    MOQ_TEST_CHECK(hb_bidi(&r, 2003, 2500) == MOQ_BRIDGE_INGRESS_REFUSE_CANCEL);
+    MOQ_TEST_CHECK(!moq_transport_bridge_stream_has_pending(r.b, 2003));
+    MOQ_TEST_CHECK(r.ep.count == 0);
+
+    /* A direct session tick at the hold age leaves it in place. */
+    (void)moq_session_tick(r.s, 1000 + age);
+    MOQ_TEST_CHECK(moq_session_next_deadline_us(r.s) == 1000 + age);
+
+    /* A mapping frees: only the oldest held stream is offered; the next one
+     * stays held even when it redelivers. */
+    bridge_deactivate_stream(&r.b->streams[0]);
+    MOQ_TEST_CHECK(moq_transport_bridge_service(r.b, 3000) == MOQ_OK);
+    MOQ_TEST_CHECK(!moq_transport_bridge_stream_has_pending(r.b, 2001));
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_has_pending(r.b, 2002));
+    MOQ_TEST_CHECK(hb_bidi(&r, 2002, 3000) == MOQ_ERR_INPUT_NOT_CONSUMED);
+
+    /* 2001 is not redelivered before its hold age: it is cancelled with
+     * EXCESSIVE_LOAD on both halves, its record frees, and 2002 is offered. */
+    MOQ_TEST_CHECK(moq_transport_bridge_service(r.b, 1000 + age) == MOQ_OK);
+    MOQ_TEST_CHECK(hb_ops(&r.ep, FAKE_OP_RESET, 2001, MOQ_STREAM_ERROR_EXCESSIVE_LOAD) == 1);
+    MOQ_TEST_CHECK(hb_ops(&r.ep, FAKE_OP_STOP, 2001, MOQ_STREAM_ERROR_EXCESSIVE_LOAD) == 1);
+    MOQ_TEST_CHECK(!moq_transport_bridge_stream_has_pending(r.b, 2001));
+    MOQ_TEST_CHECK(!moq_transport_bridge_stream_has_pending(r.b, 2002));
+    MOQ_TEST_CHECK(moq_session_next_deadline_us(r.s) == 2000 + age);
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(r.b));
+
+    /* A peer RESET of a held request stream settles only its receive half:
+     * our own half is still reset, and no STOP_SENDING follows. */
+    MOQ_TEST_CHECK(hb_bidi(&r, 2004, 6000000) == MOQ_ERR_INPUT_NOT_CONSUMED);
+    MOQ_TEST_CHECK(moq_transport_bridge_on_peer_stream_reset(r.b, 2004, 0x2,
+                                                            6000000) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_has_pending(r.b, 2004));
+    MOQ_TEST_CHECK(moq_transport_bridge_service(r.b, 6000001) == MOQ_OK);
+    MOQ_TEST_CHECK(hb_ops(&r.ep, FAKE_OP_RESET, 2004, MOQ_STREAM_ERROR_EXCESSIVE_LOAD) == 1);
+    MOQ_TEST_CHECK(hb_ops(&r.ep, FAKE_OP_STOP, 2004, MOQ_STREAM_ERROR_EXCESSIVE_LOAD) == 0);
+    MOQ_TEST_CHECK(!moq_transport_bridge_stream_has_pending(r.b, 2004));
+
+    hb_close(&r);
+    return failures;
+}
+
+/* The native whole-stream abort carries both halves in one operation; a
+ * blocked cancellation stays owed (reported as outbound work) and is retried
+ * in its own record. */
+static int test_hold_bidi_abort_and_blocked_cancel(void)
+{
+    int failures = 0;
+    const uint64_t age = 5000000;
+    hb_rig_t r;
+    if (hb_open(&r, true, true) < 0) { MOQ_TEST_CHECK(false); return failures; }
+    MOQ_TEST_CHECK(hb_bidi(&r, 2001, 1000) == MOQ_ERR_INPUT_NOT_CONSUMED);
+    r.ep.block_abort = true;
+    MOQ_TEST_CHECK(moq_transport_bridge_service(r.b, 1000 + age) == MOQ_OK);
+    MOQ_TEST_CHECK(hb_ops(&r.ep, FAKE_OP_ABORT, 2001, MOQ_STREAM_ERROR_EXCESSIVE_LOAD) == 0);
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_has_pending(r.b, 2001));
+    MOQ_TEST_CHECK(moq_transport_bridge_has_outbound_pending(r.b));
+    /* Owed cancellation has no time deadline of its own. */
+    MOQ_TEST_CHECK(moq_session_next_deadline_us(r.s) > 1000 + age);
+    /* Redelivery while cancelling is never fed. */
+    MOQ_TEST_CHECK(hb_bidi(&r, 2001, 1000 + age) == MOQ_ERR_INPUT_NOT_CONSUMED);
+    r.ep.block_abort = false;
+    MOQ_TEST_CHECK(moq_transport_bridge_service(r.b, 1001 + age) == MOQ_OK);
+    MOQ_TEST_CHECK(hb_ops(&r.ep, FAKE_OP_ABORT, 2001, MOQ_STREAM_ERROR_EXCESSIVE_LOAD) == 1);
+    MOQ_TEST_CHECK(hb_ops(&r.ep, FAKE_OP_RESET, 2001, MOQ_STREAM_ERROR_EXCESSIVE_LOAD) == 0);
+    MOQ_TEST_CHECK(!moq_transport_bridge_stream_has_pending(r.b, 2001));
+    MOQ_TEST_CHECK(!moq_transport_bridge_has_outbound_pending(r.b));
+    hb_close(&r);
+    return failures;
+}
+
+/* An endpoint that fails to take a cancellation is a fatal transport error,
+ * after which nothing is reported due. */
+static int test_hold_bidi_cancel_failure_fatal(void)
+{
+    int failures = 0;
+    const uint64_t age = 5000000;
+    hb_rig_t r;
+    if (hb_open(&r, true, false) < 0) { MOQ_TEST_CHECK(false); return failures; }
+    MOQ_TEST_CHECK(hb_bidi(&r, 2001, 1000) == MOQ_ERR_INPUT_NOT_CONSUMED);
+    r.ep.fail_stop = true;
+    MOQ_TEST_CHECK(moq_transport_bridge_service(r.b, 1000 + age) ==
+                   MOQ_ERR_INTERNAL);
+    MOQ_TEST_CHECK(moq_transport_bridge_is_fatal(r.b));
+    MOQ_TEST_CHECK(!r.s->has_owner_deadline);
+    hb_close(&r);
+    return failures;
+}
+
+/* Without the capability a full stream map stays fatal for a new request
+ * stream, as before: the refusal outcome never reaches such an adapter. */
+static int test_hold_bidi_requires_capability(void)
+{
+    int failures = 0;
+    hb_rig_t r;
+    if (hb_open(&r, false, false) < 0) { MOQ_TEST_CHECK(false); return failures; }
+    MOQ_TEST_CHECK(r.b->holds == NULL);
+    moq_result_t rc = hb_bidi(&r, 2001, 1000);
+    MOQ_TEST_CHECK(rc == MOQ_ERR_INTERNAL);
+    MOQ_TEST_CHECK(rc != MOQ_BRIDGE_INGRESS_REFUSE_CANCEL);
+    MOQ_TEST_CHECK(moq_transport_bridge_is_fatal(r.b));
+    hb_close(&r);
+    return failures;
+}
+
+/* Draft-16 with the capability: every peer uni stream is data, so a new one
+ * that finds no free mapping is held (zero consumption), offered oldest first
+ * when a mapping frees, refused for the adapter to cancel when every record
+ * is in use, and cancelled at the hold age with STOP_SENDING carrying
+ * CANCELLED (0x1) -- draft-16 has no EXCESSIVE_LOAD stream code, and a uni
+ * stream has no send half to reset. The draft-16 control path is unchanged:
+ * a new peer bidi at a full map stays fatal. */
+static int test_hold_uni_d16(void)
+{
+    int failures = 0;
+    const uint64_t age = 5000000;
+    static const uint8_t data[3] = { 0x04, 0x01, 0x00 };
+    hb_rig_t r;
+    if (hb_open_ver(&r, MOQ_VERSION_DRAFT_16, true, false) < 0) {
+        MOQ_TEST_CHECK(false);
+        return failures;
+    }
+    MOQ_TEST_CHECK(r.b->holds != NULL);
+    MOQ_TEST_CHECK(moq_transport_bridge_on_peer_uni_bytes(r.b, 101, data,
+                       sizeof(data), false, 1000) == MOQ_ERR_INPUT_NOT_CONSUMED);
+    MOQ_TEST_CHECK(moq_transport_bridge_on_peer_uni_bytes(r.b, 102, data,
+                       sizeof(data), false, 2000) == MOQ_ERR_INPUT_NOT_CONSUMED);
+    MOQ_TEST_CHECK(moq_transport_bridge_on_peer_uni_bytes(r.b, 103, data,
+                       sizeof(data), false, 2500) == MOQ_BRIDGE_INGRESS_REFUSE_CANCEL);
+    MOQ_TEST_CHECK(moq_transport_bridge_find_ref(r.b, 101)._v == 0);
+    MOQ_TEST_CHECK(moq_session_next_deadline_us(r.s) == 1000 + age);
+    MOQ_TEST_CHECK(r.ep.count == 0);
+
+    bridge_deactivate_stream(&r.b->streams[0]);
+    MOQ_TEST_CHECK(moq_transport_bridge_service(r.b, 3000) == MOQ_OK);
+    MOQ_TEST_CHECK(!moq_transport_bridge_stream_has_pending(r.b, 101));
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_has_pending(r.b, 102));
+
+    MOQ_TEST_CHECK(moq_transport_bridge_service(r.b, 1000 + age) == MOQ_OK);
+    MOQ_TEST_CHECK(hb_ops(&r.ep, FAKE_OP_STOP, 101, MOQ_STREAM_ERROR_CANCELLED) == 1);
+    MOQ_TEST_CHECK(hb_ops(&r.ep, FAKE_OP_STOP, 101, MOQ_STREAM_ERROR_EXCESSIVE_LOAD) == 0);
+    MOQ_TEST_CHECK(fake_endpoint_count_kind(&r.ep, FAKE_OP_RESET) == 0);
+    MOQ_TEST_CHECK(!moq_transport_bridge_stream_has_pending(r.b, 101));
+    MOQ_TEST_CHECK(!moq_transport_bridge_stream_has_pending(r.b, 102));
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(r.b));
+
+    /* Refill the map: a new peer bidi on draft 16 is not held. */
+    r.b->streams[0].active = true;
+    r.b->streams[0].transport_id = 950;
+    MOQ_TEST_CHECK(hb_bidi(&r, 2001, 1001 + age) == MOQ_ERR_INTERNAL);
+    MOQ_TEST_CHECK(moq_transport_bridge_is_fatal(r.b));
+    hb_close(&r);
+    return failures;
+}
+
+/* -- The peer control stream's last free stream-map entry ---------------- *
+ *
+ * A draft-18/22 server session whose peer control stream is not mapped yet,
+ * with a two-entry stream map, `occupied` entries taken first. With one
+ * occupied, a single entry is free when the peer's control stream arrives.
+ * The control stream must be admitted there whether its stream type arrives
+ * whole or split across callbacks: the receiver cannot know a split type is
+ * the control stream until its last byte arrives (draft-22 section 6.3,
+ * -22.txt:2556-2558, draft-18 section 3.3, -18.txt:1495-1497: a control
+ * stream must not be closed during the session). */
+static int cr_open(hb_rig_t *r, moq_version_t ver, uint32_t occupied)
+{
+    memset(r, 0, sizeof(*r));
+    moq_session_cfg_t cfg;
+    moq_session_cfg_init_sized(&cfg, sizeof(cfg), moq_alloc_default(),
+                               MOQ_PERSPECTIVE_SERVER);
+    cfg.version = ver;
+    if (moq_session_create(&cfg, 0, &r->s) < 0) return -1;
+    if (test_bind_if_required(r->s) < 0) { moq_session_destroy(r->s); return -1; }
+    held_endpoint_init(&r->ep, 100, 200);
+    moq_transport_bridge_cfg_t bcfg;
+    moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
+    bcfg.max_streams = 2;
+    bcfg.max_pending = 2;
+    if (held_bridge_create(&bcfg, r->s, &r->ep.vtable, &r->ep, &r->b) < 0) {
+        moq_session_destroy(r->s);
+        return -1;
+    }
+    for (uint32_t i = 0; i < occupied && i < r->b->max_streams; i++) {
+        bridge_stream_entry_t *e = &r->b->streams[i];
+        memset(e, 0, sizeof(*e));
+        e->active = true;
+        e->transport_id = 900 + i;
+        e->kind = BRIDGE_STREAM_UNI;
+        e->origin = BRIDGE_ORIGIN_PEER;
+        e->uni_disp = BRIDGE_UNI_DISP_DATA;
+        e->ref = moq_stream_ref_from_u64(BRIDGE_INBOUND_REF_BASE + 0x900 + i);
+    }
+    return 0;
+}
+
+static int test_control_last_entry(moq_version_t ver, bool split)
+{
+    int failures = 0;
+    static const uint8_t control[2] = { 0xaf, 0x00 };   /* type 0x2f00 */
+    hb_rig_t r;
+    if (cr_open(&r, ver, 1) < 0) { MOQ_TEST_CHECK(false); return failures; }
+    moq_result_t rc;
+    if (split) {
+        rc = moq_transport_bridge_on_peer_uni_bytes(r.b, 302, control, 1,
+                                                    false, 1000);
+        MOQ_TEST_CHECK(rc == MOQ_OK);
+        MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(r.b));
+        MOQ_TEST_CHECK(!r.b->peer_ctrl_uni_open);
+        rc = moq_transport_bridge_on_peer_uni_bytes(r.b, 302, control + 1, 1,
+                                                    false, 1001);
+    } else {
+        rc = moq_transport_bridge_on_peer_uni_bytes(r.b, 302, control,
+                                                    sizeof(control), false, 1000);
+    }
+    if (rc != MOQ_OK && rc != MOQ_ERR_WOULD_BLOCK)
+        fprintf(stderr, "control last entry d%d %s: rc=%d fatal=%d\n",
+                ver == MOQ_VERSION_DRAFT_22 ? 22 : 18, split ? "split" : "whole",
+                (int)rc, (int)moq_transport_bridge_is_fatal(r.b));
+    MOQ_TEST_CHECK(rc == MOQ_OK || rc == MOQ_ERR_WOULD_BLOCK);
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(r.b));
+    MOQ_TEST_CHECK(r.b->peer_ctrl_uni_open && r.b->peer_ctrl_uni_stream_id == 302);
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_is_control(r.b, 302));
+    hb_close(&r);
+    return failures;
+}
+
+/* While the session drains buffered control input on a uni-pair profile,
+ * only the identified control stream's own input is the session's retained
+ * input (WOULD_BLOCK); any other peer uni stream's chunk is refused whole
+ * (MOQ_ERR_INPUT_NOT_CONSUMED: nothing mapped, nothing fed) and reports
+ * pending until the control input drains. Streams the bridge knows were
+ * never refused there -- a mapped request stream, a local data uni and the
+ * local control uni -- do not report pending; an unmapped id does, because
+ * the bridge cannot tell it from a refused peer uni stream. Draft-16
+ * (control on a bidi stream) defers no uni input. */
+static int test_uni_deferred_behind_control(moq_version_t ver)
+{
+    int failures = 0;
+    static const uint8_t data[3] = { 0x05, 0x01, 0x00 };
+    hb_rig_t r;
+    if (cr_open(&r, ver, 1) < 0) { MOQ_TEST_CHECK(false); return failures; }
+    const bool uni_pair = ver != MOQ_VERSION_DRAFT_16;
+    r.b->streams[0].kind = BRIDGE_STREAM_BIDI;        /* a mapped request stream */
+    bridge_stream_entry_t *lu = &r.b->streams[1];     /* a local data uni */
+    memset(lu, 0, sizeof(*lu));
+    lu->active = true;
+    lu->transport_id = 901;
+    lu->kind = BRIDGE_STREAM_UNI;
+    lu->origin = BRIDGE_ORIGIN_LOCAL;
+    lu->ref = moq_stream_ref_from_u64(0x901);
+    r.b->pending_control = true;
+    r.b->pending_control_stream_id = 3;
+
+    if (uni_pair) {
+        MOQ_TEST_CHECK(moq_transport_bridge_on_peer_uni_bytes(r.b, 3, NULL, 0, false, 1000) ==
+                       MOQ_ERR_WOULD_BLOCK);
+        MOQ_TEST_CHECK(moq_transport_bridge_on_peer_uni_bytes(r.b, 7, data, sizeof(data), false, 1000) ==
+                       MOQ_ERR_INPUT_NOT_CONSUMED);
+        MOQ_TEST_CHECK(moq_transport_bridge_on_peer_uni_bytes(r.b, 7, NULL, 0, true, 1000) ==
+                       MOQ_ERR_INPUT_NOT_CONSUMED);
+        MOQ_TEST_CHECK(moq_transport_bridge_on_peer_uni_bytes(r.b, 11, NULL, 0, false, 1000) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_transport_bridge_find_ref(r.b, 7)._v == 0);
+        MOQ_TEST_CHECK(!r.b->pending_control_fin);
+        MOQ_TEST_CHECK(moq_transport_bridge_stream_has_pending(r.b, 7));
+    } else {
+        MOQ_TEST_CHECK(!moq_transport_bridge_stream_has_pending(r.b, 7));
+    }
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_has_pending(r.b, 3));
+    MOQ_TEST_CHECK(!moq_transport_bridge_stream_has_pending(r.b, 900));   /* request stream */
+    MOQ_TEST_CHECK(!moq_transport_bridge_stream_has_pending(r.b, 901));   /* local data uni */
+    /* The same entry as the local control uni. */
+    lu->transport_id = 902;
+    r.b->local_ctrl_uni_open = true;
+    r.b->local_ctrl_uni_stream_id = 902;
+    MOQ_TEST_CHECK(!moq_transport_bridge_stream_has_pending(r.b, 902));
+    /* An unmapped id is answered conservatively. */
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_has_pending(r.b, 4000) == uni_pair);
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(r.b));
+
+    r.b->pending_control = false;                      /* the control input drained */
+    MOQ_TEST_CHECK(!moq_transport_bridge_stream_has_pending(r.b, 7));
+    MOQ_TEST_CHECK(!moq_transport_bridge_stream_has_pending(r.b, 3));
+    hb_close(&r);
+    return failures;
+}
+
+/* -- New peer uni streams placed by class on a uni-pair profile ----------- *
+ *
+ * White-box rows on a draft-18 or draft-22 server session whose endpoint
+ * advertises MOQ_TRANSPORT_CAP_HOLD_BIDI_INPUT. A new peer uni stream is
+ * placed by the class of its first chunk before it takes a stream mapping:
+ * a complete data type that finds no mapping free beyond the control reserve
+ * (one entry for each control stream not yet mapped) is held without one --
+ * zero bytes and no FIN consumed -- and a complete padding type is refused
+ * for the adapter to cancel. A control, incomplete or unknown type takes the
+ * classifying path as without the capability. Every cancellation is
+ * stream-local (draft-22 section 15.5, draft-18 section 13.5); the session
+ * survives.
+ *
+ * Stream types are literal wire bytes, derived by hand from the integer
+ * encoding table (draft-22 section 8.1, draft-18 section 1.4.1: the number
+ * of leading 1 bits of the first byte gives the length) and the stream type
+ * registry: SETUP 0x2F00 is "af 00"; PADDING 0x132B3E28 needs five bytes,
+ * "f0 13 2b 3e 28"; 0x10 is a subgroup header type. */
+
+static const uint8_t k_fm_setup[2]   = { 0xaf, 0x00 };
+static const uint8_t k_fm_padding[5] = { 0xf0, 0x13, 0x2b, 0x3e, 0x28 };
+static const uint8_t k_fm_data[4]    = { 0x10, 0x01, 0x00, 0x00 };
+/* The padding type in the QUIC variable-length form. In this protocol's
+ * encoding "93 2b" is the two-byte type 0x132B, which is no stream type. */
+static const uint8_t k_fm_quic_padding[4] = { 0x93, 0x2b, 0x3e, 0x28 };
+
+#define FM_AGE 5000000ULL
+
+/* The integer encoding as the table states it, kept separate from the
+ * product decoder so the literal bytes above are checked against the text. */
+static size_t fm_spec_vi64(const uint8_t *p, size_t n, uint64_t *v)
+{
+    if (n == 0) return 0;
+    size_t len = 1;
+    while (len < 9 && (p[0] & (0x80u >> (len - 1)))) len++;
+    if (n < len) return 0;
+    uint64_t x = len == 9 ? 0 : (uint64_t)(p[0] & (0xFFu >> len));
+    for (size_t i = 1; i < len; i++) x = (x << 8) | p[i];
+    *v = x;
+    return len;
+}
+
+typedef struct {
+    bool     hold_bidi;
+    uint32_t max_streams;
+    uint32_t max_pending;
+    uint32_t occupied;       /* peer data streams mapped at open */
+    bool     local_mapped;   /* our control stream mapped once */
+    bool     peer_mapped;    /* the peer's control stream identified */
+} fm_cfg_t;
+
+static int fm_open(hb_rig_t *r, moq_version_t ver, const fm_cfg_t *c)
+{
+    memset(r, 0, sizeof(*r));
+    moq_session_cfg_t cfg;
+    moq_session_cfg_init_sized(&cfg, sizeof(cfg), moq_alloc_default(),
+                               MOQ_PERSPECTIVE_SERVER);
+    cfg.version = ver;
+    if (moq_session_create(&cfg, 0, &r->s) < 0) return -1;
+    if (test_bind_if_required(r->s) < 0) { moq_session_destroy(r->s); return -1; }
+    held_endpoint_init(&r->ep, 100, 200);
+    if (c->hold_bidi) r->ep.vtable.capabilities |= MOQ_TRANSPORT_CAP_HOLD_BIDI_INPUT;
+    moq_transport_bridge_cfg_t bcfg;
+    moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
+    bcfg.max_streams = c->max_streams;
+    bcfg.max_pending = c->max_pending;
+    if (held_bridge_create(&bcfg, r->s, &r->ep.vtable, &r->ep, &r->b) < 0) {
+        moq_session_destroy(r->s);
+        return -1;
+    }
+    if (c->peer_mapped) {
+        r->b->peer_ctrl_uni_open = true;
+        r->b->peer_ctrl_uni_stream_id = 3;
+    }
+    if (c->local_mapped) {
+        r->b->local_ctrl_uni_open = true;
+        r->b->local_ctrl_uni_stream_id = 11;
+    }
+    for (uint32_t i = 0; i < c->occupied && i < r->b->max_streams; i++) {
+        bridge_stream_entry_t *e = &r->b->streams[i];
+        memset(e, 0, sizeof(*e));
+        e->active = true;
+        e->transport_id = 900 + i;
+        e->kind = BRIDGE_STREAM_UNI;
+        e->origin = BRIDGE_ORIGIN_PEER;
+        e->uni_disp = BRIDGE_UNI_DISP_DATA;
+        e->ref = moq_stream_ref_from_u64(BRIDGE_INBOUND_REF_BASE + 0x900 + i);
+    }
+    return 0;
+}
+
+/* Two mappings, both taken by peer data streams, both control streams
+ * mapped: no mapping is free and none is reserved. */
+static const fm_cfg_t k_fm_full = { true, 2, 2, 2, true, true };
+
+static moq_result_t fm_uni(hb_rig_t *r, uint64_t id, const uint8_t *d,
+                           size_t n, bool fin, uint64_t now)
+{
+    return moq_transport_bridge_on_peer_uni_bytes(r->b, id, d, n, fin, now);
+}
+
+/* The same chunk through the borrowed-rcbuf entry; *refs is the buffer's
+ * reference count after the call, before the caller's own release. */
+static moq_result_t fm_uni_rcbuf(hb_rig_t *r, uint64_t id, const uint8_t *d,
+                                 size_t n, uint64_t now, uint32_t *refs)
+{
+    moq_rcbuf_t *rb = NULL;
+    *refs = 0;
+    if (moq_rcbuf_create(moq_alloc_default(), d, n, &rb) != MOQ_OK)
+        return MOQ_ERR_NOMEM;
+    moq_result_t rc = moq_transport_bridge_on_peer_uni_rcbuf(r->b, id, rb,
+                                                            false, now);
+    *refs = moq_rcbuf_refcount(rb);
+    moq_rcbuf_decref(rb);
+    return rc;
+}
+
+static uint32_t fm_holds(const hb_rig_t *r)
+{
+    uint32_t n = 0;
+    for (uint32_t i = 0; r->b->holds && i < r->b->max_holds; i++)
+        if (r->b->holds[i].state != BRIDGE_HOLD_FREE) n++;
+    return n;
+}
+
+static void fm_occupy(hb_rig_t *r, uint32_t slot, uint64_t id)
+{
+    bridge_stream_entry_t *e = &r->b->streams[slot];
+    memset(e, 0, sizeof(*e));
+    e->active = true;
+    e->transport_id = id;
+    e->kind = BRIDGE_STREAM_UNI;
+    e->origin = BRIDGE_ORIGIN_PEER;
+    e->uni_disp = BRIDGE_UNI_DISP_DATA;
+    e->ref = moq_stream_ref_from_u64(BRIDGE_INBOUND_REF_BASE + id);
+}
+
+/* The literal stream types classify as the stream type registry says, on
+ * both profiles, and decode by the encoding table to the registered values.
+ * A split SETUP or PADDING type is incomplete, which a one-byte data type
+ * never is. */
+static int test_fm_wire_classes(moq_version_t ver)
+{
+    int failures = 0;
+    const fm_cfg_t c = { false, 2, 2, 0, false, false };
+    hb_rig_t r;
+    if (fm_open(&r, ver, &c) < 0) { MOQ_TEST_CHECK(false); return failures; }
+    uint64_t v = 0;
+    MOQ_TEST_CHECK(fm_spec_vi64(k_fm_setup, 2, &v) == 2 && v == 0x2F00u);
+    MOQ_TEST_CHECK(fm_spec_vi64(k_fm_padding, 5, &v) == 5 && v == 0x132B3E28u);
+    MOQ_TEST_CHECK(fm_spec_vi64(k_fm_data, 1, &v) == 1 && v == 0x10u);
+    MOQ_TEST_CHECK(fm_spec_vi64(k_fm_quic_padding, 4, &v) == 2 && v == 0x132Bu);
+    MOQ_TEST_CHECK(MOQ_D18_STREAM_SETUP == 0x2F00u);
+    MOQ_TEST_CHECK(MOQ_D18_STREAM_PADDING == 0x132B3E28u);
+
+    MOQ_TEST_CHECK(moq_session_classify_peer_uni(r.s, k_fm_setup, 2) == MOQ_UNI_CLASS_CONTROL);
+    MOQ_TEST_CHECK(moq_session_classify_peer_uni(r.s, k_fm_setup, 1) == MOQ_UNI_CLASS_NEED_MORE);
+    MOQ_TEST_CHECK(moq_session_classify_peer_uni(r.s, k_fm_padding, 5) == MOQ_UNI_CLASS_PADDING);
+    MOQ_TEST_CHECK(moq_session_classify_peer_uni(r.s, k_fm_padding, 4) == MOQ_UNI_CLASS_NEED_MORE);
+    MOQ_TEST_CHECK(moq_session_classify_peer_uni(r.s, k_fm_padding, 1) == MOQ_UNI_CLASS_NEED_MORE);
+    MOQ_TEST_CHECK(moq_session_classify_peer_uni(r.s, k_fm_data, 1) == MOQ_UNI_CLASS_DATA);
+    MOQ_TEST_CHECK(moq_session_classify_peer_uni(r.s, k_fm_quic_padding, 4) == MOQ_UNI_CLASS_UNKNOWN);
+    hb_close(&r);
+    return failures;
+}
+
+/* A complete data type at a full map is held without a mapping: zero bytes
+ * and no FIN taken (a borrowed rcbuf keeps only its owner's reference),
+ * nothing mapped or fed, no endpoint call, and the session is not failed.
+ * A FIN-only delivery and an exact redelivery cannot discharge it, and its
+ * age runs from the first refusal. With every record in use, the next one
+ * is refused for the adapter to cancel and leaves no record. */
+static int test_fm_data_held(moq_version_t ver, bool use_rcbuf)
+{
+    int failures = 0;
+    hb_rig_t r;
+    if (fm_open(&r, ver, &k_fm_full) < 0) { MOQ_TEST_CHECK(false); return failures; }
+    uint32_t refs = 0;
+    moq_result_t rc = use_rcbuf
+        ? fm_uni_rcbuf(&r, 501, k_fm_data, sizeof(k_fm_data), 1000, &refs)
+        : fm_uni(&r, 501, k_fm_data, sizeof(k_fm_data), false, 1000);
+    MOQ_TEST_CHECK(rc == MOQ_ERR_INPUT_NOT_CONSUMED);
+    if (use_rcbuf) MOQ_TEST_CHECK(refs == 1);
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(r.b));
+    MOQ_TEST_CHECK(moq_transport_bridge_find_ref(r.b, 501)._v == 0);
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_count(r.b) == 2);
+    MOQ_TEST_CHECK(r.ep.count == 0);
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_has_pending(r.b, 501));
+    MOQ_TEST_CHECK(fm_holds(&r) == 1);
+    MOQ_TEST_CHECK(moq_session_next_deadline_us(r.s) == 1000 + FM_AGE);
+
+    /* The FIN cannot overtake the held bytes; a redelivery while the map is
+     * still full is refused again, its age unchanged. */
+    MOQ_TEST_CHECK(fm_uni(&r, 501, NULL, 0, true, 1100) == MOQ_ERR_INPUT_NOT_CONSUMED);
+    MOQ_TEST_CHECK(fm_uni(&r, 501, k_fm_data, sizeof(k_fm_data), false, 1200) ==
+                   MOQ_ERR_INPUT_NOT_CONSUMED);
+    MOQ_TEST_CHECK(fm_holds(&r) == 1);
+    MOQ_TEST_CHECK(moq_transport_bridge_find_ref(r.b, 501)._v == 0);
+    MOQ_TEST_CHECK(moq_session_next_deadline_us(r.s) == 1000 + FM_AGE);
+
+    MOQ_TEST_CHECK(fm_uni(&r, 505, k_fm_data, sizeof(k_fm_data), false, 1300) ==
+                   MOQ_ERR_INPUT_NOT_CONSUMED);
+    rc = use_rcbuf
+        ? fm_uni_rcbuf(&r, 509, k_fm_data, sizeof(k_fm_data), 1400, &refs)
+        : fm_uni(&r, 509, k_fm_data, sizeof(k_fm_data), false, 1400);
+    MOQ_TEST_CHECK(rc == MOQ_BRIDGE_INGRESS_REFUSE_CANCEL);
+    if (use_rcbuf) MOQ_TEST_CHECK(refs == 1);
+    MOQ_TEST_CHECK(fm_holds(&r) == 2);
+    MOQ_TEST_CHECK(!moq_transport_bridge_stream_has_pending(r.b, 509));
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_count(r.b) == 2);
+    MOQ_TEST_CHECK(r.ep.count == 0);
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(r.b));
+    hb_close(&r);
+    return failures;
+}
+
+/* Held data streams are offered oldest first when a mapping frees. Their
+ * first refusals are a second apart, so the hold age expires exactly the
+ * older one: one STOP_SENDING with EXCESSIVE_LOAD and no RESET (a uni stream
+ * has no sending half here), after which the next is offered in the same
+ * pass. Records that come due together are all cancelled in one pass. */
+static int test_fm_offer_and_age(moq_version_t ver)
+{
+    int failures = 0;
+    const uint64_t code = MOQ_STREAM_ERROR_EXCESSIVE_LOAD;
+    hb_rig_t r;
+    if (fm_open(&r, ver, &k_fm_full) < 0) { MOQ_TEST_CHECK(false); return failures; }
+    MOQ_TEST_CHECK(fm_uni(&r, 501, k_fm_data, sizeof(k_fm_data), false, 1000) ==
+                   MOQ_ERR_INPUT_NOT_CONSUMED);
+    MOQ_TEST_CHECK(fm_uni(&r, 505, k_fm_data, sizeof(k_fm_data), false, 1001000) ==
+                   MOQ_ERR_INPUT_NOT_CONSUMED);
+    MOQ_TEST_CHECK(fm_uni(&r, 509, k_fm_data, sizeof(k_fm_data), false, 1002000) ==
+                   MOQ_BRIDGE_INGRESS_REFUSE_CANCEL);
+    MOQ_TEST_CHECK(r.ep.count == 0);
+    MOQ_TEST_CHECK(moq_session_next_deadline_us(r.s) == 1000 + FM_AGE);
+
+    /* No mapping free: nothing is offered. */
+    MOQ_TEST_CHECK(moq_transport_bridge_service(r.b, 1003000) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_has_pending(r.b, 501));
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_has_pending(r.b, 505));
+
+    /* A mapping frees: only the oldest is offered, and an offer maps
+     * nothing until the redelivery. */
+    bridge_deactivate_stream(&r.b->streams[0]);
+    MOQ_TEST_CHECK(moq_transport_bridge_service(r.b, 1004000) == MOQ_OK);
+    MOQ_TEST_CHECK(!moq_transport_bridge_stream_has_pending(r.b, 501));
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_has_pending(r.b, 505));
+    MOQ_TEST_CHECK(fm_uni(&r, 505, k_fm_data, sizeof(k_fm_data), false, 1004000) ==
+                   MOQ_ERR_INPUT_NOT_CONSUMED);
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_count(r.b) == 1);
+
+    /* 501 is not redelivered before its age: cancelled, and 505 offered. */
+    MOQ_TEST_CHECK(moq_transport_bridge_service(r.b, 1000 + FM_AGE) == MOQ_OK);
+    MOQ_TEST_CHECK(hb_ops(&r.ep, FAKE_OP_STOP, 501, code) == 1);
+    MOQ_TEST_CHECK(hb_ops(&r.ep, FAKE_OP_STOP, 505, code) == 0);
+    MOQ_TEST_CHECK(fake_endpoint_count_kind(&r.ep, FAKE_OP_RESET) == 0);
+    MOQ_TEST_CHECK(!moq_transport_bridge_stream_has_pending(r.b, 501));
+    MOQ_TEST_CHECK(!moq_transport_bridge_stream_has_pending(r.b, 505));
+    MOQ_TEST_CHECK(fm_holds(&r) == 1);
+    MOQ_TEST_CHECK(moq_session_next_deadline_us(r.s) == 1001000 + FM_AGE);
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(r.b));
+
+    MOQ_TEST_CHECK(moq_transport_bridge_service(r.b, 1001000 + FM_AGE) == MOQ_OK);
+    MOQ_TEST_CHECK(hb_ops(&r.ep, FAKE_OP_STOP, 505, code) == 1);
+    MOQ_TEST_CHECK(hb_ops(&r.ep, FAKE_OP_STOP, 501, code) == 1);
+    MOQ_TEST_CHECK(fm_holds(&r) == 0);
+
+    /* Two records due at the same instant: both handled in one pass. */
+    fm_occupy(&r, 0, 950);
+    const uint64_t t = 20000000;
+    MOQ_TEST_CHECK(fm_uni(&r, 513, k_fm_data, sizeof(k_fm_data), false, t) ==
+                   MOQ_ERR_INPUT_NOT_CONSUMED);
+    MOQ_TEST_CHECK(fm_uni(&r, 517, k_fm_data, sizeof(k_fm_data), false, t) ==
+                   MOQ_ERR_INPUT_NOT_CONSUMED);
+    MOQ_TEST_CHECK(moq_transport_bridge_service(r.b, t + FM_AGE) == MOQ_OK);
+    MOQ_TEST_CHECK(hb_ops(&r.ep, FAKE_OP_STOP, 513, code) == 1);
+    MOQ_TEST_CHECK(hb_ops(&r.ep, FAKE_OP_STOP, 517, code) == 1);
+    MOQ_TEST_CHECK(fm_holds(&r) == 0);
+    MOQ_TEST_CHECK(!moq_transport_bridge_stream_has_pending(r.b, 513));
+    MOQ_TEST_CHECK(!moq_transport_bridge_stream_has_pending(r.b, 517));
+    MOQ_TEST_CHECK(fake_endpoint_count_kind(&r.ep, FAKE_OP_RESET) == 0);
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(r.b));
+    hb_close(&r);
+    return failures;
+}
+
+/* A cancellation the endpoint cannot take yet stays owed in its record: the
+ * stream reports pending and the bridge reports outbound work, and a
+ * redelivery is never fed. The peer's RESET then settles the receive half
+ * between service calls: no STOP_SENDING is sent afterwards, and the other
+ * held stream keeps its record, its age and its place. */
+static int test_fm_blocked_stop_then_reset(moq_version_t ver)
+{
+    int failures = 0;
+    const uint64_t code = MOQ_STREAM_ERROR_EXCESSIVE_LOAD;
+    hb_rig_t r;
+    if (fm_open(&r, ver, &k_fm_full) < 0) { MOQ_TEST_CHECK(false); return failures; }
+    MOQ_TEST_CHECK(fm_uni(&r, 501, k_fm_data, sizeof(k_fm_data), false, 1000) ==
+                   MOQ_ERR_INPUT_NOT_CONSUMED);
+    MOQ_TEST_CHECK(fm_uni(&r, 505, k_fm_data, sizeof(k_fm_data), false, 2000) ==
+                   MOQ_ERR_INPUT_NOT_CONSUMED);
+
+    r.ep.block_stop = true;
+    MOQ_TEST_CHECK(moq_transport_bridge_service(r.b, 1000 + FM_AGE) == MOQ_OK);
+    MOQ_TEST_CHECK(hb_ops(&r.ep, FAKE_OP_STOP, 501, code) == 0);
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_has_pending(r.b, 501));
+    MOQ_TEST_CHECK(moq_transport_bridge_has_outbound_pending(r.b));
+    MOQ_TEST_CHECK(fm_holds(&r) == 2);
+    MOQ_TEST_CHECK(fm_uni(&r, 501, k_fm_data, sizeof(k_fm_data), false, 1001 + FM_AGE) ==
+                   MOQ_ERR_INPUT_NOT_CONSUMED);
+    MOQ_TEST_CHECK(moq_transport_bridge_find_ref(r.b, 501)._v == 0);
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_count(r.b) == 2);
+
+    MOQ_TEST_CHECK(moq_transport_bridge_on_peer_stream_reset(r.b, 501, 0x2,
+                                                            1002 + FM_AGE) == MOQ_OK);
+    MOQ_TEST_CHECK(!moq_transport_bridge_stream_has_pending(r.b, 501));
+    MOQ_TEST_CHECK(!moq_transport_bridge_has_outbound_pending(r.b));
+    MOQ_TEST_CHECK(fm_holds(&r) == 1);
+
+    r.ep.block_stop = false;
+    MOQ_TEST_CHECK(moq_transport_bridge_service(r.b, 1003 + FM_AGE) == MOQ_OK);
+    MOQ_TEST_CHECK(hb_ops(&r.ep, FAKE_OP_STOP, 501, code) == 0);
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_has_pending(r.b, 505));
+    MOQ_TEST_CHECK(moq_transport_bridge_find_ref(r.b, 505)._v == 0);
+    MOQ_TEST_CHECK(moq_session_next_deadline_us(r.s) == 2000 + FM_AGE);
+
+    MOQ_TEST_CHECK(moq_transport_bridge_service(r.b, 2000 + FM_AGE) == MOQ_OK);
+    MOQ_TEST_CHECK(hb_ops(&r.ep, FAKE_OP_STOP, 505, code) == 1);
+    MOQ_TEST_CHECK(hb_ops(&r.ep, FAKE_OP_STOP, 501, code) == 0);
+    MOQ_TEST_CHECK(fm_holds(&r) == 0);
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(r.b));
+    hb_close(&r);
+    return failures;
+}
+
+/* A complete padding type that finds no mapping free beyond the reserve is
+ * refused for the adapter to cancel even with hold records free: it is never
+ * held, and a borrowed rcbuf keeps only its owner's reference. With a mapping
+ * free beyond the reserve it is mapped and discarded as before. A mapping
+ * the reserve keeps for the peer's control stream stays free for it. */
+static int test_fm_padding(moq_version_t ver, bool use_rcbuf)
+{
+    int failures = 0;
+    hb_rig_t r;
+    if (fm_open(&r, ver, &k_fm_full) < 0) { MOQ_TEST_CHECK(false); return failures; }
+    uint32_t refs = 0;
+    moq_result_t rc = use_rcbuf
+        ? fm_uni_rcbuf(&r, 501, k_fm_padding, sizeof(k_fm_padding), 1000, &refs)
+        : fm_uni(&r, 501, k_fm_padding, sizeof(k_fm_padding), false, 1000);
+    MOQ_TEST_CHECK(rc == MOQ_BRIDGE_INGRESS_REFUSE_CANCEL);
+    if (use_rcbuf) MOQ_TEST_CHECK(refs == 1);
+    MOQ_TEST_CHECK(fm_holds(&r) == 0);
+    MOQ_TEST_CHECK(!moq_transport_bridge_stream_has_pending(r.b, 501));
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_count(r.b) == 2);
+    MOQ_TEST_CHECK(r.ep.count == 0);
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(r.b));
+
+    bridge_deactivate_stream(&r.b->streams[0]);
+    MOQ_TEST_CHECK(fm_uni(&r, 505, k_fm_padding, sizeof(k_fm_padding), false, 1100) ==
+                   MOQ_OK);
+    MOQ_TEST_CHECK(moq_transport_bridge_find_ref(r.b, 505)._v != 0);
+    MOQ_TEST_CHECK(fm_holds(&r) == 0);
+    hb_close(&r);
+
+    const fm_cfg_t owed = { true, 2, 2, 1, true, false };
+    if (fm_open(&r, ver, &owed) < 0) { MOQ_TEST_CHECK(false); return failures; }
+    MOQ_TEST_CHECK(fm_uni(&r, 501, k_fm_padding, sizeof(k_fm_padding), false, 1000) ==
+                   MOQ_BRIDGE_INGRESS_REFUSE_CANCEL);
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_count(r.b) == 1);
+    MOQ_TEST_CHECK(fm_holds(&r) == 0);
+    rc = fm_uni(&r, 3, k_fm_setup, sizeof(k_fm_setup), false, 1100);
+    MOQ_TEST_CHECK(rc == MOQ_OK || rc == MOQ_ERR_WOULD_BLOCK);
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(r.b));
+    MOQ_TEST_CHECK(r.b->peer_ctrl_uni_open && r.b->peer_ctrl_uni_stream_id == 3);
+    hb_close(&r);
+    return failures;
+}
+
+/* Both control streams are owed on a two-entry map: a complete data type is
+ * held and a padding type refused although both mappings are free, and a
+ * request stream is held the same way. Each control stream then takes its
+ * mapping, in either order, and nothing fails. */
+static int test_fm_reserve_both_controls(moq_version_t ver, bool local_first)
+{
+    int failures = 0;
+    const fm_cfg_t c = { true, 2, 2, 0, false, false };
+    hb_rig_t r;
+    if (fm_open(&r, ver, &c) < 0) { MOQ_TEST_CHECK(false); return failures; }
+    MOQ_TEST_CHECK(moq_session_start(r.s, 0) == MOQ_OK);
+    MOQ_TEST_CHECK(fm_uni(&r, 501, k_fm_data, sizeof(k_fm_data), false, 1000) ==
+                   MOQ_ERR_INPUT_NOT_CONSUMED);
+    MOQ_TEST_CHECK(fm_uni(&r, 505, k_fm_padding, sizeof(k_fm_padding), false, 1000) ==
+                   MOQ_BRIDGE_INGRESS_REFUSE_CANCEL);
+    MOQ_TEST_CHECK(hb_bidi(&r, 2001, 1000) == MOQ_ERR_INPUT_NOT_CONSUMED);
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_count(r.b) == 0);
+
+    moq_result_t rc;
+    if (local_first) {
+        MOQ_TEST_CHECK(moq_transport_bridge_service(r.b, 1100) == MOQ_OK);
+        MOQ_TEST_CHECK(r.b->local_ctrl_uni_open);
+        MOQ_TEST_CHECK(moq_transport_bridge_stream_count(r.b) == 1);
+        rc = fm_uni(&r, 3, k_fm_setup, sizeof(k_fm_setup), false, 1200);
+        MOQ_TEST_CHECK(rc == MOQ_OK || rc == MOQ_ERR_WOULD_BLOCK);
+    } else {
+        rc = fm_uni(&r, 3, k_fm_setup, sizeof(k_fm_setup), false, 1100);
+        MOQ_TEST_CHECK(rc == MOQ_OK || rc == MOQ_ERR_WOULD_BLOCK);
+        MOQ_TEST_CHECK(moq_transport_bridge_stream_count(r.b) == 1);
+        MOQ_TEST_CHECK(moq_transport_bridge_service(r.b, 1200) == MOQ_OK);
+    }
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(r.b));
+    MOQ_TEST_CHECK(r.b->local_ctrl_uni_open);
+    MOQ_TEST_CHECK(r.b->peer_ctrl_uni_open && r.b->peer_ctrl_uni_stream_id == 3);
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_count(r.b) == 2);
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_has_pending(r.b, 501));
+    MOQ_TEST_CHECK(moq_transport_bridge_find_ref(r.b, 501)._v == 0);
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_has_pending(r.b, 2001));
+    hb_close(&r);
+    return failures;
+}
+
+/* Our control stream's open is blocked by the endpoint: its mapping is
+ * released and stays reserved, so neither a data stream nor a request stream
+ * takes the last free entry, and the retried open maps there. */
+static int test_fm_reserve_local_blocked(moq_version_t ver)
+{
+    int failures = 0;
+    const fm_cfg_t c = { true, 2, 2, 1, false, true };
+    hb_rig_t r;
+    if (fm_open(&r, ver, &c) < 0) { MOQ_TEST_CHECK(false); return failures; }
+    MOQ_TEST_CHECK(moq_session_start(r.s, 0) == MOQ_OK);
+    r.ep.block_open_uni = true;
+    MOQ_TEST_CHECK(moq_transport_bridge_service(r.b, 1000) == MOQ_OK);
+    MOQ_TEST_CHECK(!r.b->local_ctrl_uni_open);
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_count(r.b) == 1);
+
+    MOQ_TEST_CHECK(fm_uni(&r, 501, k_fm_data, sizeof(k_fm_data), false, 1001) ==
+                   MOQ_ERR_INPUT_NOT_CONSUMED);
+    MOQ_TEST_CHECK(hb_bidi(&r, 2001, 1001) == MOQ_ERR_INPUT_NOT_CONSUMED);
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_count(r.b) == 1);
+
+    r.ep.block_open_uni = false;
+    MOQ_TEST_CHECK(moq_transport_bridge_service(r.b, 1002) == MOQ_OK);
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(r.b));
+    MOQ_TEST_CHECK(r.b->local_ctrl_uni_open);
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_count(r.b) == 2);
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_has_pending(r.b, 501));
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_has_pending(r.b, 2001));
+    hb_close(&r);
+    return failures;
+}
+
+/* Our control stream, once mapped, stays out of the reserve after its FIN:
+ * the reserve is not raised again while the session drains. */
+static int test_fm_local_reserve_after_fin(moq_version_t ver)
+{
+    int failures = 0;
+    const fm_cfg_t c = { true, 2, 2, 1, true, true };
+    hb_rig_t r;
+    if (fm_open(&r, ver, &c) < 0) { MOQ_TEST_CHECK(false); return failures; }
+    r.b->local_ctrl_uni_open = false;               /* its FIN was written */
+    MOQ_TEST_CHECK(fm_uni(&r, 501, k_fm_padding, sizeof(k_fm_padding), false, 1000) ==
+                   MOQ_OK);
+    MOQ_TEST_CHECK(moq_transport_bridge_find_ref(r.b, 501)._v != 0);
+    hb_close(&r);
+
+    const fm_cfg_t never = { true, 2, 2, 1, false, true };
+    if (fm_open(&r, ver, &never) < 0) { MOQ_TEST_CHECK(false); return failures; }
+    MOQ_TEST_CHECK(fm_uni(&r, 501, k_fm_padding, sizeof(k_fm_padding), false, 1000) ==
+                   MOQ_BRIDGE_INGRESS_REFUSE_CANCEL);
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_count(r.b) == 1);
+    hb_close(&r);
+    return failures;
+}
+
+/* Held request and data streams share one queue, oldest first. A new data
+ * stream waits behind them even with a mapping free, and a FIN-only delivery
+ * cannot overtake a held stream's bytes. When the offered request stream is
+ * reset by its peer and cancelled, the older held data stream is offered. */
+static int test_fm_cross_kind_fifo(moq_version_t ver)
+{
+    int failures = 0;
+    const fm_cfg_t c = { true, 2, 3, 2, true, true };
+    hb_rig_t r;
+    if (fm_open(&r, ver, &c) < 0) { MOQ_TEST_CHECK(false); return failures; }
+    MOQ_TEST_CHECK(hb_bidi(&r, 2001, 1000) == MOQ_ERR_INPUT_NOT_CONSUMED);
+    MOQ_TEST_CHECK(fm_uni(&r, 501, k_fm_data, sizeof(k_fm_data), false, 2000) ==
+                   MOQ_ERR_INPUT_NOT_CONSUMED);
+    bridge_deactivate_stream(&r.b->streams[0]);
+    MOQ_TEST_CHECK(moq_transport_bridge_service(r.b, 3000) == MOQ_OK);
+    MOQ_TEST_CHECK(!moq_transport_bridge_stream_has_pending(r.b, 2001));
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_has_pending(r.b, 501));
+
+    MOQ_TEST_CHECK(fm_uni(&r, 505, k_fm_data, sizeof(k_fm_data), false, 3000) ==
+                   MOQ_ERR_INPUT_NOT_CONSUMED);
+    MOQ_TEST_CHECK(moq_transport_bridge_find_ref(r.b, 505)._v == 0);
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_count(r.b) == 1);
+    MOQ_TEST_CHECK(fm_holds(&r) == 3);
+    MOQ_TEST_CHECK(fm_uni(&r, 501, NULL, 0, true, 3000) == MOQ_ERR_INPUT_NOT_CONSUMED);
+
+    MOQ_TEST_CHECK(moq_transport_bridge_on_peer_stream_reset(r.b, 2001, 0x2, 3001) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_transport_bridge_service(r.b, 3002) == MOQ_OK);
+    MOQ_TEST_CHECK(hb_ops(&r.ep, FAKE_OP_RESET, 2001, MOQ_STREAM_ERROR_EXCESSIVE_LOAD) == 1);
+    MOQ_TEST_CHECK(!moq_transport_bridge_stream_has_pending(r.b, 2001));
+    MOQ_TEST_CHECK(!moq_transport_bridge_stream_has_pending(r.b, 501));
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_has_pending(r.b, 505));
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(r.b));
+    hb_close(&r);
+    return failures;
+}
+
+/* While the session drains buffered control input, a new data stream is
+ * refused by that deferral alone and takes no hold record; once the input
+ * drained, its redelivery is held at the full map. */
+static int test_fm_behind_pending_control(moq_version_t ver)
+{
+    int failures = 0;
+    hb_rig_t r;
+    if (fm_open(&r, ver, &k_fm_full) < 0) { MOQ_TEST_CHECK(false); return failures; }
+    r.b->pending_control = true;
+    r.b->pending_control_stream_id = 3;
+    MOQ_TEST_CHECK(fm_uni(&r, 501, k_fm_data, sizeof(k_fm_data), false, 1000) ==
+                   MOQ_ERR_INPUT_NOT_CONSUMED);
+    MOQ_TEST_CHECK(fm_holds(&r) == 0);
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_has_pending(r.b, 501));
+    r.b->pending_control = false;                      /* the control input drained */
+    MOQ_TEST_CHECK(!moq_transport_bridge_stream_has_pending(r.b, 501));
+    MOQ_TEST_CHECK(fm_uni(&r, 501, k_fm_data, sizeof(k_fm_data), false, 1001) ==
+                   MOQ_ERR_INPUT_NOT_CONSUMED);
+    MOQ_TEST_CHECK(fm_holds(&r) == 1);
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_has_pending(r.b, 501));
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(r.b));
+    hb_close(&r);
+    return failures;
+}
+
+/* An unknown type, and a second control stream, keep their existing fatal
+ * outcomes: 0x1 at a full map, PROTOCOL_VIOLATION (0x3) with a mapping free.
+ * Neither is held or refused for the adapter to cancel. */
+static int test_fm_unknown_unchanged(moq_version_t ver)
+{
+    int failures = 0;
+    hb_rig_t r;
+    if (fm_open(&r, ver, &k_fm_full) < 0) { MOQ_TEST_CHECK(false); return failures; }
+    MOQ_TEST_CHECK(fm_uni(&r, 501, k_fm_quic_padding, sizeof(k_fm_quic_padding), false,
+                          1000) == MOQ_ERR_INTERNAL);
+    MOQ_TEST_CHECK(moq_transport_bridge_fatal_code(r.b) == 0x1);
+    MOQ_TEST_CHECK(fm_holds(&r) == 0);
+    hb_close(&r);
+
+    const fm_cfg_t one_free = { true, 2, 2, 1, true, true };
+    if (fm_open(&r, ver, &one_free) < 0) { MOQ_TEST_CHECK(false); return failures; }
+    MOQ_TEST_CHECK(fm_uni(&r, 501, k_fm_quic_padding, sizeof(k_fm_quic_padding), false,
+                          1000) == MOQ_ERR_PROTO);
+    MOQ_TEST_CHECK(moq_transport_bridge_fatal_code(r.b) == 0x3);
+    hb_close(&r);
+
+    if (fm_open(&r, ver, &k_fm_full) < 0) { MOQ_TEST_CHECK(false); return failures; }
+    MOQ_TEST_CHECK(fm_uni(&r, 501, k_fm_setup, sizeof(k_fm_setup), false, 1000) ==
+                   MOQ_ERR_INTERNAL);
+    MOQ_TEST_CHECK(moq_transport_bridge_fatal_code(r.b) == 0x1);
+    MOQ_TEST_CHECK(fm_holds(&r) == 0);
+    hb_close(&r);
+    return failures;
+}
+
+/* Temporary known limitation, characterized and not endorsed: a new stream
+ * whose first chunk is an incomplete type might be the peer's control
+ * stream, so it is neither held nor cancelled, and it has no lossless
+ * destination other than a stream mapping yet. It therefore takes any free
+ * mapping, an entry the control reserve keeps included, and at a full map it
+ * fails the session. These rows keep the outcomes discriminating -- an
+ * incomplete type against a complete data type -- until incomplete types
+ * get a lossless waiting place. */
+static int test_fm_incomplete_type_known_limitation(moq_version_t ver)
+{
+    int failures = 0;
+    const fm_cfg_t owed = { true, 2, 2, 1, true, false };
+    hb_rig_t r;
+    moq_result_t rc;
+
+    /* A split padding type takes the entry reserved for the peer's control
+     * stream, which then meets a full map. */
+    if (fm_open(&r, ver, &owed) < 0) { MOQ_TEST_CHECK(false); return failures; }
+    MOQ_TEST_CHECK(fm_uni(&r, 501, k_fm_padding, 1, false, 1000) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_count(r.b) == 2);
+    MOQ_TEST_CHECK(fm_holds(&r) == 0);
+    MOQ_TEST_CHECK(fm_uni(&r, 501, k_fm_padding + 1, sizeof(k_fm_padding) - 1, false,
+                          1001) == MOQ_OK);
+    MOQ_TEST_CHECK(fm_uni(&r, 3, k_fm_setup, sizeof(k_fm_setup), false, 1002) ==
+                   MOQ_ERR_INTERNAL);
+    MOQ_TEST_CHECK(moq_transport_bridge_fatal_code(r.b) == 0x1);
+    hb_close(&r);
+
+    /* A split control type on that entry is identified and survives. */
+    if (fm_open(&r, ver, &owed) < 0) { MOQ_TEST_CHECK(false); return failures; }
+    MOQ_TEST_CHECK(fm_uni(&r, 3, k_fm_setup, 1, false, 1000) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_count(r.b) == 2);
+    MOQ_TEST_CHECK(!r.b->peer_ctrl_uni_open);
+    rc = fm_uni(&r, 3, k_fm_setup + 1, 1, false, 1001);
+    MOQ_TEST_CHECK(rc == MOQ_OK || rc == MOQ_ERR_WOULD_BLOCK);
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(r.b));
+    MOQ_TEST_CHECK(r.b->peer_ctrl_uni_open && r.b->peer_ctrl_uni_stream_id == 3);
+    hb_close(&r);
+
+    /* At a full map a complete data type is held, an incomplete type fails
+     * the session. */
+    if (fm_open(&r, ver, &k_fm_full) < 0) { MOQ_TEST_CHECK(false); return failures; }
+    MOQ_TEST_CHECK(fm_uni(&r, 501, k_fm_data, sizeof(k_fm_data), false, 1000) ==
+                   MOQ_ERR_INPUT_NOT_CONSUMED);
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(r.b));
+    MOQ_TEST_CHECK(fm_uni(&r, 505, k_fm_padding, 1, false, 1001) == MOQ_ERR_INTERNAL);
+    MOQ_TEST_CHECK(moq_transport_bridge_fatal_code(r.b) == 0x1);
+    hb_close(&r);
+    return failures;
+}
+
+/* Without the capability nothing changes: no hold records exist, a full map
+ * is fatal for data and padding alike and never answered with the refusal
+ * outcome, and a padding stream may take an entry the reserve would keep. */
+static int test_fm_capability_off(moq_version_t ver)
+{
+    int failures = 0;
+    const fm_cfg_t full = { false, 2, 2, 2, true, true };
+    hb_rig_t r;
+    if (fm_open(&r, ver, &full) < 0) { MOQ_TEST_CHECK(false); return failures; }
+    MOQ_TEST_CHECK(r.b->holds == NULL);
+    moq_result_t rc = fm_uni(&r, 501, k_fm_data, sizeof(k_fm_data), false, 1000);
+    MOQ_TEST_CHECK(rc == MOQ_ERR_INTERNAL);
+    MOQ_TEST_CHECK(rc != MOQ_BRIDGE_INGRESS_REFUSE_CANCEL);
+    MOQ_TEST_CHECK(moq_transport_bridge_fatal_code(r.b) == 0x1);
+    hb_close(&r);
+
+    if (fm_open(&r, ver, &full) < 0) { MOQ_TEST_CHECK(false); return failures; }
+    rc = fm_uni(&r, 501, k_fm_padding, sizeof(k_fm_padding), false, 1000);
+    MOQ_TEST_CHECK(rc == MOQ_ERR_INTERNAL);
+    MOQ_TEST_CHECK(moq_transport_bridge_fatal_code(r.b) == 0x1);
+    hb_close(&r);
+
+    const fm_cfg_t owed = { false, 2, 2, 1, true, false };
+    if (fm_open(&r, ver, &owed) < 0) { MOQ_TEST_CHECK(false); return failures; }
+    MOQ_TEST_CHECK(fm_uni(&r, 501, k_fm_padding, sizeof(k_fm_padding), false, 1000) ==
+                   MOQ_OK);
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_count(r.b) == 2);
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(r.b));
+    hb_close(&r);
+    return failures;
+}
+
+/* -- Minimum stream-map capacity at create ------------------------------ *
+ *
+ * A unidirectional control pair (drafts 18 and 22) keeps one map entry per
+ * control stream for the whole session, so create refuses an effective
+ * max_streams below 2 there: MOQ_ERR_INVAL, before any allocation attempt or
+ * endpoint call, with *out NULL and the session left free for a later valid
+ * create. Zero selects the default and is accepted. Draft-16 (one bidi
+ * control stream) accepts 1. The single-owner refusal is unchanged. */
+
+static unsigned g_mc_alloc_attempts;   /* alloc and realloc calls */
+static long     g_mc_live;             /* outstanding blocks */
+static unsigned g_mc_ep_calls;         /* endpoint operations invoked */
+
+static void *mc_alloc(size_t n, void *ctx)
+{
+    (void)ctx;
+    g_mc_alloc_attempts++;
+    void *p = malloc(n);
+    if (p) g_mc_live++;
+    return p;
+}
+static void *mc_realloc(void *p, size_t o, size_t n, void *ctx)
+{
+    (void)o; (void)ctx;
+    g_mc_alloc_attempts++;
+    const bool was_null = p == NULL;   /* p may be invalid after realloc */
+    void *q = realloc(p, n);
+    if (was_null && q) g_mc_live++;
+    return q;
+}
+static void mc_free(void *p, size_t n, void *ctx)
+{
+    (void)n; (void)ctx;
+    if (p) g_mc_live--;
+    free(p);
+}
+
+static moq_transport_result_t mc_open(void *ctx, uint64_t *out_id)
+{ (void)ctx; g_mc_ep_calls++; *out_id = 0; return MOQ_TRANSPORT_OK; }
+static moq_transport_result_t mc_write(void *ctx, uint64_t sid, const uint8_t *d,
+                                       size_t len, bool fin)
+{ (void)ctx; (void)sid; (void)d; (void)len; (void)fin; g_mc_ep_calls++; return MOQ_TRANSPORT_OK; }
+static moq_transport_result_t mc_code(void *ctx, uint64_t sid, uint64_t code)
+{ (void)ctx; (void)sid; (void)code; g_mc_ep_calls++; return MOQ_TRANSPORT_OK; }
+static moq_transport_result_t mc_close(void *ctx, uint64_t code,
+                                       const uint8_t *reason, size_t reason_len)
+{ (void)ctx; (void)code; (void)reason; (void)reason_len; g_mc_ep_calls++; return MOQ_TRANSPORT_OK; }
+
+static moq_transport_endpoint_ops_t mc_ops(void)
+{
+    moq_transport_endpoint_ops_t o = MOQ_TRANSPORT_ENDPOINT_OPS_INIT;
+    o.capabilities = MOQ_TRANSPORT_CAP_HOLD_INPUT;
+    o.open_uni = mc_open;
+    o.open_bidi = mc_open;
+    o.write = mc_write;
+    o.reset_stream = mc_code;
+    o.stop_sending = mc_code;
+    o.close_transport = mc_close;
+    return o;
+}
+
+static moq_result_t mc_create(moq_session_t *s, uint32_t max_streams,
+                              const moq_transport_endpoint_ops_t *ops,
+                              moq_transport_bridge_t **out)
+{
+    static const moq_alloc_t al = { .ctx = NULL, .alloc = mc_alloc,
+                                    .realloc = mc_realloc, .free = mc_free };
+    moq_transport_bridge_cfg_t bcfg;
+    moq_transport_bridge_cfg_init(&bcfg, &al);
+    bcfg.max_streams = max_streams;
+    *out = (moq_transport_bridge_t *)(uintptr_t)1;      /* must become NULL */
+    return moq_transport_bridge_create(&bcfg, s, ops, NULL, out);
+}
+
+static int test_min_streams_at_create(moq_version_t ver, moq_perspective_t persp)
+{
+    int failures = 0;
+    const bool uni_pair = ver != MOQ_VERSION_DRAFT_16;
+    moq_session_cfg_t cfg;
+    moq_session_cfg_init_sized(&cfg, sizeof(cfg), moq_alloc_default(), persp);
+    cfg.version = ver;
+    moq_session_t *s = NULL;
+    if (moq_session_create(&cfg, 0, &s) < 0) { MOQ_TEST_CHECK(false); return failures; }
+    if (test_bind_if_required(s) < 0) { MOQ_TEST_CHECK(false); moq_session_destroy(s); return failures; }
+    MOQ_TEST_CHECK(moq_session_uses_uni_control(s) == uni_pair);
+    moq_transport_endpoint_ops_t ops = mc_ops();
+    moq_transport_bridge_t *b = NULL;
+
+    /* One entry: refused on a uni pair with no allocation attempt and no
+     * endpoint call; accepted on draft-16. */
+    g_mc_alloc_attempts = 0;
+    g_mc_ep_calls = 0;
+    moq_result_t rc = mc_create(s, 1, &ops, &b);
+    if (uni_pair) {
+        MOQ_TEST_CHECK(rc == MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(b == NULL);
+        MOQ_TEST_CHECK(g_mc_alloc_attempts == 0);
+        MOQ_TEST_CHECK(g_mc_ep_calls == 0);
+        MOQ_TEST_CHECK(g_mc_live == 0);
+        /* A create that wrongly succeeded is released, so the accepted
+         * cases below still judge their own outcome. */
+        if (rc == MOQ_OK && b != NULL &&
+            b != (moq_transport_bridge_t *)(uintptr_t)1)
+            moq_transport_bridge_destroy(b);
+    } else {
+        MOQ_TEST_CHECK(rc == MOQ_OK && b != NULL);
+        if (rc == MOQ_OK) moq_transport_bridge_destroy(b);
+    }
+    MOQ_TEST_CHECK(g_mc_live == 0);
+
+    /* Two entries: accepted, and a refusal above did not claim the session. */
+    rc = mc_create(s, 2, &ops, &b);
+    MOQ_TEST_CHECK(rc == MOQ_OK && b != NULL);
+    if (rc == MOQ_OK) {
+        /* The single-owner refusal is unchanged; the capacity check comes
+         * first, before anything is allocated or the owner is registered. */
+        moq_transport_bridge_t *b2 = NULL;
+        MOQ_TEST_CHECK(mc_create(s, 2, &ops, &b2) == MOQ_ERR_WRONG_STATE);
+        MOQ_TEST_CHECK(b2 == NULL);
+        if (uni_pair) {
+            g_mc_alloc_attempts = 0;
+            MOQ_TEST_CHECK(mc_create(s, 1, &ops, &b2) == MOQ_ERR_INVAL);
+            MOQ_TEST_CHECK(b2 == NULL);
+            MOQ_TEST_CHECK(g_mc_alloc_attempts == 0);
+        }
+        moq_transport_bridge_destroy(b);
+    }
+    MOQ_TEST_CHECK(g_mc_live == 0);
+
+    /* Zero selects the default capacity and is accepted. */
+    rc = mc_create(s, 0, &ops, &b);
+    MOQ_TEST_CHECK(rc == MOQ_OK && b != NULL);
+    if (rc == MOQ_OK) {
+        MOQ_TEST_CHECK(b->max_streams == BRIDGE_DEFAULT_MAX_STREAMS);
+        moq_transport_bridge_destroy(b);
+    }
+    MOQ_TEST_CHECK(g_mc_live == 0);
+    moq_session_destroy(s);
+    return failures;
+}
+
 int main(void)
 {
     int failures = 0;
@@ -13937,6 +15267,7 @@ int main(void)
     failures += test_p7_bridge_fin_retirement();
     failures += test_p7_retirement_idempotence_and_reuse();
     failures += test_p3_bridge_fin_retirement();
+    failures += test_local_uni_fin_awaits_commit();
     failures += test_ns_sub_local_teardown_bridge_retry();
     failures += test_no_owner_admission_bridge();
     failures += test_noslot_exhaustion_reset();
@@ -14037,6 +15368,58 @@ int main(void)
     failures += test_setup_scratch_shortfall_closes_not_fatal();
 
     failures += test_hol_one_slot_per_action_and_no_drain_overflow();
+
+    /* held peer request streams */
+    failures += test_hold_bidi_records_fifo_and_expiry();
+    failures += test_hold_bidi_abort_and_blocked_cancel();
+    failures += test_hold_bidi_cancel_failure_fatal();
+    failures += test_hold_bidi_requires_capability();
+    failures += test_hold_uni_d16();
+
+    /* the peer control stream on the last free stream-map entry */
+    failures += test_control_last_entry(MOQ_VERSION_DRAFT_18, false);
+    failures += test_control_last_entry(MOQ_VERSION_DRAFT_18, true);
+    failures += test_control_last_entry(MOQ_VERSION_DRAFT_22, false);
+    failures += test_control_last_entry(MOQ_VERSION_DRAFT_22, true);
+
+    /* minimum stream-map capacity at create */
+    {
+        const moq_version_t vers[3] = { MOQ_VERSION_DRAFT_16, MOQ_VERSION_DRAFT_18,
+                                        MOQ_VERSION_DRAFT_22 };
+        const moq_perspective_t persps[2] = { MOQ_PERSPECTIVE_CLIENT,
+                                              MOQ_PERSPECTIVE_SERVER };
+        for (int v = 0; v < 3; v++)
+            for (int k = 0; k < 2; k++)
+                failures += test_min_streams_at_create(vers[v], persps[k]);
+    }
+
+    /* peer uni input deferred behind pending control input */
+    failures += test_uni_deferred_behind_control(MOQ_VERSION_DRAFT_16);
+    failures += test_uni_deferred_behind_control(MOQ_VERSION_DRAFT_18);
+    failures += test_uni_deferred_behind_control(MOQ_VERSION_DRAFT_22);
+
+    /* new peer uni streams placed by class on a uni-pair profile */
+    {
+        const moq_version_t vers[2] = { MOQ_VERSION_DRAFT_18, MOQ_VERSION_DRAFT_22 };
+        for (int v = 0; v < 2; v++) {
+            failures += test_fm_wire_classes(vers[v]);
+            failures += test_fm_data_held(vers[v], false);
+            failures += test_fm_data_held(vers[v], true);
+            failures += test_fm_offer_and_age(vers[v]);
+            failures += test_fm_blocked_stop_then_reset(vers[v]);
+            failures += test_fm_padding(vers[v], false);
+            failures += test_fm_padding(vers[v], true);
+            failures += test_fm_reserve_both_controls(vers[v], true);
+            failures += test_fm_reserve_both_controls(vers[v], false);
+            failures += test_fm_reserve_local_blocked(vers[v]);
+            failures += test_fm_local_reserve_after_fin(vers[v]);
+            failures += test_fm_cross_kind_fifo(vers[v]);
+            failures += test_fm_behind_pending_control(vers[v]);
+            failures += test_fm_unknown_unchanged(vers[v]);
+            failures += test_fm_incomplete_type_known_limitation(vers[v]);
+            failures += test_fm_capability_off(vers[v]);
+        }
+    }
 
     if (failures == 0)
         printf("test_transport_bridge: all tests passed\n");

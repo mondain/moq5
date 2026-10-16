@@ -19,6 +19,7 @@ typedef enum moq_pub_accept_mode {
     MOQ_PUB_REJECT_ALL = 0,
     MOQ_PUB_ACCEPT_ALL = 1,
     MOQ_PUB_CALLBACK   = 2,
+    MOQ_PUB_CALLBACK_V1 = 3,
 } moq_pub_accept_mode_t;
 
 typedef enum moq_pub_accept_decision {
@@ -56,6 +57,52 @@ typedef moq_pub_accept_decision_t (*moq_pub_subscribe_cb)(
     const moq_pub_subscribe_info_t *info,
     moq_request_error_t *out_error_code);
 
+/* Versioned subscribe authorization observation. Library-produced: struct_size
+ * is stamped with this library's sizeof. Before reading a field, require
+ * struct_size >= offsetof(moq_pub_subscribe_info_v1_t, FIELD) + sizeof(FIELD).
+ * The complete initial prefix extends through options; future appended fields
+ * require their own complete-field checks, not a check against current sizeof.
+ *
+ * info, namespace/name bytes, tokens (including token values), and options are
+ * BORROWED for the callback only. Copy any needed data before returning; a
+ * shallow copy does not retain the pointed-to observations. track and deferred
+ * are opaque handles with the same lifetime/resolution rules as the legacy
+ * callback. No publisher/session mutation may reenter from this callback.
+ *
+ * The legacy filter/location/timeout fields remain projections. options carries
+ * lossless selected parameters, including explicit NONE versus absence, initial
+ * fill presence, and independent timeouts. It is NULL if the event producer or
+ * negotiated profile supplies no admission record (including draft-16/18).
+ * Check its own struct_size before reading/copying its fields; its complete
+ * frozen prefix is MOQ_SUBSCRIPTION_ADMISSION_OPTIONS_V0_SIZE bytes. */
+typedef struct moq_pub_subscribe_info_v1 {
+    uint32_t                    struct_size;
+    moq_pub_track_t            *track;
+    moq_namespace_t             track_namespace;
+    moq_bytes_t                 track_name;
+    moq_subscribe_filter_t      filter;
+    uint8_t                     subscriber_priority;
+    moq_group_order_t           group_order;
+    bool                        forward;
+    uint64_t                    start_group;
+    uint64_t                    start_object;
+    uint64_t                    end_group;
+    uint64_t                    delivery_timeout_us;
+    const moq_resolved_token_t *tokens;
+    size_t                      token_count;
+    moq_pub_deferred_t         *deferred;
+    uint64_t                    deferred_id;
+    const moq_subscription_admission_options_t *options;
+} moq_pub_subscribe_info_v1_t;
+
+/* Same ACCEPT/REJECT/DEFER decisions and out_error_code contract as the legacy
+ * callback. DEFER requires a non-NULL info->deferred and is resolved through
+ * moq_pub_resolve_deferred, never by retaining this borrowed info record. */
+typedef moq_pub_accept_decision_t (*moq_pub_subscribe_v1_cb)(
+    void *ctx,
+    const moq_pub_subscribe_info_v1_t *info,
+    moq_request_error_t *out_error_code);
+
 /* -- Subscription update info ------------------------------------- */
 
 typedef struct moq_pub_subscribe_update_info {
@@ -82,17 +129,24 @@ typedef struct moq_pub_subscribe_update_info {
 
 /* Why an advertised namespace reached a terminal state. A REJECTED
  * advertisement was refused by the peer at request time; a CANCELLED
- * advertisement was accepted and later withdrawn by the peer. */
+ * advertisement was accepted and later withdrawn by the peer. TERMINATED is
+ * D22 namespace-operation closure, not a peer rejection. */
 typedef enum moq_pub_namespace_terminal_kind {
     MOQ_PUB_NAMESPACE_REJECTED  = 1,
     MOQ_PUB_NAMESPACE_CANCELLED = 2,
+    MOQ_PUB_NAMESPACE_TERMINATED = 3,
 } moq_pub_namespace_terminal_kind_t;
 
 /* Detail for on_namespace_terminal. Library-produced: struct_size is stamped
  * with this library's sizeof so a newer caller can gate any future field.
  * REJECTED carries error_code, can_retry, retry_after_ms, and reason;
  * CANCELLED carries error_code and reason with can_retry=false and
- * retry_after_ms=0. reason is BORROWED for the callback's duration only. */
+ * retry_after_ms=0. TERMINATED carries cause/local_role/stream_error_code;
+ * error_code, can_retry, retry_after_ms and reason are zero/false/empty.
+ * reason is BORROWED for the callback's duration only.
+ *
+ * Explicit D22 clients must handle kind 3: struct_size describes available
+ * fields, not which kinds the caller understands. D16/18 retain kinds 1/2. */
 typedef struct moq_pub_namespace_terminal_info {
     uint32_t                          struct_size;
     moq_pub_namespace_terminal_kind_t kind;
@@ -105,7 +159,46 @@ typedef struct moq_pub_namespace_terminal_info {
     bool                              can_retry;
     uint64_t                          retry_after_ms;
     moq_bytes_t                       reason;
+    /* Appended after the complete original extent. Announcement-specific
+     * MOQ_NAMESPACE_TERMINAL_* and MOQ_NAMESPACE_ROLE_* from session.h (not
+     * the namespace-subscription cause domain). RESET/STOP preserve the exact
+     * peer uint64 code, including zero; other causes carry zero. */
+    uint32_t                          cause;
+    uint32_t                          local_role;
+    uint64_t                          stream_error_code;
 } moq_pub_namespace_terminal_info_t;
+
+#define MOQ_PUB_NAMESPACE_TERMINAL_INFO_V0_SIZE \
+    offsetof(moq_pub_namespace_terminal_info_t, cause)
+
+/* Detail for on_new_group_request. Library-produced: struct_size is stamped
+ * with this library's sizeof; gate any future field on it.
+ *
+ *   requested_group    the request's value: the largest Group ID the
+ *                      subscriber knows, plus one; 0 when it knows none.
+ *   has_current_group  the track has published an object; current_group is
+ *                      the largest Group ID it has published. */
+typedef struct moq_pub_new_group_request_info {
+    uint32_t struct_size;
+    bool     has_current_group;
+    uint64_t requested_group;
+    uint64_t current_group;
+} moq_pub_new_group_request_info_t;
+
+/* A subscriber asked this Original Publisher to start a new group on a track
+ * that advertises DYNAMIC_GROUPS (moq_pub_track_cfg_t.dynamic_groups). Fired
+ * for a NEW_GROUP_REQUEST on an accepted SUBSCRIBE and on a subscription or
+ * publication update, and only when the request warrants one (draft-22
+ * §9.20.19; drafts 16 and 18 say the same): its value is 0 or larger than the
+ * track's current group. The publisher "SHOULD end the current Group and
+ * begin a new Group as soon as practical" and chooses that group's ID, so
+ * record the request and start the group from the application's loop. A
+ * track that does not advertise DYNAMIC_GROUPS ignores the parameter, as the
+ * draft says, and fires nothing. Non-reentrant; `info` is valid for the
+ * callback only. */
+typedef void (*moq_pub_new_group_request_cb)(
+    void *ctx, moq_pub_track_t *track,
+    const moq_pub_new_group_request_info_t *info);
 
 typedef struct moq_pub_callbacks {
     uint32_t struct_size;
@@ -153,6 +246,57 @@ MOQ_API void moq_pub_callbacks_init_sized(moq_pub_callbacks_t *cb,
 
 /* -- Configuration ------------------------------------------------ */
 
+/* Facade-local value identity. Never convert to a core fill handle. Tokens are
+ * not reused within one linked library instance; a foreign/stale token is
+ * STALE_HANDLE. Exhaustion is LIMIT, distinct from temporary job pressure. */
+typedef struct moq_pub_fill { uint64_t _opaque; } moq_pub_fill_t;
+#ifdef __cplusplus
+#define MOQ_PUB_FILL_INVALID moq_pub_fill_t{0}
+#else
+#define MOQ_PUB_FILL_INVALID ((moq_pub_fill_t){0})
+#endif
+static inline bool moq_pub_fill_is_valid(moq_pub_fill_t fill) { return fill._opaque != 0; }
+static inline bool moq_pub_fill_eq(moq_pub_fill_t a, moq_pub_fill_t b)
+{ return a._opaque == b._opaque; }
+
+typedef enum moq_pub_fill_decision {
+    MOQ_PUB_FILL_AUTO_RETAINED = 0,
+    MOQ_PUB_FILL_DEFER = 1
+} moq_pub_fill_decision_t;
+
+/* Borrowed, library-stamped records. Copy plain values during the callback;
+ * never keep the record pointer or read beyond struct_size. Exactly one parent
+ * handle is valid. Range endpoints are inclusive, with full uint64_t width. */
+typedef struct moq_pub_fill_request {
+    uint32_t struct_size;
+    moq_pub_fill_t fill;
+    moq_subscription_t sub;
+    moq_publication_t pub;
+    uint64_t initiating_request_id;
+    uint64_t start_group, start_object, end_group, end_object;
+    uint64_t processed_at_us;
+    uint64_t fill_timeout_ms;
+    uint8_t group_order;
+    uint8_t subscriber_priority;
+    bool has_fill_timeout;
+} moq_pub_fill_request_t;
+
+typedef struct moq_pub_fill_terminal {
+    uint32_t struct_size;
+    moq_pub_fill_t fill;
+    moq_subscription_t sub;
+    moq_publication_t pub;
+    uint64_t initiating_request_id;
+    uint32_t reason;       /* MOQ_FILL_* terminal reason */
+    uint32_t error_domain; /* MOQ_FILL_ERROR_* */
+    uint64_t error_code;
+} moq_pub_fill_terminal_t;
+
+typedef moq_pub_fill_decision_t (*moq_pub_fill_request_cb)(void *ctx,
+    moq_pub_track_t *track, const moq_pub_fill_request_t *request);
+typedef void (*moq_pub_fill_terminal_cb)(void *ctx, moq_pub_track_t *track,
+    const moq_pub_fill_terminal_t *terminal);
+
 typedef struct moq_pub_cfg {
     uint32_t              struct_size;
     moq_pub_accept_mode_t accept_mode;
@@ -160,15 +304,71 @@ typedef struct moq_pub_cfg {
     moq_pub_subscribe_cb  on_subscribe;
     void                 *on_subscribe_ctx;
     moq_pub_callbacks_t   callbacks;
+    /* Appended: fill requests the facade can hold in flight at once (each
+     * is answered from a snapshot of the track's retained group, or failed
+     * on the wire); 0 selects exactly 16. This bound is never enlarged to
+     * match the session pool. Jobs remain charged through terminal dispatch.
+     * Reserved only on a draft with fills (moq_session_supports_fill). Read
+     * only when struct_size covers it. */
+    uint32_t              max_fills;
+    /* Appended beyond the complete old max_fills layout. Explicit mode
+     * MOQ_PUB_CALLBACK_V1 requires this WHOLE callback/context block and a
+     * non-NULL hook; a NULL context is valid. Missing/partial block, a selected
+     * V1 hook or context under another mode, or both legacy and V1 authorizers
+     * are INVAL before allocation. No implicit callback-mode selection.
+     * Older libraries reject mode3 rather than falling back to ACCEPT_ALL. */
+    moq_pub_subscribe_v1_cb on_subscribe_v1;
+    void                  *on_subscribe_v1_ctx;
+    /* Beyond the complete V1 layout (through on_subscribe_v1_ctx). Aggregate
+     * AND per-candidate retained
+     * payload+serialized-property byte ceiling; zero is exactly 16 MiB.
+     * Temporary shared credit delays acceptance. A candidate larger than the
+     * ceiling is accepted without refs and failed with INTERNAL_ERROR. */
+    uint64_t               max_fill_snapshot_bytes;
+    /* Each callback/context pair must be wholly present or absent. Request
+     * defaults to AUTO_RETAINED; DEFER leaves the bounded job usable after
+     * callback return. Callbacks are non-reentrant: no publisher/session
+     * mutation, destruction, tick or flush within either callback. */
+    moq_pub_fill_request_cb on_fill_request;
+    void                  *on_fill_request_ctx;
+    moq_pub_fill_terminal_cb on_fill_terminal;
+    void                  *on_fill_terminal_ctx;
+    /* Appended: see moq_pub_new_group_request_cb. The pair is read only when
+     * struct_size covers both; a torn pair is MOQ_ERR_INVAL. */
+    moq_pub_new_group_request_cb on_new_group_request;
+    void                  *on_new_group_request_ctx;
+    /* Appended: fired on a session-wide GOAWAY with the new session URI
+     * (borrowed for the callback; empty means reuse the current URI). Uses
+     * callbacks.ctx. When set it is called instead of callbacks.on_draining.
+     * Read only when struct_size covers it. */
+    void (*on_goaway)(void *ctx, moq_bytes_t new_session_uri);
 } moq_pub_cfg_t;
+
+/* Single-owner, non-reentrant fill operations, after a DEFER callback has
+ * returned. The object cfg has its own struct_size. Caller rcbuf ownership is
+ * unchanged on EVERY result; accepted actions hold independent refs. Queued
+ * FIN/reset does not release job credit: the real terminal is dispatched once
+ * before refs/identity are released. A blocked abort is retained for flush.
+ * No operation exposes session access or creates a new FETCH request. */
+MOQ_API moq_result_t moq_pub_open_fill(moq_publisher_t *pub, moq_pub_fill_t fill,
+                                      uint64_t now_us);
+MOQ_API moq_result_t moq_pub_write_fill_object(moq_publisher_t *pub, moq_pub_fill_t fill,
+    const moq_fetch_object_cfg_t *cfg, uint64_t now_us);
+MOQ_API moq_result_t moq_pub_write_fill_range(moq_publisher_t *pub, moq_pub_fill_t fill,
+    moq_fetch_range_kind_t kind, uint64_t group_id, uint64_t object_id, uint64_t now_us);
+MOQ_API moq_result_t moq_pub_end_fill(moq_publisher_t *pub, moq_pub_fill_t fill,
+                                     uint64_t now_us);
+MOQ_API moq_result_t moq_pub_abort_fill(moq_publisher_t *pub, moq_pub_fill_t fill,
+                                       uint64_t error_code, uint64_t now_us);
 
 /* Pointer-only initializer. Clears and stamps ONLY the frozen prefix (the
  * original layout: struct_size, accept_mode, default_publisher_priority). It
  * cannot know the caller's storage size, so it must not write the full current
  * sizeof -- that would overflow a caller compiled against the original (smaller)
- * struct. The appended fields (on_subscribe, on_subscribe_ctx, callbacks)
- * default to disabled; to set any of them, or to initialize the full current
- * struct, use moq_pub_cfg_init_sized(). */
+ * struct. The appended fields (on_subscribe, on_subscribe_ctx, callbacks,
+ * max_fills, on_subscribe_v1/on_subscribe_v1_ctx) default to disabled;
+ * to set any of them, or to initialize the full
+ * current struct, use moq_pub_cfg_init_sized(). */
 MOQ_API void moq_pub_cfg_init(moq_pub_cfg_t *cfg);
 
 /* Size-aware initializer. Clears and stamps min(cfg_size, sizeof current
@@ -196,6 +396,22 @@ MOQ_API void moq_pub_destroy(moq_publisher_t *pub);
  * Fires callbacks synchronously. Retries pending accept/reject, deferred
  * retained-FETCH serving, lazy subgroup retirements, and finite-window
  * completion work unlocked by moq_pub_declare_groups_complete_through.
+ * D22 keeps draining the normal FIFO while admissions wait for fill credit or
+ * retained-FETCH responses wait for output credit. Each retained FETCH has a
+ * bounded owner and immutable snapshot; progress visits owners in arrival
+ * order and skips blocked owners so independent work can proceed. D16/18 keep
+ * one retained-FETCH slot and serialize polling until that response completes.
+ * Drain actions and retry tick; WOULD_BLOCK reports remaining staged work.
+ *
+ * Because tick is the session's only event consumer, it answers every request
+ * nothing else will: a SUBSCRIBE or TRACK_STATUS for a track this publisher
+ * does not have is refused with DOES_NOT_EXIST, and a request kind the facade
+ * does not serve (a peer's publication or namespace advertisement, a
+ * namespace or track-discovery subscription) with NOT_SUPPORTED ("Limited endpoints SHOULD respond to
+ * any unsupported messages with the appropriate NOT_SUPPORTED error code,
+ * rather than ignoring them", draft-22 §1.6; the same in drafts 16 and 18). An
+ * answer the session cannot take yet is retried by later ticks and flushes.
+ * moq_pub_handle_event leaves those requests IGNORED for another owner.
  *
  * The caller must NOT also call moq_session_poll_events on the same
  * session when using tick.
@@ -221,22 +437,23 @@ typedef struct moq_pub_track_cfg {
      * moq_pub_track_cfg_init() stamps the frozen prefix, which excludes this
      * field, so it is ignored. */
     bool            has_publisher_priority;
-    /* Permanently reserved, never read. The pre-monotonic struct ended in
-     * seven bytes of trailing padding after has_publisher_priority; a field
-     * placed there would sit INSIDE an old full-size caller's storage --
-     * that caller's struct_size would appear to cover it and its
-     * uninitialized padding would be misread as an explicit declaration.
-     * This tail pushes the next append to the old sizeof boundary. */
+    /* Permanently reserved, never read. Covers the pre-monotonic struct's
+     * trailing padding after has_publisher_priority (its size varies by
+     * target), plus any additional bytes needed for the frozen placement.
+     * A field in old padding would misread an old caller's uninitialized
+     * bytes as an explicit declaration. These seven reserved bytes keep
+     * the next append at or beyond the historical sizeof boundary. */
     uint8_t         _reserved_track_tail[7];
     /* Immutable per-track declaration: this track's group ids are
      * non-decreasing for its whole lifetime, and a group is never written
      * again once a higher group has begun or once its End-of-Group evidence
      * is recorded. The facade enforces the promise (violating writes return
      * MOQ_ERR_WRONG_STATE before any state changes) and uses the evidence
-     * to auto-complete finite subscription filters: a destination whose
-     * filter End Group is provably complete is terminated with
-     * SUBSCRIPTION_ENDED and the exact stream count, the same completion
-     * flow as moq_pub_declare_groups_complete_through. Declaring it opts
+     * to auto-complete finite subscription filters: on drafts 16 and 18 a
+     * destination whose filter End Group is provably complete is terminated
+     * with SUBSCRIPTION_ENDED and the exact stream count, the same
+     * completion flow as moq_pub_declare_groups_complete_through (draft-22
+     * keeps it established; see there). Declaring it opts
      * the track out of honoring a later End-widening at or below the
      * completion watermark (subscribers fill gaps via FETCH). Completion is
      * staged work: evidence created by a write is acted on by
@@ -245,6 +462,25 @@ typedef struct moq_pub_track_cfg {
      * Read only when struct_size covers the whole field: set it only with
      * moq_pub_track_cfg_init_sized(). */
     bool            monotonic_groups;
+    /* Permanently reserved, never read: keeps the fields below past the
+     * sizeof of the layout that ends at monotonic_groups on every target. */
+    uint8_t         _reserved_track_tail2[7];
+    /* Appended: the track's Track Properties (draft-22 §10) in the
+     * session's encoding, copied by add_track. Every answer the facade gives for the track carries
+     * them: SUBSCRIBE_OK, TRACK_STATUS_OK, the retained-group fetch answer
+     * and, when the publish cfg supplies none, the publication (each request
+     * that asked for none with INCLUDE_PROPERTIES = 0 gets none). Validated as
+     * moq_session_accept_subscribe() validates them: MOQ_ERR_INVAL from
+     * add_track. Read only when struct_size covers the field; empty sends
+     * none. */
+    moq_bytes_t     track_properties;
+    /* Appended: advertise DYNAMIC_GROUPS = 1 (draft-22 §10.6), added to
+     * track_properties in the session's encoding unless they already carry
+     * it. Subscribers may then ask for new groups, which surface through
+     * on_new_group_request. A track_properties set that carries
+     * DYNAMIC_GROUPS = 0 is MOQ_ERR_INVAL. Read only when struct_size covers
+     * the field. */
+    bool            dynamic_groups;
 } moq_pub_track_cfg_t;
 
 /* Pointer-only initializer: zeroes and stamps ONLY the frozen original
@@ -283,7 +519,12 @@ MOQ_API moq_result_t moq_pub_add_track(
  * MOQ_ERR_WRONG_STATE -- finish it or abandon via moq_pub_reset_group first.
  * Retryable: WOULD_BLOCK at any step resumes without re-sending or skipping
  * (a queued RESET clears the mid-stream state, so a later blocked step never
- * wedges the retry). */
+ * wedges the retry).
+ *
+ * Removal ends this publisher's memory of the track's group history. Adding
+ * the same Full Track Name again does not reset its wire identity: the
+ * application must not publish again any Location the track published
+ * before, and the facade does not detect it. */
 MOQ_API moq_result_t moq_pub_remove_track(
     moq_publisher_t *pub,
     moq_pub_track_t *track,
@@ -352,6 +593,23 @@ MOQ_API moq_result_t moq_pub_unpublish_track(
     moq_pub_track_t *track,
     uint64_t now_us);
 
+/* Where the track's publication went when the peer moved it elsewhere: a
+ * REDIRECT refusal of the PUBLISH (on_publish_error reported
+ * MOQ_REQUEST_ERROR_REDIRECT) or a GOAWAY on its request stream
+ * (on_publish_finished reported the end). The track is unpublished either
+ * way and may be published again (here, or at the target). MOQ_OK writes
+ * min(out_size, library size) bytes and stamps struct_size; spans borrow
+ * facade storage until the track is published again, removed or the
+ * publisher destroyed. MOQ_DONE: the last publication did not end by
+ * migration. MOQ_ERR_NOMEM: the migration was recorded but its target could
+ * not be kept. MOQ_ERR_INVAL for NULL arguments, a foreign track, or an
+ * out_size short of the fields through `target`. Not an advancing call. */
+MOQ_API moq_result_t moq_pub_get_track_migration(
+    const moq_publisher_t *pub,
+    const moq_pub_track_t *track,
+    moq_request_migration_t *out,
+    size_t out_size);
+
 /* True once the peer has accepted this track's publication. False for NULL
  * inputs, a foreign track, a track never published, or while the publication
  * is still pending / errored / finished. */
@@ -411,10 +669,56 @@ MOQ_API bool moq_pub_track_forward(
  * retained set is bounded: at most MOQ_PUB_RETAINED_MAX_OBJECTS objects and a
  * total payload+properties byte budget (the track's max_retained_bytes) —
  * exceeding either is MOQ_ERR_INVAL and leaves the prior retained set intact.
+ * D22 can retain one immutable response snapshot per session FETCH slot. Each
+ * snapshot pins at most MOQ_PUB_RETAINED_MAX_OBJECTS payload/properties pairs
+ * and its source track's max_retained_bytes at admission. The total pinned
+ * response bytes are bounded by the sum of those per-owner limits, separately
+ * from the current retained caches, fill budgets and transport send buffers.
+ * Replacing/clearing a cache or removing its track does not change an already
+ * admitted response. Completion, cancellation or publisher destruction releases
+ * its snapshot. D16/18 retain only one such response snapshot at a time.
+ *
+ * Fills: on a draft with fills (draft-22 section 3.4), a subscription on the
+ * track may carry a fill request, surfaced by the session as
+ * MOQ_EVENT_FILL_REQUEST with the resolved inclusive range. AUTO_RETAINED
+ * answers from an immutable retained-group snapshot when that snapshot covers
+ * the entire resolved inclusive range. Only the requested objects are sent,
+ * followed by FIN. Missing requested coverage, including an empty snapshot,
+ * fails with FETCH_HEADER followed by RESET_STREAM
+ * (MOQ_STREAM_ERROR_UNKNOWN_OBJECT_STATUS), leaving the subscription untouched
+ * (section 3.4.1); a strict subset never finishes successfully. Unlike the
+ * explicit FETCH policy above, a fill need not request object 0. This does not
+ * change the service catalog's independent-base requirement. The stream count
+ * the facade reports when it completes a subscription or publication stays
+ * the count of streams the facade itself opened for the destination; the
+ * session adds the fill fetch streams it opened (section 9.9 counts them).
+ *
+ * Identity (group history, see the write contract below): an install
+ * assigns Objects 0..N Subgroup ID 0 of the group, and every FETCH or fill
+ * response carries the Subgroup ID each Object was assigned. It is allowed
+ * for a group with no history, and for a group whose only assignments are
+ * one subgroup (no datagram, no revisit) holding Objects 0..M without a gap:
+ * when N <= M it assigns nothing new and is allowed even after a FIN;
+ * Objects above M extend that subgroup only when none of them is assigned
+ * and none of its streams has ended with a FIN. Anything else -- a sealed
+ * group, a final Object below N, a datagram, a revisit, an assigned Object
+ * above M, or Objects above M after a FIN -- is MOQ_ERR_WRONG_STATE before
+ * any effect; an install needing a seventeenth range is MOQ_ERR_NOMEM.
+ * Clearing or replacing the retained group never removes identity.
+ *
+ * Draft-16 whole-group FETCH: a FETCH whose range requests the entire group
+ * (End Location Object 0, or an end group past it) makes the last Object it
+ * sends the group's final Object (draft-16 section 2.4.2). When the track
+ * assigned an Object above the retained ones, the request is refused with
+ * MOQ_REQUEST_ERROR_NOT_SUPPORTED (the session stays open). The response is
+ * committed only with its snapshot: once staged, an Object above the last
+ * retained one is refused MOQ_ERR_WRONG_STATE, while a staging that failed to
+ * allocate its snapshot fixes nothing.
  *
  * Returns MOQ_OK, MOQ_ERR_INVAL (NULL/foreign, bad struct_size, empty/oversize/
- * out-of-order objects, NULL payload), MOQ_ERR_WRONG_STATE (track ended), or
- * MOQ_ERR_NOMEM.
+ * out-of-order objects, NULL payload), MOQ_ERR_WRONG_STATE (track ended, or
+ * the group history refuses the install), or MOQ_ERR_NOMEM (allocation, or
+ * the group needs a record and none can be freed).
  */
 #define MOQ_PUB_RETAINED_MAX_OBJECTS 64u
 
@@ -513,7 +817,62 @@ MOQ_API void moq_pub_object_cfg_init_sized(moq_pub_object_cfg_t *cfg,
  * released exactly once -- on completion, moq_pub_reset_group (the abandon
  * path), moq_pub_remove_track, session close, or moq_pub_destroy -- so a
  * wrapped buffer's release callback may fire later than the caller's own
- * decref, within normal refcount semantics. */
+ * decref, within normal refcount semantics.
+ *
+ * Group history (every draft). Each Object the track admits -- a stream
+ * write or begin, a datagram, a status, or a retained install, with or
+ * without eligible destinations -- is assigned its (Group, Subgroup ID,
+ * delivery mode) at admission and keeps it for the track's life; a write
+ * that would change it is refused. Groups need not increase. The stream
+ * Objects the track writes while it stays in one group share one subgroup.
+ * When the track leaves the group (a stream write to another group, or
+ * moq_pub_end_group) or abandons it (moq_pub_reset_group), that subgroup
+ * ends; a later stream Object in the group is a revisit, which opens the
+ * next Subgroup ID (1, 2, ...) and must be larger than every Object already
+ * assigned in the group. Once one destination has ended the open subgroup
+ * with a FIN, its final Object is fixed for that receiver: replaying an
+ * Object already in it still continues it, but a new Object above every
+ * Object assigned in the group opens the next Subgroup ID instead (and one
+ * at or below that maximum is refused); the other destinations finish the
+ * old subgroup. FIRST_OBJECT (drafts 18 and 22, never draft 16) is
+ * set on a stream exactly when the stream's first Object is its subgroup's
+ * first Object. A destination's stream ends with a FIN only when it carried
+ * every Object of its subgroup except those below the destination's Start
+ * Location; otherwise it is RESET. An Object past the end of the
+ * destination's window is never sent to it, and a stream that ends without
+ * it ends with a RESET.
+ *
+ * Bounds (local policy, not wire limits): the track holds exact records for
+ * 16 groups. A revisited group keeps its record for the track's life, at
+ * most 15 groups may be revisited, and a group may be revisited at most 7
+ * times (Subgroup IDs 0..7). When a newer group needs a record, the least
+ * recently admitted group that was never revisited and is not the group
+ * being written is sealed; a datagram in a new group may seal the group
+ * being written when no other record can go (its destinations' streams still
+ * end correctly, and later Objects of it are refused). Each group record
+ * keeps its assigned Objects exactly, as at most 16 ranges of consecutive
+ * Objects of one subgroup or of the datagram mode; replaying an assigned
+ * Object, extending a range or joining two ranges always fits. Freeing
+ * streams never restores these budgets.
+ *
+ * Refusals, all before any effect (nothing sent, payload stays the caller's):
+ *   MOQ_ERR_WRONG_STATE  an Object in a sealed group (moq_pub_end_group, or
+ *                        displaced from the records); a revisit at or below
+ *                        the group's largest assigned Object, and any later
+ *                        Object of a revisit subgroup at or below the highest
+ *                        Object of the subgroup before it; an Object
+ *                        above the group's final Object (fixed by a FIN of a
+ *                        subgroup whose header carried END_OF_GROUP, or by a
+ *                        staged draft-16 whole-group FETCH), at or above an
+ *                        admitted END_OF_GROUP status, or at or beyond an
+ *                        admitted END_OF_TRACK status; an Object already
+ *                        assigned in the other delivery mode or to another
+ *                        subgroup; a new Object after a subgroup whose header
+ *                        carried END_OF_GROUP.
+ *   MOQ_ERR_NOMEM        an eighth revisit of a group, a revisit that would
+ *                        make a sixteenth revisited group, a displaced group
+ *                        the sealed record cannot hold, or an Object that
+ *                        would need a seventeenth range in its group. */
 MOQ_API moq_result_t moq_pub_write_object_ex(
     moq_publisher_t *pub,
     moq_pub_track_t *track,
@@ -548,8 +907,9 @@ MOQ_API moq_result_t moq_pub_write_object(
  * receive it either -- but BOTH still get the terminal control message the
  * drafts require regardless of Forward state: any open subgroup is closed
  * first (streams close before the done), then the subscription is ended
- * with SUBSCRIPTION_ENDED when its finite filter end was genuinely passed,
- * TRACK_ENDED otherwise, carrying the EXACT count of streams the facade
+ * with SUBSCRIPTION_ENDED when its finite filter end was genuinely passed
+ * on a draft that defines that status (16 and 18), TRACK_ENDED otherwise
+ * (always on draft-22), carrying the EXACT count of streams the facade
  * opened for it -- retryably and idempotently across WOULD_BLOCK.
  *
  * After end_track succeeds the track is terminal: moq_pub_write_object[_ex],
@@ -640,6 +1000,14 @@ MOQ_API moq_result_t moq_pub_end_object(
 
 /* -- Group end ---------------------------------------------------- */
 
+/* End the track's current group: every destination's open subgroup ends
+ * (FIN, or RESET for a destination that omitted an Object it owed -- any
+ * at or after its Start Location), and the group is sealed -- no further stream, datagram or
+ * retained Object is admitted in it (MOQ_ERR_WRONG_STATE). Sealing applies
+ * with no destinations too and repeats harmlessly. It is a local
+ * declaration: the wire carries an END_OF_GROUP only when the subgroup
+ * header carried it. MOQ_ERR_WRONG_STATE mid-object or while another
+ * operation is pending; MOQ_ERR_WOULD_BLOCK is retryable. */
 MOQ_API moq_result_t moq_pub_end_group(
     moq_publisher_t *pub,
     moq_pub_track_t *track,
@@ -658,10 +1026,14 @@ MOQ_API moq_result_t moq_pub_end_group(
  * datagram, status, or streaming begin) whose Group ID <= the declared
  * watermark is rejected with MOQ_ERR_WRONG_STATE before any state mutation.
  *
- * Completion: every destination whose subscription/publication filter has a
- * finite End Group <= the watermark terminates -- its open subgroup is
- * closed cleanly first, then the terminal done is sent with status
- * SUBSCRIPTION_ENDED (0x3) and the exact per-destination stream count.
+ * Completion (drafts 16 and 18): every destination whose
+ * subscription/publication filter has a finite End Group <= the watermark
+ * terminates -- its open subgroup is closed cleanly first, then the terminal
+ * done is sent with status SUBSCRIPTION_ENDED (0x3) and the exact
+ * per-destination stream count. Draft-22 has no SUBSCRIPTION_ENDED, and its
+ * publisher does not end a subscription because its filter end was passed
+ * (draft-22 §3.3.1): such a destination stays established, receives nothing
+ * outside its window, and ends with the track or with the subscriber.
  * This includes destinations still installed after moq_pub_end_track (the
  * terminal-status recipients keep their slots). moq_pub_end_track honors the
  * watermark: its terminal Location is chosen strictly above both the
@@ -697,8 +1069,12 @@ MOQ_API moq_result_t moq_pub_declare_groups_complete_through(
  * rather than closing it cleanly. Use this to drop a partially-sent group
  * under backpressure -- a clean close would imply a complete group, and
  * just discarding local state would leave the subscriber a truncated
- * subgroup it cannot decode. The next write to the track opens a fresh
- * subgroup. No-op (MOQ_OK) when no group is open. MOQ_ERR_WOULD_BLOCK if
+ * subgroup it cannot decode. The group's Objects keep their assignments
+ * and no final Object is fixed: the next stream Object in the same group
+ * opens a new subgroup and must be larger than every Object already
+ * assigned there (a revisit; see the write contract). Abandoning needs no
+ * capacity and never fails on the history bounds. No wire effect (MOQ_OK)
+ * when no subgroup is open. MOQ_ERR_WOULD_BLOCK if
  * the reset action cannot be queued yet (retryable; slots already reset
  * are not reset again). */
 MOQ_API moq_result_t moq_pub_reset_group(
@@ -718,9 +1094,18 @@ MOQ_API moq_result_t moq_pub_reset_group(
  *                           publisher's tracks/slots and was taken by this
  *                           publisher (subscribe request, subscribe/publish
  *                           update, publish ok/error/unsubscribed, unsubscribed,
- *                           namespace lifecycle for an advertised track). Fully
- *                           handled on a MOQ_OK return; with WOULD_BLOCK the
- *                           event's owned state is staged but not yet flushed.
+ *                           a fill request or fill terminal on a served
+ *                           subscription, namespace lifecycle for an
+ *                           advertised track, a TRACK_STATUS for one of its
+ *                           tracks, answered as a SUBSCRIBE would be: the
+ *                           Largest Object and Track Properties a SUBSCRIBE_OK
+ *                           would carry, or the refusal it would get; in a
+ *                           callback accept mode a track with no accepted
+ *                           subscription on this session is UNAUTHORIZED,
+ *                           as a standalone FETCH is, and the callback is not
+ *                           consulted). All required borrowed input has
+ *                           been consumed; this does NOT promise completed
+ *                           output. With WOULD_BLOCK, owned work remains staged.
  *   MOQ_PUB_EVENT_IGNORED   the event did not match this publisher (or is not
  *                           a publisher-facing event, e.g. PUBLISH_FINISHED,
  *                           which the session emits only to the subscriber
@@ -743,30 +1128,43 @@ typedef enum moq_pub_event_result {
  * moq_pub_tick, so a consumer that polls moq_session_poll_events itself and
  * forwards each event here gets behavior identical to the tick pump.
  *
- * SERIALIZED usage. Event namespace/name/token spans are borrowed and go
- * invalid at the next advancing session call (see moq/session.h). Therefore a
- * manual consumer MUST process one event to completion before polling the
- * next: on MOQ_ERR_WOULD_BLOCK, drain session actions and call moq_pub_flush
- * until it returns MOQ_OK, THEN poll/forward the next event. A polled event is
- * NEVER held across a flush, and is NEVER re-submitted (its borrowed spans
- * would be dead). For a correctly serialized event the single call fully
- * consumes its borrowed data (resolving the track, running the accept callback)
- * and stages only owned state, so flush completes from that owned state with no
- * event access.
+ * Event namespace/name/token/options spans are borrowed and go invalid at the
+ * next advancing session call (see moq/session.h). Dispatch while they are live,
+ * clean up each event exactly once, and NEVER retain/re-submit it across flush.
+ * CONSUMED means required state is owned, not that ACK/output has completed.
+ *
+ * D22: drain actions and call flush once per progress round, then continue
+ * ordinary FIFO polling/dispatch even after WOULD_BLOCK + CONSUMED. In
+ * particular, FILL_REQUEST and FILL_TERMINAL must reach this publisher: only
+ * terminal dispatch returns a bound job's credit. Flush never polls events.
+ * Retry flush after terminal dispatch; yield to the driver when no event,
+ * action or application progress exists (an intentionally deferred fill or
+ * authorizer may remain pending). Do not spin waiting for flush-to-OK.
+ * Retained FETCHes follow the same D22 polling rule: each has a fixed owner
+ * indexed by the session FETCH slot and distinguished by its full generation.
+ * CONSUMED owns the complete response snapshot even if output is blocked.
+ * Admissions use fixed per-parent scalar cells; the authorizer runs once and
+ * a reserved candidate remains immutable until its ACK commits. This relies
+ * on D22's one-unanswered-UPDATE-per-parent bound.
+ * If destination allocation fails after staging, NOMEM + CONSUMED leaves the
+ * decision owned for a later flush; no ACK or peer rejection has been sent.
+ *
+ * D16/18 retain the SERIALIZED rule: after WOULD_BLOCK, drain actions and flush
+ * until OK before polling the next event. On every profile, let other owners
+ * inspect IGNORED events before an advancing call invalidates borrowed spans.
  *
  * Returns MOQ_OK (see *result for CONSUMED/IGNORED), MOQ_ERR_INVAL on NULL
- * args, or MOQ_ERR_WOULD_BLOCK against a full action queue:
+ * args, or MOQ_ERR_WOULD_BLOCK for pending output/admission credit:
  *
  *   WOULD_BLOCK + result == CONSUMED: THIS event was taken and staged owned
  *     work (a Forward-0 subgroup retirement, or a blocked accept/reject).
- *     Drain actions + moq_pub_flush to completion; do NOT replay the event.
+ *     Drain actions + moq_pub_flush; use the profile-specific pump rule above.
+ *     Do NOT replay the event.
  *
- *   WOULD_BLOCK + result == IGNORED: the single pending slot is still occupied
- *     by earlier staged work, so this event was NOT taken. This only happens
- *     if the caller broke serialization (polled a new event before flushing
- *     the previous one to MOQ_OK). Recovery: flush to completion; the event's
- *     borrowed spans are now invalid, so it cannot be resubmitted -- structure
- *     the loop to flush before polling the next event and this never arises.
+ *   WOULD_BLOCK + result == IGNORED: this event was NOT taken. D16/18's single
+ *     pending admission and retained-FETCH response require serialization.
+ *     D22 SUBSCRIBE/UPDATE admissions and retained FETCHes never return this
+ *     combination merely because another owner is waiting for credit.
  */
 MOQ_API moq_result_t moq_pub_handle_event(
     moq_publisher_t *pub,
@@ -776,14 +1174,19 @@ MOQ_API moq_result_t moq_pub_handle_event(
 
 /*
  * Progress ALL staged manual-mode work after the caller drains session
- * actions: a pending subscribe accept/reject, a deferred retained FETCH,
+ * actions: pending subscribe accept/reject or UPDATE answers, retained FETCHes,
  * lazy subgroup retirements armed by a Forward-0 update, and finite-window
  * completion work unlocked by moq_pub_declare_groups_complete_through.
  * This is the required follow-up to a MOQ_ERR_WOULD_BLOCK from
  * moq_pub_handle_event (and the manual-mode drive for completion work
  * staged by a declaration that returned MOQ_ERR_WOULD_BLOCK).
  * Returns MOQ_OK when no staged work remains or it all completed.
- * Returns MOQ_ERR_WOULD_BLOCK if still blocked — drain actions and call again.
+ * Returns MOQ_ERR_WOULD_BLOCK if still blocked. D22 callers must keep routing
+ * FIFO events for admission/output-credit waits as described above, not require
+ * flush-to-OK before another poll. D16/18 retained-FETCH serving remains
+ * serialized. Each D22 admission or retained-FETCH pass visits its occupied
+ * owners once in arrival order, skipping blocked entries so independent work
+ * can progress. Flush never polls or takes the next request.
  * Idempotent under retry: callbacks and wire actions never double.
  * Caller must resolve pending work (flush until OK or error) before destroying
  * the publisher.
@@ -813,6 +1216,10 @@ MOQ_API moq_result_t moq_pub_resolve_deferred(
 
 /* -- Query -------------------------------------------------------- */
 
+/* The subscriptions the facade currently serves on `track`. Where the
+ * session allows several subscriptions to one track (draft-22), each
+ * accepted one counts and every write reaches each of them whose filter
+ * admits the object; on drafts 16 and 18 a second one is refused. */
 MOQ_API size_t moq_pub_active_subscriptions(
     const moq_publisher_t *pub,
     const moq_pub_track_t *track);

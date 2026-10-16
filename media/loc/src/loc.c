@@ -1,24 +1,38 @@
 #include <moq/loc.h>
 #include <moq/vi64.h>
 #include <moq/wire.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
 /*
- * LOC-02 uses the draft-18 property identifiers and would additionally
- * reassign Audio Level's ID to Timestamp; that profile is still reserved
- * here and parse/encode returns MOQ_ERR_INVAL for it. The KVP INTEGER
- * CODEC is a separate axis and is selected by transport_version below --
- * a draft-18 session carrying LOC-01 properties is a supported and
- * exercised combination, not a profile bump.
+ * Two LOC revisions are registered, each bound to the transport drafts
+ * that carry it (see loc_row_for): LOC-01 ids on drafts 16 and 18, LOC-04
+ * ids on draft 22. LOC-02 is reserved and selected by no row. The KVP
+ * INTEGER CODEC is the second axis of the same row, so a draft can never
+ * be half-applied: its ids and its integer encoding travel together.
  */
 
-/* -- Property IDs (LOC-01, draft-ietf-moq-loc-01) -------------------- */
+/* -- Property IDs, LOC-01 (draft-ietf-moq-loc-01) -------------------- */
 
 #define LOC01_CAPTURE_TIMESTAMP   0x02u
 #define LOC01_VIDEO_FRAME_MARKING 0x04u
 #define LOC01_AUDIO_LEVEL         0x06u
 #define LOC01_VIDEO_CONFIG        0x0du
+
+/* -- Property IDs, LOC-04 (draft-ietf-moq-loc-04 section 6.1) --------- */
+
+#define LOC04_TIMESCALE           0x08u   /* even: vi64 units per second */
+#define LOC04_VIDEO_FRAME_MARKING 0x09u   /* odd: 1..4 RFC 9626 bytes */
+#define LOC04_AUDIO_LEVEL         0x0cu   /* even: RFC 6464 byte, low 8 bits */
+#define LOC04_VIDEO_CONFIG        0x0du   /* odd: codec extradata */
+#define LOC04_AUDIO_CONFIG        0x0fu   /* odd: codec configuration */
+#define LOC04_TIMESTAMP           0x10u   /* even: vi64, timescale units */
+
+/* LOC04 preserves the complete declared payload, including opaque fourth-byte
+ * forms; this codec does not normalize or invent RFC fields. */
+#define LOC04_FRAME_MARKING_MIN_LEN 1u
+#define LOC04_FRAME_MARKING_MAX_LEN 4u
 
 /* An odd-type KVP value carries a Length; both drafts cap it at 2^16-1
  * (draft-16 section 1.4.2, draft-18 section 1.4.3). */
@@ -53,13 +67,48 @@ static const loc_int_codec_t k_codec_d18 = {
     UINT64_MAX,
 };
 
-static const loc_int_codec_t *loc_codec_for(moq_version_t v)
+/* One row per transport draft: the integer codec its KVPs use and the LOC
+ * revision whose property ids it carries. Lookup returns NULL for anything
+ * not registered, which is what makes an unknown or future version fail
+ * closed instead of silently borrowing a neighbour's encoding or ids. */
+typedef struct loc_row {
+    const loc_int_codec_t *codec;
+    moq_loc_profile_t      profile;
+} loc_row_t;
+
+static const loc_row_t k_row_d16 = { &k_codec_d16, MOQ_LOC_PROFILE_01 };
+static const loc_row_t k_row_d18 = { &k_codec_d18, MOQ_LOC_PROFILE_01 };
+static const loc_row_t k_row_d22 = { &k_codec_d18, MOQ_LOC_PROFILE_04 };
+
+static const loc_row_t *loc_row_for(moq_version_t v)
 {
     switch (v) {
-    case MOQ_VERSION_DRAFT_16: return &k_codec_d16;  /* section 1.4 (i)    */
-    case MOQ_VERSION_DRAFT_18: return &k_codec_d18;  /* section 1.4.1 vi64 */
+    case MOQ_VERSION_DRAFT_16: return &k_row_d16;  /* section 1.4 (i)    */
+    case MOQ_VERSION_DRAFT_18: return &k_row_d18;  /* section 1.4.1 vi64 */
+    case MOQ_VERSION_DRAFT_22: return &k_row_d22;  /* section 8.3 vi64   */
     default: return NULL;   /* unknown/unregistered: fail closed */
     }
+}
+
+moq_loc_profile_t moq_loc_profile_for_version(moq_version_t transport_version)
+{
+    const loc_row_t *row = loc_row_for(transport_version);
+    return row ? row->profile : (moq_loc_profile_t)0;
+}
+
+uint64_t moq_loc_value_max_for_version(moq_version_t transport_version)
+{
+    const loc_row_t *row = loc_row_for(transport_version);
+    return row ? row->codec->max_value : 0;
+}
+
+/* The row for a (version, profile) pair, or NULL when the version is not
+ * registered or the profile is not the revision registered for it. */
+static const loc_row_t *loc_row_select(moq_version_t v, moq_loc_profile_t p)
+{
+    const loc_row_t *row = loc_row_for(v);
+    if (!row || row->profile != p) return NULL;
+    return row;
 }
 
 /* -- The bounded KVP walker ------------------------------------------
@@ -213,11 +262,25 @@ static size_t loc_kvp_item_encode(const loc_int_codec_t *codec,
     return pos;
 }
 
+
+_Static_assert(sizeof(moq_loc_headers_t) == MOQ_LOC_HEADERS_V0_SIZE,
+               "legacy LOC complete layout is frozen");
+_Static_assert(sizeof(moq_loc_metadata_t) == MOQ_LOC_METADATA_V0_SIZE,
+               "metadata v0 includes its complete current layout");
+
 void moq_loc_headers_init(moq_loc_headers_t *h)
 {
     if (!h) return;
     memset(h, 0, sizeof(*h));
-    h->struct_size = sizeof(*h);
+    h->struct_size = (uint32_t)sizeof(*h);
+}
+
+void moq_loc_metadata_init_sized(moq_loc_metadata_t *out, size_t size)
+{
+    if (!out || size < sizeof(uint32_t)) return;
+    size_t n = size < sizeof(*out) ? size : sizeof(*out);
+    memset(out, 0, n);
+    out->struct_size = (uint32_t)n;
 }
 
 /* -- Video frame marking decode/encode ------------------------------- */
@@ -257,6 +320,8 @@ static uint64_t encode_video_frame_marking(
     return first;
 }
 
+
+
 /* -- Audio level decode/encode --------------------------------------- */
 
 static moq_result_t decode_audio_level(uint64_t val,
@@ -279,6 +344,43 @@ static uint64_t encode_audio_level(const moq_loc_audio_level_t *al)
 
 /* -- Parse ----------------------------------------------------------- */
 
+static moq_result_t parse_loc01_item(const loc_kvp_item_t *item,
+                                     moq_loc_headers_t *out)
+{
+    if (item->is_varint) {
+        /* Duplicate known properties: the last value wins. */
+        switch (item->type) {
+        case LOC01_CAPTURE_TIMESTAMP:
+            out->has_timestamp = true;
+            out->timestamp = item->value;
+            break;
+        case LOC01_VIDEO_FRAME_MARKING: {
+            moq_result_t drc = decode_video_frame_marking(
+                item->value, &out->video_frame_marking);
+            if (drc < 0) return drc;
+            out->has_video_frame_marking = true;
+            break;
+        }
+        case LOC01_AUDIO_LEVEL: {
+            moq_result_t drc = decode_audio_level(
+                item->value, &out->audio_level);
+            if (drc < 0) return drc;
+            out->has_audio_level = true;
+            break;
+        }
+        default:
+            /* A well-formed unknown property is skipped, not an error. */
+            break;
+        }
+    } else if (item->type == LOC01_VIDEO_CONFIG) {
+        out->has_video_config = true;
+        out->video_config.data = item->bytes;
+        out->video_config.len = item->bytes_len;
+    }
+    return MOQ_OK;
+}
+
+
 moq_result_t moq_loc_parse(moq_version_t transport_version,
                             moq_loc_profile_t profile,
                             moq_bytes_t properties,
@@ -286,179 +388,260 @@ moq_result_t moq_loc_parse(moq_version_t transport_version,
 {
     if (!out) return MOQ_ERR_INVAL;
     moq_loc_headers_init(out);
-
-    /* Both selectors are checked before the empty-block shortcut: an
-     * unnamed codec is refused whether or not there are bytes to read. */
-    const loc_int_codec_t *codec = loc_codec_for(transport_version);
-    if (!codec) return MOQ_ERR_INVAL;
-
-    if (profile != MOQ_LOC_PROFILE_01)
+    if (profile != MOQ_LOC_PROFILE_01 ||
+        (transport_version != MOQ_VERSION_DRAFT_16 &&
+         transport_version != MOQ_VERSION_DRAFT_18))
         return MOQ_ERR_INVAL;
-
-    if (properties.len == 0)
-        return MOQ_OK;
-    if (!properties.data)
-        return MOQ_ERR_INVAL;
-
+    const loc_row_t *row = loc_row_select(transport_version, profile);
+    if (properties.len > 0 && !properties.data) return MOQ_ERR_INVAL;
     loc_kvp_walker_t w;
-    loc_kvp_walker_init(&w, codec, properties.data, properties.len);
-
+    loc_kvp_walker_init(&w, row->codec, properties.data, properties.len);
     loc_kvp_item_t item;
     moq_result_t rc;
     while ((rc = loc_kvp_next(&w, &item)) == MOQ_OK) {
-        if (item.is_varint) {
-            /* Duplicate known properties: the last value wins. */
-            switch (item.type) {
-            case LOC01_CAPTURE_TIMESTAMP:
-                out->has_timestamp = true;
-                out->timestamp = item.value;
-                break;
-            case LOC01_VIDEO_FRAME_MARKING: {
-                moq_result_t drc = decode_video_frame_marking(
-                    item.value, &out->video_frame_marking);
-                if (drc < 0) return drc;
-                out->has_video_frame_marking = true;
-                break;
-            }
-            case LOC01_AUDIO_LEVEL: {
-                moq_result_t drc = decode_audio_level(
-                    item.value, &out->audio_level);
-                if (drc < 0) return drc;
-                out->has_audio_level = true;
-                break;
-            }
-            default:
-                /* A well-formed unknown property is skipped, not an error. */
-                break;
-            }
-        } else {
-            if (item.type == LOC01_VIDEO_CONFIG) {
-                out->has_video_config = true;
-                out->video_config.data = item.bytes;
-                out->video_config.len = item.bytes_len;
-            }
-        }
+        rc = parse_loc01_item(&item, out);
+        if (rc < 0) return rc;
     }
+    return rc == MOQ_DONE ? MOQ_OK : rc;
+}
 
-    if (rc != MOQ_DONE)
-        return rc;
+/* -- Lossless parse -------------------------------------------------- */
+
+static moq_result_t loc_metadata_item(moq_loc_profile_t profile,
+    const loc_kvp_item_t *item, moq_loc_metadata_t *out)
+{
+    bool loc04 = profile == MOQ_LOC_PROFILE_04;
+    uint32_t flag = 0;
+    if (item->type == (loc04 ? LOC04_TIMESTAMP : LOC01_CAPTURE_TIMESTAMP))
+        flag = MOQ_LOC_METADATA_HAS_TIMESTAMP;
+    else if (loc04 && item->type == LOC04_TIMESCALE)
+        flag = MOQ_LOC_METADATA_HAS_TIMESCALE;
+    else if (item->type == (loc04 ? LOC04_VIDEO_FRAME_MARKING : LOC01_VIDEO_FRAME_MARKING))
+        flag = MOQ_LOC_METADATA_HAS_MARKING;
+    else if (item->type == (loc04 ? LOC04_AUDIO_LEVEL : LOC01_AUDIO_LEVEL))
+        flag = MOQ_LOC_METADATA_HAS_AUDIO_LEVEL;
+    else if (item->type == LOC01_VIDEO_CONFIG)
+        flag = MOQ_LOC_METADATA_HAS_VIDEO_CONFIG;
+    else if (loc04 && item->type == LOC04_AUDIO_CONFIG)
+        flag = MOQ_LOC_METADATA_HAS_AUDIO_CONFIG;
+    if (flag == 0) return MOQ_OK;
+    if (out->present & flag) return MOQ_ERR_UNSUPPORTED;
+
+    switch (flag) {
+    case MOQ_LOC_METADATA_HAS_TIMESTAMP:
+        out->timestamp = item->value;
+        break;
+    case MOQ_LOC_METADATA_HAS_TIMESCALE:
+        out->timescale = item->value;
+        break;
+    case MOQ_LOC_METADATA_HAS_MARKING:
+        if (loc04) {
+            if (item->bytes_len < LOC04_FRAME_MARKING_MIN_LEN ||
+                item->bytes_len > LOC04_FRAME_MARKING_MAX_LEN)
+                return MOQ_ERR_PROTO;
+            out->marking_len = (uint8_t)item->bytes_len;
+            memcpy(out->marking, item->bytes, item->bytes_len);
+        } else {
+            if (item->value > UINT32_MAX) return MOQ_ERR_PROTO;
+            size_t n = 1;
+            while (n < 4 && (item->value >> (n * 8)) != 0) ++n;
+            out->marking_len = (uint8_t)n;
+            for (size_t i = 0; i < n; ++i)
+                out->marking[i] = (uint8_t)(item->value >> ((n - i - 1) * 8));
+        }
+        break;
+    case MOQ_LOC_METADATA_HAS_AUDIO_LEVEL:
+        if (item->value > UINT8_MAX) return MOQ_ERR_PROTO;
+        out->audio_level = (uint8_t)item->value;
+        break;
+    case MOQ_LOC_METADATA_HAS_VIDEO_CONFIG:
+        out->video_config = (moq_bytes_t){item->bytes, item->bytes_len};
+        break;
+    case MOQ_LOC_METADATA_HAS_AUDIO_CONFIG:
+        out->audio_config = (moq_bytes_t){item->bytes, item->bytes_len};
+        break;
+    default:
+        return MOQ_ERR_INVAL;
+    }
+    out->present |= flag;
     return MOQ_OK;
 }
 
-/* -- Encode ---------------------------------------------------------- */
-
-moq_result_t moq_loc_encode(const moq_alloc_t *alloc,
-                             moq_version_t transport_version,
-                             moq_loc_profile_t profile,
-                             const moq_loc_headers_t *headers,
-                             moq_rcbuf_t **out_properties)
+moq_result_t moq_loc_parse_metadata(moq_version_t transport_version,
+    moq_loc_profile_t profile, moq_bytes_t properties,
+    moq_loc_metadata_t *out, size_t out_size)
 {
-    if (!alloc || !headers || !out_properties) return MOQ_ERR_INVAL;
-    *out_properties = NULL;
-
-    const loc_int_codec_t *codec = loc_codec_for(transport_version);
-    if (!codec) return MOQ_ERR_INVAL;
-
-    if (profile != MOQ_LOC_PROFILE_01)
+    const loc_row_t *row = loc_row_select(transport_version, profile);
+    if (!row || !out || out_size < MOQ_LOC_METADATA_V0_SIZE ||
+        (properties.len > 0 && !properties.data))
         return MOQ_ERR_INVAL;
-
-    if (headers->has_audio_level && headers->audio_level.level > 127)
-        return MOQ_ERR_INVAL;
-    if (headers->has_video_frame_marking &&
-        headers->video_frame_marking.temporal_id > 7)
-        return MOQ_ERR_INVAL;
-    if (headers->has_timescale)
-        return MOQ_ERR_INVAL;
-    /* A timestamp the SELECTED codec cannot represent is refused here
-     * rather than truncated. Under draft-16 that is anything above
-     * MOQ_QUIC_VARINT_MAX; under draft-18 the whole uint64 range fits. */
-    if (headers->has_timestamp && headers->timestamp > codec->max_value)
-        return MOQ_ERR_INVAL;
-
-    /* Plan every present field in ascending LOC-01 property-ID order:
-     * 0x02 timestamp, 0x04 frame marking, 0x06 audio level,
-     * 0x0d video config. */
-    loc_kvp_item_t props[4];
-    size_t prop_count = 0;
-    memset(props, 0, sizeof(props));
-
-    if (headers->has_timestamp) {
-        props[prop_count].type = LOC01_CAPTURE_TIMESTAMP;
-        props[prop_count].is_varint = true;
-        props[prop_count].value = headers->timestamp;
-        prop_count++;
+    moq_loc_metadata_t tmp = {0};
+    loc_kvp_walker_t outer;
+    loc_kvp_walker_init(&outer, row->codec, properties.data, properties.len);
+    loc_kvp_item_t item;
+    moq_result_t rc;
+    while ((rc = loc_kvp_next(&outer, &item)) == MOQ_OK) {
+        if (item.type == 0x0b) {
+            /* Exactly one inner list; borrow its original offsets and reset its
+             * delta accumulator. No flattening, allocation, or recursive walk. */
+            loc_kvp_walker_t inner;
+            loc_kvp_walker_init(&inner, row->codec, item.bytes, item.bytes_len);
+            while ((rc = loc_kvp_next(&inner, &item)) == MOQ_OK) {
+                if (item.type == 0x0b) return MOQ_ERR_PROTO;
+                rc = loc_metadata_item(profile, &item, &tmp);
+                if (rc < 0) return rc;
+            }
+            if (rc != MOQ_DONE) return rc;
+        } else {
+            rc = loc_metadata_item(profile, &item, &tmp);
+            if (rc < 0) return rc;
+        }
     }
+    if (rc != MOQ_DONE) return rc;
+    size_t n = out_size < sizeof(tmp) ? out_size : sizeof(tmp);
+    tmp.struct_size = (uint32_t)n;
+    memcpy(out, &tmp, n);
+    return MOQ_OK;
+}
 
-    if (headers->has_video_frame_marking) {
-        props[prop_count].type = LOC01_VIDEO_FRAME_MARKING;
-        props[prop_count].is_varint = true;
-        props[prop_count].value = encode_video_frame_marking(
-            &headers->video_frame_marking);
-        prop_count++;
-    }
+/* -- Shared sorted-property emission -------------------------------- */
 
-    if (headers->has_audio_level) {
-        props[prop_count].type = LOC01_AUDIO_LEVEL;
-        props[prop_count].is_varint = true;
-        props[prop_count].value = encode_audio_level(&headers->audio_level);
-        prop_count++;
-    }
-
-    if (headers->has_video_config) {
-        props[prop_count].type = LOC01_VIDEO_CONFIG;
-        props[prop_count].is_varint = false;
-        props[prop_count].bytes = headers->video_config.data;
-        props[prop_count].bytes_len = headers->video_config.len;
-        prop_count++;
-    }
-
-    /* No fields present means no properties: the caller gets MOQ_OK with a
-     * NULL rcbuf. Every path below therefore encodes at least one entry,
-     * so the selected buffer is always written before it is copied. */
-    if (prop_count == 0) return MOQ_OK;
-
-    /* Compute total encoded size under the selected codec. */
+static moq_result_t loc_encode_items(const moq_alloc_t *alloc,
+    const loc_int_codec_t *codec, const loc_kvp_item_t *props,
+    size_t prop_count, moq_rcbuf_t **out_properties)
+{
     size_t total = 0;
     uint64_t prev = 0;
-    for (size_t i = 0; i < prop_count; i++) {
+    for (size_t i = 0; i < prop_count; ++i) {
         size_t n = loc_kvp_item_len(codec, prev, &props[i]);
-        if (n == 0) return MOQ_ERR_INVAL;
-        if (n > SIZE_MAX - total) return MOQ_ERR_INVAL;
+        if (n == 0 || n > SIZE_MAX - total) return MOQ_ERR_INVAL;
         total += n;
         prev = props[i].type;
     }
-
-    /* Encode into a stack buffer, then copy into an rcbuf. */
+    if (total == 0) {
+        *out_properties = NULL;
+        return MOQ_OK;
+    }
     uint8_t scratch[256];
     uint8_t *buf = scratch;
-    bool heap = false;
     if (total > sizeof(scratch)) {
         buf = (uint8_t *)alloc->alloc(total, alloc->ctx);
         if (!buf) return MOQ_ERR_NOMEM;
-        heap = true;
     }
-
     size_t pos = 0;
     prev = 0;
-    for (size_t i = 0; i < prop_count; i++) {
-        size_t n = loc_kvp_item_encode(codec, prev, &props[i],
-                                       buf + pos, total - pos);
+    for (size_t i = 0; i < prop_count; ++i) {
+        size_t n = loc_kvp_item_encode(codec, prev, &props[i], buf + pos, total - pos);
         if (n == 0) {
-            if (heap) alloc->free(buf, total, alloc->ctx);
+            if (buf != scratch) alloc->free(buf, total, alloc->ctx);
             return MOQ_ERR_INVAL;
         }
         pos += n;
         prev = props[i].type;
     }
-
-    /* The bytes handed to the rcbuf are exactly the bytes the plan
-     * measured; a short write would copy unwritten buffer tail. */
     if (pos != total) {
-        if (heap) alloc->free(buf, total, alloc->ctx);
+        if (buf != scratch) alloc->free(buf, total, alloc->ctx);
         return MOQ_ERR_INVAL;
     }
-
-    moq_result_t rc = moq_rcbuf_create(alloc, buf, pos, out_properties);
-    if (heap) alloc->free(buf, total, alloc->ctx);
+    moq_rcbuf_t *encoded = NULL;
+    moq_result_t rc = moq_rcbuf_create(alloc, buf, pos, &encoded);
+    if (buf != scratch) alloc->free(buf, total, alloc->ctx);
+    if (rc == MOQ_OK) *out_properties = encoded;
     return rc;
+}
+
+/* -- Legacy encode --------------------------------------------------- */
+
+moq_result_t moq_loc_encode(const moq_alloc_t *alloc,
+    moq_version_t transport_version, moq_loc_profile_t profile,
+    const moq_loc_headers_t *headers, moq_rcbuf_t **out_properties)
+{
+    if (!alloc || !headers || !out_properties) return MOQ_ERR_INVAL;
+    *out_properties = NULL;
+    if (profile != MOQ_LOC_PROFILE_01 ||
+        (transport_version != MOQ_VERSION_DRAFT_16 &&
+         transport_version != MOQ_VERSION_DRAFT_18))
+        return MOQ_ERR_INVAL;
+    const loc_int_codec_t *codec = loc_row_select(transport_version, profile)->codec;
+    if ((headers->has_audio_level && headers->audio_level.level > 127) ||
+        (headers->has_video_frame_marking && headers->video_frame_marking.temporal_id > 7) ||
+        headers->has_timescale ||
+        (headers->has_timestamp && headers->timestamp > codec->max_value))
+        return MOQ_ERR_INVAL;
+    loc_kvp_item_t props[4];
+    size_t count = 0;
+    if (headers->has_timestamp)
+        props[count++] = (loc_kvp_item_t){.type = LOC01_CAPTURE_TIMESTAMP,
+            .is_varint = true, .value = headers->timestamp};
+    if (headers->has_video_frame_marking)
+        props[count++] = (loc_kvp_item_t){.type = LOC01_VIDEO_FRAME_MARKING,
+            .is_varint = true, .value = encode_video_frame_marking(&headers->video_frame_marking)};
+    if (headers->has_audio_level)
+        props[count++] = (loc_kvp_item_t){.type = LOC01_AUDIO_LEVEL,
+            .is_varint = true, .value = encode_audio_level(&headers->audio_level)};
+    if (headers->has_video_config)
+        props[count++] = (loc_kvp_item_t){.type = LOC01_VIDEO_CONFIG,
+            .bytes = headers->video_config.data, .bytes_len = headers->video_config.len};
+    return loc_encode_items(alloc, codec, props, count, out_properties);
+}
+
+/* -- Lossless encode ------------------------------------------------- */
+
+moq_result_t moq_loc_encode_metadata(const moq_alloc_t *alloc,
+    moq_version_t transport_version, moq_loc_profile_t profile,
+    const moq_loc_metadata_t *in, moq_rcbuf_t **out_properties)
+{
+    const loc_row_t *row = loc_row_select(transport_version, profile);
+    if (!row || !alloc || !alloc->alloc || !alloc->free || !in || !out_properties ||
+        in->struct_size < MOQ_LOC_METADATA_V0_SIZE)
+        return MOQ_ERR_INVAL;
+    if ((in->present & ~MOQ_LOC_METADATA_PRESENT_MASK) ||
+        in->reserved[0] || in->reserved[1])
+        return MOQ_ERR_INVAL;
+    bool loc04 = profile == MOQ_LOC_PROFILE_04;
+    if (!loc04 && (in->present & (MOQ_LOC_METADATA_HAS_TIMESCALE | MOQ_LOC_METADATA_HAS_AUDIO_CONFIG)))
+        return MOQ_ERR_UNSUPPORTED;
+    if (((in->present & MOQ_LOC_METADATA_HAS_TIMESTAMP) && in->timestamp > row->codec->max_value) ||
+        ((in->present & MOQ_LOC_METADATA_HAS_TIMESCALE) && in->timescale > row->codec->max_value))
+        return MOQ_ERR_INVAL;
+    if ((in->present & MOQ_LOC_METADATA_HAS_MARKING) &&
+        (in->marking_len < 1 || in->marking_len > 4))
+        return MOQ_ERR_INVAL;
+    if (!loc04 && (in->present & MOQ_LOC_METADATA_HAS_MARKING) &&
+        in->marking_len > 1 && in->marking[0] == 0)
+        return MOQ_ERR_UNSUPPORTED;
+
+    loc_kvp_item_t props[6];
+    size_t count = 0;
+    if (!loc04 && (in->present & MOQ_LOC_METADATA_HAS_TIMESTAMP))
+        props[count++] = (loc_kvp_item_t){.type = LOC01_CAPTURE_TIMESTAMP,
+            .is_varint = true, .value = in->timestamp};
+    if (in->present & MOQ_LOC_METADATA_HAS_TIMESCALE)
+        props[count++] = (loc_kvp_item_t){.type = LOC04_TIMESCALE,
+            .is_varint = true, .value = in->timescale};
+    if (in->present & MOQ_LOC_METADATA_HAS_MARKING) {
+        if (loc04) {
+            props[count++] = (loc_kvp_item_t){.type = LOC04_VIDEO_FRAME_MARKING,
+                .bytes = in->marking, .bytes_len = in->marking_len};
+        } else {
+            uint64_t value = 0;
+            for (size_t i = 0; i < in->marking_len; ++i)
+                value = (value << 8) | in->marking[i];
+            props[count++] = (loc_kvp_item_t){.type = LOC01_VIDEO_FRAME_MARKING,
+                .is_varint = true, .value = value};
+        }
+    }
+    if (in->present & MOQ_LOC_METADATA_HAS_AUDIO_LEVEL)
+        props[count++] = (loc_kvp_item_t){.type = loc04 ? LOC04_AUDIO_LEVEL : LOC01_AUDIO_LEVEL,
+            .is_varint = true, .value = in->audio_level};
+    if (in->present & MOQ_LOC_METADATA_HAS_VIDEO_CONFIG)
+        props[count++] = (loc_kvp_item_t){.type = LOC01_VIDEO_CONFIG,
+            .bytes = in->video_config.data, .bytes_len = in->video_config.len};
+    if (in->present & MOQ_LOC_METADATA_HAS_AUDIO_CONFIG)
+        props[count++] = (loc_kvp_item_t){.type = LOC04_AUDIO_CONFIG,
+            .bytes = in->audio_config.data, .bytes_len = in->audio_config.len};
+    if (loc04 && (in->present & MOQ_LOC_METADATA_HAS_TIMESTAMP))
+        props[count++] = (loc_kvp_item_t){.type = LOC04_TIMESTAMP,
+            .is_varint = true, .value = in->timestamp};
+    return loc_encode_items(alloc, row->codec, props, count, out_properties);
 }

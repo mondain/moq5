@@ -1,8 +1,13 @@
 #include "session_internal.h"
 #include "../internal/validate.h"
+#include "request_stream_internal.h"
 
 static moq_result_t handle_subscriber_response(moq_session_t *s,
                                                 int32_t slot);
+struct moq_decoded_ns_sub_response;
+static moq_result_t ns_sub_on_update_response(moq_session_t *s, int32_t slot,
+    const struct moq_decoded_ns_sub_response *resp);
+static moq_result_t ns_sub_flush_terminal(moq_session_t *s, size_t slot);
 
 /* Accumulate a tail byte length with overflow detection: *acc += add, returning
  * false if the sum would wrap. A wrapped tail total would look falsely small to
@@ -446,13 +451,23 @@ void moq_prefix_free(moq_session_t *s, uint8_t **buf, size_t *buf_len,
     }
 }
 
+/* PREFIX_OVERLAP compares the namespace subscriptions one subscriber holds at
+ * one publisher (§4.2: "if a publisher receives a SUBSCRIBE_NAMESPACE with a
+ * Track Namespace Prefix that shares a common prefix with an established
+ * SUBSCRIBE_NAMESPACE"). `local_subscriber` selects the direction: true scans
+ * the requests this side made, false the requests the peer made of this side.
+ * A request in the other direction has the other subscriber and never
+ * overlaps. */
 static bool ns_sub_prefix_conflicts(moq_session_t *s,
                                      const moq_bytes_t *parts, size_t count,
-                                     int exclude_slot)
+                                     bool local_subscriber, int exclude_slot)
 {
     for (size_t i = 0; i < s->ns_sub_cap; i++) {
-        if (s->ns_subs[i].state == MOQ_NS_SUB_FREE) continue;
+        /* A retained transport owner is no longer an active subscription. */
+        if (s->ns_subs[i].state == MOQ_NS_SUB_FREE ||
+            s->ns_subs[i].state == MOQ_NS_SUB_DRAINING) continue;
         if ((int)i == exclude_slot) continue;
+        if (s->ns_subs[i].local_subscriber != local_subscriber) continue;
         /* Skip entries whose prefix has not been parsed/stored yet (e.g. an
          * inbound stream still in RECVING_PUBLISHER after only a partial
          * fragment). Their prefix_count==0 is not a real empty "match-all"
@@ -460,6 +475,17 @@ static bool ns_sub_prefix_conflicts(moq_session_t *s,
         if (!s->ns_subs[i].prefix_valid) continue;
         if (moq_prefix_overlaps(s->ns_subs[i].prefix_parts,
                 s->ns_subs[i].prefix_count, parts, count))
+            return true;
+        /* A prefix an owed or outstanding update would install is claimed
+         * until that update concludes (§9.5.2). */
+        const moq_ns_update_t *u = &s->ns_subs[i].update;
+        if (u->owed && (u->owed_flags & MOQ_NAMESPACE_UPDATE_PREFIX) &&
+            moq_prefix_overlaps(u->owed_prefix_parts, u->owed_prefix_count,
+                                parts, count))
+            return true;
+        if (u->outstanding && (u->out_flags & MOQ_NAMESPACE_UPDATE_PREFIX) &&
+            moq_prefix_overlaps(u->out_prefix_parts, u->out_prefix_count,
+                                parts, count))
             return true;
     }
     return false;
@@ -493,6 +519,7 @@ static void ns_sub_free_prefix(moq_session_t *s, moq_ns_sub_entry_t *e)
  * an internal retry. */
 static moq_result_t ns_sub_send_request_error(moq_session_t *s,
                                                 size_t ns_slot,
+                                                const moq_request_endpoint_t *endpoint,
                                                 uint64_t error_code,
                                                 bool peer_fin_observed)
 {
@@ -516,7 +543,7 @@ static moq_result_t ns_sub_send_request_error(moq_session_t *s,
     moq_buf_writer_t ew;
     moq_buf_writer_init(&ew, ebuf, sizeof(ebuf));
     moq_request_error_encode_args_t err_args = {
-        .request_id = e->request_id,
+        .request_id = endpoint->request_id,
         .error_code = error_code,
     };
     moq_result_t rc = s->profile->encode_request_error(s, &ew, &err_args);
@@ -527,7 +554,7 @@ static moq_result_t ns_sub_send_request_error(moq_session_t *s,
     rc = queue_send_bidi(s, e->stream_ref, ebuf, moq_buf_writer_offset(&ew), true);
     if (rc < 0) return rc;
 
-    s->profile->commit_inbound_request(s, &e->request_ep);
+    s->profile->commit_inbound_request(s, endpoint);
     process_auth_tokens_commit_txn(s, &e->auth_txn);
     e->auth_committed = true;
     process_auth_tokens_free_staging(s, e->resolved_tokens,
@@ -567,7 +594,8 @@ static int ns_sub_resolve_handle(moq_session_t *s, moq_ns_sub_handle_t h)
     if (tag != s->session_tag) return -1;
     if (slot >= s->ns_sub_cap) return -1;
     if (s->ns_subs[slot].generation != gen) return -1;
-    if (s->ns_subs[slot].state == MOQ_NS_SUB_FREE) return -1;
+    if (s->ns_subs[slot].state == MOQ_NS_SUB_FREE ||
+        s->ns_subs[slot].state == MOQ_NS_SUB_DRAINING) return -1;
     return (int)slot;
 }
 
@@ -607,6 +635,10 @@ void ns_sub_free_entry(moq_session_t *s, size_t slot)
     e->local_teardown_pending = false;   /* selective free: a completed or
                                           * reused slot must not carry a stale
                                           * teardown obligation */
+    memset(&e->terminal, 0, sizeof(e->terminal));
+    memset(&e->cancel_lifetime, 0, sizeof(e->cancel_lifetime));
+    ns_update_release(s, &e->update);
+    e->terminal_notified = false;
     e->state = MOQ_NS_SUB_FREE;
     e->stream_kind = MOQ_STREAM_KIND_UNKNOWN;
     memset(&e->request_ep, 0, sizeof(e->request_ep));
@@ -615,6 +647,7 @@ void ns_sub_free_entry(moq_session_t *s, size_t slot)
     e->got_response = false;
     e->pending_fin = false;
     e->closing_remote_error = false;
+    e->retained_output = MOQ_RETAINED_OUTPUT_NONE;
     e->forward = false;
     e->auth_processed = false;
     e->auth_committed = false;
@@ -627,6 +660,7 @@ void ns_sub_destroy_all(moq_session_t *s)
 {
     for (size_t i = 0; i < s->ns_sub_cap; i++) {
         moq_ns_sub_entry_t *e = &s->ns_subs[i];
+        ns_update_release(s, &e->update);
         process_auth_tokens_free_staging(s, e->resolved_tokens,
             e->token_staged, e->token_count);
         if (!e->auth_committed)
@@ -689,7 +723,8 @@ moq_result_t moq_session_subscribe_namespace(
         auth_tokens = cfg->auth_tokens;
         auth_token_count = cfg->auth_token_count;
     }
-    if (moq_validate_auth_tokens(auth_tokens, auth_token_count) < 0)
+    if (moq_validate_auth_tokens(auth_tokens, auth_token_count,
+                                 s->profile->auth_token_type_max) < 0)
         return MOQ_ERR_INVAL;
 #undef NS_CFG_HAS
 #undef NS_CFG_MIN
@@ -713,7 +748,7 @@ moq_result_t moq_session_subscribe_namespace(
         }
     }
     if (ns_sub_prefix_conflicts(s, cfg->track_namespace_prefix.parts,
-            cfg->track_namespace_prefix.count, -1))
+            cfg->track_namespace_prefix.count, true, -1))
         return MOQ_ERR_INVAL;
 
     /* Check request ID credit via profile. */
@@ -780,6 +815,8 @@ moq_result_t moq_session_subscribe_namespace(
 
     e->generation |= 1;
     e->state = MOQ_NS_SUB_PENDING_SUBSCRIBER;
+    e->local_subscriber = true;
+    e->terminal_notified = false;
     e->stream_kind = MOQ_STREAM_KIND_NAMESPACE_SUB;
     e->request_id = req_ep.request_id;
     e->stream_ref = ref;
@@ -845,6 +882,83 @@ static moq_result_t ns_sub_local_teardown(moq_session_t *s, size_t slot,
     return MOQ_OK;
 }
 
+static moq_result_t ns_sub_answer_update(moq_session_t *s, size_t slot,
+    const moq_request_envelope_t *env, size_t consumed);
+
+/* An unsupported update still owes a response and consumes its request ID.
+ * Decode only complete buffered messages; output pressure retains the bytes
+ * but commits neither identity nor token-cache changes. With namespace
+ * updates enabled (moq_session_set_defer_namespace_updates) the update is
+ * answered instead (ns_sub_answer_update). */
+static moq_result_t ns_sub_reject_update(moq_session_t *s, size_t slot)
+{
+    moq_ns_sub_entry_t *e = &s->ns_subs[slot];
+    const moq_request_codec_t *codec = s->profile->request_codec;
+    moq_request_envelope_t env;
+    size_t consumed = 0;
+    moq_result_t rc = codec->decode_envelope(e->recv_buf, e->recv_len,
+                                             &env, &consumed);
+    if (rc == MOQ_ERR_BUFFER) {
+        if (ns_sub_fin_observed(e, false))
+            return close_with_error(s, 0x3, "truncated namespace UPDATE at FIN");
+        return MOQ_OK;
+    }
+    if (rc < 0)
+        return close_with_error(s, 0x3, "malformed namespace request envelope");
+    if (env.msg_type == codec->type.goaway) {
+        size_t taken = 0;
+        return moq_request_stream_process_goaway(s, e->stream_ref,
+            MOQ_REQUEST_FAMILY_NS_SUB, (int)slot, &env, e->recv_buf, consumed,
+            e->recv_len, ns_sub_fin_observed(e, false), &taken);
+    }
+    if (env.msg_type != codec->type.request_update)
+        return close_with_error(s, 0x3, "unexpected message on namespace request");
+    if (s->defer_namespace_updates) {
+        /* The initial response must precede this update's response. */
+        if (e->state == MOQ_NS_SUB_PENDING_PUBLISHER) return MOQ_ERR_WOULD_BLOCK;
+        return ns_sub_answer_update(s, slot, &env, consumed);
+    }
+    moq_decoded_namespace_update_t decoded;
+    moq_request_tokens_t tokens;
+    rc = codec->decode_namespace_update(env.payload, env.payload_len,
+                                         MOQ_REQUEST_FAMILY_NS_SUB, &decoded,
+                                         &tokens);
+    if (rc < 0 && rc != MOQ_REQUEST_DECODE_INVALID_FILTER)
+        return close_with_error(s, rc == MOQ_REQUEST_DECODE_BAD_PARAMS ? 0x6 : 0x3,
+                                 "malformed namespace UPDATE");
+    uint64_t request_id = decoded.request_id;
+    /* The initial response must precede this update's response. A bridge
+     * retry uses an empty feed after the application answers the request. */
+    if (e->state == MOQ_NS_SUB_PENDING_PUBLISHER) return MOQ_ERR_WOULD_BLOCK;
+    moq_request_endpoint_t endpoint;
+    rc = moq_request_stream_validate_inbound(s, e->stream_ref, env.msg_type,
+                                              request_id, &endpoint);
+    if (rc < 0 || s->state == MOQ_SESS_CLOSED) return rc;
+    bool drain = !ns_sub_fin_observed(e, false);
+    if (action_queue_full(s) || (drain && s->drain_ref_count >= s->drain_ref_cap))
+        return MOQ_ERR_WOULD_BLOCK;
+
+    /* Initial-request staging was released when its event committed. This
+     * transaction borrows the same owner storage only for this call. */
+    e->token_count = 0;
+    uint64_t reject_code = 0;
+    rc = process_auth_tokens(s, tokens.in, tokens.count, e->resolved_tokens,
+        &e->token_count, MOQ_DECODED_MAX_TOKENS, &reject_code,
+        e->token_staged, &e->auth_txn);
+    if (rc < 0 || s->state == MOQ_SESS_CLOSED) goto abort;
+    rc = ns_sub_send_request_error(s, slot, &endpoint,
+        reject_code ? reject_code : MOQ_REQUEST_ERROR_NOT_SUPPORTED,
+        ns_sub_fin_observed(e, false));
+    if (rc != MOQ_OK) goto abort;
+    return MOQ_OK;
+abort:
+    process_auth_tokens_free_staging(s, e->resolved_tokens,
+                                     e->token_staged, e->token_count);
+    process_auth_tokens_abort_txn(s, &e->auth_txn);
+    e->token_count = 0;
+    return rc;
+}
+
 /* Reciprocate the subscriber's graceful cancel: close our own send half so the
  * peer can retire the bidi, then tear the publisher-side entry down. The close
  * needs an action slot, so a refusal leaves the entry AND its transitional FIN
@@ -877,12 +991,30 @@ moq_result_t ns_sub_process_recving_publisher(moq_session_t *s,
     if (e->state != MOQ_NS_SUB_RECVING_PUBLISHER)
         return MOQ_OK;
 
+    size_t request_len = e->recv_len;
+    const moq_request_codec_t *codec = s->profile->request_codec;
+    const bool updates = codec && codec->decode_namespace_update;
+    if (updates) {
+        moq_request_envelope_t env;
+        moq_result_t rc = codec->decode_envelope(e->recv_buf, e->recv_len,
+                                                &env, &request_len);
+        if (rc == MOQ_ERR_BUFFER) {
+            if (ns_sub_fin_observed(e, fin))
+                return close_with_error(s, 0x3,
+                    "incomplete SUBSCRIBE_NAMESPACE at stream FIN");
+            return MOQ_OK;
+        }
+        if (rc < 0)
+            return close_with_error(s, 0x3,
+                "malformed SUBSCRIBE_NAMESPACE envelope");
+    }
+
+    moq_decoded_ns_sub_request_t decoded;
     /* If parse already complete, skip to event push (retry path). */
     if (!e->parse_complete) {
         /* Profile decode: envelope + msg_type + payload + validation. */
-        moq_decoded_ns_sub_request_t decoded;
         moq_result_t rc = s->profile->decode_ns_sub_request(
-            s, e->recv_buf, e->recv_len, &decoded);
+            s, e->recv_buf, request_len, &decoded);
         if (rc == MOQ_ERR_BUFFER) {
             if (fin)
                 return close_with_error(s, 0x3,
@@ -938,9 +1070,15 @@ moq_result_t ns_sub_process_recving_publisher(moq_session_t *s,
             e->auth_reject_code = auth_reject_code;
         }
 
+        /* A new request the session refuses itself (after our GOAWAY, or
+         * for a reserved session-level namespace), with that code. */
+        uint64_t refuse_code;
+        if (session_refuses_request(s, &decoded.prefix, &refuse_code))
+            return ns_sub_send_request_error(s, (size_t)ns_slot, &e->request_ep, refuse_code,
+                                             ns_sub_fin_observed(e, fin));
         if (e->auth_reject_code) {
             moq_result_t erc = ns_sub_send_request_error(s,
-                (size_t)ns_slot, e->auth_reject_code,
+                (size_t)ns_slot, &e->request_ep, e->auth_reject_code,
                 ns_sub_fin_observed(e, fin));
             return erc;
         }
@@ -952,9 +1090,9 @@ moq_result_t ns_sub_process_recving_publisher(moq_session_t *s,
             return close_with_error(s, 0x1,
                 "allocation failure storing NS_SUB prefix");
         if (ns_sub_prefix_conflicts(s, e->prefix_parts,
-                e->prefix_count, (int)ns_slot)) {
+                e->prefix_count, false, (int)ns_slot)) {
             moq_result_t erc = ns_sub_send_request_error(s,
-                (size_t)ns_slot, MOQ_REQUEST_ERROR_PREFIX_OVERLAP,
+                (size_t)ns_slot, &e->request_ep, MOQ_REQUEST_ERROR_PREFIX_OVERLAP,
                 ns_sub_fin_observed(e, fin));
             if (erc != MOQ_OK) ns_sub_free_prefix(s, e);
             return erc;
@@ -981,10 +1119,9 @@ moq_result_t ns_sub_process_recving_publisher(moq_session_t *s,
     }
 
     /* Re-decode prefix from recv_buf (idempotent). */
-    moq_decoded_ns_sub_request_t decoded;
     {
         moq_result_t drc = s->profile->decode_ns_sub_request(
-            s, e->recv_buf, e->recv_len, &decoded);
+            s, e->recv_buf, request_len, &decoded);
         if (drc < 0)
             return close_with_error(s, 0x3,
                 "SUBSCRIBE_NAMESPACE re-decode failed");
@@ -1126,6 +1263,14 @@ moq_result_t ns_sub_process_recving_publisher(moq_session_t *s,
     request_registry_insert_by_id(s, e->request_ep.request_id, e->request_ep);
     s->profile->commit_inbound_request(s, &e->request_ep);
 
+    if (updates) {
+        /* Prefix and event tokens now own their copies. Keep later messages
+         * from the same transport chunk until the application answers. */
+        size_t remaining = e->recv_len - request_len;
+        memmove(e->recv_buf, e->recv_buf + request_len, remaining);
+        e->recv_len = remaining;
+    }
+
     return MOQ_OK;
 }
 
@@ -1145,6 +1290,8 @@ moq_result_t ns_sub_on_new_bidi(moq_session_t *s,
 
     e->generation |= 1;
     e->state = MOQ_NS_SUB_RECVING_PUBLISHER;
+    e->local_subscriber = false;
+    e->terminal_notified = false;
     e->stream_kind = MOQ_STREAM_KIND_NAMESPACE_SUB;
     e->stream_ref = stream_ref;
     e->parse_complete = false;
@@ -1158,6 +1305,82 @@ moq_result_t ns_sub_on_new_bidi(moq_session_t *s,
     moq_index_insert(s->idx_ns_by_ref, s->idx_ns_mask,
                      stream_ref._v, slot);
     return MOQ_OK;
+}
+
+
+/* The peer's FIN after this side's GOAWAY retires the request, unless it
+ * still owes an update answer: then it retires once that answer is given. */
+static void ns_sub_retire_after_own_goaway(moq_session_t *s, int32_t ns_slot)
+{
+    moq_ns_sub_entry_t *e = &s->ns_subs[ns_slot];
+    if (e->update.owed) {
+        e->update.retire_after_answer = true;
+        e->update.retire_close_half = true;
+        return;
+    }
+    ns_sub_free_entry(s, (size_t)ns_slot);
+}
+
+/* The publisher side of a namespace subscription it migrated with its own
+ * GOAWAY: buffer what the subscriber sends and frame it. A GOAWAY from the
+ * subscriber is the first received on the stream and migrates the request
+ * (what follows it is then drained: discarded, a second GOAWAY closes);
+ * every other message is discarded. The peer's FIN retires the entry. */
+static moq_result_t ns_sub_after_own_goaway(moq_session_t *s, int32_t ns_slot,
+                                            const uint8_t *buf, size_t len, bool fin)
+{
+    moq_ns_sub_entry_t *e = &s->ns_subs[ns_slot];
+    const moq_request_codec_t *c = s->profile->request_codec;
+    if (len > 0) {
+        if (len > e->recv_cap - e->recv_len)
+            return close_with_error(s, 0x3, "namespace-sub stream message too large");
+        memcpy(e->recv_buf + e->recv_len, buf, len);
+        e->recv_len += len;
+    }
+    if (fin) e->pending_fin = true;
+    for (;;) {
+        moq_request_envelope_t env;
+        size_t off = 0;
+        moq_result_t rc = c->decode_envelope(e->recv_buf, e->recv_len, &env, &off);
+        if (rc == MOQ_ERR_BUFFER) {
+            /* Incomplete: wait, or at the peer's FIN retire the request (a
+             * truncated message there is discarded with the rest) -- once
+             * any answer it owes is given. */
+            if (e->pending_fin) ns_sub_retire_after_own_goaway(s, ns_slot);
+            return MOQ_OK;
+        }
+        if (rc < 0)
+            return close_with_error(s, 0x3, "malformed message on a namespace-sub stream");
+        if (env.msg_type == c->type.goaway) {
+            moq_request_goaway_msg_t ga;
+            if (c->decode_goaway_request(env.payload, env.payload_len, &ga) < 0)
+                return close_with_error(s, 0x3, "malformed request-stream GOAWAY");
+            if (s->perspective == MOQ_PERSPECTIVE_SERVER && ga.uri.len > 0)
+                return close_with_error(s, 0x3,
+                    "server received GOAWAY with non-zero New Session URI");
+            moq_drain_scan_t scan;
+            memset(&scan, 0, sizeof(scan));
+            if (off < e->recv_len) {
+                rc = drain_goaway_scan(s, &scan, e->recv_buf + off, e->recv_len - off);
+                if (rc < 0 || s->state == MOQ_SESS_CLOSED) return rc;
+            }
+            moq_stream_ref_t ref = e->stream_ref;
+            e->retained_output = MOQ_RETAINED_OUTPUT_FIN;
+            rc = session_core_on_request_goaway(s, MOQ_REQUEST_FAMILY_NS_SUB, ns_slot,
+                ref, ga.uri.data, ga.uri.len, ga.timeout_ms, e->pending_fin);
+            if (rc < 0 || s->state == MOQ_SESS_CLOSED) return rc;
+            moq_drain_scan_t *kept = drain_ref_scan(s, ref);
+            if (kept) *kept = scan;
+            return MOQ_OK;
+        }
+        /* An update that crossed the GOAWAY still owes its one answer
+         * (draft-22 §9.5): it is handled as on a live request. */
+        if (env.msg_type == c->type.request_update)
+            return ns_sub_reject_update(s, (size_t)ns_slot);
+        /* Anything else the subscriber still sends is discarded. */
+        memmove(e->recv_buf, e->recv_buf + off, e->recv_len - off);
+        e->recv_len -= off;
+    }
 }
 
 moq_result_t handle_bidi_stream_bytes(moq_session_t *s,
@@ -1198,15 +1421,8 @@ moq_result_t handle_bidi_stream_bytes(moq_session_t *s,
     moq_ns_sub_entry_t *e;
 
     if (ns_slot < 0) {
-        /* A fresh bidi opening a NEW namespace subscription. After our GOAWAY
-         * (§10.4) the peer must not open new requests. (Bytes on an already-
-         * classified ns_sub bidi take the ns_slot >= 0 branch below and stay
-         * legal during draining; stream-correlated profiles route fresh request
-         * bidis through handle_request_stream_bytes above, gated there.) */
-        if (session_refuses_new_requests(s))
-            return close_with_error(s, 0x3,
-                "SUBSCRIBE_NAMESPACE after local GOAWAY");
-
+        /* A fresh bidi opening a NEW namespace subscription. One that crossed
+         * our GOAWAY is refused once parsed, like any other new request. */
         /* New bidi stream: classify by profile.  D16 only supports
          * SUBSCRIBE_NAMESPACE on bidi streams; future profiles may
          * dispatch other request types here. */
@@ -1221,24 +1437,39 @@ moq_result_t handle_bidi_stream_bytes(moq_session_t *s,
     } else {
         e = &s->ns_subs[ns_slot];
 
+        if (e->terminal.cause) {
+            /* Terminal work discards later bytes, but STOP alone never stands
+             * in for the peer's eventual receive-direction terminal. */
+            if (fin) (void)moq_request_lifetime_peer_fin(&e->cancel_lifetime);
+            return ns_sub_flush_terminal(s, (size_t)ns_slot);
+        }
+
         /* A namespace-sub we migrated with an outbound GOAWAY (entry kept live so
          * the app keeps producing, §10.4): the peer's empty-FIN old-stream close
          * silently retires it (no event). On the subscriber side, in-flight
-         * NAMESPACE and a duplicate GOAWAY fall through to the response parser (a
-         * duplicate GOAWAY closes 0x3 via request_goaway_already_sent); on the
-         * publisher side the subscriber only ever closes with a FIN, so any further
-         * bytes are a second GOAWAY / stray -> PROTOCOL_VIOLATION. */
+         * NAMESPACE and the publisher's own GOAWAY fall through to the response
+         * parser (a GOAWAY received there is the first received on the stream
+         * and migrates the request). On the publisher side the GOAWAY does not
+         * end the request either, so the subscriber may still send what it
+         * owes there: those messages are discarded, and its own GOAWAY -- the
+         * first received on the stream -- migrates the request. */
         if (e->goaway_sent) {
-            if (len == 0) {
-                if (fin) ns_sub_free_entry(s, (size_t)ns_slot);
-                return MOQ_OK;
-            }
             bool subscriber_side =
                 e->state == MOQ_NS_SUB_PENDING_SUBSCRIBER ||
                 (e->state == MOQ_NS_SUB_ESTABLISHED && e->got_response);
+            /* A latched FIN still owns terminal work after the bytes drain. */
+            if (len == 0 && fin && e->recv_len == 0 && !e->pending_fin) {
+                if (!subscriber_side) {
+                    e->pending_fin = true;
+                    ns_sub_retire_after_own_goaway(s, ns_slot);
+                } else {
+                    ns_sub_free_entry(s, (size_t)ns_slot);
+                }
+                return MOQ_OK;
+            }
             if (!subscriber_side)
-                return close_with_error(s, 0x3,
-                    "bytes on a namespace-sub already migrated by GOAWAY");
+                return ns_sub_after_own_goaway(s, ns_slot, buf, len, fin);
+            if (len == 0 && e->recv_len == 0 && !e->pending_fin) return MOQ_OK;
             /* subscriber-side: fall through to the response parser */
         }
 
@@ -1272,6 +1503,17 @@ moq_result_t handle_bidi_stream_bytes(moq_session_t *s,
          * has no post-request message, so extra bytes are a protocol violation. */
         if (e->state == MOQ_NS_SUB_PENDING_PUBLISHER ||
             e->state == MOQ_NS_SUB_ESTABLISHED) {
+            if (s->profile->request_codec &&
+                s->profile->request_codec->decode_namespace_update) {
+                if (len > e->recv_cap - e->recv_len) return MOQ_ERR_BUFFER;
+                if (len) {
+                    memcpy(e->recv_buf + e->recv_len, buf, len);
+                    e->recv_len += len;
+                }
+                if (fin) e->pending_fin = true;
+                if (e->recv_len) return ns_sub_reject_update(s, (size_t)ns_slot);
+                return MOQ_OK;
+            }
             /* Extra bytes -- or a re-feed of a teardown already owed. The
              * teardown closes just this bidi (§10.9.1), so the bytes are NOT
              * buffered; instead the OBLIGATION is made durable before the
@@ -1301,13 +1543,24 @@ moq_result_t handle_bidi_stream_bytes(moq_session_t *s,
              * is a graceful FIN, not a reset), then tear the publisher-side entry
              * down. Reserve the close action first (retryable on re-feed). */
             if (ns_sub_fin_observed(e, fin) &&
-                moq_session_uses_request_streams(s))
+                moq_session_uses_request_streams(s)) {
+                /* Where a FIN is no cancellation the subscriber merely has
+                 * nothing more to send; latch it and keep serving. */
+                if (s->profile->request_fin_is_not_cancel) {
+                    e->pending_fin = true;
+                    e->handoff_fin_pending = false;
+                    return MOQ_OK;
+                }
                 return ns_sub_publisher_graceful_close(s, ns_slot);
+            }
             return MOQ_OK;
         }
 
-        /* Full-parse pending (RECVING with parse_complete): retry only. */
-        if (e->parse_complete) {
+        /* Legacy complete requests cannot carry later messages. D22 may
+         * accumulate UPDATE bytes while its initial event is backpressured. */
+        const bool updates = s->profile->request_codec &&
+            s->profile->request_codec->decode_namespace_update;
+        if (e->parse_complete && !updates) {
             if (len > 0)
                 return close_with_error(s, 0x3,
                     "extra bytes on bidi stream with pending request");
@@ -1321,6 +1574,7 @@ moq_result_t handle_bidi_stream_bytes(moq_session_t *s,
                 e->recv_len += len;
             }
         }
+        if (updates && fin) e->pending_fin = true;
     }
 
     /* Decode, validate, auth, emit NS_SUB_REQUEST, commit -- shared with the
@@ -1333,10 +1587,20 @@ moq_result_t handle_bidi_stream_bytes(moq_session_t *s,
          * was handed over at the ownership transition; that close is owed here,
          * on the index-routed path, exactly as on the original dispatch. */
         e = &s->ns_subs[ns_slot];
+        if (e->state == MOQ_NS_SUB_PENDING_PUBLISHER && e->recv_len &&
+            s->profile->request_codec &&
+            s->profile->request_codec->decode_namespace_update)
+            return ns_sub_reject_update(s, (size_t)ns_slot);
         if (e->state == MOQ_NS_SUB_PENDING_PUBLISHER &&
             ns_sub_fin_observed(e, fin) &&
-            moq_session_uses_request_streams(s))
+            moq_session_uses_request_streams(s)) {
+            if (s->profile->request_fin_is_not_cancel) {
+                e->pending_fin = true;
+                e->handoff_fin_pending = false;
+                return prc;
+            }
             return ns_sub_publisher_graceful_close(s, ns_slot);
+        }
         return prc;
     }
 }
@@ -1358,7 +1622,7 @@ moq_result_t moq_session_accept_ns_sub(
     int slot = ns_sub_resolve_handle(s, handle);
     if (slot < 0) return MOQ_ERR_STALE_HANDLE;
     moq_ns_sub_entry_t *e = &s->ns_subs[slot];
-    if (e->state != MOQ_NS_SUB_PENDING_PUBLISHER)
+    if (e->state != MOQ_NS_SUB_PENDING_PUBLISHER || e->terminal.cause)
         return MOQ_ERR_WRONG_STATE;
 
     uint8_t buf[128];
@@ -1405,7 +1669,7 @@ moq_result_t moq_session_reject_ns_sub(
     int slot = ns_sub_resolve_handle(s, handle);
     if (slot < 0) return MOQ_ERR_STALE_HANDLE;
     moq_ns_sub_entry_t *e = &s->ns_subs[slot];
-    if (e->state != MOQ_NS_SUB_PENDING_PUBLISHER)
+    if (e->state != MOQ_NS_SUB_PENDING_PUBLISHER || e->terminal.cause)
         return MOQ_ERR_WRONG_STATE;
 
     moq_request_error_encode_args_t err_args = {
@@ -1489,7 +1753,7 @@ static moq_result_t send_ns_msg(moq_session_t *s,
     int slot = ns_sub_resolve_handle(s, handle);
     if (slot < 0) return MOQ_ERR_STALE_HANDLE;
     moq_ns_sub_entry_t *e = &s->ns_subs[slot];
-    if (e->state != MOQ_NS_SUB_ESTABLISHED || e->got_response)
+    if (e->state != MOQ_NS_SUB_ESTABLISHED || e->got_response || e->terminal.cause)
         return MOQ_ERR_WRONG_STATE;
     /* Migrated by an outbound GOAWAY: no further NAMESPACE/NAMESPACE_DONE. Check
      * before the key allocation + capacity work so the contract is WRONG_STATE. */
@@ -1681,23 +1945,29 @@ static bool ns_suffix_key_decode(const ns_suffix_key_t *key,
  * where it stopped without repeating or losing one. Both the close action slot
  * and the drain slot are reserved BEFORE the first outcome, so a refusal (full
  * action queue or full drain ring) emits nothing. */
-static moq_result_t ns_sub_response_terminal(moq_session_t *s, size_t slot,
-                                             bool close_half, bool install_drain)
+/* The publisher's FIN arrived before its response: the pending namespace
+ * subscription failed. The generic terminal event names the cause, our own
+ * direction is reset with CANCELLED, and the entry is freed. Both slots are
+ * reserved before anything is emitted. */
+static moq_result_t ns_sub_failed_by_fin(moq_session_t *s, int32_t slot,
+                                         bool truncated)
 {
     moq_ns_sub_entry_t *e = &s->ns_subs[slot];
+    if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+    if (action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+    if (!e->terminal_notified) {
+        push_request_terminated(s, MOQ_REQUEST_FAMILY_NS_SUB,
+                                MOQ_REQUEST_ROLE_REQUESTER,
+                                request_terminal_fin(truncated), e->handle._opaque);
+        e->terminal_notified = true;
+    }
+    request_bidi_reset_local(s, e->stream_ref);
+    ns_sub_free_entry(s, (size_t)slot);
+    return MOQ_OK;
+}
 
-    bool req_streams = moq_session_uses_request_streams(s) &&
-                       e->stream_ref._v != 0;
-    /* The close and the drain carrier are owed as soon as the terminal
-     * completes, so both slots are reserved before the first outcome: the bidi
-     * must never close (or leave a live peer half uncarried) while outcomes are
-     * still owed, and a refusal here must not have emitted any. */
-    bool want_close = close_half && req_streams;
-    bool want_drain = install_drain && req_streams;
-    if (want_close && action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
-    if (want_drain && s->drain_ref_count >= s->drain_ref_cap)
-        return MOQ_ERR_WOULD_BLOCK;
-
+static moq_result_t ns_sub_emit_gone(moq_session_t *s, moq_ns_sub_entry_t *e)
+{
     /* Only the inbound, peer-announced set is synthesized. The publisher-side
      * set records what we announced to a subscriber and owes nothing here. */
     ns_suffix_set_t *set = e->announced_suffixes_inbound
@@ -1743,11 +2013,123 @@ static moq_result_t ns_sub_response_terminal(moq_session_t *s, size_t slot,
          * minimum of the live tree. m stays valid until this call frees it. */
         ns_suffix_set_remove_counted(s, set, m->data, m->len);
     }
+    return MOQ_OK;
+}
+
+static moq_result_t ns_sub_response_terminal(moq_session_t *s, size_t slot,
+                                             bool close_half, bool install_drain)
+{
+    moq_ns_sub_entry_t *e = &s->ns_subs[slot];
+    bool req_streams = moq_session_uses_request_streams(s) && e->stream_ref._v != 0;
+    bool want_close = close_half && req_streams;
+    bool want_drain = install_drain && req_streams;
+    if (want_close && action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+    if (want_drain && s->drain_ref_count >= s->drain_ref_cap)
+        return MOQ_ERR_WOULD_BLOCK;
+    moq_result_t rc = ns_sub_emit_gone(s, e);
+    if (rc < 0 || s->state == MOQ_SESS_CLOSED) return rc;
 
     if (want_close) (void)queue_close_bidi(s, e->stream_ref);
     if (want_drain) (void)drain_ref_add(s, e->stream_ref);   /* slot reserved above */
     ns_sub_free_entry(s, slot);
     return MOQ_OK;
+}
+
+/* Event commitment retires the application identity. Directional closure
+ * progresses independently, one available action slot at a time. */
+static moq_result_t ns_sub_flush_terminal(moq_session_t *s, size_t slot)
+{
+    moq_ns_sub_entry_t *e = &s->ns_subs[slot];
+    bool blocked = false;
+    if (!e->terminal_notified) {
+        moq_result_t rc = ns_sub_emit_gone(s, e);
+        if (s->state == MOQ_SESS_CLOSED) return rc;
+        if (rc < 0 && rc != MOQ_ERR_WOULD_BLOCK) return rc;
+        if (rc == MOQ_ERR_WOULD_BLOCK || event_queue_full(s)) {
+            blocked = true;
+        } else {
+            push_request_terminated(s, MOQ_REQUEST_FAMILY_NS_SUB,
+                e->local_subscriber ? MOQ_REQUEST_ROLE_REQUESTER : MOQ_REQUEST_ROLE_RESPONDER,
+                e->terminal, e->handle._opaque);
+            e->terminal_notified = true;
+            if (e->state == MOQ_NS_SUB_PENDING_SUBSCRIBER ||
+                e->state == MOQ_NS_SUB_PENDING_PUBLISHER)
+                request_registry_remove_by_id(s, e->request_id);
+            e->state = MOQ_NS_SUB_DRAINING;
+        }
+    }
+    moq_request_lifetime_t *life = &e->cancel_lifetime;
+    if (e->terminal.cause == MOQ_REQUEST_TERMINAL_PEER_FIN_COMPLETE && !life->cancelled) {
+        if (!life->local_fin) {
+            if (action_queue_full(s)) {
+                blocked = true;
+            } else {
+                (void)queue_close_bidi(s, e->stream_ref);
+                (void)moq_request_lifetime_fin_committed(life);
+            }
+        }
+    } else {
+        unsigned owed = moq_request_lifetime_cancel_actions(life);
+        if (owed & MOQ_REQUEST_CANCEL_RESET_LOCAL) {
+            if (action_queue_full(s)) {
+                blocked = true;
+            } else {
+                request_bidi_reset_local(s, e->stream_ref);
+                (void)moq_request_lifetime_reset_committed(life);
+            }
+        }
+        if (owed & MOQ_REQUEST_CANCEL_STOP_PEER) {
+            if (action_queue_full(s)) {
+                blocked = true;
+            } else {
+                moq_action_t a;
+                memset(&a, 0, sizeof(a));
+                a.kind = MOQ_ACTION_STOP_BIDI_STREAM;
+                a.detail_size = (uint32_t)sizeof(moq_stop_bidi_stream_action_t);
+                a.borrow_epoch = s->borrow_epoch;
+                a.u.stop_bidi_stream.stream_ref = e->stream_ref;
+                a.u.stop_bidi_stream.error_code = MOQ_STREAM_ERROR_CANCELLED;
+                (void)push_action(s, &a);
+                (void)moq_request_lifetime_stop_committed(life);
+            }
+        }
+    }
+    if (e->terminal_notified && moq_request_lifetime_cancel_actions(life) == 0 &&
+        (life->peer_fin || life->peer_reset))
+        ns_sub_free_entry(s, slot);
+    return blocked ? MOQ_ERR_WOULD_BLOCK : MOQ_OK;
+}
+
+static moq_result_t ns_sub_cancel_signal(moq_session_t *s, size_t slot,
+                                         bool reset, uint64_t error_code)
+{
+    moq_ns_sub_entry_t *e = &s->ns_subs[slot];
+    if (!e->terminal.cause) {
+        e->terminal = request_terminal_signal(reset, error_code);
+        (void)moq_request_lifetime_init(&e->cancel_lifetime,
+                                      MOQ_REQUEST_FAMILY_NS_SUB, e->local_subscriber);
+        /* CLOSING already committed rejection or local cancellation. An own
+         * GOAWAY likewise must not gain a second application outcome. */
+        if (e->state == MOQ_NS_SUB_CLOSING || e->goaway_sent) {
+            e->cancel_lifetime.local_fin = e->state == MOQ_NS_SUB_CLOSING;
+            e->terminal_notified = true;
+            e->state = MOQ_NS_SUB_DRAINING;
+        }
+        if (ns_sub_fin_observed(e, false))
+            (void)moq_request_lifetime_peer_fin(&e->cancel_lifetime);
+        e->recv_len = 0;
+    }
+    if (reset) (void)moq_request_lifetime_peer_reset(&e->cancel_lifetime);
+    else (void)moq_request_lifetime_peer_stop(&e->cancel_lifetime);
+    return ns_sub_flush_terminal(s, slot);
+}
+
+void ns_sub_retry_pending(moq_session_t *s)
+{
+    if (!s->profile->premature_fin_fails_request) return;
+    for (size_t i = 0; i < s->ns_sub_cap && session_is_active(s); ++i)
+        if (s->ns_subs[i].state != MOQ_NS_SUB_FREE && s->ns_subs[i].terminal.cause)
+            (void)ns_sub_flush_terminal(s, i);
 }
 
 /* Recovery contract for the results this returns.
@@ -1781,13 +2163,21 @@ static moq_result_t handle_subscriber_response(moq_session_t *s,
                                         !e->pending_fin);
 
     while (e->recv_len > 0) {
+        /* The publisher closes a request whose update it refused (§9.5.1):
+         * nothing but its FIN may follow that REQUEST_ERROR. */
+        if (e->update.failed)
+            return close_with_error(s, 0x3,
+                "message after a refused namespace update");
         moq_decoded_ns_sub_response_t resp;
         moq_result_t rc = s->profile->decode_ns_sub_response(s,
             e->recv_buf, e->recv_len, e->got_response, e->request_id, &resp);
         if (rc == MOQ_ERR_BUFFER) {
-            if (e->pending_fin && e->recv_len > 0)
+            if (e->pending_fin && e->recv_len > 0) {
+                if (!e->got_response && s->profile->premature_fin_fails_request)
+                    return ns_sub_failed_by_fin(s, slot, true);
                 return close_with_error(s, 0x3,
                     "incomplete message at bidi response stream FIN");
+            }
             return MOQ_OK;
         }
         if (rc == MOQ_ERR_PROTO)
@@ -1797,23 +2187,35 @@ static moq_result_t handle_subscriber_response(moq_session_t *s,
         switch (resp.kind) {
         case MOQ_NS_RESP_GOAWAY: {
             /* Request-stream GOAWAY (§10.4): migrate the namespace subscription.
-             * Terminal on this bidi -- reject trailing bytes -- then the
-             * draft-neutral core surfaces MOQ_EVENT_REQUEST_GOAWAY, frees the
-             * entry, closes our half, and strict-drains the ref only when the
-             * peer's FIN has not already been observed. */
-            if (resp.has_trailing_bytes)
-                return close_with_error(s, 0x3, "extra bytes after GOAWAY");
+             * The draft-neutral core surfaces MOQ_EVENT_REQUEST_GOAWAY, frees
+             * the entry, closes our half, and drains the ref only when the
+             * peer's FIN has not already been observed. The GOAWAY does not
+             * end the request: messages buffered behind it are discarded
+             * like later ones, and a second GOAWAY among them closes. */
             if (s->perspective == MOQ_PERSPECTIVE_SERVER &&
                 resp.goaway_uri_len > 0)
                 return close_with_error(s, 0x3,
                     "server received GOAWAY with non-zero New Session URI");
+            moq_drain_scan_t scan;
+            memset(&scan, 0, sizeof(scan));
+            if (resp.consumed < e->recv_len) {
+                rc = drain_goaway_scan(s, &scan, e->recv_buf + resp.consumed,
+                                       e->recv_len - resp.consumed);
+                if (rc < 0 || s->state == MOQ_SESS_CLOSED) return rc;
+            }
+            moq_stream_ref_t gref = e->stream_ref;
             /* This route's durable FIN fact is `pending_fin`, latched by the
              * dispatcher before the response parser runs and retained across a
              * refusal -- so a GOAWAY that rode the FIN still knows it on the
              * empty re-feed that completes it. */
-            return session_core_on_request_goaway(s, MOQ_REQUEST_FAMILY_NS_SUB,
-                slot, e->stream_ref, resp.goaway_uri, resp.goaway_uri_len,
+            e->retained_output = MOQ_RETAINED_OUTPUT_FIN;
+            rc = session_core_on_request_goaway(s, MOQ_REQUEST_FAMILY_NS_SUB,
+                slot, gref, resp.goaway_uri, resp.goaway_uri_len,
                 resp.goaway_timeout_ms, e->pending_fin);
+            if (rc < 0 || s->state == MOQ_SESS_CLOSED) return rc;
+            moq_drain_scan_t *kept = drain_ref_scan(s, gref);
+            if (kept) *kept = scan;
+            return MOQ_OK;
         }
         case MOQ_NS_RESP_OK: {
             if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
@@ -1850,12 +2252,13 @@ static moq_result_t handle_subscriber_response(moq_session_t *s,
                         "server received REDIRECT with non-zero Connect URI");
             }
 
-            if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
             /* Stream-correlated profiles close the subscriber's send half after the
              * terminal error so the publisher can retire the request bidi; reserve
              * that action up front (retryable). */
             bool close_half = moq_session_uses_request_streams(s) &&
                               e->stream_ref._v != 0;
+            if (close_half) e->retained_output = MOQ_RETAINED_OUTPUT_FIN;
+            if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
             if (close_half && action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
 
             size_t scratch_save = s->event_scratch_len;
@@ -1864,7 +2267,7 @@ static moq_result_t handle_subscriber_response(moq_session_t *s,
                     MOQ_REQUEST_FAMILY_NS_SUB, e->handle._opaque,
                     &resp.redirect, resp.error_code,
                     resp.retry_interval != 0,
-                    resp.retry_interval != 0 ? resp.retry_interval - 1u : 0,
+                    retry_interval_to_ms(resp.retry_interval),
                     resp.reason, resp.reason_len);
                 /* The emitter reports a terminal close as MOQ_OK, so the
                  * teardown below runs only while the session is still open. */
@@ -1907,6 +2310,7 @@ static moq_result_t handle_subscriber_response(moq_session_t *s,
              * the publisher can retire the request bidi. */
             if (close_half)
                 (void)queue_close_bidi(s, e->stream_ref);
+            e->retained_output = MOQ_RETAINED_OUTPUT_NONE;
             request_registry_remove_by_id(s, e->request_id);
             e->closing_remote_error = true;
             e->state = MOQ_NS_SUB_CLOSING;
@@ -1916,6 +2320,11 @@ static moq_result_t handle_subscriber_response(moq_session_t *s,
             if (e->pending_fin) ns_sub_free_entry(s, (size_t)slot);
             return MOQ_OK;
         }
+        case MOQ_NS_RESP_UPDATE_OK:
+        case MOQ_NS_RESP_UPDATE_ERROR:
+            rc = ns_sub_on_update_response(s, slot, &resp);
+            if (rc < 0 || s->state == MOQ_SESS_CLOSED) return rc;
+            break;
         case MOQ_NS_RESP_NAMESPACE:
         case MOQ_NS_RESP_NAMESPACE_DONE: {
             size_t skey_len = ns_suffix_key_len(&resp.suffix);
@@ -2063,9 +2472,24 @@ static moq_result_t handle_subscriber_response(moq_session_t *s,
 
     /* The buffer is drained. A FIN latched by the dispatcher terminates the
      * subscription (§10.18); the latch survives every refusal, so an ordinary
-     * empty re-feed resumes the terminal. */
-    if (e->pending_fin)
+     * empty re-feed resumes the terminal. Before the response, on a profile
+     * where a FIN is no cancellation, the publisher owed REQUEST_OK or
+     * REQUEST_ERROR: the request failed. */
+    if (e->pending_fin) {
+        if (!e->got_response && s->profile->premature_fin_fails_request)
+            return ns_sub_failed_by_fin(s, slot, false);
+        if (s->profile->premature_fin_fails_request && !e->goaway_sent) {
+            /* All response bytes committed: preserve completion before any
+             * event/action refusal, independently of later RESET/STOP facts. */
+            e->terminal.cause = MOQ_REQUEST_TERMINAL_PEER_FIN_COMPLETE;
+            e->terminal.error_code = 0;
+            (void)moq_request_lifetime_init(&e->cancel_lifetime, MOQ_REQUEST_FAMILY_NS_SUB, true);
+            (void)moq_request_lifetime_initial_response_committed(&e->cancel_lifetime, false, true);
+            (void)moq_request_lifetime_peer_fin(&e->cancel_lifetime);
+            return ns_sub_flush_terminal(s, (size_t)slot);
+        }
         return ns_sub_response_terminal(s, (size_t)slot, true, false);
+    }
     return MOQ_OK;
 }
 
@@ -2083,8 +2507,8 @@ moq_result_t moq_session_cancel_namespace_sub(
     int slot = ns_sub_resolve_handle(s, handle);
     if (slot < 0) return MOQ_ERR_STALE_HANDLE;
     moq_ns_sub_entry_t *e = &s->ns_subs[slot];
-    if (e->state != MOQ_NS_SUB_PENDING_SUBSCRIBER &&
-        e->state != MOQ_NS_SUB_ESTABLISHED)
+    if (e->terminal.cause || (e->state != MOQ_NS_SUB_PENDING_SUBSCRIBER &&
+        e->state != MOQ_NS_SUB_ESTABLISHED))
         return MOQ_ERR_WRONG_STATE;
 
     if (action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
@@ -2106,11 +2530,25 @@ moq_result_t moq_session_cancel_namespace_sub(
 }
 
 /* -- Bidi stream reset / stop handlers ----------------------------- *
- * RESET_STREAM and STOP_SENDING are distinct peer signals (kept on separate
- * session inputs), but both terminate the request the bidi carried, so they
- * share the same local cleanup: a namespace-sub entry, or a stream-correlated
- * subscription/fetch via request_stream_teardown. An unknown ref is a no-op
- * (the stream may already be gone). */
+ * D22 retains application and direction obligations independently. Legacy
+ * profiles keep their existing teardown; unknown refs remain no-ops. */
+
+/* A complete refusal of this side's own update (FETCH or PUBLISH) already
+ * received on `ref` but still held for event capacity. */
+static bool own_update_refusal_held(const moq_session_t *s, moq_stream_ref_t ref)
+{
+    moq_request_endpoint_t ep = request_registry_find_by_streamref(s, ref);
+    if (ep.kind == MOQ_REQ_FETCH) {
+        const moq_fetch_entry_t *e = &s->fetches[ep.slot];
+        return e->own_update_pending && e->rs.recv_len > 0;
+    }
+    if (ep.kind == MOQ_REQ_PUBLISH) {
+        const moq_pub_entry_t *e = &s->publishes[ep.slot];
+        return e->role == MOQ_PUB_ROLE_PUBLISHER && e->update_pending &&
+               e->rs.recv_len > 0;
+    }
+    return false;
+}
 
 static moq_result_t bidi_stream_teardown(moq_session_t *s,
                                          moq_stream_ref_t stream_ref,
@@ -2118,15 +2556,31 @@ static moq_result_t bidi_stream_teardown(moq_session_t *s,
 {
     if (s->state == MOQ_SESS_CLOSED) return MOQ_ERR_CLOSED;
 
+    /* The refusal of an update arrived before the peer's signal: it is the
+     * request's outcome, so it is processed first. While it cannot be, the
+     * signal waits with it (WOULD_BLOCK; the caller repeats the signal). */
+    if (own_update_refusal_held(s, stream_ref)) {
+        moq_result_t rc = handle_bidi_stream_bytes(s, stream_ref, NULL, 0, false);
+        if (rc < 0) return rc;
+        if (s->state == MOQ_SESS_CLOSED) return MOQ_OK;
+    }
+
     /* A bidi whose request already ended locally and whose peer half is being
      * drained. A RESET ends that half: retire the drain ref. A STOP_SENDING
      * only concerns our own, already-finished half -- the peer's FIN or RESET
      * is still owed and must still find the drain ref, or it would read as a
-     * fresh request. */
+     * fresh request. A terminal held behind owed resets on this stream is moot
+     * once the peer abandons it. */
+    held_done_retire(s, stream_ref);
     if (drain_ref_contains(s, stream_ref)) {
         if (reset) (void)drain_ref_remove(s, stream_ref);
         return MOQ_OK;
     }
+
+    int32_t ns_slot = moq_index_find(s->idx_ns_by_ref, s->idx_ns_mask,
+                                    stream_ref._v);
+    if (ns_slot >= 0 && s->profile->premature_fin_fails_request)
+        return ns_sub_cancel_signal(s, (size_t)ns_slot, reset, error_code);
 
     /* A request we migrated with an outbound GOAWAY (entry kept live, §10.4): the
      * peer's reset/stop is its old-stream close, so silently retire the request
@@ -2137,9 +2591,24 @@ static moq_result_t bidi_stream_teardown(moq_session_t *s,
         request_goaway_free_on_teardown(s, stream_ref))
         return MOQ_OK;
 
-    int32_t ns_slot = moq_index_find(s->idx_ns_by_ref, s->idx_ns_mask,
-                                      stream_ref._v);
     if (ns_slot >= 0) {
+        /* Legacy profiles: a requester still waiting for its response, and a
+         * responder in any state, learn of the peer's signal through the typed terminal
+         * event, once (latched so a refused continuation does not repeat
+         * it). An established requester-side subscription keeps the §10.18
+         * outcome below: its announced namespaces end individually on a
+         * reset, and a STOP_SENDING retires it with nothing owed. */
+        moq_ns_sub_entry_t *ne = &s->ns_subs[ns_slot];
+        bool owed = !ne->local_subscriber ||
+                    ne->state == MOQ_NS_SUB_PENDING_SUBSCRIBER;
+        if (owed && !ne->terminal_notified) {
+            if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+            push_request_terminated(s, MOQ_REQUEST_FAMILY_NS_SUB,
+                ne->local_subscriber ? MOQ_REQUEST_ROLE_REQUESTER
+                                     : MOQ_REQUEST_ROLE_RESPONDER,
+                request_terminal_signal(reset, error_code), ne->handle._opaque);
+            ne->terminal_notified = true;
+        }
         /* §10.18 names the reset, not STOP_SENDING: a reset of the response
          * stream is a NAMESPACE_DONE for every active namespace, and the reset
          * ingress owns the physical teardown, so no local close is queued. A
@@ -2188,6 +2657,375 @@ moq_result_t moq_session_request_goaway_ns_sub(
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;
     int slot = ns_sub_resolve_handle(s, handle);
     if (slot < 0) return MOQ_ERR_STALE_HANDLE;
+    if (s->ns_subs[slot].terminal.cause) return MOQ_ERR_WRONG_STATE;
     return session_core_send_request_goaway(s, MOQ_REQUEST_FAMILY_NS_SUB, slot,
         cfg->new_session_uri.data, cfg->new_session_uri.len, cfg->timeout_ms);
+}
+
+/* -- Draft-22 namespace updates (§9.5, §9.5.2) ----------------------- *
+ * SUBSCRIBE_NAMESPACE's update carries AUTHORIZATION_TOKEN and
+ * TRACK_NAMESPACE_PREFIX. A new prefix changes what later NAMESPACE /
+ * NAMESPACE_DONE suffixes mean; the REQUEST_OK is the barrier on both sides.
+ * Each side's active suffix set is rebased there: a namespace still under the
+ * new prefix keeps its identity under its new suffix, one outside it leaves
+ * the set without a NAMESPACE_DONE (the publisher may still serve it). */
+
+static bool ns_sub_updates_supported(const moq_session_t *s)
+{
+    return s->profile->request_codec &&
+           s->profile->request_codec->decode_namespace_update &&
+           s->profile->encode_namespace_update;
+}
+
+/* Map one tracked suffix of the old prefix into `dst` under the new prefix;
+ * a namespace outside the new prefix is skipped. `key` is caller scratch of
+ * NS_REBASE_KEY_MAX bytes. */
+#define NS_REBASE_KEY_MAX (1u + 2u * MOQ_DECODED_MAX_NAMESPACE_PARTS + MOQ_FULL_TRACK_NAME_MAX)
+
+static bool ns_rebase_one(moq_session_t *s, const ns_suffix_node_t *n,
+    const moq_bytes_t *old_prefix, size_t old_count,
+    const moq_bytes_t *new_prefix, size_t new_count,
+    ns_suffix_set_t *dst, uint8_t *key, size_t *bytes)
+{
+    moq_bytes_t sparts[MOQ_DECODED_MAX_NAMESPACE_PARTS];
+    moq_namespace_t suffix;
+    ns_suffix_key_t k = { n->data, n->len };
+    if (!ns_suffix_key_decode(&k, sparts, MOQ_DECODED_MAX_NAMESPACE_PARTS, &suffix) ||
+        old_count + suffix.count > MOQ_DECODED_MAX_NAMESPACE_PARTS)
+        return false;
+    moq_bytes_t full[MOQ_DECODED_MAX_NAMESPACE_PARTS];
+    size_t full_count = 0;
+    for (size_t i = 0; i < old_count; i++) full[full_count++] = old_prefix[i];
+    for (size_t i = 0; i < suffix.count; i++) full[full_count++] = suffix.parts[i];
+    if (!ns_update_has_prefix(new_prefix, new_count, full, full_count))
+        return true;
+    moq_namespace_t ns = { full + new_count, full_count - new_count };
+    size_t klen = ns_suffix_key_len(&ns);
+    if (klen > NS_REBASE_KEY_MAX) return false;
+    ns_suffix_key_build(&ns, key);
+    if (!ns_suffix_set_add(dst, &s->alloc, key, klen, NULL)) return false;
+    *bytes += klen;
+    return true;
+}
+
+/* Build the set `set` becomes under a new prefix, without touching it. The
+ * result owns its nodes; *out_bytes is the copied key bytes (the charge an
+ * inbound set carries). NULL `set` rebases to NULL. All-or-nothing. The walk
+ * is in order with an explicit stack: an AVL tree of any size this session
+ * can hold is far shallower than the stack array. */
+static moq_result_t ns_suffix_set_rebase(moq_session_t *s, const ns_suffix_set_t *set,
+    const moq_bytes_t *old_prefix, size_t old_count,
+    const moq_bytes_t *new_prefix, size_t new_count,
+    ns_suffix_set_t **out, size_t *out_bytes)
+{
+    *out = NULL;
+    *out_bytes = 0;
+    if (!set) return MOQ_OK;
+    ns_suffix_set_t *dst = (ns_suffix_set_t *)s->alloc.alloc(sizeof(*dst), s->alloc.ctx);
+    if (!dst) return MOQ_ERR_NOMEM;
+    memset(dst, 0, sizeof(*dst));
+    uint8_t *key = (uint8_t *)s->alloc.alloc(NS_REBASE_KEY_MAX, s->alloc.ctx);
+    bool ok = key != NULL;
+    size_t bytes = 0;
+    const ns_suffix_node_t *stack[96];
+    size_t depth = 0;
+    const ns_suffix_node_t *n = set->root;
+    while (ok && (n || depth)) {
+        while (n) {
+            if (depth == sizeof(stack) / sizeof(stack[0])) { ok = false; break; }
+            stack[depth++] = n;
+            n = n->left;
+        }
+        if (!ok) break;
+        n = stack[--depth];
+        ok = ns_rebase_one(s, n, old_prefix, old_count, new_prefix, new_count,
+                           dst, key, &bytes);
+        n = n->right;
+    }
+    if (key) s->alloc.free(key, NS_REBASE_KEY_MAX, s->alloc.ctx);
+    if (!ok) {
+        ns_suffix_set_free(dst, &s->alloc);
+        s->alloc.free(dst, sizeof(*dst), s->alloc.ctx);
+        return MOQ_ERR_NOMEM;
+    }
+    *out = dst;
+    *out_bytes = bytes;
+    return MOQ_OK;
+}
+
+/* Replace the entry's suffix set with a rebased one; an inbound set moves its
+ * receive-budget charge to the new key bytes. */
+static void ns_sub_install_set(moq_session_t *s, moq_ns_sub_entry_t *e,
+                               ns_suffix_set_t *fresh, size_t bytes)
+{
+    ns_suffix_set_t *old = (ns_suffix_set_t *)e->announced_suffixes;
+    if (old) {
+        if (e->announced_suffixes_inbound)
+            ns_recv_budget_release(s, old->counted_bytes);
+        ns_suffix_set_free(old, &s->alloc);
+        s->alloc.free(old, sizeof(*old), s->alloc.ctx);
+    }
+    e->announced_suffixes = fresh;
+    if (fresh && e->announced_suffixes_inbound) {
+        fresh->counted_bytes = bytes;
+        s->recv_payload_bytes += bytes;
+    }
+}
+
+/* A refused peer update: REQUEST_ERROR + FIN, REFUSED reported, the request
+ * retired on this side. Room for every output is reserved first. */
+static moq_result_t ns_sub_refuse_update(moq_session_t *s, size_t slot,
+                                         ns_update_admission_t *a, uint64_t code)
+{
+    moq_ns_sub_entry_t *e = &s->ns_subs[slot];
+    bool drain = e->stream_ref._v != 0 && !ns_sub_fin_observed(e, false);
+    if (drain && s->drain_ref_count >= s->drain_ref_cap) return MOQ_ERR_WOULD_BLOCK;
+    if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+    uint8_t buf[128];
+    size_t len = 0;
+    moq_result_t rc = ns_update_encode_error(s, a->d.request_id, code, NULL, 0,
+                                             buf, sizeof(buf), &len);
+    if (rc < 0) return rc;
+    rc = queue_send_bidi(s, e->stream_ref, buf, len, true);
+    if (rc < 0) return rc;
+    (void)ns_update_push_result_event(s, MOQ_REQUEST_FAMILY_NS_SUB,
+        e->handle._opaque, a->d.request_id, MOQ_NAMESPACE_UPDATE_OUTCOME_REFUSED,
+        MOQ_REQUEST_ROLE_RESPONDER, code, NULL, 0, false, 0);
+    ns_update_admission_commit(s, a);
+    if (drain) (void)drain_ref_add(s, e->stream_ref);   /* slot reserved above */
+    ns_sub_free_entry(s, slot);
+    return MOQ_OK;
+}
+
+static moq_result_t ns_sub_answer_update(moq_session_t *s, size_t slot,
+    const moq_request_envelope_t *env, size_t consumed)
+{
+    moq_ns_sub_entry_t *e = &s->ns_subs[slot];
+    if (e->update.owed)
+        return close_with_error(s, s->profile->request_updates_exceeded_error,
+                                "too many outstanding REQUEST_UPDATEs");
+    ns_update_admission_t a;
+    moq_result_t rc = ns_update_admit(s, MOQ_REQUEST_FAMILY_NS_SUB,
+                                      e->stream_ref, env, &a);
+    if (rc < 0 || s->state == MOQ_SESS_CLOSED) return rc;
+    uint64_t refuse = a.refuse_code;
+    if (!refuse && a.d.has_prefix &&
+        ns_sub_prefix_conflicts(s, a.d.prefix.parts, a.d.prefix.count, false,
+                                (int)slot))
+        refuse = MOQ_REQUEST_ERROR_PREFIX_OVERLAP;
+    if (refuse) {
+        rc = ns_sub_refuse_update(s, slot, &a, refuse);
+        if (rc < 0 || s->state == MOQ_SESS_CLOSED) ns_update_admission_abort(s, &a);
+        return rc;
+    }
+    rc = ns_update_defer(s, MOQ_REQUEST_FAMILY_NS_SUB, e->handle._opaque,
+                         &e->update, &a);
+    if (rc < 0 || s->state == MOQ_SESS_CLOSED) {
+        ns_update_admission_abort(s, &a);
+        return rc;
+    }
+    /* The update now owns copies of everything it needs. */
+    size_t remaining = e->recv_len - consumed;
+    memmove(e->recv_buf, e->recv_buf + consumed, remaining);
+    e->recv_len = remaining;
+    if (remaining) return ns_sub_reject_update(s, slot);
+    return MOQ_OK;
+}
+
+static moq_result_t ns_sub_owed_slot(moq_session_t *s, moq_ns_sub_handle_t handle,
+                                     int *out_slot)
+{
+    int slot = ns_sub_resolve_handle(s, handle);
+    if (slot < 0) return MOQ_ERR_STALE_HANDLE;
+    if (s->ns_subs[slot].local_subscriber) return MOQ_ERR_WRONG_STATE;
+    *out_slot = slot;
+    return MOQ_OK;
+}
+
+moq_result_t moq_session_accept_ns_sub_update(moq_session_t *s,
+    moq_ns_sub_handle_t handle, const moq_accept_subscription_update_cfg_t *cfg,
+    uint64_t now_us)
+{
+    if (!s || !cfg) return MOQ_ERR_INVAL;
+    if (!ns_sub_updates_supported(s)) return MOQ_ERR_UNSUPPORTED;
+    session_begin_advance(s, now_us);
+    if (!session_is_active(s)) return MOQ_ERR_CLOSED;
+    int slot = -1;
+    moq_result_t rc = ns_sub_owed_slot(s, handle, &slot);
+    if (rc < 0) return rc;
+    moq_ns_sub_entry_t *e = &s->ns_subs[slot];
+    moq_ns_update_t *u = &e->update;
+    rc = ns_update_check_accept(s, u, cfg);
+    if (rc < 0) return rc;
+    if (e->terminal.cause) return MOQ_ERR_WRONG_STATE;
+    /* A request retired after this answer also finishes this side's
+     * direction and, after the peer's GOAWAY without its FIN, drains. */
+    bool retire = u->retire_after_answer;
+    bool retire_drain = retire && u->retire_goaway_received &&
+                        !ns_sub_fin_observed(e, false);
+    if (retire && (action_queue_avail(s) < 2 ||
+                   (retire_drain && s->drain_ref_count >= s->drain_ref_cap)))
+        return MOQ_ERR_WOULD_BLOCK;
+    bool prefix = (u->owed_flags & MOQ_NAMESPACE_UPDATE_PREFIX) != 0;
+    ns_suffix_set_t *fresh = NULL;
+    size_t bytes = 0;
+    if (prefix) {
+        rc = ns_suffix_set_rebase(s, (const ns_suffix_set_t *)e->announced_suffixes,
+            e->prefix_parts, e->prefix_count, u->owed_prefix_parts,
+            u->owed_prefix_count, &fresh, &bytes);
+        if (rc < 0) return rc;
+    }
+    uint8_t buf[64];
+    size_t len = 0;
+    rc = ns_update_encode_ok(s, u->owed_request_id, buf, sizeof(buf), &len);
+    if (rc >= 0) rc = queue_send_bidi(s, e->stream_ref, buf, len, false);
+    if (rc < 0) {
+        if (fresh) {
+            ns_suffix_set_free(fresh, &s->alloc);
+            s->alloc.free(fresh, sizeof(*fresh), s->alloc.ctx);
+        }
+        return rc;
+    }
+    if (prefix) {
+        ns_sub_install_set(s, e, fresh, bytes);
+        ns_sub_free_prefix(s, e);
+        ns_update_take_owed_prefix(u, &e->prefix_buf, &e->prefix_buf_len,
+                                   &e->prefix_parts, &e->prefix_count);
+        e->prefix_valid = true;
+    }
+    ns_update_clear_owed(s, u);
+    if (retire) {
+        if (u->retire_close_half) (void)queue_close_bidi(s, e->stream_ref);
+        if (retire_drain) (void)drain_ref_add_goaway_received(s, e->stream_ref);
+        ns_sub_free_entry(s, (size_t)slot);
+    }
+    return MOQ_OK;
+}
+
+moq_result_t moq_session_reject_ns_sub_update(moq_session_t *s,
+    moq_ns_sub_handle_t handle, const moq_reject_subscription_update_cfg_t *cfg,
+    uint64_t now_us)
+{
+    if (!s || !cfg) return MOQ_ERR_INVAL;
+    if (!ns_sub_updates_supported(s)) return MOQ_ERR_UNSUPPORTED;
+    session_begin_advance(s, now_us);
+    if (!session_is_active(s)) return MOQ_ERR_CLOSED;
+    int slot = -1;
+    moq_result_t rc = ns_sub_owed_slot(s, handle, &slot);
+    if (rc < 0) return rc;
+    moq_ns_sub_entry_t *e = &s->ns_subs[slot];
+    rc = ns_update_check_reject(s, &e->update, cfg);
+    if (rc < 0) return rc;
+    if (e->terminal.cause) return MOQ_ERR_WRONG_STATE;
+    bool drain = e->stream_ref._v != 0 && !ns_sub_fin_observed(e, false);
+    if (drain && s->drain_ref_count >= s->drain_ref_cap) return MOQ_ERR_WOULD_BLOCK;
+    uint8_t buf[1152];
+    size_t len = 0;
+    rc = ns_update_encode_error(s, e->update.owed_request_id, cfg->error_code,
+        cfg->reason.data, cfg->reason.len, buf, sizeof(buf), &len);
+    if (rc < 0) return rc;
+    rc = queue_send_bidi(s, e->stream_ref, buf, len, true);
+    if (rc < 0) return rc;
+    if (drain) (void)drain_ref_add(s, e->stream_ref);   /* slot reserved above */
+    ns_sub_free_entry(s, (size_t)slot);
+    return MOQ_OK;
+}
+
+moq_result_t moq_session_ns_sub_owed_update(moq_session_t *s,
+    moq_ns_sub_handle_t handle, moq_namespace_update_record_t *out, size_t out_size)
+{
+    if (!s || !out || out_size < MOQ_NAMESPACE_UPDATE_RECORD_V0_SIZE)
+        return MOQ_ERR_INVAL;
+    if (!ns_sub_updates_supported(s)) return MOQ_ERR_UNSUPPORTED;
+    int slot = -1;
+    moq_result_t rc = ns_sub_owed_slot(s, handle, &slot);
+    if (rc < 0) return rc;
+    return ns_update_owed_query(&s->ns_subs[slot].update, out, out_size);
+}
+
+moq_result_t moq_session_update_ns_sub(moq_session_t *s,
+    moq_ns_sub_handle_t handle, const moq_namespace_update_cfg_t *cfg,
+    uint64_t now_us, uint64_t *out_update_request_id)
+{
+    if (!s || !cfg) return MOQ_ERR_INVAL;
+    if (!ns_sub_updates_supported(s)) return MOQ_ERR_UNSUPPORTED;
+    moq_namespace_update_encode_args_t args;
+    moq_result_t rc = ns_update_cfg_read(s, cfg, MOQ_REQUEST_FAMILY_NS_SUB, &args);
+    if (rc < 0) return rc;
+    session_begin_advance(s, now_us);
+    if (!session_is_active(s)) return MOQ_ERR_CLOSED;
+    int slot = ns_sub_resolve_handle(s, handle);
+    if (slot < 0) return MOQ_ERR_STALE_HANDLE;
+    moq_ns_sub_entry_t *e = &s->ns_subs[slot];
+    if (!e->local_subscriber || e->state != MOQ_NS_SUB_ESTABLISHED ||
+        !e->got_response || e->terminal.cause || e->goaway_sent ||
+        e->update.failed || e->suffix_cap_terminating)
+        return MOQ_ERR_WRONG_STATE;
+    if (s->goaway_received) return MOQ_ERR_GOAWAY;
+    if (e->update.outstanding) return MOQ_ERR_REQUEST_BLOCKED;
+    if (args.has_prefix &&
+        ns_sub_prefix_conflicts(s, args.prefix.parts, args.prefix.count, true,
+                                slot))
+        return MOQ_ERR_INVAL;
+    return ns_update_send(s, e->stream_ref, &e->update, &args, out_update_request_id);
+}
+
+/* The publisher's answer to this side's update. OK is the barrier: the new
+ * prefix and the rebased active set take effect before the next message is
+ * parsed. ERROR ends the request; only the FIN may follow. */
+static moq_result_t ns_sub_on_update_response(moq_session_t *s, int32_t slot,
+    const moq_decoded_ns_sub_response_t *resp)
+{
+    moq_ns_sub_entry_t *e = &s->ns_subs[slot];
+    moq_ns_update_t *u = &e->update;
+    if (!u->outstanding)
+        return close_with_error(s, 0x3, "duplicate response on bidi stream");
+    bool ok = resp->kind == MOQ_NS_RESP_UPDATE_OK;
+    if (!ok && resp->has_trailing_bytes)
+        return close_with_error(s, 0x3,
+            "message after a refused namespace update");
+    if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+    bool prefix = ok && (u->out_flags & MOQ_NAMESPACE_UPDATE_PREFIX);
+    ns_suffix_set_t *fresh = NULL;
+    size_t bytes = 0;
+    if (prefix) {
+        const ns_suffix_set_t *old = (const ns_suffix_set_t *)e->announced_suffixes;
+        moq_result_t rc = ns_suffix_set_rebase(s, old, e->prefix_parts,
+            e->prefix_count, u->out_prefix_parts, u->out_prefix_count,
+            &fresh, &bytes);
+        if (rc < 0) return rc;
+        size_t held = e->announced_suffixes_inbound && old ? old->counted_bytes : 0;
+        size_t base = s->recv_payload_bytes - held;
+        if (fresh && e->announced_suffixes_inbound &&
+            (bytes > s->max_recv_buf || base > s->max_recv_buf - bytes)) {
+            ns_suffix_set_free(fresh, &s->alloc);
+            s->alloc.free(fresh, sizeof(*fresh), s->alloc.ctx);
+            return close_with_error(s, 0x1,
+                "inbound namespace suffix tracking exceeds receive budget");
+        }
+    }
+    moq_result_t rc = ns_update_push_result_event(s, MOQ_REQUEST_FAMILY_NS_SUB,
+        e->handle._opaque, u->out_request_id,
+        ok ? MOQ_NAMESPACE_UPDATE_OUTCOME_OK : MOQ_NAMESPACE_UPDATE_OUTCOME_ERROR,
+        MOQ_REQUEST_ROLE_REQUESTER,
+        ok ? 0 : s->profile->semantic_request_error(resp->error_code),
+        ok ? NULL : resp->reason, ok ? 0 : resp->reason_len,
+        ok && resp->has_expires, resp->expires_ms);
+    if (rc < 0 || s->state == MOQ_SESS_CLOSED) {
+        if (fresh) {
+            ns_suffix_set_free(fresh, &s->alloc);
+            s->alloc.free(fresh, sizeof(*fresh), s->alloc.ctx);
+        }
+        return rc;
+    }
+    if (prefix) {
+        ns_sub_install_set(s, e, fresh, bytes);
+        ns_sub_free_prefix(s, e);
+        ns_update_take_out_prefix(u, &e->prefix_buf, &e->prefix_buf_len,
+                                  &e->prefix_parts, &e->prefix_count);
+        e->prefix_valid = true;
+    }
+    if (!ok) u->failed = true;
+    ns_update_clear_outstanding(s, u);
+    return MOQ_OK;
 }

@@ -155,9 +155,33 @@ typedef struct moqr_log_append_desc {
      * length known up front. Ignored for COMPLETE appends. */
     moqr_obj_state_t  obj_state;
     uint64_t          declared_len;
+    /* Appended. The upstream subgroup header set FIRST_OBJECT and this record
+     * is the first object its stream carried: the first object ever
+     * published in the subgroup. A downstream stream that begins with this
+     * record sets FIRST_OBJECT (draft-18 and draft-22 §2.2). A descriptor
+     * whose struct_size ends at declared_len is accepted and appends the
+     * record with the mark clear. */
+    bool              first_object;
+    /* Appended at the descriptor's previous sizeof (the bytes of
+     * _reserved_desc lie inside that sizeof and are never read). The
+     * upstream subgroup header set PROPERTIES: every object of that stream
+     * had a Properties field, and a downstream stream that carries this
+     * record opens with the same form. Read only when struct_size covers it;
+     * otherwise the record is appended with the flag clear. */
+    uint8_t           _reserved_desc[7];
+    bool              subgroup_properties;
 } moqr_log_append_desc_t;
 
+/* The symbol clears and stamps the descriptor as a caller built before any
+ * field was appended to it holds it (its sizeof through declared_len); the
+ * appended fields stay unread. The function-like macro passes the caller's
+ * sizeof to moqr_log_append_desc_init_sized(), which clears and stamps
+ * min(desc_size, sizeof current). */
 MOQR_CORE_API void moqr_log_append_desc_init(moqr_log_append_desc_t *d);
+MOQR_CORE_API void moqr_log_append_desc_init_sized(moqr_log_append_desc_t *d,
+                                                   size_t desc_size);
+#define moqr_log_append_desc_init(d) \
+    moqr_log_append_desc_init_sized((d), sizeof(*(d)))
 
 /*
  * Append one complete object record.
@@ -302,6 +326,8 @@ typedef struct moqr_record_view {
                                       * OPEN/ABANDONED for chunked records  */
     bool               datagram_pref;
     bool               end_of_group;
+    bool               first_object; /* see moqr_log_append_desc_t; former
+                                      * padding, layout unchanged          */
     const moq_rcbuf_t *payload;      /* BORROWED; NULL for status/chunked   */
     const moq_rcbuf_t *properties;   /* BORROWED; NULL if none             */
     /* Chunked records (chunk_count > 0): payload is NULL and the retained
@@ -440,6 +466,34 @@ MOQR_CORE_API bool moqr_log_subgroup_sealed(const moqr_log_t *log, uint64_t grou
 MOQR_CORE_API bool moqr_log_subgroup_reset(const moqr_log_t *log, uint64_t group_id,
                              uint32_t list_slot,
                              moqr_reset_desc_t *out_reset);
+
+/* The greatest object id any record retained in the group carries, over its
+ * subgroup lists and datagram list alike (status objects included: an
+ * END_OF_GROUP marker at id N contributes N). False for an absent or evicted
+ * group, or one with no records left. This is the extent of the group the log
+ * has evidence for; nothing is known about Locations past it. */
+MOQR_CORE_API bool moqr_log_group_last(const moqr_log_t *log, uint64_t group_id,
+                                       uint64_t *last_object_id);
+
+/* The group's final object id, when the log knows it: an END_OF_GROUP status
+ * object (its own id), the END_OF_GROUP bit on a datagram or on the header
+ * of a subgroup that ended with a FIN (that subgroup's last object), or an
+ * END_OF_TRACK status object in the group. No object with a greater id exists
+ * in the group. False for an absent or evicted group, or one whose final is
+ * not known: then nothing is known about the Locations past its extent. */
+MOQR_CORE_API bool moqr_log_group_final(const moqr_log_t *log, uint64_t group_id,
+                                        uint64_t *final_object_id);
+
+/* The status and completion state of the record retained at one Location,
+ * if any. True when a record is retained there (in any subgroup list or the
+ * datagram list), outputting its status and state; false when the Location
+ * holds nothing, or the group is absent or evicted. A pure lookup for a
+ * reader that must tell a hole from a status object or an in-progress
+ * record before deciding what the hole means. */
+MOQR_CORE_API bool moqr_log_object_status(const moqr_log_t *log, uint64_t group_id,
+                                          uint64_t object_id,
+                                          moqr_obj_status_t *status,
+                                          moqr_obj_state_t *state);
 
 /* -- Introspection ------------------------------------------------------ */
 

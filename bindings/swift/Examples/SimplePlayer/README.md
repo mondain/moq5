@@ -64,6 +64,11 @@ version pin, CA bundle path, and skip-verification toggle. The controls are
 disabled while a connection is live (configuration is fixed for the life of a
 connection).
 
+Choosing **Draft 22** explicitly selects both its wire version and its
+MSF-01/LOC-04 media companion profile. Automatic version selection keeps the
+legacy profile and default draft-18/16 offer. This opt-in does not bypass the
+backend or playback limitations below.
+
 While playing, the controls recede to leave just the video; tap it to bring
 them back. The status line (`Playing — N samples · track · draft`) lives in
 that control card, never over the video. The layout adapts to rotation — a 4:3

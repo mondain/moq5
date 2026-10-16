@@ -1,4 +1,6 @@
 #include "log_internal.h"
+#include "retrieve_internal.h"
+#include <moq/relay/relay.h>
 #include <moq/relay/capacity.h>
 
 #include <stddef.h>
@@ -144,14 +146,59 @@ moqr_log_structure_ceiling(const moqr_log_cfg_resolved_t *r)
     return s;
 }
 
+/* The descriptor's sizeof before any field was appended to it: the extent
+ * through declared_len, rounded to the descriptor's alignment. */
+#define LOG_DESC_SIZE_THROUGH_DECLARED_LEN                                    \
+    ((offsetof(moqr_log_append_desc_t, declared_len) + sizeof(uint64_t) +    \
+      _Alignof(moqr_log_append_desc_t) - 1u) &                                \
+     ~(size_t)(_Alignof(moqr_log_append_desc_t) - 1u))
+
+static moqr_group_t *group_find(const moqr_log_t *log, uint64_t group_id,
+                                uint32_t *out_idx);
+
+/* Parenthesized: defines the symbol, not the header's sized macro. */
 void
-moqr_log_append_desc_init(moqr_log_append_desc_t *d)
+(moqr_log_append_desc_init)(moqr_log_append_desc_t *d)
 {
     if (d == NULL) {
         return;
     }
-    memset(d, 0, sizeof(*d));
-    d->struct_size = sizeof(*d);
+    memset(d, 0, LOG_DESC_SIZE_THROUGH_DECLARED_LEN);
+    d->struct_size = (uint32_t)LOG_DESC_SIZE_THROUGH_DECLARED_LEN;
+}
+
+void
+moqr_log_append_desc_init_sized(moqr_log_append_desc_t *d, size_t desc_size)
+{
+    if (d == NULL || desc_size < sizeof(d->struct_size)) {
+        return;
+    }
+    size_t n = desc_size < sizeof(*d) ? desc_size : sizeof(*d);
+    memset(d, 0, n);
+    d->struct_size = (uint32_t)n;
+}
+
+void
+moqr_log_internal_rec_flags(const moqr_log_t *log, uint64_t group_id,
+                            uint32_t list_slot, uint32_t rec_idx,
+                            bool *subgroup_properties, bool *follows_gap,
+                            moqr_reset_desc_t *gap_reset)
+{
+    *subgroup_properties = false;
+    *follows_gap = false;
+    *gap_reset = moqr_reset_desc_none();
+    if (log == NULL || list_slot == MOQR_LOG_LIST_DATAGRAM) {
+        return;
+    }
+    const moqr_group_t *g = group_find(log, group_id, NULL);
+    if (g == NULL || list_slot >= g->sg_count ||
+        rec_idx >= g->sgs[list_slot].v.count) {
+        return;
+    }
+    const moqr_rec_t *rec = &g->sgs[list_slot].v.recs[rec_idx];
+    *subgroup_properties = rec->subgroup_properties;
+    *follows_gap = rec->follows_gap;
+    *gap_reset = rec->gap_reset;
 }
 
 /* -- lifecycle ---------------------------------------------------------- */
@@ -329,6 +376,9 @@ group_release(moqr_log_t *log, moqr_group_t *g)
 static bool
 id_set_contains(const moqr_log_t *log, const moqr_group_t *g, uint64_t id)
 {
+    if (id == UINT64_MAX) {
+        return g->has_max_object;
+    }
     uint32_t mask = log->id_set_cap - 1;
     uint32_t i = (uint32_t)((id * UINT64_C(0x9E3779B97F4A7C15)) >> 32) & mask;
     while (g->id_set[i] != UINT64_MAX) {
@@ -343,6 +393,10 @@ id_set_contains(const moqr_log_t *log, const moqr_group_t *g, uint64_t id)
 static void
 id_set_insert(const moqr_log_t *log, moqr_group_t *g, uint64_t id)
 {
+    if (id == UINT64_MAX) {
+        g->has_max_object = true;
+        return;
+    }
     uint32_t mask = log->id_set_cap - 1;
     uint32_t i = (uint32_t)((id * UINT64_C(0x9E3779B97F4A7C15)) >> 32) & mask;
     while (g->id_set[i] != UINT64_MAX) {
@@ -678,11 +732,210 @@ group_retains_beyond(const moqr_group_t *g, uint64_t final_q)
     return false;
 }
 
+/* A descriptor must cover the layout that ends at declared_len; later
+ * fields are read only when the caller's struct_size covers them. */
+#define LOG_DESC_MIN_SIZE \
+    (offsetof(moqr_log_append_desc_t, declared_len) + sizeof(uint64_t))
+#define LOG_DESC_HAS(desc, field)                             \
+    (offsetof(moqr_log_append_desc_t, field) +                \
+         sizeof(((moqr_log_append_desc_t *)0)->field) <= (desc)->struct_size)
+
+static bool
+log_hole_has(const moqr_log_t *log, uint64_t group_id, uint64_t subgroup_id)
+{
+    for (uint32_t i = 0; i < MOQR_LOG_HOLES; i++) {
+        if (log->holes[i].used && log->holes[i].group_id == group_id &&
+            log->holes[i].subgroup_id == subgroup_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void
+log_hole_clear(moqr_log_t *log, uint64_t group_id, uint64_t subgroup_id)
+{
+    for (uint32_t i = 0; i < MOQR_LOG_HOLES; i++) {
+        if (log->holes[i].used && log->holes[i].group_id == group_id &&
+            log->holes[i].subgroup_id == subgroup_id) {
+            log->holes[i].used = false;
+        }
+    }
+}
+
+moqr_result_t
+moqr_log_note_gap(moqr_log_t *log, uint64_t group_id, uint64_t subgroup_id)
+{
+    if (log == NULL) {
+        return MOQR_ERR_INVAL;
+    }
+    moqr_group_t *g = group_find(log, group_id, NULL);
+    if (g != NULL) {
+        for (uint32_t s = 0; s < g->sg_count; s++) {
+            if (g->sgs[s].subgroup_id == subgroup_id) {
+                g->sgs[s].gap_pending = true;
+                g->sgs[s].incomplete = true;
+                return MOQR_OK;
+            }
+        }
+    } else if (log->any_evicted && group_id <= log->max_evicted_group_id) {
+        return MOQR_DONE;   /* the group is gone: nothing more is retained */
+    }
+    if (!log_hole_has(log, group_id, subgroup_id)) {
+        uint32_t i = log->holes_next % MOQR_LOG_HOLES;
+        log->holes[i].used = true;
+        log->holes[i].group_id = group_id;
+        log->holes[i].subgroup_id = subgroup_id;
+        log->holes_next++;
+    }
+    return MOQR_OK;
+}
+
+/* The record retained at (group, object), in any list. */
+static const moqr_rec_t *
+log_rec_at(const moqr_group_t *g, uint64_t object_id)
+{
+    for (uint32_t s = 0; s < g->sg_count; s++) {
+        const moqr_rec_vec_t *v = &g->sgs[s].v;
+        for (uint32_t i = 0; i < v->count; i++) {
+            if (v->recs[i].object_id == object_id) {
+                return &v->recs[i];
+            }
+        }
+    }
+    for (uint32_t i = 0; i < g->dg.count; i++) {
+        if (g->dg.recs[i].object_id == object_id) {
+            return &g->dg.recs[i];
+        }
+    }
+    return NULL;
+}
+
+/* The payload length of a retained record: declared for a chunked or OPEN
+ * one, the payload's for a whole one. */
+static uint64_t
+log_rec_len(const moqr_rec_t *rec)
+{
+    return rec->chunk_count > 0 || rec->obj_state == MOQR_OBJ_OPEN
+               ? rec->declared_len
+               : (uint64_t)moq_rcbuf_len(rec->payload);
+}
+
+/* Compare `len` bytes at `offset` of the record's payload with `data`, over
+ * the bytes the record holds: DIFFERS on the first unequal byte, EQUAL when
+ * every byte was held and equal, UNKNOWN when some were not held yet. */
+static uint32_t
+log_rec_compare(const moqr_log_t *log, const moqr_rec_t *rec, uint64_t offset,
+                const uint8_t *data, size_t len)
+{
+    if (offset > log_rec_len(rec) || len > log_rec_len(rec) - offset) {
+        return MOQR_LOG_RANGE_DIFFERS;
+    }
+    if (rec->chunk_count == 0 && rec->obj_state != MOQR_OBJ_OPEN) {
+        if (len == 0) return MOQR_LOG_RANGE_EQUAL;
+        return memcmp(moq_rcbuf_data(rec->payload) + offset, data, len) == 0
+                   ? MOQR_LOG_RANGE_EQUAL
+                   : MOQR_LOG_RANGE_DIFFERS;
+    }
+    uint64_t pos = 0;          /* payload offset of the current chunk */
+    size_t done = 0;           /* bytes of `data` compared            */
+    for (uint32_t n = rec->chunk_head; n != MOQR_CHUNK_NIL && done < len;
+         n = log->chunk_pool[n].next) {
+        const moqr_chunk_node_t *c = &log->chunk_pool[n];
+        uint64_t end = pos + c->len;
+        uint64_t want = offset + done;
+        if (want < end) {
+            size_t from = (size_t)(want - pos);
+            size_t take = (size_t)(end - want);
+            if (take > len - done) take = len - done;
+            if (memcmp(moq_rcbuf_data(c->buf) + from, data + done, take) != 0) {
+                return MOQR_LOG_RANGE_DIFFERS;
+            }
+            done += take;
+        }
+        pos = end;
+    }
+    return done == len ? MOQR_LOG_RANGE_EQUAL : MOQR_LOG_RANGE_UNKNOWN;
+}
+
+uint32_t
+moqr_log_duplicate(const moqr_log_t *log, const moqr_log_append_desc_t *desc)
+{
+    if (log == NULL || desc == NULL || desc->struct_size < LOG_DESC_MIN_SIZE) {
+        return MOQR_LOG_DUP_NONE;
+    }
+    const moqr_group_t *g = group_find(log, desc->group_id, NULL);
+    if (g == NULL) {
+        return MOQR_LOG_DUP_NONE;
+    }
+    const moqr_rec_t *rec = log_rec_at(g, desc->object_id);
+    if (rec == NULL) {
+        return MOQR_LOG_DUP_NONE;
+    }
+    if (rec->obj_state == MOQR_OBJ_ABANDONED) {
+        return MOQR_LOG_DUP_NONE;   /* nothing of it is retained to compare */
+    }
+    if (rec->datagram_pref != desc->datagram_pref ||
+        (!desc->datagram_pref && rec->subgroup_id != desc->subgroup_id) ||
+        rec->publisher_priority != desc->publisher_priority) {
+        return MOQR_LOG_DUP_DIFFERS;
+    }
+    /* §7.1 item 1: an object may go from existing to not existing. A status
+     * at the object's own Location saying no object from it on exists (End
+     * of Group, End of Track) is that update; the relay keeps what it has.
+     * Nothing goes the other way. */
+    if (rec->status == MOQR_OBJ_NORMAL &&
+        (desc->status == MOQR_OBJ_END_OF_GROUP ||
+         desc->status == MOQR_OBJ_END_OF_TRACK)) {
+        return MOQR_LOG_DUP_UPDATE;
+    }
+    if (rec->status != desc->status) {
+        return MOQR_LOG_DUP_DIFFERS;
+    }
+    if (desc->obj_state == MOQR_OBJ_OPEN) {
+        /* A streamed copy: equal lengths are not equal bytes. Its chunks are
+         * compared as they arrive. */
+        return desc->declared_len == log_rec_len(rec) ? MOQR_LOG_DUP_PENDING
+                                                       : MOQR_LOG_DUP_DIFFERS;
+    }
+    size_t plen = moq_rcbuf_len(desc->payload);
+    if ((uint64_t)plen != log_rec_len(rec)) {
+        return MOQR_LOG_DUP_DIFFERS;
+    }
+    if (plen == 0) {
+        return MOQR_LOG_DUP_IDENTICAL;
+    }
+    switch (log_rec_compare(log, rec, 0, moq_rcbuf_data(desc->payload), plen)) {
+    case MOQR_LOG_RANGE_EQUAL:   return MOQR_LOG_DUP_IDENTICAL;
+    case MOQR_LOG_RANGE_DIFFERS: return MOQR_LOG_DUP_DIFFERS;
+    default:                     return MOQR_LOG_DUP_UNVERIFIED;
+    }
+}
+
+uint32_t
+moqr_log_duplicate_range(const moqr_log_t *log, uint64_t group_id,
+                         uint64_t subgroup_id, uint64_t object_id,
+                         uint64_t offset, const uint8_t *data, size_t len)
+{
+    if (log == NULL || (data == NULL && len > 0)) {
+        return MOQR_LOG_RANGE_UNKNOWN;
+    }
+    const moqr_group_t *g = group_find(log, group_id, NULL);
+    const moqr_rec_t *rec = g != NULL ? log_rec_at(g, object_id) : NULL;
+    if (rec == NULL || rec->obj_state == MOQR_OBJ_ABANDONED) {
+        return MOQR_LOG_RANGE_UNKNOWN;
+    }
+    if (rec->datagram_pref || rec->subgroup_id != subgroup_id) {
+        return MOQR_LOG_RANGE_DIFFERS;
+    }
+    return log_rec_compare(log, rec, offset, data, len);
+}
+
 moqr_result_t
 moqr_log_append(moqr_log_t *log, const moqr_log_append_desc_t *desc)
 {
     if (log == NULL || desc == NULL ||
-        desc->struct_size < sizeof(moqr_log_append_desc_t)) {
+        desc->struct_size < LOG_DESC_MIN_SIZE) {
         return MOQR_ERR_INVAL;
     }
     /* Status objects carry no payload (mirrors the session's
@@ -706,12 +959,6 @@ moqr_log_append(moqr_log_t *log, const moqr_log_append_desc_t *desc)
          * never a per-record terminal, so it cannot fire while OPEN. */
         return MOQR_ERR_INVAL;
     }
-    /* Wire object IDs are varints (< 2^62); UINT64_MAX is the id-set
-     * sentinel and can never be a real object. */
-    if (desc->object_id == UINT64_MAX) {
-        return MOQR_ERR_INVAL;
-    }
-
     /* End-of-track: appends beyond the final location are ordering
      * violations the binding may escalate (spec: malformed-track
      * condition 5, -18 :1069-1072). */
@@ -753,14 +1000,14 @@ moqr_log_append(moqr_log_t *log, const moqr_log_append_desc_t *desc)
     if (eog_evidence || eot_evidence) {
         const moqr_group_t *pg = group_find(log, desc->group_id, NULL);
         if (pg != NULL) {
-            bool lowers = pg->final_object_id == MOQR_FINAL_UNKNOWN ||
+            bool lowers = !pg->has_final ||
                           desc->object_id < pg->final_object_id;
             if ((eot_evidence || lowers) &&
                 group_retains_beyond(pg, desc->object_id)) {
                 return MOQR_ERR_INVAL;
             }
             if (eot_evidence &&
-                pg->final_object_id != MOQR_FINAL_UNKNOWN &&
+                pg->has_final &&
                 pg->final_object_id > desc->object_id) {
                 return MOQR_ERR_INVAL;   /* declared group final beyond EOT */
             }
@@ -778,7 +1025,7 @@ moqr_log_append(moqr_log_t *log, const moqr_log_append_desc_t *desc)
     }
 
     /* Group-final enforcement (EOG evidence seen earlier). */
-    if (g->final_object_id != MOQR_FINAL_UNKNOWN &&
+    if (g->has_final &&
         desc->object_id > g->final_object_id) {
         return MOQR_ERR_INVAL;
     }
@@ -816,6 +1063,8 @@ moqr_log_append(moqr_log_t *log, const moqr_log_append_desc_t *desc)
             sg->sealed_reset = false;
             sg->reset = moqr_reset_desc_none();
             sg->end_of_group = false;
+            sg->gap_pending = false;
+            sg->incomplete = log_hole_has(log, desc->group_id, desc->subgroup_id);
             jslot_index = g->sg_count;
         } else {
             jslot_index = (uint32_t)(sg - g->sgs);
@@ -863,6 +1112,8 @@ moqr_log_append(moqr_log_t *log, const moqr_log_append_desc_t *desc)
                 sg->sealed_reset = false;
                 sg->reset = moqr_reset_desc_none();
                 sg->end_of_group = false;
+                sg->gap_pending = false;
+                sg->incomplete = log_hole_has(log, desc->group_id, desc->subgroup_id);
                 jslot_index = g->sg_count;
             }
         }
@@ -899,6 +1150,8 @@ moqr_log_append(moqr_log_t *log, const moqr_log_append_desc_t *desc)
                 sg->sealed_reset = false;
                 sg->reset = moqr_reset_desc_none();
                 sg->end_of_group = false;
+                sg->gap_pending = false;
+                sg->incomplete = log_hole_has(log, desc->group_id, desc->subgroup_id);
                 jslot_index = g->sg_count;
             }
         }
@@ -927,6 +1180,22 @@ moqr_log_append(moqr_log_t *log, const moqr_log_append_desc_t *desc)
     rec.obj_state = desc->obj_state;   /* COMPLETE (0) or OPEN */
     rec.datagram_pref = desc->datagram_pref;
     rec.end_of_group = desc->end_of_group;
+    rec.first_object = LOG_DESC_HAS(desc, first_object) && desc->first_object;
+    rec.subgroup_properties = LOG_DESC_HAS(desc, subgroup_properties) &&
+                              desc->subgroup_properties;
+    rec.follows_gap = !desc->datagram_pref && sg->gap_pending;
+    rec.gap_reset = moqr_reset_desc_none();
+    /* An append to a subgroup whose upstream stream already ended (a RESET,
+     * or a FIN the session could not tell was final) arrives on a new
+     * upstream stream: a new lifetime of the subgroup. Its first record does
+     * not continue the stream the earlier records were on, and carries the
+     * terminal that stream owes; the subgroup is open again, so the earlier
+     * terminal is not passed on as the new stream's (draft-22 §11.3.2). */
+    bool reopens = !desc->datagram_pref && sg->has_records && sg->sealed;
+    if (reopens) {
+        rec.follows_gap = true;
+        if (sg->sealed_reset) rec.gap_reset = sg->reset;
+    }
 
     uint32_t rec_index = 0;
     moqr_rec_vec_t *dst = desc->datagram_pref ? &g->dg : &sg->v;
@@ -938,9 +1207,17 @@ moqr_log_append(moqr_log_t *log, const moqr_log_append_desc_t *desc)
     if (!desc->datagram_pref) {
         if (jslot_index == g->sg_count) {
             g->sg_count++;   /* the subgroup slot is now committed */
+            log_hole_clear(log, desc->group_id, desc->subgroup_id);
         }
         sg->last_object_id = desc->object_id;
         sg->has_records = true;
+        sg->gap_pending = false;
+        if (reopens) {
+            sg->sealed = false;
+            sg->sealed_reset = false;
+            sg->reset = moqr_reset_desc_none();
+            sg->incomplete = false;
+        }
         /* desc->end_of_group is subgroup-header METADATA (this subgroup ends
          * its group), NOT a per-record terminal — more objects may follow on
          * the same subgroup. Sealing happens only at the actual graceful
@@ -977,9 +1254,10 @@ moqr_log_append(moqr_log_t *log, const moqr_log_append_desc_t *desc)
     bool group_closed = false;
     if (desc->status == MOQR_OBJ_END_OF_GROUP ||
         (desc->end_of_group && desc->datagram_pref)) {
-        if (g->final_object_id == MOQR_FINAL_UNKNOWN ||
+        if (!g->has_final ||
             desc->object_id < g->final_object_id) {
             g->final_object_id = desc->object_id;
+            g->has_final = true;
             group_closed = true;
         }
     } else if (desc->end_of_group && !desc->datagram_pref) {
@@ -989,8 +1267,9 @@ moqr_log_append(moqr_log_t *log, const moqr_log_append_desc_t *desc)
         log->end_of_track = true;
         log->final_group_id = desc->group_id;
         log->final_track_object_id = desc->object_id;
-        if (g->final_object_id == MOQR_FINAL_UNKNOWN) {
+        if (!g->has_final) {
             g->final_object_id = desc->object_id;
+            g->has_final = true;
         }
         group_closed = true;
     }
@@ -1009,7 +1288,7 @@ moqr_result_t
 moqr_log_open_record(moqr_log_t *log, const moqr_log_append_desc_t *desc)
 {
     if (log == NULL || desc == NULL ||
-        desc->struct_size < sizeof(moqr_log_append_desc_t)) {
+        desc->struct_size < LOG_DESC_MIN_SIZE) {
         return MOQR_ERR_INVAL;
     }
     if (desc->obj_state != MOQR_OBJ_OPEN) {
@@ -1116,6 +1395,41 @@ moqr_log_append_chunk(moqr_log_t *log, uint64_t group_id, uint64_t subgroup_id,
     tr(log, MOQR_TRACE_APPEND, 2u /* chunk */, group_id, subgroup_id,
        object_id, len);
     return MOQR_OK;
+}
+
+moqr_result_t
+moqr_log_set_opener(moqr_log_t *log, uint64_t group_id, uint64_t subgroup_id,
+                    uint64_t object_id, uint32_t conn, uint64_t src)
+{
+    if (log == NULL) {
+        return MOQR_ERR_INVAL;
+    }
+    moqr_rec_t *rec = NULL;
+    moqr_result_t rc =
+        resolve_open_rec(log, group_id, subgroup_id, object_id, NULL, NULL, &rec);
+    if (rc != MOQR_OK) {
+        return rc;
+    }
+    rec->has_opener = true;
+    rec->opener_conn = conn;
+    rec->opener_src = src;
+    return MOQR_OK;
+}
+
+bool
+moqr_log_open_by_other(const moqr_log_t *log, uint64_t group_id,
+                       uint64_t subgroup_id, uint64_t object_id, uint32_t conn,
+                       uint64_t src)
+{
+    if (log == NULL) {
+        return false;
+    }
+    moqr_rec_t *rec = NULL;
+    if (resolve_open_rec((moqr_log_t *)log, group_id, subgroup_id, object_id,
+                         NULL, NULL, &rec) != MOQR_OK) {
+        return false;
+    }
+    return rec->has_opener && (rec->opener_conn != conn || rec->opener_src != src);
 }
 
 moqr_result_t
@@ -1349,6 +1663,7 @@ view_fill(moqr_record_view_t *out, const moqr_rec_t *rec)
     out->obj_state = rec->obj_state;
     out->datagram_pref = rec->datagram_pref;
     out->end_of_group = rec->end_of_group;
+    out->first_object = rec->first_object;
     out->payload = rec->payload;
     out->properties = rec->properties;
     out->chunk_count = rec->chunk_count;
@@ -1557,8 +1872,22 @@ moqr_log_seal_subgroup(moqr_log_t *log, uint64_t group_id, uint64_t subgroup_id)
     }
     for (uint32_t s = 0; s < g->sg_count; s++) {
         if (g->sgs[s].subgroup_id == subgroup_id) {
+            if (g->sgs[s].incomplete) {
+                /* An object of this subgroup was refused: the upstream FIN
+                 * cannot be passed on, since a downstream FIN would claim
+                 * every object was delivered. Recorded as a RESET, which
+                 * also leaves header-EOG finality unresolved. */
+                if (!g->sgs[s].sealed) {
+                    moqr_reset_desc_t rd = moqr_reset_desc_none();
+                    (void)moqr_reset_desc_internal(MOQR_RESET_CODE_EVICTED, &rd);
+                    g->sgs[s].sealed = true;
+                    g->sgs[s].sealed_reset = true;
+                    g->sgs[s].reset = rd;
+                }
+                return MOQR_OK;
+            }
             if (g->sgs[s].end_of_group && g->sgs[s].has_records &&
-                (g->final_object_id == MOQR_FINAL_UNKNOWN ||
+                (!g->has_final ||
                  g->sgs[s].last_object_id < g->final_object_id)) {
                 /* Header-EOG resolves here: the group's final object is this
                  * subgroup's last, known only now that the stream FIN'd.
@@ -1574,6 +1903,7 @@ moqr_log_seal_subgroup(moqr_log_t *log, uint64_t group_id, uint64_t subgroup_id)
                 }
                 g->sgs[s].sealed = true;
                 g->final_object_id = final_q;
+                g->has_final = true;
                 tr(log, MOQR_TRACE_GROUP_CLOSE, 0u, g->group_id,
                    g->final_object_id, g->record_count, log->trace_id);
                 return MOQR_OK;
@@ -1637,6 +1967,119 @@ moqr_log_subgroup_is_final(const moqr_log_t *log, uint64_t group_id,
      * terminal is the reset-flavored seal notice, nothing else. */
     return sg->sealed && !sg->sealed_reset && sg->v.count > 0 &&
            object_id == sg->last_object_id;
+}
+
+bool
+moqr_log_group_last(const moqr_log_t *log, uint64_t group_id,
+                    uint64_t *last_object_id)
+{
+    if (log == NULL) {
+        return false;
+    }
+    const moqr_group_t *g = group_find(log, group_id, NULL);
+    if (g == NULL) {
+        return false;
+    }
+    bool any = false;
+    uint64_t last = 0;
+    for (uint32_t s = 0; s < g->sg_count; s++) {
+        const moqr_subgroup_t *sg = &g->sgs[s];
+        if (sg->has_records && sg->v.count > 0 &&
+            (!any || sg->last_object_id > last)) {
+            last = sg->last_object_id;
+            any = true;
+        }
+    }
+    for (uint32_t i = 0; i < g->dg.count; i++) {
+        if (!any || g->dg.recs[i].object_id > last) {
+            last = g->dg.recs[i].object_id;
+            any = true;
+        }
+    }
+    if (any && last_object_id != NULL) {
+        *last_object_id = last;
+    }
+    return any;
+}
+
+bool
+moqr_log_group_final(const moqr_log_t *log, uint64_t group_id,
+                     uint64_t *final_object_id)
+{
+    if (log == NULL) {
+        return false;
+    }
+    const moqr_group_t *g = group_find(log, group_id, NULL);
+    if (g == NULL || !g->has_final) {
+        return false;
+    }
+    if (final_object_id != NULL) {
+        *final_object_id = g->final_object_id;
+    }
+    return true;
+}
+
+bool
+moqr_log_object_status(const moqr_log_t *log, uint64_t group_id,
+                       uint64_t object_id, moqr_obj_status_t *status,
+                       moqr_obj_state_t *state)
+{
+    if (log == NULL) {
+        return false;
+    }
+    const moqr_group_t *g = group_find(log, group_id, NULL);
+    if (g == NULL || !id_set_contains(log, g, object_id)) {
+        return false;
+    }
+    /* The id set proves a record exists; find it. Subgroup lists ascend by
+     * object id, so each stops at the first greater id; the datagram list is
+     * unordered and is scanned in full. */
+    for (uint32_t s = 0; s <= g->sg_count; s++) {
+        const moqr_rec_vec_t *v = (s == g->sg_count) ? &g->dg : &g->sgs[s].v;
+        for (uint32_t i = 0; i < v->count; i++) {
+            const moqr_rec_t *r = &v->recs[i];
+            if (r->object_id == object_id) {
+                if (status != NULL) {
+                    *status = r->status;
+                }
+                if (state != NULL) {
+                    *state = r->obj_state;
+                }
+                return true;
+            }
+            if (s != g->sg_count && r->object_id > object_id) {
+                break;
+            }
+        }
+    }
+    return false;
+}
+
+bool
+moqr_log_internal_object_arrival(const moqr_log_t *log, uint64_t group_id,
+                                 uint64_t object_id, uint64_t *arrival_us)
+{
+    if (log == NULL) {
+        return false;
+    }
+    const moqr_group_t *g = group_find(log, group_id, NULL);
+    if (g == NULL || !id_set_contains(log, g, object_id)) {
+        return false;
+    }
+    for (uint32_t s = 0; s <= g->sg_count; s++) {
+        const moqr_rec_vec_t *v = (s == g->sg_count) ? &g->dg : &g->sgs[s].v;
+        for (uint32_t i = 0; i < v->count; i++) {
+            const moqr_rec_t *r = &v->recs[i];
+            if (r->object_id == object_id) {
+                *arrival_us = r->arrival_us;
+                return true;
+            }
+            if (s != g->sg_count && r->object_id > object_id) {
+                break;
+            }
+        }
+    }
+    return false;
 }
 
 bool

@@ -156,7 +156,7 @@ int main(void)
 
         moq_media_parsed_object_t po;
         moq_media_parsed_object_init(&po);
-        CHECK(po.struct_size == sizeof(moq_media_parsed_object_t));
+        CHECK(po.struct_size == MOQ_MEDIA_PARSED_OBJECT_V0_SIZE);
     }
 
     /* -- NULL args return INVAL -------------------------------------- */
@@ -201,7 +201,7 @@ int main(void)
         moq_media_drop_reason_t reason = 0;
         CHECK(moq_media_object_parse(&ti, &oi, NULL, 0, &po, &reason) == MOQ_OK);
         CHECK(reason == 0);
-        CHECK(po.struct_size == sizeof(moq_media_parsed_object_t));
+        CHECK(po.struct_size == MOQ_MEDIA_PARSED_OBJECT_V0_SIZE);
         CHECK(po.packaging == MOQ_MEDIA_PACKAGING_RAW);
         CHECK(po.has_capture_time == true);
         CHECK(po.capture_time_us == 1000000);
@@ -1490,6 +1490,20 @@ int main(void)
                 }
                 moq_rcbuf_decref(props);
             }
+        }
+
+        /* The unsized old output has no D22 metadata contract. */
+        {
+            moq_media_track_info_t ti;
+            moq_media_track_info_init_sized(&ti, sizeof(ti));
+            ti.media_type = MOQ_MEDIA_TYPE_VIDEO;
+            ti.packaging = MOQ_MEDIA_PACKAGING_RAW;
+            ti.transport_version = MOQ_VERSION_DRAFT_22;
+            moq_media_parsed_object_t out;
+            memset(&out, 0xa5, sizeof(out));
+            CHECK(moq_media_object_parse(&ti, &in, NULL, 0, &out, NULL) == MOQ_ERR_INVAL);
+            for (size_t j = 0; j < sizeof(out); ++j)
+                CHECK(((const uint8_t *)&out)[j] == 0xa5);
         }
 
         moq_rcbuf_decref(payload);

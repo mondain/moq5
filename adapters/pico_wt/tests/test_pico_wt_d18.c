@@ -70,7 +70,8 @@ static void term_observer(moq_pico_wt_conn_t *c, int event, uint64_t sid, int ph
     if (cnx == NULL) return;
     picoquic_stream_head_t *st = picoquic_find_stream(cnx, sid);
     r->stream_present = st != NULL;
-    r->raw_code = picoquic_get_remote_stream_error(cnx, sid);
+    r->raw_code = event == (int)picohttp_callback_stop_sending && st
+        ? st->remote_stop_error : picoquic_get_remote_stream_error(cnx, sid);
     r->has_mapped_code = pico_wt_wt_err_to_moq(r->raw_code, &r->mapped_code);
     if (st) { r->reset_received = st->reset_received != 0; r->reset_offset = st->reset_offset; }
 }
@@ -209,6 +210,44 @@ static int run_subscribe_object(pico_wt_harness_t *h, const char *tname)
  * (never the WT session stream) and carries the exact WT-mapped code, and
  * (both peers negotiating reliable-reset) keeps the RESET_STREAM_AT form.
  */
+static void check_namespace_withdrawal(pico_wt_harness_t *h,
+                                       moq_announcement_t expected, uint64_t sid)
+{
+    unsigned legacy = 0, typed = 0;
+    const term_rec_t *first = NULL;
+    for (int i = 0; i < g_term_n; ++i) {
+        if (g_term[i].conn == h->server_conn && g_term[i].sid == sid &&
+            g_term[i].phase == 0) {
+            first = &g_term[i];
+            break;
+        }
+    }
+    moq_event_t ev;
+    while (moq_session_poll_events(h->server_session, &ev, 1) > 0) {
+        if (ev.kind == MOQ_EVENT_NAMESPACE_DONE) {
+            legacy++;
+            CHECK(ev.u.namespace_done.ann._opaque == expected._opaque);
+        } else if (ev.kind == MOQ_EVENT_NAMESPACE_TERMINATED) {
+            typed++;
+            CHECK(ev.detail_size == sizeof(ev.u.namespace_terminated));
+            CHECK(ev.u.namespace_terminated.ann._opaque == expected._opaque);
+            CHECK(first != NULL && first->stream_present);
+            if (first) {
+                uint32_t cause = first->event == (int)picohttp_callback_reset
+                    ? MOQ_NAMESPACE_TERMINAL_PEER_RESET_STREAM
+                    : MOQ_NAMESPACE_TERMINAL_PEER_STOP_SENDING;
+                CHECK(ev.u.namespace_terminated.cause == cause);
+                CHECK(first->mapped_code == 1);
+                CHECK(ev.u.namespace_terminated.stream_error_code == first->mapped_code);
+            }
+            CHECK(ev.u.namespace_terminated.local_role == MOQ_NAMESPACE_ROLE_RESPONDER);
+        }
+        moq_event_cleanup(&ev);
+    }
+    CHECK(legacy == (h->version == MOQ_VERSION_DRAFT_22 ? 0u : 1u));
+    CHECK(typed == (h->version == MOQ_VERSION_DRAFT_22 ? 1u : 0u));
+}
+
 static int run_publish_namespace_done(pico_wt_harness_t *h, bool is_d18)
 {
     int local_failures = 0;
@@ -268,19 +307,15 @@ static int run_publish_namespace_done(pico_wt_harness_t *h, bool is_d18)
         DCHECK(ann_bidi != h->client_conn->moq_control_stream_id);
     }
 
-    /* Withdraw: draft-18 aborts the request bidi; the receiver sees DONE. */
+    /* Withdraw: request-stream profiles abort the bidi. D22 reports the
+     * exact typed terminal; legacy profiles retain NAMESPACE_DONE. */
     term_install(h);
     DCHECK(moq_session_publish_namespace_done(h->client_session, ann,
                                               h->now) == MOQ_OK);
     pico_wt_harness_pump(h, 200);
     term_remove();
 
-    bool got_done = false;
-    while (moq_session_poll_events(h->server_session, &ev, 1) > 0) {
-        if (ev.kind == MOQ_EVENT_NAMESPACE_DONE) got_done = true;
-        moq_event_cleanup(&ev);
-    }
-    DCHECK(got_done);
+    check_namespace_withdrawal(h, sh, ann_bidi);
 
     /* The connection must survive the withdrawal on both ends. */
     DCHECK(moq_session_state(h->client_session) == MOQ_SESS_ESTABLISHED);
@@ -329,7 +364,7 @@ static int run_publish_namespace_done(pico_wt_harness_t *h, bool is_d18)
         /* Now pin the OTHER branch on the same live connection: force the
          * synthesized-capability decision and withdraw a second namespace. The
          * capability-aware reset must downgrade to a plain RESET_STREAM
-         * (reliable_size == 0); the peer still sees NAMESPACE_DONE and neither
+         * (reliable_size == 0); the peer still sees its terminal and neither
          * side goes fatal. (Both peers genuinely support reliable-reset here,
          * so a plain reset is equally accepted -- this isolates the branch, and
          * the managed no-rsa test covers the real faked-peer path.) */
@@ -368,12 +403,7 @@ static int run_publish_namespace_done(pico_wt_harness_t *h, bool is_d18)
                 h->client_session, ann2, h->now) == MOQ_OK);
             pico_wt_harness_pump(h, 200);
             term_remove();
-            bool got_done2 = false;
-            while (moq_session_poll_events(h->server_session, &ev, 1) > 0) {
-                if (ev.kind == MOQ_EVENT_NAMESPACE_DONE) got_done2 = true;
-                moq_event_cleanup(&ev);
-            }
-            DCHECK(got_done2);
+            check_namespace_withdrawal(h, sh2, ann2_bidi);
             DCHECK(h->client_conn->endpoint_ctx.last_reset_reliable_size == 0);
             /* The downgrade is a plain RESET_STREAM on the second announce
              * bidi: same WT-mapped code, no reliable prefix, exactly one
@@ -637,7 +667,8 @@ static void run_deferred_reset_bound(void)
 
 static void run_version(uint8_t cid_byte, moq_version_t version)
 {
-    scenario = (version == MOQ_VERSION_DRAFT_18) ? "d18" : "d16";
+    scenario = version == MOQ_VERSION_DRAFT_22 ? "d22"
+             : version == MOQ_VERSION_DRAFT_18 ? "d18" : "d16";
 
     pico_wt_harness_t h;
     pico_wt_harness_cfg_t cfg;
@@ -654,7 +685,7 @@ static void run_version(uint8_t cid_byte, moq_version_t version)
         CHECK(moq_session_state(h.server_session) == MOQ_SESS_ESTABLISHED);
         failures += run_subscribe_object(&h, "v");
         failures += run_publish_namespace_done(
-            &h, version == MOQ_VERSION_DRAFT_18);
+            &h, version != MOQ_VERSION_DRAFT_16);
         failures += run_reset_before_preamble(&h);
     }
     pico_wt_harness_cleanup(&h);
@@ -734,6 +765,10 @@ int main(void)
     run_deferred_reset_retired();
     run_deferred_reset_detach();
     run_deferred_reset_bound();
+
+    /* Draft-22: the attaching harness binds both sessions to the
+     * WebTransport session before starting them. */
+    run_version(0x22, MOQ_VERSION_DRAFT_22);
 
     if (failures == 0)
         printf("PASS: pico_wt_d18\n");

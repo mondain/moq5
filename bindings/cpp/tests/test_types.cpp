@@ -2,6 +2,7 @@
 #include <moq/visit.hpp>
 #include "test_support.hpp"
 
+#include <limits>
 #include <string_view>
 #include <unordered_map>
 #include <variant>
@@ -141,6 +142,7 @@ int main()
         moq::namespace_name ns({"a"});
         MOQ_CHECK(ns[1] == "");
         MOQ_CHECK(ns[99] == "");
+        MOQ_CHECK(ns[std::numeric_limits<size_t>::max()].empty());
     }
 
     // Overflow
@@ -163,6 +165,8 @@ int main()
             std::span<const std::string_view>(parts, 32));
         MOQ_CHECK(ns.count() == 32);
         MOQ_CHECK(!ns.overflowed());
+        MOQ_CHECK(ns[31] == "y");
+        MOQ_CHECK(ns[32].empty());
     }
 
     // c_namespace round-trip

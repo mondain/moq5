@@ -1,10 +1,16 @@
+#if defined(__linux__) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 /*
  * moq_media_sender_t — send-side media facade over an endpoint
  * (MEDIA_SERVICE_DESIGN.md §7). Tracks, catalog, readiness, and the media
  * write path: objects written from the app thread are enqueued in decode
  * order into a bounded, per-track sync-anchored queue and drained to the
- * session on the network thread, generating standard LOC-01 properties
- * from the typed fields, applying the configured backpressure policy, and
+ * session on the network thread, generating the standard LOC properties
+ * for the sender's companion (legacy LOC-01 on drafts16/18, LOC-04 metadata
+ * on draft22; AUTO picks the one matching the negotiated draft), applying
+ * backpressure policy, and
  * abandoning open subgroups wire-correctly (reset_group) on a drop.
  *
  * Threading mirrors the receiver: the publisher lives on the endpoint's
@@ -76,6 +82,20 @@ _Static_assert(offsetof(moq_media_track_cfg_t, extensions) >=
                     ~((size_t)_Alignof(uint64_t) - 1u)),
                "extensions must follow the complete layout through "
                "publisher_priority");
+/* track_properties starts at the uint64_t-aligned boundary after the MPEG2TS
+ * block, so a caller whose struct ends with that block (its sizeof, padding
+ * included) never covers any part of it. */
+#define MEDIA_TRACK_CFG_MPEG2TS_END \
+    (offsetof(moq_media_track_cfg_t, mpeg2ts_forward_before_random_access) + \
+     sizeof(((moq_media_track_cfg_t *)0)->mpeg2ts_forward_before_random_access))
+_Static_assert(offsetof(moq_media_track_cfg_t, track_properties) ==
+               ((MEDIA_TRACK_CFG_MPEG2TS_END + _Alignof(uint64_t) - 1u) &
+                ~((size_t)_Alignof(uint64_t) - 1u)),
+               "track_properties must begin at the aligned end of the MPEG2TS block");
+_Static_assert(offsetof(moq_media_track_cfg_t, dynamic_groups) ==
+               offsetof(moq_media_track_cfg_t, track_properties) +
+               sizeof(moq_bytes_t),
+               "dynamic_groups must directly follow track_properties");
 
 /* Minimum accepted moq_media_sender_cfg_t size: the prefix through the last
  * pre-callbacks field. A create/attach caller must supply at least this; the
@@ -134,6 +154,16 @@ struct moq_media_track {
     moq_bytes_t           codec;
     uint32_t              timescale;
     moq_bytes_t           init_data;        /* raw (pre-base64) */
+    /* The initDataList id this track's initRef names (CMAF, and every
+     * init-bearing track of the draft-22 companion). Assigned once at
+     * add_track and never changed: tracks with identical init bytes share one
+     * id, which stays bound to those bytes for the sender's life, so a
+     * surviving track's initRef does not move when the track that introduced
+     * the entry is removed (MSF-01 5.3). Borrows the introducing track's name
+     * (track objects live until destroy) or init_ref_alloc. Empty = none. */
+    moq_bytes_t           init_ref;
+    uint8_t              *init_ref_alloc;   /* owned id when the name is taken */
+    size_t                init_ref_alloc_size;
     bool                  has_cmaf_init_track_id; /* parsed from a CMAF init seg */
     uint32_t              cmaf_init_track_id;     /* for §3.3 track_ID validation */
     moq_bytes_t           role;
@@ -162,6 +192,16 @@ struct moq_media_track {
 
     uint8_t              *strings;           /* owned backing for the spans */
     size_t                strings_size;
+
+    moq_bytes_t           track_properties;  /* in `strings`; empty = none */
+    /* Whether the Track Properties declare a LOC-04 Timescale, which a
+     * draft-22 receiver applies to every object without its own
+     * (sender_track_scale_of). Set at add_track; immutable. */
+    uint8_t               track_scale;
+    bool                  dynamic_groups;
+    /* A subscriber's new-group request not yet taken (mu). */
+    bool                  new_group_pending;
+    uint64_t              new_group_value;
 
     moq_pub_track_t      *pub_track;         /* NULL until the hook adds it */
     size_t                active_subs;       /* mirrored subscriber count (mu);
@@ -330,8 +370,8 @@ typedef struct sender_preq_entry {
     bool               ends_group;
     uint64_t           group_seq;
     uint64_t           pts_us;              /* presentation time; LOC ts fallback */
-    bool               has_capture_time;    /* app-supplied LOC Capture Timestamp */
-    uint64_t           capture_time_us;     /* wall-clock us since epoch (LOC-01 2.3.1.1) */
+    bool               has_capture_time;    /* legacy LOC-01 capture presence */
+    uint64_t           capture_time_us;     /* legacy UNIX microseconds */
     size_t             bytes;
     /* App-declared SAP type for the generated timeline (when the track has one).
      * Recorded at emit time so the timeline record carries the real Location. */
@@ -351,6 +391,16 @@ struct moq_media_sender {
      * Zero means "not yet observed", and encoding fails closed on it -- the
      * sender never falls back to a draft. */
     moq_version_t    transport_version;
+    /* The companion in effect, under mu. Explicit LEGACY/D22 is fixed at
+     * creation. AUTO (companion_auto) stays MOQ_MEDIA_COMPANION_AUTO until
+     * the first latch of a draft-16/18/22 session, which replaces it once
+     * with the matching companion (sender_resolve_companion_locked). */
+    moq_media_companion_profile_t companion_profile;
+    bool             companion_auto;
+    /* AUTO resolved to draft-22 while a registered CMAF track has no
+     * init_data (CMSF-01 3.1). The companion is then unusable, reported as
+     * MOQ_ERR_UNSUPPORTED, until such tracks are removed. Under mu. */
+    bool             companion_blocked;
 
     /* Namespace + catalog track name, deep-copied (same idiom as the
      * receiver): [ns part bytes...][catalog name bytes]. */
@@ -395,6 +445,10 @@ struct moq_media_sender {
     moq_media_track_t **tracks;           /* app-built track list */
     size_t            track_count, track_cap;
     bool              tracks_frozen;      /* hook started building publisher */
+    /* The session was already draining when this sender first saw it: the
+     * publisher facade exists only to own the session's events (and so
+     * record the GOAWAY), and nothing is set up on the draining session. */
+    bool              observe_only;
 #ifdef MOQ_MEDIA_SENDER_TESTING
     /* One-shot fault seam: force the catalog-republish live-write loop to
      * behave as if object `test_block_republish_obj` hit WOULD_BLOCK, and
@@ -461,7 +515,13 @@ struct moq_media_sender {
     moq_media_track_t *catalog_track;
     bool              catalog_published;     /* initial retained catalog installed */
     bool              live_catalog_sent;     /* initial catalog emitted live (publish) */
-    uint64_t          catalog_group;        /* last published generation (0 = initial) */
+    uint64_t          catalog_group;        /* last published generation (the
+                                               group base = initial) */
+    uint64_t          group_base;           /* first Group ID of every track:
+                                               resolved and range-checked before
+                                               the sender exists (sender_prepare);
+                                               an AUTO sender resolving to legacy
+                                               resets it to 0 (under mu) */
     moq_rcbuf_t      *published_catalog;     /* last committed catalog bytes (the
                                                 independent base / no-op dedup) */
     /* MSF §5.1.2 generatedAt of the bytes in published_catalog. Paired with the
@@ -590,25 +650,54 @@ static moq_bytes_t default_role(moq_media_type_t t)
     return (moq_bytes_t){ (const uint8_t *)"video", 5 };
 }
 
-/* The LOC profile for the session. LOC-01 is the only profile the loc
- * library implements (both parse and encode), and the receiver's decode
- * path is LOC-01 too, so the whole media stack is LOC-01 today regardless
- * of the negotiated MoQ draft. LOC-02 (the draft-18 KVP profile) is a
- * coordinated future item -- encode, decode, and this selector must move
- * together; this is the single place the sender picks it up. The
- * standard-key validation in write() and any property generation both key
- * off this, so they can never disagree on the profile. */
-/* Whether the latched draft names a codec the property encoder can use.
- * Zero -- the never-observed value -- is not one of them. */
-static bool sender_version_usable(moq_version_t v)
+/* Whether the companion in effect can encode for the latched draft. An
+ * unresolved AUTO companion is usable on none. CALLER MUST HOLD s->mu. */
+static bool sender_version_usable(const moq_media_sender_t *s)
 {
-    return v == MOQ_VERSION_DRAFT_16 || v == MOQ_VERSION_DRAFT_18;
+    if (s->companion_profile == MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC)
+        return s->transport_version == MOQ_VERSION_DRAFT_22 &&
+               !s->companion_blocked;
+    if (s->companion_profile == MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01)
+        return s->transport_version == MOQ_VERSION_DRAFT_16 ||
+               s->transport_version == MOQ_VERSION_DRAFT_18;
+    return false;
 }
 
-static moq_loc_profile_t sender_loc_profile(const moq_media_sender_t *s)
+/* Whether a media write is refused as a companion/negotiated-version
+ * mismatch: the latched draft is one the companion in effect cannot use
+ * (including an AUTO companion blocked on draft 22), or an explicit D22
+ * companion has not yet observed draft 22. An unresolved AUTO companion
+ * before any draft is latched is not refused. CALLER MUST HOLD s->mu. */
+static bool sender_companion_refused_locked(const moq_media_sender_t *s)
 {
-    (void)s;   /* version-driven once LOC-02 lands; LOC-01-only for now */
-    return MOQ_LOC_PROFILE_01;
+    if (sender_version_usable(s)) return false;
+    return s->transport_version != 0 ||
+           s->companion_profile == MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC;
+}
+
+/* The largest LOC timestamp write() admits for the latched draft `v`. It is
+ * read from the LOC version table moq_loc_encode itself checks against, so a
+ * value admitted here is one the drain path can encode: the whole uint64
+ * range on legacy draft18's vi64 codec,
+ * MOQ_QUIC_VARINT_MAX where it is the QUIC variable-length integer (draft
+ * 16). Before the session's draft has been observed (or for a draft the
+ * table does not register, which the drain refuses anyway) the bound is the
+ * narrowest of the drafts the sender can encode: a write that has not yet
+ * met its session must not be admitted on a promise only some drafts could
+ * keep. */
+static uint64_t sender_loc_ts_max(moq_version_t v)
+{
+    uint64_t max = moq_loc_value_max_for_version(v);
+    if (max != 0) return max;
+    static const moq_version_t k_drafts[] = {
+        MOQ_VERSION_DRAFT_16, MOQ_VERSION_DRAFT_18,
+    };
+    max = UINT64_MAX;
+    for (size_t i = 0; i < sizeof(k_drafts) / sizeof(k_drafts[0]); i++) {
+        uint64_t m = moq_loc_value_max_for_version(k_drafts[i]);
+        if (m < max) max = m;
+    }
+    return max;
 }
 
 /* -- Send queue (mu held by caller) ----------------------------------- *
@@ -1021,6 +1110,56 @@ static void sender_tracks_release(moq_media_sender_t *s,
  * stay distinguishable: a REAL build (initial/mutation/refresh) chooses one
  * fresh stamp and carries it with the buffer it encoded, while a COMPARISON
  * build is handed the published stamp and never consults the clock. */
+/* Whether this sender publishes the draft-22 companion's MSF-01 catalog:
+ * version "draft-01" (5.1.1), every track's initialization data in the root
+ * initDataList referenced by initRef (5.1.7, 5.2.13), and Group IDs based on
+ * the wallclock at creation, the approach 6.1 suggests. That base is
+ * best-effort: it does not by itself guarantee 6.1's restart rule that a new
+ * starting Group ID exceeds every earlier one (draft-ietf-moq-msf-01 6.1,
+ * lines 2778-2790), which stays the application's responsibility. The legacy
+ * companion keeps its catalog and group numbering unchanged. */
+static bool sender_msf01_catalog(const moq_media_sender_t *s)
+{
+    return s->companion_profile == MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC;
+}
+
+/* Whether t's initialization data is carried in the root initDataList and
+ * referenced by initRef, rather than inline: a CMAF init segment (CMSF 3.1),
+ * an mpeg2ts track's PSI (Use of MSF Initialization Data), and every track of
+ * the draft-22 companion (MSF-01 5.1.7, 5.2.13). The one rule for the
+ * independent catalog, id assignment and the deltaUpdate fallback. */
+static bool sender_init_by_reference(const moq_media_sender_t *s,
+                                     const moq_media_track_t *t)
+{
+    return t->init_data.len > 0 &&
+           (t->packaging == MOQ_MEDIA_PACKAGING_CMAF ||
+            t->packaging == MOQ_MEDIA_PACKAGING_MPEG2TS ||
+            sender_msf01_catalog(s));
+}
+
+/* The first Group ID of every track of this sender instance, media,
+ * generated timeline and catalog alike (sender_resolve_group_base). */
+static uint64_t sender_group_base(const moq_media_sender_t *s)
+{
+    return s->group_base;
+}
+
+/* Whether a post-ready catalog change can still be given a Group ID. A change
+ * made while a generation is already owed (catalog_dirty) coalesces into it;
+ * otherwise it needs the group after the last committed or staged one, which
+ * must not pass MOQ_QUIC_VARINT_MAX (the publisher's object write-path bound
+ * on every profile; the ID space never wraps). Checked by every catalog-mutating call before it
+ * changes anything, so an exhausted catalog refuses the change with
+ * MOQ_ERR_LIMIT instead of failing later on the network thread.
+ * CALLER MUST HOLD s->mu. */
+static bool sender_catalog_group_available(const moq_media_sender_t *s)
+{
+    if (!s->ready || s->catalog_dirty) return true;
+    uint64_t last = s->pending_obj_count > 0 ? s->pending_group
+                                             : s->catalog_group;
+    return last < MOQ_QUIC_VARINT_MAX;
+}
+
 static moq_result_t sender_build_catalog_at(moq_media_sender_t *s,
                                             moq_rcbuf_t **out,
                                             bool only_registered,
@@ -1039,16 +1178,11 @@ static moq_result_t sender_build_catalog_at(moq_media_sender_t *s,
         cap * sizeof(moq_rcbuf_t *), s->alloc.ctx);
     moq_msf_init_data_entry_t *idl = (moq_msf_init_data_entry_t *)s->alloc.alloc(
         cap * sizeof(moq_msf_init_data_entry_t), s->alloc.ctx);
-    /* Raw (pre-base64) init bytes per initDataList entry, for dedup compares. */
-    moq_bytes_t *idl_raw = (moq_bytes_t *)s->alloc.alloc(
-        cap * sizeof(moq_bytes_t), s->alloc.ctx);
-    if (!mt || !b64 || !idl || !idl_raw) {
+    if (!mt || !b64 || !idl) {
         if (mt)  s->alloc.free(mt, cap * sizeof(moq_msf_track_t), s->alloc.ctx);
         if (b64) s->alloc.free(b64, cap * sizeof(moq_rcbuf_t *), s->alloc.ctx);
         if (idl) s->alloc.free(idl,
             cap * sizeof(moq_msf_init_data_entry_t), s->alloc.ctx);
-        if (idl_raw) s->alloc.free(idl_raw, cap * sizeof(moq_bytes_t),
-            s->alloc.ctx);
         return MOQ_ERR_NOMEM;
     }
     memset(b64, 0, cap * sizeof(moq_rcbuf_t *));
@@ -1062,21 +1196,20 @@ static moq_result_t sender_build_catalog_at(moq_media_sender_t *s,
         if (!track_in_catalog(t, only_registered)) continue;
         track_fill_msf(t, &mt[k]);
         if (t->init_data.len > 0) {
-            if (t->packaging == MOQ_MEDIA_PACKAGING_CMAF ||
-                t->packaging == MOQ_MEDIA_PACKAGING_MPEG2TS) {
-                /* CMSF §3.1: the init segment lives in initDataList[]; the track
-                 * references it via initRef. An mpeg2ts track's PSI packets go
-                 * the same way, as the "inline" entry the draft requires (Use of
-                 * MSF Initialization Data). MSF-01 lets several tracks share one
-                 * entry, so reuse an existing entry whose raw init bytes are
-                 * identical instead of duplicating it; the entry id is the name
-                 * of the track that introduced it. */
+            if (sender_init_by_reference(s, t)) {
+                /* CMSF §3.1, and MSF-01 5.1.7/5.2.13 for every track of the
+                 * draft-22 companion: the init data lives in initDataList[];
+                 * the track references it via initRef. An mpeg2ts track's PSI
+                 * packets go the same way, as the "inline" entry the draft
+                 * requires (Use of MSF Initialization Data). Tracks with
+                 * identical init bytes share the one id assigned at add_track,
+                 * so the catalog emits one entry per id, whichever of its
+                 * tracks is still included. */
                 size_t e = idl_count;
                 for (size_t j = 0; j < idl_count; j++) {
-                    if (idl_raw[j].len == t->init_data.len &&
-                        (t->init_data.len == 0 ||
-                         memcmp(idl_raw[j].data, t->init_data.data,
-                                t->init_data.len) == 0)) {
+                    if (idl[j].id.len == t->init_ref.len &&
+                        memcmp(idl[j].id.data, t->init_ref.data,
+                               t->init_ref.len) == 0) {
                         e = j;
                         break;
                     }
@@ -1085,19 +1218,18 @@ static moq_result_t sender_build_catalog_at(moq_media_sender_t *s,
                     rc = moq_msf_encode_init_data(&s->alloc, t->init_data,
                                                   &b64[nb]);
                     if (rc < 0) break;
-                    idl[idl_count].id   = t->name;
+                    idl[idl_count].id   = t->init_ref;
                     idl[idl_count].type =
                         (moq_bytes_t){ (const uint8_t *)"inline", 6 };
                     idl[idl_count].data = (moq_bytes_t){
                         moq_rcbuf_data(b64[nb]), moq_rcbuf_len(b64[nb]) };
-                    idl_raw[idl_count] = t->init_data;
                     nb++;
                     idl_count++;
                 }
                 mt[k].has_init_ref = true;
                 mt[k].init_ref = idl[e].id;
             } else {
-                /* LOC: legacy inline initData (base64), not shared. */
+                /* Legacy LOC: inline initData (base64), not shared. */
                 rc = moq_msf_encode_init_data(&s->alloc, t->init_data, &b64[nb]);
                 if (rc < 0) break;
                 if (moq_rcbuf_len(b64[nb]) > 0) {
@@ -1130,6 +1262,8 @@ static moq_result_t sender_build_catalog_at(moq_media_sender_t *s,
          * broadcast complete. All tracks are marked removed at complete(), so
          * the loop above already yields an empty tracks array. */
         cat.is_complete = s->completing;
+        if (sender_msf01_catalog(s))
+            cat.version_form = MOQ_MSF_VERSION_FORM_DRAFT_NAME;   /* 5.1.1 */
         rc = moq_msf_catalog_encode(&s->alloc, &cat, out);
     }
 
@@ -1138,7 +1272,6 @@ static moq_result_t sender_build_catalog_at(moq_media_sender_t *s,
     s->alloc.free(mt, cap * sizeof(moq_msf_track_t), s->alloc.ctx);
     s->alloc.free(b64, cap * sizeof(moq_rcbuf_t *), s->alloc.ctx);
     s->alloc.free(idl, cap * sizeof(moq_msf_init_data_entry_t), s->alloc.ctx);
-    s->alloc.free(idl_raw, cap * sizeof(moq_bytes_t), s->alloc.ctx);
     return rc;
 }
 
@@ -1157,15 +1290,85 @@ static moq_result_t sender_build_catalog_fresh(moq_media_sender_t *s,
     return rc;
 }
 
+/* moq_media_track.track_scale. */
+#define SENDER_TRACK_SCALE_NONE    0u  /* LOC-04 parse found no Timescale */
+#define SENDER_TRACK_SCALE_PRESENT 1u  /* LOC-04 Timescale, any value */
+#define SENDER_TRACK_SCALE_UNKNOWN 2u  /* not parseable as LOC-04 metadata */
+
+/* Classify a track's own copy of its Track Properties as draft-22 LOC-04
+ * metadata. The parser searches the mutable list and any immutable inner
+ * list. A failed parse proves nothing about a Timescale, so it is UNKNOWN,
+ * never NONE; the parser publishes no output on failure, and none is read. */
+static uint8_t sender_track_scale_of(moq_bytes_t track_properties)
+{
+    if (track_properties.len == 0) return SENDER_TRACK_SCALE_NONE;
+    moq_loc_metadata_t m;
+    if (moq_loc_parse_metadata(MOQ_VERSION_DRAFT_22, MOQ_LOC_PROFILE_04,
+                               track_properties, &m, sizeof(m)) != MOQ_OK)
+        return SENDER_TRACK_SCALE_UNKNOWN;
+    return (m.present & MOQ_LOC_METADATA_HAS_TIMESCALE)
+               ? SENDER_TRACK_SCALE_PRESENT : SENDER_TRACK_SCALE_NONE;
+}
+
+/* Whether this AUTO sender is, or may still become, the draft-22 companion:
+ * resolved to it, or unresolved with draft 22 in the endpoint's offer. The
+ * offer is fixed when the endpoint is created. CALLER MUST HOLD s->mu. */
+static bool sender_auto_d22_possible_locked(const moq_media_sender_t *s)
+{
+    if (!s->companion_auto) return false;
+    if (s->companion_profile == MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC)
+        return true;
+    if (s->companion_profile != MOQ_MEDIA_COMPANION_AUTO) return false;
+    moq_version_t versions[MOQ_ENDPOINT_MAX_VERSIONS];
+    size_t n = moq_endpoint_offered_versions_internal(s->ep, versions,
+                                                      MOQ_ENDPOINT_MAX_VERSIONS);
+    for (size_t i = 0; i < n && i < MOQ_ENDPOINT_MAX_VERSIONS; i++)
+        if (versions[i] == MOQ_VERSION_DRAFT_22) return true;
+    return false;
+}
+
 /* -- Drain: emit queued objects (network thread, s->mu held) ---------- */
 
-/* Build the object's property block. RAW/LOC: generate the whole standard
- * LOC block from the typed fields for the session's profile -- the Capture
- * Timestamp is the app-supplied capture_time_us when has_capture_time, else it
- * falls back to presentation_time_us; plus video sync marking. RAW objects
- * carry no app extras in v0 (rejected at write(), see the note there). CMAF:
- * pass the app's complete block through unchanged. *out is a NEW ref the caller
- * decrefs (NULL = none). Returns false only on allocation failure. */
+/* The LOC-04 block an AUTO sender resolved to draft 22 generates for a RAW
+ * object written without a metadata snapshot, from the typed fields:
+ *   - a capture time is wall-clock time: an unscaled Timestamp (0x10), which
+ *     LOC-04 2.3.1.1 defines as microseconds since the Unix epoch;
+ *   - otherwise the presentation time is media time: the Timestamp with a
+ *     Timescale (0x08) of 1000000, which LOC-04 2.3.1.2 makes media time with
+ *     an application-defined anchor -- never a presentation time passed off
+ *     as a Unix wall clock;
+ *   - on video, a one-byte frame marking (0x09) whose I bit is the object's
+ *     sync flag. */
+static bool sender_build_typed_loc04(moq_media_sender_t *s,
+                                     const sender_preq_entry_t *e,
+                                     moq_rcbuf_t **out)
+{
+    moq_loc_metadata_t m;
+    moq_loc_metadata_init_sized(&m, sizeof(m));
+    m.present = MOQ_LOC_METADATA_HAS_TIMESTAMP;
+    if (e->has_capture_time) {
+        m.timestamp = e->capture_time_us;
+    } else {
+        m.timestamp = e->pts_us;
+        m.present |= MOQ_LOC_METADATA_HAS_TIMESCALE;
+        m.timescale = 1000000u;
+    }
+    if (e->track->media_type == MOQ_MEDIA_TYPE_VIDEO) {
+        m.present |= MOQ_LOC_METADATA_HAS_MARKING;
+        m.marking_len = 1;
+        m.marking[0] = e->keyframe ? 0x20u : 0x00u;   /* RFC 9626 I bit */
+    }
+    return moq_loc_encode_metadata(&s->alloc, MOQ_VERSION_DRAFT_22,
+                                   MOQ_LOC_PROFILE_04, &m, out) == MOQ_OK &&
+           *out;
+}
+
+/* Legacy RAW generates LOC-01 capture/PTS fallback plus video sync marking.
+ * D22 RAW reuses the already-owned metadata snapshot, or, for an AUTO sender's
+ * object written without one, generates LOC-04 from the typed fields; CMAF
+ * passes its complete app block unchanged. RAW extras remain refused. *out is
+ * a new ref (or NULL) the caller decrefs. Invalid legacy eligibility or
+ * allocation fails closed. */
 static bool sender_build_props(moq_media_sender_t *s,
                                const sender_preq_entry_t *e,
                                moq_rcbuf_t **out)
@@ -1173,7 +1376,14 @@ static bool sender_build_props(moq_media_sender_t *s,
     *out = NULL;
     moq_media_track_t *t = e->track;
 
-    if (t->packaging != MOQ_MEDIA_PACKAGING_RAW) {
+    if (t->packaging == MOQ_MEDIA_PACKAGING_RAW &&
+        s->companion_profile == MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC &&
+        !e->properties && s->companion_auto) {
+        if (!sender_version_usable(s)) return false;
+        return sender_build_typed_loc04(s, e, out);
+    }
+    if (t->packaging != MOQ_MEDIA_PACKAGING_RAW ||
+        s->companion_profile == MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC) {
         if (e->properties) *out = moq_rcbuf_incref(e->properties);
         return true;
     }
@@ -1181,10 +1391,11 @@ static bool sender_build_props(moq_media_sender_t *s,
     moq_loc_headers_t h;
     moq_loc_headers_init(&h);
     h.has_timestamp = true;
-    /* LOC-01 2.3.1.1: the Capture Timestamp is wall-clock microseconds since the
-     * Unix epoch. Emit the app-supplied capture_time_us verbatim when present
-     * (no clamp/scale -- large epoch values are valid); otherwise fall back to
-     * presentation_time_us so legacy callers keep a timestamped LOC header. */
+    /* Legacy LOC-01 Capture Timestamp (0x02) on drafts16/18. Emit the
+     * app-supplied capture_time_us verbatim when present (no clamp/scale --
+     * large epoch values are valid); otherwise fall back to
+     * presentation_time_us so callers without a capture clock keep a
+     * timestamped LOC header. */
     h.timestamp = e->has_capture_time ? e->capture_time_us : e->pts_us;
     if (t->media_type == MOQ_MEDIA_TYPE_VIDEO) {
         h.has_video_frame_marking = true;
@@ -1193,14 +1404,54 @@ static bool sender_build_props(moq_media_sender_t *s,
     /* Fail closed on an unobserved or unsupported draft: an object may not
      * be encoded before the session's version has been latched, and there
      * is deliberately no draft-16 fallback here. */
-    if (!sender_version_usable(s->transport_version))
+    if (!sender_version_usable(s))
         return false;
     moq_rcbuf_t *loc = NULL;
     if (moq_loc_encode(&s->alloc, s->transport_version,
-                       sender_loc_profile(s), &h, &loc) != MOQ_OK)
+                       MOQ_LOC_PROFILE_01, &h, &loc) != MOQ_OK)
         return false;
     *out = loc;   /* has_timestamp is always set, so loc is non-NULL */
     return true;
+}
+
+/* Only representability is needed here, not a converted clock or anchor.
+ * Exact fractional scaling uses bounded quotient/remainder arithmetic. */
+static bool sender_loc_time_usable(uint64_t ticks, uint64_t scale)
+{
+    if (!scale) return false;
+    uint64_t whole = ticks / scale, rem = ticks % scale;
+    if (whole > UINT64_MAX / 1000000u) return false;
+    uint64_t frac = 0, r = 0;
+    for (uint32_t bit = UINT32_C(1) << 19; bit; bit >>= 1) {
+        frac *= 2;
+        if (r >= scale - r) { r -= scale - r; ++frac; }
+        else r += r;
+        if (UINT32_C(1000000) & bit) {
+            if (r >= scale - rem) { r -= scale - rem; ++frac; }
+            else r += rem;
+        }
+    }
+    return frac <= UINT64_MAX - whole * 1000000u;
+}
+
+static moq_result_t sender_encode_metadata(moq_media_sender_t *s,
+    const moq_media_send_object_t *obj, moq_rcbuf_t **out)
+{
+    if (obj->struct_size < offsetof(moq_media_send_object_t, metadata) +
+                           sizeof(obj->metadata) || !obj->metadata)
+        return MOQ_ERR_INVAL;
+    const moq_media_metadata_t *m = obj->metadata;
+    if (m->struct_size < MOQ_MEDIA_METADATA_V0_SIZE ||
+        m->loc.struct_size < MOQ_LOC_METADATA_V0_SIZE ||
+        !(m->loc.present & MOQ_LOC_METADATA_HAS_TIMESTAMP))
+        return MOQ_ERR_INVAL;
+    if ((m->loc.present & MOQ_LOC_METADATA_HAS_TIMESCALE) &&
+        !sender_loc_time_usable(m->loc.timestamp, m->loc.timescale))
+        return MOQ_ERR_INVAL;
+    /* LOC-04 pairs only with draft 22, so its codec is known even before an
+     * AUTO sender has latched the session's draft. */
+    return moq_loc_encode_metadata(&s->alloc, MOQ_VERSION_DRAFT_22,
+                                   MOQ_LOC_PROFILE_04, &m->loc, out);
 }
 
 /* -- Generated SAP timeline emission (network thread, s->mu held) ----- */
@@ -1886,6 +2137,8 @@ static void sender_add_pub_track(moq_media_sender_t *s, moq_media_track_t *t,
      * generation group. Declaring it lets finite subscription filters
      * auto-complete once production passes their end group. */
     tcfg.monotonic_groups = true;
+    tcfg.track_properties = t->track_properties;
+    tcfg.dynamic_groups = t->dynamic_groups;
 
     if (moq_pub_add_track(s->pub, &tcfg, now_us, &t->pub_track) != MOQ_OK) {
         sender_set_fatal_locked(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
@@ -2055,6 +2308,14 @@ static bool sender_stage_generation(moq_media_sender_t *s)
         return false;
     }
 
+    /* Every app-driven change was refused at its call once no group was left
+     * (sender_catalog_group_available); a change raised on the network thread
+     * alone (a deferred registration) still never wraps or reuses an ID. */
+    if (s->catalog_group >= MOQ_QUIC_VARINT_MAX) {
+        moq_rcbuf_decref(current);
+        sender_set_fatal_locked(s, MOQ_MEDIA_SENDER_FATAL_CATALOG_ENCODE);
+        return false;
+    }
     s->pending_group = s->catalog_group + 1;
     s->pending_obj_cursor = 0;
     s->pending_retained_set = false;
@@ -2086,7 +2347,7 @@ static bool sender_stage_generation(moq_media_sender_t *s)
         return false;
     }
     size_t na = 0, nr = 0;
-    bool cmaf_init_add = false;
+    bool init_ref_add = false;
     bool meta_changed = false;
     for (size_t i = 0; i < s->track_count; i++) {
         moq_media_track_t *t = s->tracks[i];
@@ -2101,23 +2362,24 @@ static bool sender_stage_generation(moq_media_sender_t *s)
         }
         if (in_cat && !t->in_published) {
             adds[na++] = t;
-            /* A CMAF init segment lives in the independent catalog's root
-             * initDataList (referenced by initRef), a shape a deltaUpdate add
-             * cannot carry. Emitting it inline here would diverge from the
-             * track's canonical (initRef) shape in every later independent
-             * catalog, which the receiver's immutable-tuple check rejects. So a
-             * generation that adds a CMAF init-bearing track falls back to a
-             * full independent generation (LOC inline init, and init-less
-             * tracks, stay on the delta path). */
-            if (t->packaging == MOQ_MEDIA_PACKAGING_CMAF &&
-                t->init_data.len > 0)
-                cmaf_init_add = true;
+            /* Initialization in the independent catalog's root initDataList
+             * (referenced by initRef) is a shape a deltaUpdate add cannot
+             * carry. Emitting it inline here would diverge from the track's
+             * canonical (initRef) shape in every later independent catalog,
+             * which the receiver's immutable-tuple check rejects. So a
+             * generation that adds such a track -- an init-bearing CMAF or
+             * mpeg2ts track, and every init-bearing track of the draft-22
+             * companion (MSF-01 has no per-track initData) -- falls back to
+             * a full independent generation. Legacy LOC inline init, and
+             * init-less tracks, stay on the delta path. */
+            if (sender_init_by_reference(s, t))
+                init_ref_add = true;
         } else if (!in_cat && t->in_published) {
             rems[nr++] = t;
         }
     }
 
-    if (cmaf_init_add || meta_changed) {
+    if (init_ref_add || meta_changed) {
         s->alloc.free(adds, s->track_count * sizeof(*adds), s->alloc.ctx);
         s->alloc.free(rems, s->track_count * sizeof(*rems), s->alloc.ctx);
         moq_rcbuf_incref(current);
@@ -2541,17 +2803,45 @@ static void sender_pub_on_publish_error(void *ctx, moq_pub_track_t *track,
     sender_set_fatal(s, MOQ_MEDIA_SENDER_FATAL_PUBLISH_REJECTED);
 }
 
-/* Peer refused (REJECTED) or withdrew (CANCELLED) the advertised namespace:
- * the sender cannot publish under it, so become fatal with the matching
- * code (the public header declares NAMESPACE_REJECTED/CANCELLED). */
+/* Loss of the advertised namespace is sender-local. Keep operation closure
+ * distinct from a peer REQUEST_ERROR and use the existing once-only fatal path. */
 static void sender_pub_on_namespace_terminal(void *ctx,
     const moq_pub_namespace_terminal_info_t *info)
 {
     moq_media_sender_t *s = (moq_media_sender_t *)ctx;
-    uint64_t code = (info->kind == MOQ_PUB_NAMESPACE_CANCELLED)
-        ? MOQ_MEDIA_SENDER_FATAL_NAMESPACE_CANCELLED
-        : MOQ_MEDIA_SENDER_FATAL_NAMESPACE_REJECTED;
+    uint64_t code = info->kind == MOQ_PUB_NAMESPACE_TERMINATED
+        ? MOQ_MEDIA_SENDER_FATAL_NAMESPACE_TERMINATED
+        : info->kind == MOQ_PUB_NAMESPACE_CANCELLED
+            ? MOQ_MEDIA_SENDER_FATAL_NAMESPACE_CANCELLED
+            : MOQ_MEDIA_SENDER_FATAL_NAMESPACE_REJECTED;
     sender_set_fatal(s, code);
+}
+
+/* A subscriber asked for a new group on a dynamic-groups track: latch it for
+ * moq_media_sender_take_new_group_request. Fires on the network thread from
+ * moq_pub_tick, which runs without s->mu. */
+/* Publisher callback on the network thread inside moq_pub_tick (sender_hook,
+ * ep->mu held): the peer's session-wide GOAWAY. The endpoint keeps its New
+ * Session URI for moq_endpoint_get_goaway_uri(). */
+static void sender_pub_on_goaway(void *ctx, moq_bytes_t new_session_uri)
+{
+    moq_media_sender_t *s = (moq_media_sender_t *)ctx;
+    moq_endpoint_note_goaway_locked(s->ep, new_session_uri);
+}
+
+static void sender_pub_on_new_group_request(
+    void *ctx, moq_pub_track_t *track, const moq_pub_new_group_request_info_t *info)
+{
+    moq_media_sender_t *s = (moq_media_sender_t *)ctx;
+    pthread_mutex_lock(&s->mu);
+    for (size_t i = 0; i < s->track_count; i++) {
+        moq_media_track_t *t = s->tracks[i];
+        if (t->pub_track != track) continue;
+        t->new_group_pending = true;
+        t->new_group_value = info->requested_group;
+        break;
+    }
+    pthread_mutex_unlock(&s->mu);
 }
 
 static void sender_pub_on_closed(void *ctx, uint64_t error_code)
@@ -2589,6 +2879,62 @@ static void sender_pub_on_publish_finished(void *ctx, moq_pub_track_t *pt)
     if (fire && cb) cb(cbctx, s, t);
 }
 
+static bool sender_assign_init_ref(moq_media_sender_t *s, moq_media_track_t *t);
+
+/* Resolve an AUTO companion against the draft just latched: draft 22 selects
+ * D22_MSF01_LOC04_PUBLIC, drafts 16/18 LEGACY_MSF01_LOC01, and any other draft
+ * leaves it unresolved, which no draft can use. The latch runs before this
+ * session's publisher, catalog or first object exists, so nothing reaches the
+ * wire under an unresolved companion. Resolution happens once:
+ *   draft-22: tracks registered meanwhile take the initDataList ids the
+ *     draft-22 companion gives every init-bearing track. Group IDs already
+ *     assigned keep the wallclock base read at creation.
+ *   legacy: Group IDs assigned meanwhile were counted from that base; they
+ *     are moved down by it, so the legacy companion still starts at 0.
+ * Until the track list is frozen, each pass also re-derives companion_blocked.
+ * Returns false only when an initDataList id cannot be allocated.
+ * CALLER MUST HOLD s->mu. */
+static bool sender_resolve_companion_locked(moq_media_sender_t *s)
+{
+    if (s->companion_profile == MOQ_MEDIA_COMPANION_AUTO) {
+        moq_version_t v = s->transport_version;
+        if (v == MOQ_VERSION_DRAFT_22) {
+            s->companion_profile = MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC;
+            for (size_t i = 0; i < s->track_count; i++) {
+                if (s->tracks[i]->init_ref.len == 0 &&
+                    !sender_assign_init_ref(s, s->tracks[i]))
+                    return false;
+            }
+        } else if (v == MOQ_VERSION_DRAFT_16 || v == MOQ_VERSION_DRAFT_18) {
+            s->companion_profile = MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01;
+            uint64_t base = s->group_base;
+            for (size_t i = 0; i < s->track_count; i++) {
+                moq_media_track_t *t = s->tracks[i];
+                if (t->group_started) t->group_seq -= base;
+                if (t->drop_group_valid) t->drop_group_last -= base;
+            }
+            for (uint32_t i = s->preq_head; i != s->preq_tail; i++) {
+                sender_preq_entry_t *e = &s->preq[i % s->ring_cap];
+                if (e->track && e->track->group_started) e->group_seq -= base;
+            }
+            s->group_base = 0;
+        }
+    }
+    if (s->companion_auto && !s->tracks_frozen) {
+        bool blocked = false;
+        if (s->companion_profile == MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC) {
+            for (size_t i = 0; i < s->track_count && !blocked; i++) {
+                const moq_media_track_t *t = s->tracks[i];
+                blocked = !t->removed &&
+                          t->packaging == MOQ_MEDIA_PACKAGING_CMAF &&
+                          t->init_data.len == 0;
+            }
+        }
+        s->companion_blocked = blocked;
+    }
+    return true;
+}
+
 static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
                         uint64_t now_us, void *ctx)
 {
@@ -2621,11 +2967,26 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
         moq_version_t v = moq_session_version(session);
         pthread_mutex_lock(&s->mu);
         s->transport_version = v;
+        bool resolved = sender_resolve_companion_locked(s);
+        bool usable = resolved && sender_version_usable(s);
+        if (resolved && !usable) s->stats.last_error = MOQ_ERR_UNSUPPORTED;
         pthread_mutex_unlock(&s->mu);
+        if (!resolved) {
+            sender_set_fatal(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
+            return;
+        }
+        if (!usable) return;
     }
 
     if (!s->pub) {
-        if (moq_session_state(session) != MOQ_SESS_ESTABLISHED)
+        moq_session_state_t st = moq_session_state(session);
+        /* SETUP and a session-wide GOAWAY can both precede this sender's
+         * first pass (or the sender is attached after them): the facade is
+         * still created, as the session's one event owner, so the GOAWAY and
+         * its New Session URI are observed; nothing is published on a
+         * session that is going away. */
+        bool observe = st == MOQ_SESS_DRAINING;
+        if (st != MOQ_SESS_ESTABLISHED && !observe)
             return;
 
         moq_pub_cfg_t pcfg;
@@ -2637,10 +2998,20 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
         pcfg.callbacks.on_publish_error = sender_pub_on_publish_error;
         pcfg.callbacks.on_namespace_terminal =
             sender_pub_on_namespace_terminal;
+        pcfg.on_new_group_request = sender_pub_on_new_group_request;
+        pcfg.on_new_group_request_ctx = s;
+        pcfg.on_goaway = sender_pub_on_goaway;
         if (moq_pub_create(session, &s->alloc, &pcfg, &s->pub) != MOQ_OK) {
             sender_set_fatal(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
             return;
         }
+        s->observe_only = observe;
+    }
+    if (s->observe_only) {
+        (void)moq_pub_tick(s->pub, now_us);
+        return;
+    }
+    if (!s->tracks_frozen) {
 
         /* Freeze the app's track list and build pub tracks from it. The
          * catalog track carries the single namespace advertisement; media
@@ -2710,6 +3081,7 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
         pthread_mutex_lock(&s->mu);
         moq_result_t bcrc = sender_build_catalog_fresh(s, &json, true,
                                                        &json_stamp);
+        uint64_t first_group = sender_group_base(s);
         pthread_mutex_unlock(&s->mu);
         if (bcrc != MOQ_OK || !json) {
             sender_set_fatal(s, MOQ_MEDIA_SENDER_FATAL_CATALOG_ENCODE);
@@ -2718,7 +3090,7 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
         moq_pub_retained_object_t robj = { .object_id = 0, .payload = json };
         moq_pub_retained_group_cfg_t rg;
         moq_pub_retained_group_cfg_init(&rg);
-        rg.group_id = 0;
+        rg.group_id = first_group;
         rg.objects = &robj;
         rg.object_count = 1;
         moq_result_t src = moq_pub_set_retained_group(
@@ -2738,7 +3110,7 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
          * stamp these exact bytes carry. */
         s->published_catalog = json;
         s->published_generated_at = json_stamp;
-        s->catalog_group = 0;
+        s->catalog_group = first_group;
         s->catalog_published = true;
 
         if (s->publish_tracks) {
@@ -2786,9 +3158,12 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
         moq_pub_object_cfg_t ocfg;
         moq_pub_object_cfg_init_sized(&ocfg, sizeof(ocfg));
 
-        /* Same (group 0, object 0) as the retained group: it is the same catalog
-         * object, so a live subscriber and a FETCH joiner see one identity. */
-        ocfg.group_id = 0;
+        /* Same (first group, object 0) as the retained group: it is the same
+         * catalog object, so a live subscriber and a FETCH joiner see one
+         * identity. */
+        pthread_mutex_lock(&s->mu);
+        ocfg.group_id = sender_group_base(s);
+        pthread_mutex_unlock(&s->mu);
         ocfg.object_id = 0;
         ocfg.payload = s->published_catalog;
         ocfg.end_of_group = true;
@@ -3043,6 +3418,9 @@ void moq_media_sender_cfg_init_sized(moq_media_sender_cfg_t *cfg,
     if (n >= offsetof(moq_media_sender_cfg_t, validate_cmaf) +
              sizeof(cfg->validate_cmaf))
         cfg->validate_cmaf = true;
+    if (n >= offsetof(moq_media_sender_cfg_t, companion_profile) +
+             sizeof(cfg->companion_profile))
+        cfg->companion_profile = MOQ_MEDIA_COMPANION_AUTO;
     /* backpressure stays UNSET on purpose: forced choice (§7.5). */
 }
 
@@ -3397,6 +3775,19 @@ void moq_media_sender_test_set_wait_entry_hook(void (*fn)(void *), void *ctx)
 }
 #define SENDER_WAIT_ENTRY_HOOK() \
     do { if (g_test_wait_entry) g_test_wait_entry(g_test_wait_entry_ctx); } while (0)
+/* Test-only gap observation in write_mpeg2ts: called while the writer has
+ * released s->mu between Objects (sender_ts_yield), so a test can latch a
+ * session into that gap. NULL disables. */
+static void (*g_test_ts_yield)(void *ctx);
+static void *g_test_ts_yield_ctx;
+void moq_media_sender_test_set_ts_yield_hook(void (*fn)(void *), void *ctx);
+void moq_media_sender_test_set_ts_yield_hook(void (*fn)(void *), void *ctx)
+{
+    g_test_ts_yield = fn;
+    g_test_ts_yield_ctx = ctx;
+}
+#define SENDER_TS_YIELD_HOOK() \
+    do { if (g_test_ts_yield) g_test_ts_yield(g_test_ts_yield_ctx); } while (0)
 /* Test-only gap observation in add_track: called after argument validation
  * and the initial state checks, before any allocation or the registration
  * critical section, so a test can drive a terminal transition into the gap. */
@@ -3456,16 +3847,33 @@ void moq_media_sender_test_set_cond_wait_hook(int (*fn)(const struct timespec *,
 #define SENDER_CTOR_ALLOC() moq_alloc_default()
 #define SENDER_CFG_PARTS_WALK_HOOK(count) ((void)0)
 #define SENDER_WAIT_ENTRY_HOOK() ((void)0)
+#define SENDER_TS_YIELD_HOOK() ((void)0)
 #define SENDER_ADD_TRACK_GAP_HOOK() ((void)0)
 #define SENDER_REFS_WALK_HOOK(count) ((void)0)
 #define SENDER_CLOCK_REALTIME(ts) clock_gettime(CLOCK_REALTIME, (ts))
 #define SENDER_COND_TIMEDWAIT(cv, mu, abs) pthread_cond_timedwait((cv), (mu), (abs))
 #endif
 
+/* The configured companion. An absent or partially covered field is AUTO,
+ * the same default the sized initializers stamp. */
+static moq_media_companion_profile_t sender_cfg_companion(
+    const moq_media_sender_cfg_t *cfg)
+{
+    if (cfg->struct_size >= offsetof(moq_media_sender_cfg_t, companion_profile) +
+                            sizeof(cfg->companion_profile))
+        return cfg->companion_profile;
+    return MOQ_MEDIA_COMPANION_AUTO;
+}
+
 static moq_result_t sender_validate_cfg(const moq_media_sender_cfg_t *cfg)
 {
     if (!cfg) return MOQ_ERR_INVAL;
     if (cfg->struct_size < MEDIA_SENDER_CFG_MIN_SIZE)
+        return MOQ_ERR_INVAL;
+    moq_media_companion_profile_t companion = sender_cfg_companion(cfg);
+    if (companion != MOQ_MEDIA_COMPANION_AUTO &&
+        companion != MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01 &&
+        companion != MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC)
         return MOQ_ERR_INVAL;
     if (cfg->namespace_.count == 0 || !cfg->namespace_.parts)
         return MOQ_ERR_INVAL;
@@ -3535,6 +3943,8 @@ static void track_free(moq_media_sender_t *s, moq_media_track_t *t)
         s->alloc.free(t->mt_recs,
             t->mt_rec_cap * sizeof(moq_msf_media_timeline_record_t),
             s->alloc.ctx);
+    if (t->init_ref_alloc)
+        s->alloc.free(t->init_ref_alloc, t->init_ref_alloc_size, s->alloc.ctx);
     if (t->strings) s->alloc.free(t->strings, t->strings_size, s->alloc.ctx);
     s->alloc.free(t, sizeof(*t), s->alloc.ctx);
 }
@@ -3595,6 +4005,65 @@ static moq_media_track_t *sender_make_timeline(moq_media_sender_t *s,
 
 /* True if a track named `name` is already registered (mu held). Catalog track
  * names must be unique, so this guards both app tracks and generated ones. */
+static bool sender_init_ref_taken(const moq_media_sender_t *s, moq_bytes_t id)
+{
+    for (size_t i = 0; i < s->track_count; i++) {
+        moq_bytes_t r = s->tracks[i]->init_ref;
+        if (r.len == id.len && r.len > 0 && memcmp(r.data, id.data, r.len) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* Assign t's initDataList id (see moq_media_track.init_ref). Every track ever
+ * registered on this sender -- removed ones included, since their objects and
+ * ids outlive removal -- is considered, so an id is never rebound to
+ * different bytes: identical init bytes share the existing id; otherwise the
+ * id is the track's name, or "<name>~<n>" with the least n that is free when
+ * the name already identifies other bytes (a removed name reused for new
+ * init data). Returns false on allocation failure.
+ * CALLER MUST HOLD s->mu; t is not yet registered. */
+static bool sender_assign_init_ref(moq_media_sender_t *s, moq_media_track_t *t)
+{
+    if (!sender_init_by_reference(s, t))
+        return true;
+    for (size_t i = 0; i < s->track_count; i++) {
+        const moq_media_track_t *u = s->tracks[i];
+        if (u->init_ref.len > 0 && u->init_data.len == t->init_data.len &&
+            memcmp(u->init_data.data, t->init_data.data,
+                   t->init_data.len) == 0) {
+            t->init_ref = u->init_ref;
+            return true;
+        }
+    }
+    if (!sender_init_ref_taken(s, t->name)) {
+        t->init_ref = t->name;
+        return true;
+    }
+    /* name + '~' + up to 20 decimal digits. A free suffix exists within
+     * track_count + 1 tries, since at most track_count ids are taken. */
+    size_t cap = t->name.len + 1 + 20;
+    uint8_t *buf = (uint8_t *)s->alloc.alloc(cap, s->alloc.ctx);
+    if (!buf) return false;
+    memcpy(buf, t->name.data, t->name.len);
+    for (uint64_t n = 1;; n++) {
+        uint8_t digits[20];
+        size_t nd = 0;
+        for (uint64_t v = n; v > 0; v /= 10)
+            digits[nd++] = (uint8_t)('0' + v % 10);
+        size_t w = t->name.len;
+        buf[w++] = '~';
+        while (nd > 0) buf[w++] = digits[--nd];
+        moq_bytes_t id = { buf, w };
+        if (!sender_init_ref_taken(s, id)) {
+            t->init_ref = id;
+            t->init_ref_alloc = buf;
+            t->init_ref_alloc_size = cap;
+            return true;
+        }
+    }
+}
+
 static bool sender_name_taken(const moq_media_sender_t *s, moq_bytes_t name)
 {
     for (size_t i = 0; i < s->track_count; i++) {
@@ -3710,6 +4179,8 @@ static void sender_free(moq_media_sender_t *s)
 static void sender_copy_cfg_tail(moq_media_sender_t *s,
                                  const moq_media_sender_cfg_t *cfg)
 {
+    s->companion_profile = sender_cfg_companion(cfg);
+    s->companion_auto = s->companion_profile == MOQ_MEDIA_COMPANION_AUTO;
     size_t cb_off = offsetof(moq_media_sender_cfg_t, callbacks);
     if (cfg->struct_size > cb_off) {
         const moq_media_sender_callbacks_t *cb = &cfg->callbacks;
@@ -3775,6 +4246,7 @@ typedef struct sender_sizes {
     size_t   ring_bytes;
     size_t   ns_bytes;
     size_t   ns_data_size;    /* namespace bytes + catalog name bytes */
+    uint64_t group_base;      /* sender_resolve_group_base */
 } sender_sizes_t;
 
 /* count * elem fits in size_t. Taking the count as uint64_t keeps the check
@@ -3878,6 +4350,39 @@ static bool sender_sum_fits(size_t *acc, size_t add)
     return true;
 }
 
+/* MSF-01 6.1: a publisher that restarts MUST start each track's Group IDs
+ * above any it published before. The draft-22 companion takes the approach
+ * 6.1 suggests, best-effort: the first Group ID of every track of the instance
+ * is the wallclock in milliseconds since the Unix epoch, read once before the
+ * sender exists, and later groups count up from it. This guarantees the 6.1
+ * ordering only while the clock moves forward between instances and an
+ * instance never runs ahead of it (more groups than elapsed milliseconds);
+ * neither holds in general, so restart identity remains the application's
+ * responsibility. The legacy companion starts at 0. An AUTO companion reads
+ * the base the same way, failing creation the same way, because it may
+ * resolve to draft 22 and objects written before then are numbered from it.
+ *
+ * The base must be a Group ID: a clock that cannot be read (or reads before
+ * the epoch) is MOQ_ERR_INTERNAL, and a reading above MOQ_QUIC_VARINT_MAX is
+ * MOQ_ERR_LIMIT, both before any allocation or endpoint effect. A base of
+ * exactly MOQ_QUIC_VARINT_MAX is valid; the next group is then refused with
+ * MOQ_ERR_LIMIT where it is requested. */
+static moq_result_t sender_resolve_group_base(bool msf01, uint64_t *out)
+{
+    *out = 0;
+    if (!msf01) return MOQ_OK;
+    struct timespec ts;
+    if (SENDER_CLOCK_REALTIME(&ts) != 0 || ts.tv_sec < 0 || ts.tv_nsec < 0 ||
+        ts.tv_nsec >= SENDER_NS_PER_S)
+        return MOQ_ERR_INTERNAL;
+    uint64_t sec = (uint64_t)ts.tv_sec;
+    if (sec > MOQ_QUIC_VARINT_MAX / 1000u) return MOQ_ERR_LIMIT;
+    uint64_t ms = sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+    if (ms > MOQ_QUIC_VARINT_MAX) return MOQ_ERR_LIMIT;
+    *out = ms;
+    return MOQ_OK;
+}
+
 static moq_result_t sender_prepare(const moq_media_sender_cfg_t *cfg,
                                    sender_sizes_t *sz)
 {
@@ -3908,7 +4413,11 @@ static moq_result_t sender_prepare(const moq_media_sender_cfg_t *cfg,
         ? cfg->catalog_track.len : (size_t)MOQ_MSF_CATALOG_TRACK_NAME_LEN;
     if (catalog_len > SIZE_MAX - sz->ns_bytes) return MOQ_ERR_INVAL;
     sz->ns_data_size = sz->ns_bytes + catalog_len;
-    return MOQ_OK;
+    /* AUTO reads the base too: objects written before the draft is known
+     * are numbered from it, and a legacy resolution moves them down by it. */
+    bool msf01 = sender_cfg_companion(cfg) !=
+                 MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01;
+    return sender_resolve_group_base(msf01, &sz->group_base);
 }
 
 static moq_result_t sender_new(moq_endpoint_t *ep, bool owns,
@@ -3930,6 +4439,7 @@ static moq_result_t sender_new(moq_endpoint_t *ep, bool owns,
     s->backpressure = cfg->backpressure;
     s->validate_cmaf = cfg->validate_cmaf;
     sender_copy_cfg_tail(s, cfg);
+    s->group_base = sz->group_base;
     s->block_timeout_us = cfg->block_timeout_us
         ? cfg->block_timeout_us : SENDER_DEFAULT_BLOCK_TIMEOUT_US;
     s->queue_cap = sz->queue_cap;
@@ -4441,7 +4951,8 @@ static moq_result_t track_derive_sizes(const moq_media_track_cfg_t *cfg,
         !sender_sum_fits(&media, cfg->init_data.len) ||
         !sender_sum_fits(&media, cfg->role.len) ||
         !sender_sum_fits(&media, cfg->lang.len) ||
-        !sender_sum_fits(&media, cfg->channel_config.len))
+        !sender_sum_fits(&media, cfg->channel_config.len) ||
+        !sender_sum_fits(&media, cfg->track_properties.len))
         return MOQ_ERR_INVAL;
     /* Each resolved ref id contributes its bytes to the SAME buffer. Every
      * subtotal addition is checked, so the final sum below can never receive
@@ -4509,6 +5020,10 @@ static void sender_track_cfg_read(const moq_media_track_cfg_t *in,
     if (TCFG_HAS(mpeg2ts_forward_before_random_access))
         out->mpeg2ts_forward_before_random_access =
             in->mpeg2ts_forward_before_random_access;
+    if (TCFG_HAS(track_properties))
+        out->track_properties = in->track_properties;
+    if (TCFG_HAS(dynamic_groups))
+        out->dynamic_groups = in->dynamic_groups;
 #undef TCFG_HAS
     out->struct_size = (uint32_t)sizeof(*out);
 }
@@ -4550,7 +5065,8 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
         (cfg->init_data.len && !cfg->init_data.data) ||
         (cfg->role.len && !cfg->role.data) ||
         (cfg->lang.len && !cfg->lang.data) ||
-        (cfg->channel_config.len && !cfg->channel_config.data))
+        (cfg->channel_config.len && !cfg->channel_config.data) ||
+        (cfg->track_properties.len && !cfg->track_properties.data))
         return MOQ_ERR_INVAL;
     /* MSF-01: an audio/video track has an inherent codec, so it MUST carry the
      * conditional catalog fields for that codec -- the sender never emits a
@@ -4568,6 +5084,15 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
         if (cfg->samplerate == 0) return MOQ_ERR_INVAL;          /* 5.2.28 */
         if (cfg->channel_config.len == 0) return MOQ_ERR_INVAL;  /* 5.2.29 */
     }
+    /* CMSF-01 3.1: a CMAF track's initialization (its moov) MUST reach the
+     * catalog; without it no moof is decodable. Enforced for the draft-22
+     * companion, whose catalog carries it in the root initDataList. An
+     * explicit companion is fixed at creation, so this read needs no lock;
+     * an AUTO sender is checked under the lock at registration. */
+    bool cmaf_needs_init =
+        cfg->packaging == MOQ_MEDIA_PACKAGING_CMAF && cfg->init_data.len == 0;
+    if (cmaf_needs_init && !s->companion_auto && sender_msf01_catalog(s))
+        return MOQ_ERR_INVAL;
     /* contentProtectionRefIDs: each id must be coherent AND resolve to a
      * configured root contentProtections entry (catalog coherence, not DRM
      * semantics). Root entries are immutable after construction, so this read
@@ -4608,8 +5133,28 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
     pthread_mutex_lock(&s->mu);
     if (s->fatal) { pthread_mutex_unlock(&s->mu); return MOQ_ERR_CLOSED; }
     if (s->completing) { pthread_mutex_unlock(&s->mu); return MOQ_ERR_WRONG_STATE; }
+    moq_version_t negotiated = s->transport_version;
     pthread_mutex_unlock(&s->mu);
     SENDER_ADD_TRACK_GAP_HOOK();
+
+    /* Track Properties are checked here, as the publisher facade will check
+     * them, so an unpublishable set is refused at the call rather than
+     * failing the sender when the track activates: against the negotiated
+     * version once known, before that against every version the endpoint
+     * offers (any may be negotiated). */
+    if (cfg->track_properties.len > 0 || cfg->dynamic_groups) {
+        moq_version_t versions[MOQ_ENDPOINT_MAX_VERSIONS];
+        size_t nv = 1;
+        if (negotiated) versions[0] = negotiated;
+        else nv = moq_endpoint_offered_versions_internal(s->ep, versions,
+                                                         MOQ_ENDPOINT_MAX_VERSIONS);
+        for (size_t i = 0; i < nv && i < MOQ_ENDPOINT_MAX_VERSIONS; i++) {
+            moq_result_t vrc = moq_track_properties_validate(versions[i],
+                cfg->track_properties.data, cfg->track_properties.len,
+                cfg->dynamic_groups);
+            if (vrc == MOQ_ERR_INVAL || vrc == MOQ_ERR_NOMEM) return vrc;
+        }
+    }
 
     /* Deep-copy every span into one buffer so the cfg need not outlive the
      * call and the catalog encode borrows stable bytes. The contentProtection
@@ -4645,7 +5190,13 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
     COPY_SPAN(t->role, cfg->role);
     COPY_SPAN(t->lang, cfg->lang);
     COPY_SPAN(t->channel_config, cfg->channel_config);
+    COPY_SPAN(t->track_properties, cfg->track_properties);
 #undef COPY_SPAN
+    /* Read from the owned copy. Only a RAW track of a sender that can
+     * synthesize LOC-04 (AUTO) needs it; it gates typed capture times in
+     * write(). */
+    if (cfg->packaging == MOQ_MEDIA_PACKAGING_RAW && s->companion_auto)
+        t->track_scale = sender_track_scale_of(t->track_properties);
     /* contentProtection ref ids: copy bytes into the shared buffer, index via
      * the dedicated array (validated above; each ref.len > 0). */
     for (size_t i = 0; i < ncpref; i++) {
@@ -4670,6 +5221,7 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
     t->max_grp_sap = cfg->max_grp_sap;
     t->has_max_obj_sap = cfg->has_max_obj_sap;
     t->max_obj_sap = cfg->max_obj_sap;
+    t->dynamic_groups = cfg->dynamic_groups;
 
     /* Parse a CMAF init segment once to cache its track_ID, so CMAF
      * validation can check object track_IDs against the init (CMSF §3.3), and
@@ -4772,7 +5324,25 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
         track_free(s, t);
         return MOQ_ERR_INVAL;
     }
-    if (!sender_tracks_push(s, t)) {
+    /* An AUTO sender already resolved to draft 22 refuses it like an
+     * explicit one. Before resolution it is accepted; resolving to draft 22
+     * with it still registered blocks the companion (companion_blocked). */
+    if (cmaf_needs_init && sender_msf01_catalog(s)) {
+        pthread_mutex_unlock(&s->mu);
+        if (mtl) track_free(s, mtl);
+        if (tl) track_free(s, tl);
+        track_free(s, t);
+        return MOQ_ERR_INVAL;
+    }
+    /* A post-ready add needs a catalog generation to advertise it. */
+    if (!sender_catalog_group_available(s)) {
+        pthread_mutex_unlock(&s->mu);
+        if (mtl) track_free(s, mtl);
+        if (tl) track_free(s, tl);
+        track_free(s, t);
+        return MOQ_ERR_LIMIT;
+    }
+    if (!sender_assign_init_ref(s, t) || !sender_tracks_push(s, t)) {
         pthread_mutex_unlock(&s->mu);
         if (mtl) track_free(s, mtl);
         if (tl) track_free(s, tl);
@@ -4823,6 +5393,10 @@ typedef struct sender_admit {
     uint64_t     capture_time_us;
     bool         has_sap_type;
     uint8_t      sap_type;
+    /* Draft-22 companion RAW: the object whose metadata generates the LOC
+     * property block, after the anchor checks and before any room is made.
+     * properties is then NULL. */
+    const moq_media_send_object_t *metadata_src;
 } sender_admit_t;
 
 /* Admit one media object of `track` into the send queue: the sync-anchor
@@ -4837,7 +5411,12 @@ static moq_result_t sender_admit_locked(moq_media_sender_t *s,
     /* The queue takes ownership of both refs, so both count toward the
      * byte budget. */
     size_t need = moq_rcbuf_len(a->payload);
-    if (a->properties) need += moq_rcbuf_len(a->properties);
+    size_t property_bytes = moq_rcbuf_len(a->properties);
+    if (property_bytes > SIZE_MAX - need) {
+        s->stats.last_error = MOQ_ERR_INVAL;
+        return MOQ_ERR_INVAL;
+    }
+    need += property_bytes;
 
     /* Would this object open a new group? (Pure -- no mutation until the
      * enqueue is committed.) A sync point that opens a group is a stream
@@ -4858,9 +5437,32 @@ static moq_result_t sender_admit_locked(moq_media_sender_t *s,
             s->stats.last_error = MOQ_ERR_WOULD_BLOCK;
             return MOQ_ERR_WOULD_BLOCK;   /* a group cannot lead with a delta */
         }
+        /* The new group's ID must exist: after MOQ_QUIC_VARINT_MAX the track
+         * has no further group (never a wrap or a reused ID). Refused here,
+         * before anything is evicted or owned. */
+        if (track->group_started && track->group_seq >= MOQ_QUIC_VARINT_MAX) {
+            s->stats.last_error = MOQ_ERR_LIMIT;
+            return MOQ_ERR_LIMIT;
+        }
     } else if (!track->cur_group_anchored) {
         s->stats.last_error = MOQ_ERR_WOULD_BLOCK;
         return MOQ_ERR_WOULD_BLOCK;
+    }
+
+    moq_rcbuf_t *generated = NULL;
+    if (a->metadata_src) {
+        moq_result_t rc = sender_encode_metadata(s, a->metadata_src, &generated);
+        if (rc != MOQ_OK) {
+            s->stats.last_error = rc;
+            return rc;
+        }
+        size_t n = moq_rcbuf_len(generated);
+        if (n > SIZE_MAX - need) {
+            moq_rcbuf_decref(generated);
+            s->stats.last_error = MOQ_ERR_INVAL;
+            return MOQ_ERR_INVAL;
+        }
+        need += n;
     }
 
     /* Make room per the backpressure policy. Drop policies evict (and may
@@ -4870,6 +5472,7 @@ static moq_result_t sender_admit_locked(moq_media_sender_t *s,
      * silent drop. */
     if (!preq_make_room(s, track, incoming_anchors, need)) {
         if (s->backpressure != MOQ_MEDIA_SEND_BP_BLOCK_TIMEOUT) {
+            moq_rcbuf_decref(generated);
             s->stats.last_error = MOQ_ERR_WOULD_BLOCK;
             return MOQ_ERR_WOULD_BLOCK;
         }
@@ -4937,6 +5540,7 @@ static moq_result_t sender_admit_locked(moq_media_sender_t *s,
             }
         }
         if (wres != MOQ_OK) {
+            moq_rcbuf_decref(generated);
             s->stats.last_error = wres;
             return wres;   /* no ownership taken */
         }
@@ -4944,22 +5548,26 @@ static moq_result_t sender_admit_locked(moq_media_sender_t *s,
          * meanwhile, or its open Group closed by a drop; the object is then
          * refused as it would be now, and the caller retries. */
         if (track->end_requested || track->removed || track->vod_converted) {
+            moq_rcbuf_decref(generated);
             s->stats.last_error = MOQ_ERR_WRONG_STATE;
             return MOQ_ERR_WRONG_STATE;
         }
         if ((a->starts_group || !track->group_open) != opened) {
+            moq_rcbuf_decref(generated);
             s->stats.last_error = MOQ_ERR_WOULD_BLOCK;
             return MOQ_ERR_WOULD_BLOCK;
         }
     }
 
     /* Commit the service group id: a new group bumps the seq (the first
-     * group ever is 0). group_open tracks completion separately so an
-     * ends_group does not make the next group reuse the same id.
+     * group ever is the instance's group base, sender_group_base). group_open
+     * tracks completion separately so an ends_group does not make the next
+     * group reuse the same id.
      * cur_group_anchored records that this group was opened by a sync
      * point, so a later delta is accepted even after the keyframe drains. */
     if (opened) {
-        track->group_seq = track->group_started ? track->group_seq + 1 : 0;
+        track->group_seq = track->group_started ? track->group_seq + 1
+                                                : sender_group_base(s);
         track->group_started = true;
         track->group_open = true;
         track->cur_group_anchored = anchor;
@@ -4969,7 +5577,7 @@ static moq_result_t sender_admit_locked(moq_media_sender_t *s,
     memset(e, 0, sizeof(*e));
     e->track = track;
     e->payload = a->payload;            /* ownership transfers */
-    e->properties = a->properties;
+    e->properties = generated ? generated : a->properties;
     e->is_sync = anchor;
     e->keyframe = a->is_sync;
     e->starts_group = opened;
@@ -5006,7 +5614,7 @@ moq_result_t moq_media_sender_write(moq_media_sender_t *s,
     /* Only obj fields are touched here; the opaque track (shared with the
      * receiver API) is NOT dereferenced until proven sender-owned below. */
     if (!s || !track || !obj) return MOQ_ERR_INVAL;
-    if (obj->struct_size < sizeof(moq_media_send_object_t))
+    if (obj->struct_size < MOQ_MEDIA_SEND_OBJECT_V0_SIZE)
         return MOQ_ERR_INVAL;
     if (!obj->payload) return MOQ_ERR_INVAL;
     /* A declared SAP type must be concrete (CMSF §3.6.1: 0/1/2/3); the internal
@@ -5046,28 +5654,30 @@ moq_result_t moq_media_sender_write(moq_media_sender_t *s,
         return MOQ_ERR_WRONG_STATE;
     }
 
-    /* The LOC Capture Timestamp is emitted by moq_loc_encode, but ONLY for
-     * RAW packaging (CMAF passes the app's property block through untouched,
-     * so its timestamp fields are never encoded here). A value the NEGOTIATED
-     * draft's codec cannot represent cannot be encoded; left to the drain path
-     * it would fatal the sender AFTER the object was queued and its payload
-     * ownership taken. Reject it synchronously -- before any enqueue /
+    if (sender_companion_refused_locked(s)) {
+        s->stats.last_error = MOQ_ERR_UNSUPPORTED;
+        pthread_mutex_unlock(&s->mu);
+        return MOQ_ERR_UNSUPPORTED;
+    }
+
+    /* The legacy LOC-01 Capture Timestamp on drafts16/18 is emitted by
+     * moq_loc_encode, but ONLY
+     * for RAW packaging (CMAF passes the app's property block through
+     * untouched, so its timestamp fields are never encoded here). A value the
+     * negotiated draft's codec cannot represent cannot be encoded; left to the
+     * drain path it would fatal the sender AFTER the object was queued and its
+     * payload ownership taken. Reject it synchronously -- before any enqueue /
      * ownership transfer. The encoded value is capture_time_us when
      * has_capture_time, else the presentation_time_us fallback
-     * (sender_build_props), so validate whichever will be encoded.
-     *
-     * The bound FOLLOWS THE CODEC: draft-16 (i) tops out at
-     * MOQ_QUIC_VARINT_MAX, which is itself encodable and accepted, while
-     * draft-18 vi64 carries the complete uint64 range and rejects nothing
-     * here. Before the session's draft has been observed the STRICTER
-     * draft-16 bound applies -- a write that has not yet met its session
-     * must not be admitted on a promise only draft-18 could keep. */
-    if (track->packaging == MOQ_MEDIA_PACKAGING_RAW) {
+     * (sender_build_props), so validate whichever will be encoded, against
+     * sender_loc_ts_max (the encoder's own bound for the latched draft). */
+    /* An unresolved AUTO companion may still become legacy, so its RAW
+     * timestamps are held to the same bound. */
+    if (track->packaging == MOQ_MEDIA_PACKAGING_RAW &&
+        s->companion_profile != MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC) {
         uint64_t loc_ts = obj->has_capture_time ? obj->capture_time_us
                                                 : obj->presentation_time_us;
-        uint64_t loc_ts_max = (s->transport_version == MOQ_VERSION_DRAFT_18)
-                                  ? UINT64_MAX : MOQ_QUIC_VARINT_MAX;
-        if (loc_ts > loc_ts_max) {
+        if (loc_ts > sender_loc_ts_max(s->transport_version)) {
             s->stats.last_error = MOQ_ERR_INVAL;
             pthread_mutex_unlock(&s->mu);
             return MOQ_ERR_INVAL;
@@ -5204,6 +5814,37 @@ moq_result_t moq_media_sender_write(moq_media_sender_t *s,
     a.pts_us = obj->presentation_time_us;
     a.has_capture_time = obj->has_capture_time;
     a.capture_time_us = obj->capture_time_us;
+    /* Explicit D22 RAW requires the metadata snapshot. An AUTO sender that
+     * is (or may still become) draft-22 encodes one when the object carries
+     * it, and otherwise generates LOC-04 from the typed fields at drain; a
+     * sender resolved to legacy ignores it, as explicit legacy does. */
+    if (track->packaging == MOQ_MEDIA_PACKAGING_RAW) {
+        bool has_metadata =
+            obj->struct_size >= offsetof(moq_media_send_object_t, metadata) +
+                                sizeof(obj->metadata) && obj->metadata;
+        /* A typed capture time is sent as an unscaled LOC-04 Timestamp, Unix
+         * microseconds (LOC-04 2.3.1.1). A Timescale among the Track
+         * Properties applies to every object without its own (2.3.1.2), so
+         * the receiver would read that capture time as media time at the
+         * track's scale. Refused, before anything is evicted or owned,
+         * whenever the object may go out as draft 22; a track whose
+         * properties do not parse as LOC-04 metadata may carry a Timescale
+         * and is refused the same way. Explicit metadata and the
+         * presentation-time form are unaffected. */
+        if (!has_metadata && obj->has_capture_time &&
+            track->track_scale != SENDER_TRACK_SCALE_NONE &&
+            sender_auto_d22_possible_locked(s)) {
+            s->stats.last_error = MOQ_ERR_INVAL;
+            pthread_mutex_unlock(&s->mu);
+            return MOQ_ERR_INVAL;
+        }
+        if (s->companion_auto
+                ? s->companion_profile !=
+                      MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01 && has_metadata
+                : s->companion_profile ==
+                      MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC)
+            a.metadata_src = obj;
+    }
     if (track->sap_timeline && obj->has_sap_type) {
         a.has_sap_type = true;
         a.sap_type = (uint8_t)obj->sap_type;
@@ -5274,7 +5915,8 @@ static moq_result_t sender_ts_queue(moq_media_sender_t *s,
              * complete, alone. */
             ts->broken = true;
             if (o->new_group) {
-                t->group_seq = t->group_started ? t->group_seq + 1 : 0;
+                t->group_seq = t->group_started ? t->group_seq + 1
+                                                : sender_group_base(s);
                 t->group_started = true;
                 t->group_open = false;
                 t->cur_group_anchored = false;
@@ -5360,7 +6002,8 @@ static moq_result_t sender_ts_packet(moq_media_sender_t *s,
 /* After an Object was queued the writer lets go of s->mu, so the drain is
  * never shut out for longer than one Object; the busy latch keeps the track
  * to this writer meanwhile. Returns non-OK when the track or sender changed
- * state in between. */
+ * state in between, including a companion the draft latched meanwhile
+ * refuses: no further byte is then taken. */
 static moq_result_t sender_ts_yield(moq_media_sender_t *s,
                                     moq_media_track_t *t, bool *queued_any)
 {
@@ -5369,9 +6012,11 @@ static moq_result_t sender_ts_yield(moq_media_sender_t *s,
     bool wake = s->ready;
     pthread_mutex_unlock(&s->mu);
     if (wake) moq_endpoint_wake(s->ep);
+    SENDER_TS_YIELD_HOOK();
     pthread_mutex_lock(&s->mu);
     if (s->fatal || sender_ep_closed(s)) return MOQ_ERR_CLOSED;
     if (t->removed || t->vod_converted) return MOQ_ERR_WRONG_STATE;
+    if (sender_companion_refused_locked(s)) return MOQ_ERR_UNSUPPORTED;
     return MOQ_OK;
 }
 #endif
@@ -5407,6 +6052,13 @@ moq_result_t moq_media_sender_write_mpeg2ts(moq_media_sender_t *s,
         track->removed || track->vod_converted) {
         pthread_mutex_unlock(&s->mu);
         return MOQ_ERR_WRONG_STATE;
+    }
+    /* The same companion refusal as write(), before any carry, parked
+     * Object, packetizer or queue state is touched: nothing is consumed. */
+    if (sender_companion_refused_locked(s)) {
+        s->stats.last_error = MOQ_ERR_UNSUPPORTED;
+        pthread_mutex_unlock(&s->mu);
+        return MOQ_ERR_UNSUPPORTED;
     }
     ts->busy = true;
 
@@ -5589,6 +6241,10 @@ moq_result_t moq_media_sender_remove_track(moq_media_sender_t *s,
         pthread_mutex_unlock(&s->mu);
         return MOQ_ERR_WRONG_STATE;
     }
+    if (!sender_catalog_group_available(s)) {
+        pthread_mutex_unlock(&s->mu);
+        return MOQ_ERR_LIMIT;   /* no Group ID left for the removal catalog */
+    }
 
     track->removed = true;
     if (track->sap_timeline) track->sap_timeline->removed = true;  /* couple */
@@ -5617,6 +6273,10 @@ moq_result_t moq_media_sender_complete(moq_media_sender_t *s)
     if (s->completing) { pthread_mutex_unlock(&s->mu); return MOQ_OK; }
     /* Completion is meaningful only once the catalog is established. */
     if (!s->ready) { pthread_mutex_unlock(&s->mu); return MOQ_ERR_WRONG_STATE; }
+    if (!sender_catalog_group_available(s)) {
+        pthread_mutex_unlock(&s->mu);
+        return MOQ_ERR_LIMIT;   /* no Group ID left for the terminal catalog */
+    }
 
     /* MSF §11.3 permanent termination: mark every user + generated track removed
      * (the hook ends their publisher tracks reliably, then removes them), and
@@ -5670,6 +6330,10 @@ moq_result_t moq_media_sender_convert_to_vod(moq_media_sender_t *s,
                 pthread_mutex_unlock(&s->mu);
                 return MOQ_ERR_INVAL;   /* duplicate in the batch */
             }
+    }
+    if (!sender_catalog_group_available(s)) {
+        pthread_mutex_unlock(&s->mu);
+        return MOQ_ERR_LIMIT;   /* no Group ID left for the conversion catalog */
     }
     /* Apply: flip each to VOD (isLive false + trackDuration), arm the §11.3
      * step-1 subscriber finish, and dirty the catalog. The metadata change is an
@@ -5826,8 +6490,10 @@ moq_result_t moq_media_sender_wait(moq_media_sender_t *s, uint64_t timeout_us)
     pthread_mutex_lock(&s->mu);
     bool level = sender_wait_level(s);
     bool fatal = s->fatal;
+    bool mismatch = s->transport_version && !sender_version_usable(s);
     pthread_mutex_unlock(&s->mu);
     if (fatal || moq_endpoint_is_closed(s->ep)) return MOQ_ERR_CLOSED;
+    if (mismatch) return MOQ_ERR_UNSUPPORTED;
     if (level) return MOQ_OK;
 
     moq_result_t rc = moq_endpoint_wait(s->ep, timeout_us);
@@ -5837,8 +6503,10 @@ moq_result_t moq_media_sender_wait(moq_media_sender_t *s, uint64_t timeout_us)
     pthread_mutex_lock(&s->mu);
     level = sender_wait_level(s);
     fatal = s->fatal;
+    mismatch = s->transport_version && !sender_version_usable(s);
     pthread_mutex_unlock(&s->mu);
     if (fatal || moq_endpoint_is_closed(s->ep)) return MOQ_ERR_CLOSED;
+    if (mismatch) return MOQ_ERR_UNSUPPORTED;
     if (level) return MOQ_OK;
     return rc < 0 ? rc : MOQ_OK;
 }
@@ -5858,6 +6526,27 @@ size_t moq_media_sender_track_subscriptions(const moq_media_sender_t *s,
     if (owned) n = track->active_subs;
     pthread_mutex_unlock(&ms->mu);
     return n;
+}
+
+moq_result_t moq_media_sender_take_new_group_request(moq_media_sender_t *s,
+                                                     moq_media_track_t *track,
+                                                     uint64_t *requested_group)
+{
+    if (!s || !track) return MOQ_ERR_INVAL;
+    moq_result_t rc = MOQ_ERR_INVAL;
+    pthread_mutex_lock(&s->mu);
+    for (size_t i = 0; i < s->track_count; i++) {
+        if (s->tracks[i] != track) continue;
+        rc = MOQ_DONE;
+        if (track->new_group_pending) {
+            track->new_group_pending = false;
+            if (requested_group) *requested_group = track->new_group_value;
+            rc = MOQ_OK;
+        }
+        break;
+    }
+    pthread_mutex_unlock(&s->mu);
+    return rc;
 }
 
 bool moq_media_sender_track_has_subscriber(const moq_media_sender_t *s,
@@ -6314,6 +7003,38 @@ void moq_media_sender_test_mark_published(moq_media_sender_t *s)
         sender_commit_baseline(s);
     }
     pthread_mutex_unlock(&s->mu);
+}
+
+/* Select the media companion of an endpoint-free test sender (one built by
+ * moq_media_sender_test_new), as moq_media_sender_cfg_t.companion_profile
+ * does at creation. Call before adding tracks: track-level state derived from
+ * the profile (initDataList ids) is fixed at add_track. Test-only; declared
+ * by the tests that use it. */
+void moq_media_sender_test_set_companion(moq_media_sender_t *s,
+                                         moq_media_companion_profile_t profile);
+void moq_media_sender_test_set_companion(moq_media_sender_t *s,
+                                         moq_media_companion_profile_t profile)
+{
+    pthread_mutex_lock(&s->mu);
+    s->companion_profile = profile;
+    s->companion_auto = profile == MOQ_MEDIA_COMPANION_AUTO;
+    (void)sender_resolve_group_base(
+        profile != MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01, &s->group_base);
+    pthread_mutex_unlock(&s->mu);
+}
+
+/* The companion currently in effect: MOQ_MEDIA_COMPANION_AUTO until an AUTO
+ * sender's first draft-16/18/22 latch, then the resolved companion. */
+moq_media_companion_profile_t moq_media_sender_test_companion(
+    const moq_media_sender_t *s);
+moq_media_companion_profile_t moq_media_sender_test_companion(
+    const moq_media_sender_t *s)
+{
+    moq_media_sender_t *ms = (moq_media_sender_t *)(uintptr_t)s;
+    pthread_mutex_lock(&ms->mu);
+    moq_media_companion_profile_t c = ms->companion_profile;
+    pthread_mutex_unlock(&ms->mu);
+    return c;
 }
 
 /* Pin (or release) this sender's catalog clock. `set` false restores the real

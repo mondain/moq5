@@ -206,9 +206,11 @@ typedef struct {
     bool                  ended;
 } run_state_t;
 
-#define SCEN_FAIL(rs, fmt, ...) do { \
-    fprintf(stderr, "FAIL [seed=0x%" PRIx64 " step=%d]: " fmt "\n", \
-            (rs)->seed, (rs)->step, ##__VA_ARGS__); \
+#define SCEN_FAIL(rs, ...) do { \
+    fprintf(stderr, "FAIL [seed=0x%" PRIx64 " step=%d]: ", \
+            (rs)->seed, (rs)->step); \
+    fprintf(stderr, __VA_ARGS__); \
+    fputc('\n', stderr); \
     (*(rs)->failures)++; \
 } while(0)
 

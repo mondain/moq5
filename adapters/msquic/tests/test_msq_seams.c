@@ -268,7 +268,7 @@ static void t_public_create_is_socket_free(void)
     cfg.alloc = moq_alloc_default();
     cfg.perspective = MOQ_PERSPECTIVE_SERVER;
     cfg.host = NULL;                 /* no bind address: nothing listens */
-    cfg.port = 0;
+    cfg.port = 4433;                 /* fake listener; bypass real UDP port selection */
     cfg.cert_path = "unused-by-the-fake-cert.pem";
     cfg.key_path = "unused-by-the-fake-key.pem";
     cfg.version = MOQ_VERSION_DRAFT_18;

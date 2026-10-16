@@ -7,9 +7,14 @@ add_library(moq-core
     src/wire/buf.c
     src/wire/control_d16.c
     src/wire/control_d18.c
+    src/wire/control_d22.c
+    src/wire/params_d22.c
+    src/wire/messages_d22.c
+    src/location.c
     src/base/rcbuf.c
     src/session/session.c
     src/session/session_setup.c
+    src/session/transport_binding.c
     src/session/session_subscribe.c
     src/session/session_fetch.c
     src/session/session_publish.c
@@ -17,12 +22,23 @@ add_library(moq-core
     src/session/session_track_hist.c
     src/session/session_namespace.c
     src/session/session_namespace_sub.c
+    src/session/session_namespace_update.c
     src/session/session_subscribe_tracks.c
     src/session/session_subgroup.c
     src/session/session_receive.c
+    src/session/session_malformed.c
     src/session/session_auth.c
     src/session/profile_d16.c
     src/session/profile_d18.c
+    src/session/profile_d22.c
+    src/session/request_stream.c
+    src/session/profile_registry.c
+    src/session/request_lifetime.c
+    src/session/fill_owner.c
+    src/session/fill_range.c
+    src/session/fill_input.c
+    src/session/session_fill.c
+    src/session/location_d22.c
     src/facade/publisher.c
     src/facade/subscriber.c
     src/bridge/transport_bridge.c
@@ -72,16 +88,23 @@ if(MOQ_BUILD_TESTS)
         src/version.c src/types.c
         src/wire/quic_varint.c src/wire/vi64.c src/wire/kvp.c src/wire/buf.c
         src/wire/control_d16.c src/wire/control_d18.c
+        src/wire/control_d22.c src/wire/params_d22.c src/wire/messages_d22.c src/location.c
         src/base/rcbuf.c
         src/session/session.c src/session/session_setup.c
+        src/session/transport_binding.c
         src/session/session_subscribe.c src/session/session_fetch.c
         src/session/session_publish.c src/session/session_track_status.c
         src/session/session_track_hist.c
         src/session/session_namespace.c src/session/session_namespace_sub.c
+        src/session/session_namespace_update.c
         src/session/session_subscribe_tracks.c
         src/session/session_subgroup.c src/session/session_receive.c
+        src/session/session_malformed.c
         src/session/session_auth.c src/session/profile_d16.c
-        src/session/profile_d18.c
+        src/session/profile_d18.c src/session/profile_d22.c src/session/request_stream.c
+        src/session/profile_registry.c src/session/request_lifetime.c
+        src/session/fill_owner.c src/session/fill_range.c src/session/fill_input.c
+        src/session/session_fill.c src/session/location_d22.c
         src/facade/publisher.c src/facade/subscriber.c
         src/bridge/transport_bridge.c
         src/url.c
@@ -90,6 +113,10 @@ if(MOQ_BUILD_TESTS)
         PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     )
     target_compile_features(moq-core-test-internals PUBLIC c_std_11)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(moq-core-test-internals PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
     # White-box instrumentation compiled ONLY into this internals-only static
     # lib -- never the shipping moq-core library/dylib (verified with nm in CI
     # symbol-hygiene checks): publisher admission counters for exactly-once

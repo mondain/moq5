@@ -56,7 +56,7 @@ set_target_properties(moq-adapter-pico-wt PROPERTIES
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
     target_compile_options(moq-adapter-pico-wt PRIVATE
-        -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+        -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
 endif()
 
 # -- Build-tree package target ------------------------------------------
@@ -140,6 +140,10 @@ if(MOQ_BUILD_TESTS)
     include("${PROJECT_SOURCE_DIR}/tests/cmake/ConsumerBuildContext.cmake")
     set(_picowt_abi_context "${CMAKE_CURRENT_BINARY_DIR}/consumer-abi-context.cmake")
     moq_write_consumer_abi_context("${_picowt_abi_context}")
+    # Children that link this build's archives also take its OpenSSL selection.
+    include("${PROJECT_SOURCE_DIR}/tests/cmake/ConsumerProviderContext.cmake")
+    set(_picowt_openssl_context "${CMAKE_CURRENT_BINARY_DIR}/consumer-openssl-context.cmake")
+    moq_write_consumer_openssl_context("${_picowt_openssl_context}")
 
     # Exercise the actual dependency parser used for WebTransport capsules.
     add_executable(test_pico_wt_capsule_sequence tests/test_pico_wt_capsule_sequence.c)
@@ -162,7 +166,7 @@ if(MOQ_BUILD_TESTS)
     )
     if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
         target_compile_options(test_pico_wt_public_compile PRIVATE
-            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
     endif()
     add_test(NAME pico_wt_public_compile
              COMMAND test_pico_wt_public_compile)
@@ -177,7 +181,7 @@ if(MOQ_BUILD_TESTS)
     add_test(NAME pico_wt_findpicoquic_http_contract
         COMMAND bash
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_findpicoquic_http_contract.sh"
-            "${CMAKE_SOURCE_DIR}/cmake/FindPicoquic.cmake"
+            "${PROJECT_SOURCE_DIR}/cmake/FindPicoquic.cmake"
             "${CMAKE_COMMAND}")
     set_tests_properties(pico_wt_findpicoquic_http_contract
         PROPERTIES TIMEOUT 120)
@@ -306,10 +310,48 @@ if(MOQ_BUILD_TESTS AND TARGET picoquic-test AND MOQ_PICOQUIC_SOURCE_DIR)
         PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
     if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
         target_compile_options(test_pico_wt_loopback PRIVATE
-            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
     endif()
     add_test(NAME pico_wt_loopback COMMAND test_pico_wt_loopback)
     set_tests_properties(pico_wt_loopback PROPERTIES TIMEOUT 30)
+
+    # The loopback rows that construct an endpoint directly call the
+    # adapter's private endpoint constructor, which the shipping library does
+    # not export. They run in this build, which compiles the adapter sources
+    # in (the same closure as test_pico_wt_d18); every other loopback row
+    # runs above against the shipping library.
+    add_executable(test_pico_wt_loopback_private
+        tests/test_pico_wt_loopback.c
+        tests/pico_wt_harness.c
+        pico_wt_adapter.c
+        pico_wt_endpoint.c
+        ../common/moq_pq_send_queue.c
+    )
+    # The adapter sources are compiled into this executable, so their public
+    # functions are defined here rather than imported from the adapter DLL.
+    # MOQ_STATIC declares every MOQ_API function without import or export
+    # decoration: the local adapter definitions match their declarations, and
+    # the calls into the core resolve through its import library (the core
+    # exports functions only, no data). It changes nothing on ELF or Mach-O,
+    # where MOQ_API is a default-visibility attribute either way.
+    target_compile_definitions(test_pico_wt_loopback_private PRIVATE
+        MOQ_PICO_WT_LOOPBACK_PRIVATE
+        MOQ_STATIC
+        PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
+    target_include_directories(test_pico_wt_loopback_private PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests
+    )
+    target_link_libraries(test_pico_wt_loopback_private PRIVATE
+        moq::adapter-pico-wt
+        picoquic-test
+    )
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_pico_wt_loopback_private PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME pico_wt_loopback_private COMMAND test_pico_wt_loopback_private)
+    set_tests_properties(pico_wt_loopback_private PROPERTIES TIMEOUT 30)
 
     # One WebTransport session per QUIC connection: the client and server
     # limits, and the slot the attach adapter releases when it detaches.
@@ -329,10 +371,38 @@ if(MOQ_BUILD_TESTS AND TARGET picoquic-test AND MOQ_PICOQUIC_SOURCE_DIR)
         PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
     if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
         target_compile_options(test_pico_wt_one_session PRIVATE
-            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
     endif()
     add_test(NAME pico_wt_one_session COMMAND test_pico_wt_one_session)
     set_tests_properties(pico_wt_one_session PROPERTIES TIMEOUT 30)
+
+    # Reliable resets over the real WebTransport transport: a MoQ stream
+    # reset in the pass that opened it still delivers its header (the WT
+    # preamble plus the MoQ header are the reliable size) where reliable
+    # reset was genuinely negotiated.
+    add_executable(test_pico_wt_reliable_reset
+        tests/test_pico_wt_reliable_reset.c
+        tests/pico_wt_harness.c
+    )
+    target_include_directories(test_pico_wt_reliable_reset PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests
+    )
+    target_link_libraries(test_pico_wt_reliable_reset PRIVATE
+        moq::adapter-pico-wt
+        picoquic-test
+    )
+    target_compile_definitions(test_pico_wt_reliable_reset PRIVATE
+        PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_pico_wt_reliable_reset PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME pico_wt_reliable_reset COMMAND test_pico_wt_reliable_reset)
+    set_tests_properties(pico_wt_reliable_reset PROPERTIES TIMEOUT 120)
+
+    include(${PROJECT_SOURCE_DIR}/cmake/MoqPicoquicTerminalTests.cmake)
+    moq_add_picoquic_terminal_tests(pico_wt moq::adapter-pico-wt)
 
     # Draft-18 over the real WT transport in the deterministic sim:
     # symmetric uni-control establish, request-bidi routing, subgroup
@@ -361,7 +431,7 @@ if(MOQ_BUILD_TESTS AND TARGET picoquic-test AND MOQ_PICOQUIC_SOURCE_DIR)
         PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
     if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
         target_compile_options(test_pico_wt_d18 PRIVATE
-            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
     endif()
     add_test(NAME pico_wt_d18 COMMAND test_pico_wt_d18)
     set_tests_properties(pico_wt_d18 PROPERTIES TIMEOUT 30)
@@ -383,7 +453,7 @@ if(MOQ_BUILD_TESTS AND TARGET picoquic-test AND MOQ_PICOQUIC_SOURCE_DIR)
         PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
     if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
         target_compile_options(test_pico_wt_protocol_nego PRIVATE
-            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
     endif()
     add_test(NAME pico_wt_protocol_nego COMMAND test_pico_wt_protocol_nego)
     set_tests_properties(pico_wt_protocol_nego PROPERTIES TIMEOUT 30)
@@ -407,7 +477,7 @@ if(MOQ_BUILD_TESTS AND TARGET picoquic-test AND MOQ_PICOQUIC_SOURCE_DIR)
         PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
     if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
         target_compile_options(test_pico_wt_conformance PRIVATE
-            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
     endif()
     add_test(NAME pico_wt_conformance COMMAND test_pico_wt_conformance)
     set_tests_properties(pico_wt_conformance PROPERTIES TIMEOUT 60)
@@ -438,7 +508,7 @@ if(MOQ_BUILD_TESTS AND TARGET picoquic-test AND MOQ_PICOQUIC_SOURCE_DIR)
         PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
     if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
         target_compile_options(test_pico_wt_backpressure PRIVATE
-            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
     endif()
     add_test(NAME pico_wt_backpressure COMMAND test_pico_wt_backpressure)
     set_tests_properties(pico_wt_backpressure PROPERTIES TIMEOUT 180)
@@ -469,7 +539,7 @@ if(MOQ_BUILD_TESTS AND TARGET picoquic-test AND MOQ_PICOQUIC_SOURCE_DIR)
         PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
     if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
         target_compile_options(test_pico_wt_rx_lifecycle PRIVATE
-            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
     endif()
     add_test(NAME pico_wt_rx_lifecycle COMMAND test_pico_wt_rx_lifecycle)
     set_tests_properties(pico_wt_rx_lifecycle PROPERTIES TIMEOUT 180)
@@ -507,9 +577,32 @@ if(MOQ_BUILD_TESTS)
     target_link_libraries(test_pico_wt_hold_input PRIVATE moq::core)
     if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
         target_compile_options(test_pico_wt_hold_input PRIVATE
-            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
     endif()
     add_test(NAME pico_wt_hold_input COMMAND test_pico_wt_hold_input)
+
+    # A reliable reset after the FIN was pushed: the endpoint and send queue
+    # with picoquic/h3zero stubbed, so provide-data (credit) runs only when a
+    # row asks for it. Pins the MoQ reliable size kept in the queue and the
+    # WebTransport preamble added once at the provider.
+    add_executable(test_pico_wt_reset_after_fin
+        tests/test_pico_wt_reset_after_fin.c
+        pico_wt_endpoint.c
+        ../common/moq_pq_send_queue.c
+    )
+    target_compile_definitions(test_pico_wt_reset_after_fin PRIVATE MOQ_STATIC)
+    target_include_directories(test_pico_wt_reset_after_fin PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        $<TARGET_PROPERTY:${_PICOHTTP},INTERFACE_INCLUDE_DIRECTORIES>
+        $<TARGET_PROPERTY:${_PW_HOLD_CORE_INC},INTERFACE_INCLUDE_DIRECTORIES>
+    )
+    target_link_libraries(test_pico_wt_reset_after_fin PRIVATE moq::core)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_pico_wt_reset_after_fin PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME pico_wt_reset_after_fin COMMAND test_pico_wt_reset_after_fin)
 endif()
 
 # -- Managed facade -------------------------------------------------
@@ -566,7 +659,7 @@ if(MOQ_BUILD_PICO_WT_MANAGED)
         C_VISIBILITY_PRESET hidden)
     if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
         target_compile_options(moq-adapter-pico-wt-managed PRIVATE
-            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
     endif()
 
     # -- Build-tree package target --------------------------------------
@@ -652,7 +745,8 @@ endif()\n")
             COMMAND ${CMAKE_COMMAND} -E env bash -c
                 "set -e; \
                  '${CMAKE_COMMAND}' -E rm -rf '${_picowtm_consumer_bld}'; \
-                 '${CMAKE_COMMAND}' -C '${_picowt_abi_context}' -S '${_picowtm_consumer_src}' \
+                 '${CMAKE_COMMAND}' -C '${_picowt_abi_context}' \
+                     -C '${_picowt_openssl_context}' -S '${_picowtm_consumer_src}' \
                      -B '${_picowtm_consumer_bld}' \
                      -DCMAKE_PREFIX_PATH='${PROJECT_BINARY_DIR}' \
                      -DMOQ_BUILD_ADAPTER_PICO_WT=ON \
@@ -739,7 +833,8 @@ endif()\n")
             COMMAND ${CMAKE_COMMAND} -E env bash -c
                 "set -e; \
                  '${CMAKE_COMMAND}' -E rm -rf '${_picowtmv_consumer_bld}'; \
-                 '${CMAKE_COMMAND}' -C '${_picowt_abi_context}' -S '${_picowtmv_consumer_src}' \
+                 '${CMAKE_COMMAND}' -C '${_picowt_abi_context}' \
+                     -C '${_picowt_openssl_context}' -S '${_picowtmv_consumer_src}' \
                      -B '${_picowtmv_consumer_bld}' \
                      -DCMAKE_PREFIX_PATH='${PROJECT_BINARY_DIR}' \
                      -DMOQ_BUILD_ADAPTER_PICO_WT=ON \
@@ -804,7 +899,7 @@ endif()\n")
         if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
             target_compile_options(test_pico_wt_managed_keepalive PRIVATE
                 -Wall -Wextra -Wpedantic
-                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
         endif()
         add_test(NAME pico_wt_managed_keepalive
             COMMAND test_pico_wt_managed_keepalive)
@@ -841,7 +936,7 @@ endif()\n")
         if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
             target_compile_options(test_pico_wt_managed_early_streams PRIVATE
                 -Wall -Wextra -Wpedantic
-                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
         endif()
         add_test(NAME pico_wt_managed_early_streams
             COMMAND test_pico_wt_managed_early_streams)
@@ -850,7 +945,7 @@ endif()\n")
     endif()
 
     # Managed client test: drives the facade against the example
-    # server (built under MOQ_BUILD_ADAPTER_PICO_WT). Reuses the
+    # server (built by examples/pico_wt under MOQ_BUILD_EXAMPLES). Reuses the
     # example smoke driver. Labeled "network" so UDP-restricted
     # environments can exclude it.
     if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR AND
@@ -863,7 +958,7 @@ endif()\n")
                 PRIVATE moq::adapter-pico-wt-managed)
             if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
                 target_compile_options(test_pico_wt_managed_client PRIVATE
-                    -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+                    -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
             endif()
             add_test(NAME pico_wt_managed_client
                 COMMAND bash
@@ -886,7 +981,7 @@ endif()\n")
             PRIVATE moq::adapter-pico-wt-managed)
         if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
             target_compile_options(test_pico_wt_managed_loopback PRIVATE
-                -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+                -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
         endif()
         add_test(NAME pico_wt_managed_loopback
             COMMAND test_pico_wt_managed_loopback
@@ -978,7 +1073,7 @@ endif()\n")
             PRIVATE moq::adapter-pico-wt-managed)
         if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
             target_compile_options(test_pico_wt_managed_tokens PRIVATE
-                -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+                -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
         endif()
         add_test(NAME pico_wt_managed_tokens
             COMMAND test_pico_wt_managed_tokens
@@ -1026,6 +1121,22 @@ endif()\n")
             TIMEOUT 30
             LABELS "network;pico_wt;managed")
 
+        # Draft-22 through the managed pair over real UDP: both facades bind
+        # their sessions to the WebTransport session before starting them;
+        # a client offering {22, 18, 16} falls back to 18 and to 16 when the
+        # server supports only those.
+        # Without picoquic's stream terminal contract the same rows check
+        # that a draft-22 offer is refused at create.
+        foreach(_m22 loopback_22 nego_22_18 nego_22_16)
+            add_test(NAME pico_wt_managed_${_m22}
+                COMMAND test_pico_wt_managed_loopback --mode ${_m22}
+                    --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                    --key  "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+            set_tests_properties(pico_wt_managed_${_m22} PROPERTIES
+                TIMEOUT 30
+                LABELS "network;pico_wt;managed;d22")
+        endforeach()
+
         # WT_ALPN_ERROR wire obligation (draft-ietf-webtrans-http3-15 3.3):
         # the server echoes no WT-Protocol on a successful CONNECT and the
         # client requires exact draft-18, so the client must close the
@@ -1056,6 +1167,10 @@ endif()\n")
         target_include_directories(test_pico_wt_ownership PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(test_pico_wt_ownership PRIVATE moq::adapter-pico-wt-managed)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pico_wt_ownership PRIVATE
+                -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
         # Session-terminal arbitration through the managed facade: a control
         # reset, close capsule and connection loss scripted from one side's
         # network thread, for client and server receivers on both drafts.
@@ -1072,6 +1187,10 @@ endif()\n")
             ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(test_pico_wt_managed_arbitration PRIVATE
             moq::adapter-pico-wt-managed)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pico_wt_managed_arbitration PRIVATE
+                -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
         add_test(NAME pico_wt_managed_arbitration
             COMMAND test_pico_wt_managed_arbitration
                 "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
@@ -1178,6 +1297,7 @@ endif()\n")
             LABELS "network;pico_wt;managed")
 
         # Edge cases: config validation, NULL safety, connect failure,
+        # the CONNECT :authority (URI authority, independent of the SNI),
         # cert-verification failure, stop/wake/wait lifecycle, and
         # stop-from-on_pump rejection.
         # Compiled from the facade sources with MOQ_PICO_WT_TESTING, so the
@@ -1205,7 +1325,7 @@ endif()\n")
         endif()
         if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
             target_compile_options(test_pico_wt_managed_edges PRIVATE
-                -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+                -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
         endif()
         add_test(NAME pico_wt_managed_edges
             COMMAND test_pico_wt_managed_edges
@@ -1226,7 +1346,7 @@ endif()\n")
         if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
             target_compile_options(test_pico_wt_managed_cfg_abi PRIVATE
                 -Wall -Wextra -Wpedantic
-                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
         endif()
         add_test(NAME pico_wt_managed_cfg_abi
             COMMAND test_pico_wt_managed_cfg_abi)

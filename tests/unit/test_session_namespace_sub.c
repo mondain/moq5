@@ -880,8 +880,10 @@ int main(void)
 
     /* == 4b. Inbound SUBSCRIBE_NAMESPACE after local GOAWAY refused ==== */
     {
-        /* After we send GOAWAY (§10.4) the peer must not open new requests --
-         * including a SUBSCRIBE_NAMESPACE on a fresh bidi. */
+        /* After our GOAWAY the peer SHOULD NOT open new requests (§9.4) --
+         * including a SUBSCRIBE_NAMESPACE on a fresh bidi. One that crossed
+         * the GOAWAY is refused with a REQUEST_ERROR (draft-16 registers no
+         * GOING_AWAY code: INTERNAL_ERROR); the session stays up. */
         test_alloc_state_t as = {0};
         moq_alloc_t alloc = test_allocator(&as);
         moq_session_t *c = NULL, *sv = NULL;
@@ -895,19 +897,33 @@ int main(void)
         moq_stream_ref_t ref = moq_stream_ref_from_u64(150);
         moq_session_on_bidi_stream_bytes(sv, ref, msg, msg_len, false, 0);
 
-        MOQ_TEST_CHECK(moq_session_state(sv) == MOQ_SESS_CLOSED);
+        MOQ_TEST_CHECK(moq_session_state(sv) == MOQ_SESS_DRAINING);
         moq_event_t ev;
-        bool saw_ns_sub = false, saw_closed = false;
+        bool saw_ns_sub = false;
         while (moq_session_poll_events(sv, &ev, 1) == 1) {
             if (ev.kind == MOQ_EVENT_NS_SUB_REQUEST) saw_ns_sub = true;
-            if (ev.kind == MOQ_EVENT_SESSION_CLOSED) {
-                saw_closed = true;
-                MOQ_TEST_CHECK(ev.u.closed.code == 0x3);
-            }
             moq_event_cleanup(&ev);
         }
         MOQ_TEST_CHECK(!saw_ns_sub);
-        MOQ_TEST_CHECK(saw_closed);
+        bool refused = false;
+        moq_action_t act;
+        while (moq_session_poll_actions(sv, &act, 1) > 0) {
+            if (act.kind == MOQ_ACTION_SEND_BIDI_STREAM &&
+                act.u.send_bidi_stream.stream_ref._v == ref._v) {
+                moq_buf_reader_t r;
+                moq_buf_reader_init(&r, act.u.send_bidi_stream.data,
+                                    act.u.send_bidi_stream.len);
+                moq_control_envelope_t env;
+                moq_d16_request_error_t e;
+                if (moq_control_decode_envelope(&r, &env) == MOQ_OK &&
+                    env.msg_type == 0x05 &&
+                    moq_d16_decode_request_error(env.payload, env.payload_len, &e) == MOQ_OK &&
+                    e.error_code == MOQ_REQUEST_ERROR_INTERNAL_ERROR)
+                    refused = true;
+            }
+            moq_action_cleanup(&act);
+        }
+        MOQ_TEST_CHECK(refused);
 
         DRAIN_BOTH(c, sv);
         moq_session_destroy(c);

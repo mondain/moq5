@@ -5,6 +5,7 @@
 
 #include <time.h>
 #include <moq/picoquic_threaded.h>
+#include <moq/connection_target.h>
 #include <moq/picoquic_verify.h>
 #include <picoquic.h>
 #include <moq/publisher.h>
@@ -544,6 +545,44 @@ static void make_client_cfg(moq_pq_threaded_cfg_t *cfg,
 }
 
 #ifdef MOQ_TEST_CERT_PATH
+/* -- Version negotiation pump + URI policy --------------------------- *
+ * Records whether the facade's session reached ESTABLISHED (client), and
+ * what a server's URI policy was asked. */
+typedef struct {
+    int established;                 /* atomic */
+    int policy_calls;                /* atomic */
+    char authority[64];
+    char path[64];
+} nego_ctx_t;
+
+static int nego_client_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
+                            uint64_t now, void *vctx)
+{
+    (void)lane; (void)now;
+    nego_ctx_t *nc = (nego_ctx_t *)vctx;
+    moq_session_t *s = moq_pq_threaded_session(t);
+    if (s && moq_session_state(s) == MOQ_SESS_ESTABLISHED)
+        __atomic_store_n(&nc->established, 1, __ATOMIC_RELEASE);
+    return 0;
+}
+
+static uint32_t nego_accept_uri(void *ctx, uint32_t present,
+                                moq_bytes_t authority, moq_bytes_t path_query)
+{
+    nego_ctx_t *nc = (nego_ctx_t *)ctx;
+    (void)present;
+    if (authority.len < sizeof(nc->authority)) {
+        memcpy(nc->authority, authority.data, authority.len);
+        nc->authority[authority.len] = '\0';
+    }
+    if (path_query.len < sizeof(nc->path)) {
+        memcpy(nc->path, path_query.data, path_query.len);
+        nc->path[path_query.len] = '\0';
+    }
+    __atomic_add_fetch(&nc->policy_calls, 1, __ATOMIC_ACQ_REL);
+    return MOQ_URI_ACCEPT;
+}
+
 /* -- Terminal-conn lifecycle pump ------------------------------------ *
  * Tracks ONE accepted connection through the app's eyes: polls its
  * session only through live lane iteration iteration (never a stale
@@ -562,6 +601,7 @@ typedef struct {
 static int lifecycle_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
                     uint64_t now, void *vctx)
 {
+    (void)t;
     (void)lane;
     (void)now;
     lifecycle_ctx_t *lc = (lifecycle_ctx_t *)vctx;
@@ -763,6 +803,35 @@ int main(void)
             moq_pq_threaded_destroy(t);
         }
         PASS("cfg_old_prefix_goaway_absent");
+    }
+
+    /* A caller built before `target` was appended: its struct ends at
+     * ca_file, struct_size is that layout's sizeof (the end of ca_file
+     * rounded to the struct's alignment), and the bytes past ca_file are
+     * garbage -- a wild target pointer if read. _create must use no target:
+     * a malformed one is refused there. */
+    {
+        enum { END = offsetof(moq_pq_threaded_cfg_t, ca_file) + sizeof(const char *) };
+        _Static_assert(offsetof(moq_pq_threaded_cfg_t, target) >=
+                       (END + _Alignof(moq_pq_threaded_cfg_t) - 1) /
+                       _Alignof(moq_pq_threaded_cfg_t) *
+                       _Alignof(moq_pq_threaded_cfg_t),
+                       "target starts past the sizeof through ca_file");
+        const size_t align = _Alignof(moq_pq_threaded_cfg_t);
+        moq_pq_threaded_cfg_t cfg;
+        make_client_cfg(&cfg, &alloc);
+        cfg.insecure_skip_verify = true;
+        cfg.port = 14600 + (rand() % 400);
+        memset((unsigned char *)&cfg + END, 0xFF, sizeof(cfg) - END);
+        cfg.struct_size = (uint32_t)((END + align - 1) / align * align);
+        moq_pq_threaded_t *t = NULL;
+        moq_result_t rc = moq_pq_threaded_create(&cfg, &t);
+        CHECK(rc == MOQ_OK);   /* the garbage target is never read */
+        if (rc == MOQ_OK) {
+            moq_pq_threaded_stop(t);
+            moq_pq_threaded_destroy(t);
+        }
+        PASS("cfg_old_prefix_target_absent");
     }
 
     /* A caller built before idle_timeout_ms was appended: struct_size ends
@@ -1896,7 +1965,7 @@ int main(void)
     {
         int server_port = 14600 + (rand() % 400);
 
-        smoke_srv_t srv_state = { NULL, NULL, 0 };
+        smoke_srv_t srv_state = { .pub = NULL, .track = NULL, .obj_written = 0 };
         moq_pq_threaded_cfg_t srv_cfg;
         make_server_cfg_real(&srv_cfg, moq_alloc_default());
         srv_cfg.port = server_port;
@@ -1987,6 +2056,139 @@ int main(void)
             moq_pq_threaded_destroy(srv);
         }
         PASS("facade_smoke_object");
+    }
+
+
+    /* ================================================================ */
+    /* Draft-22 negotiation over real UDP: the server offers {22, 18, 16};  */
+    /* a client offering {22, 18, 16} establishes at 22; clients offering  */
+    /* only {18, 16} or {16} fall back to 18 and 16. On each, the session  */
+    /* is bound to the connection and its SETUP names the configured      */
+    /* target, which the server's URI policy sees.                        */
+    /* Draft 22 needs this picoquic's exact stream terminal outcomes      */
+    /* (PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1). Without them a   */
+    /* server or client offering moqt-22 is refused at create with        */
+    /* MOQ_ERR_UNSUPPORTED and nothing starts; the server then offers      */
+    /* {18, 16} and the two fallback rows run unchanged.                  */
+    /* ================================================================ */
+    {
+#if defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) && \
+    PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1
+        static const char *const srv_offer[] = { "moqt-22", "moqt-18", "moqt-16" };
+        const size_t srv_offer_n = 3;
+        const int first_row = 0;
+#else
+        static const char *const srv22[] = { "moqt-22", "moqt-18", "moqt-16" };
+        static const char *const srv_offer[] = { "moqt-18", "moqt-16" };
+        const size_t srv_offer_n = 2;
+        const int first_row = 1;
+        {
+            moq_pq_threaded_cfg_t refused_cfg;
+            make_server_cfg_real(&refused_cfg, moq_alloc_default());
+            refused_cfg.port = 15300 + (rand() % 300);
+            refused_cfg.alpn_list = srv22;
+            refused_cfg.alpn_count = 3;
+            moq_pq_threaded_t *refused = (moq_pq_threaded_t *)(uintptr_t)1;
+            CHECK(moq_pq_threaded_create(&refused_cfg, &refused) ==
+                  MOQ_ERR_UNSUPPORTED);
+            CHECK(refused == NULL);
+            make_client_cfg(&refused_cfg, moq_alloc_default());
+            refused_cfg.host = "127.0.0.1";
+            refused_cfg.port = 15300;
+            refused_cfg.insecure_skip_verify = true;
+            refused_cfg.alpn_list = srv22;
+            refused_cfg.alpn_count = 3;
+            refused = (moq_pq_threaded_t *)(uintptr_t)1;
+            CHECK(moq_pq_threaded_create(&refused_cfg, &refused) ==
+                  MOQ_ERR_UNSUPPORTED);
+            CHECK(refused == NULL);
+        }
+#endif
+        static const char *const cli_offers[3][3] = {
+            { "moqt-22", "moqt-18", "moqt-16" },
+            { "moqt-18", "moqt-16", NULL },
+            { "moqt-16", NULL, NULL },
+        };
+        static const moq_version_t want[3] = {
+            MOQ_VERSION_DRAFT_22, MOQ_VERSION_DRAFT_18, MOQ_VERSION_DRAFT_16 };
+        for (int i = first_row; i < 3; i++) {
+            int server_port = 15300 + (rand() % 300);
+            nego_ctx_t srv_nc; memset(&srv_nc, 0, sizeof(srv_nc));
+            moq_connection_target_t policy;
+            memset(&policy, 0, sizeof(policy));
+            policy.struct_size = sizeof(policy);
+            policy.accept_uri = nego_accept_uri;
+            policy.accept_uri_ctx = &srv_nc;
+            moq_pq_threaded_cfg_t srv_cfg;
+            make_server_cfg_real(&srv_cfg, moq_alloc_default());
+            srv_cfg.port = server_port;
+            srv_cfg.alpn_list = srv_offer;
+            srv_cfg.alpn_count = srv_offer_n;
+            srv_cfg.target = &policy;
+            moq_pq_threaded_t *srv = NULL;
+            if (moq_pq_threaded_create(&srv_cfg, &srv) != MOQ_OK || !srv) {
+                CHECK(0 && "draft-22 negotiation server create");
+                continue;
+            }
+            static const uint8_t authority[] = "relay.example:443";
+            static const uint8_t path[] = "/live/room?x=1";
+            moq_connection_target_t target;
+            memset(&target, 0, sizeof(target));
+            target.struct_size = sizeof(target);
+            target.target_present = MOQ_BINDING_TARGET_COMPLETE;
+            target.authority.data = authority;
+            target.authority.len = sizeof(authority) - 1;
+            target.path_query.data = path;
+            target.path_query.len = sizeof(path) - 1;
+            nego_ctx_t cli_nc; memset(&cli_nc, 0, sizeof(cli_nc));
+            moq_pq_threaded_cfg_t c;
+            make_client_cfg(&c, moq_alloc_default());
+            c.host = "127.0.0.1";
+            c.port = server_port;
+            c.insecure_skip_verify = true;
+            c.on_lane_pump = nego_client_pump;
+            c.on_lane_pump_ctx = &cli_nc;
+            c.alpn_list = cli_offers[i];
+            c.alpn_count = cli_offers[i][2] ? 3 : (cli_offers[i][1] ? 2 : 1);
+            c.target = &target;
+            moq_pq_threaded_t *cli = NULL;
+            CHECK(moq_pq_threaded_create(&c, &cli) == MOQ_OK);
+            if (cli) {
+                int ready = 0;
+                for (int tries = 0; tries < 400 && !ready; tries++) {
+                    moq_pq_threaded_wait(cli, 25000);
+                    ready = __atomic_load_n(&cli_nc.established, __ATOMIC_ACQUIRE);
+                }
+                CHECK(ready);
+                CHECK(!moq_pq_threaded_is_fatal(cli));
+                CHECK(moq_pq_threaded_negotiated_version(cli) == want[i]);
+                int srv_ok = 0;
+                for (int tries = 0; tries < 200 && !srv_ok; tries++) {
+                    moq_pq_threaded_wait(srv, 25000);
+                    srv_ok = moq_pq_threaded_negotiated_version(srv) == want[i];
+                }
+                CHECK(moq_pq_threaded_negotiated_version(srv) == want[i]);
+                CHECK(!moq_pq_threaded_is_fatal(srv));
+                /* The target travels in SETUP natively over QUIC on every
+                 * draft; the policy sees exactly the configured spelling. The
+                 * client can establish before the server has processed the
+                 * client's SETUP, so give the server's side a bounded wait. */
+                int calls = 0;
+                for (int tries = 0; tries < 200; tries++) {
+                    calls = __atomic_load_n(&srv_nc.policy_calls, __ATOMIC_ACQUIRE);
+                    if (calls > 0) break;
+                    moq_pq_threaded_wait(srv, 25000);
+                }
+                CHECK(calls == 1);
+                CHECK(strcmp(srv_nc.authority, "relay.example:443") == 0);
+                CHECK(strcmp(srv_nc.path, "/live/room?x=1") == 0);
+                moq_pq_threaded_stop(cli);
+                moq_pq_threaded_destroy(cli);
+            }
+            moq_pq_threaded_stop(srv);
+            moq_pq_threaded_destroy(srv);
+        }
+        PASS("draft22_negotiation_and_fallback");
     }
 
 #else

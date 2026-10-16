@@ -32,6 +32,8 @@
 #include <moq/msquic_managed.h>
 #include <moq/rcbuf.h>
 
+#include "msq_loopback_port.h"
+
 #include <inttypes.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -558,7 +560,6 @@ run_case(moq_version_t version, const char *alpn, bool streaming)
     scfg.alloc = moq_alloc_default();
     scfg.perspective = MOQ_PERSPECTIVE_SERVER;
     scfg.host = "127.0.0.1";
-    scfg.port = 0;   /* ephemeral */
     scfg.cert_path = g_cert;
     scfg.key_path = g_key;
     scfg.send_request_capacity = true;
@@ -570,7 +571,7 @@ run_case(moq_version_t version, const char *alpn, bool streaming)
     scfg.on_lane_pump = relay_lane_pump;
     scfg.on_lane_pump_user = &rctx;
     moq_msquic_managed_t *relay = NULL;
-    L_CHECK(moq_msquic_managed_create(&scfg, &relay) == MOQ_OK);
+    L_CHECK(msqt_server_create(&scfg, &relay) == MOQ_OK);
     if (relay == NULL) {
         moqr_bind_destroy(rctx.bind);
         moqr_core_destroy(rctx.core);
@@ -880,7 +881,6 @@ run_lanes_case(moq_version_t version, const char *alpn, uint32_t sub_lane)
     scfg.alloc = moq_alloc_default();
     scfg.perspective = MOQ_PERSPECTIVE_SERVER;
     scfg.host = "127.0.0.1";
-    scfg.port = 0;
     scfg.cert_path = g_cert;
     scfg.key_path = g_key;
     scfg.send_request_capacity = true;
@@ -893,7 +893,7 @@ run_lanes_case(moq_version_t version, const char *alpn, uint32_t sub_lane)
     scfg.on_lane_pump = relay_lanes_pump;
     scfg.on_lane_pump_user = &rctx;
     moq_msquic_managed_t *relay = NULL;
-    L_CHECK(moq_msquic_managed_create(&scfg, &relay) == MOQ_OK);
+    L_CHECK(msqt_server_create(&scfg, &relay) == MOQ_OK);
     if (relay == NULL) {
         moqr_shards_destroy(shards);
         return g_failures - before;
@@ -1017,7 +1017,6 @@ run_lanes_admit_drive(moqr_shards_t *shards, uint32_t max_conns,
     scfg.alloc = moq_alloc_default();
     scfg.perspective = MOQ_PERSPECTIVE_SERVER;
     scfg.host = "127.0.0.1";
-    scfg.port = 0;
     scfg.cert_path = g_cert;
     scfg.key_path = g_key;
     scfg.send_request_capacity = true;
@@ -1030,7 +1029,7 @@ run_lanes_admit_drive(moqr_shards_t *shards, uint32_t max_conns,
     scfg.on_lane_pump = relay_lanes_pump;
     scfg.on_lane_pump_user = &rctx;
     moq_msquic_managed_t *relay = NULL;
-    L_CHECK(moq_msquic_managed_create(&scfg, &relay) == MOQ_OK);
+    L_CHECK(msqt_server_create(&scfg, &relay) == MOQ_OK);
     if (relay == NULL) {
         moqr_shards_destroy(shards);
         return g_failures - before;
@@ -1369,7 +1368,6 @@ run_lanes_auth_revoke_case(moq_version_t version, const char *alpn,
     scfg.alloc = moq_alloc_default();
     scfg.perspective = MOQ_PERSPECTIVE_SERVER;
     scfg.host = "127.0.0.1";
-    scfg.port = 0;
     scfg.cert_path = g_cert;
     scfg.key_path = g_key;
     scfg.send_request_capacity = true;
@@ -1382,7 +1380,7 @@ run_lanes_auth_revoke_case(moq_version_t version, const char *alpn,
     scfg.on_lane_pump = relay_lanes_pump;
     scfg.on_lane_pump_user = &rctx;
     moq_msquic_managed_t *relay = NULL;
-    L_CHECK(moq_msquic_managed_create(&scfg, &relay) == MOQ_OK);
+    L_CHECK(msqt_server_create(&scfg, &relay) == MOQ_OK);
     if (relay == NULL) {
         moqr_shards_destroy(shards);
         return g_failures - before;
@@ -1571,7 +1569,6 @@ mk_ack_relay(relay_ctx_t *rctx, moq_version_t version, uint32_t facade_conns,
     scfg.alloc = moq_alloc_default();
     scfg.perspective = MOQ_PERSPECTIVE_SERVER;
     scfg.host = "127.0.0.1";
-    scfg.port = 0;
     scfg.cert_path = g_cert;
     scfg.key_path = g_key;
     scfg.send_request_capacity = true;
@@ -1582,7 +1579,7 @@ mk_ack_relay(relay_ctx_t *rctx, moq_version_t version, uint32_t facade_conns,
     scfg.on_lane_pump = relay_lane_pump;
     scfg.on_lane_pump_user = rctx;
     moq_msquic_managed_t *relay = NULL;
-    if (moq_msquic_managed_create(&scfg, &relay) != MOQ_OK) {
+    if (msqt_server_create(&scfg, &relay) != MOQ_OK) {
         return NULL;
     }
     return relay;
@@ -1807,6 +1804,15 @@ main(int argc, char **argv)
         if (strcmp(sel, "lanes_same_d18") == 0) {
             return run_lanes_case(MOQ_VERSION_DRAFT_18, "moqt-18", 0);
         }
+        if (strcmp(sel, "lanes_cross_d22") == 0) {
+            return run_lanes_case(MOQ_VERSION_DRAFT_22, "moqt-22", 1);
+        }
+        if (strcmp(sel, "lanes_same_d22") == 0) {
+            return run_lanes_case(MOQ_VERSION_DRAFT_22, "moqt-22", 0);
+        }
+        if (strcmp(sel, "relay_d22") == 0) {
+            return run_case(MOQ_VERSION_DRAFT_22, "moqt-22", true);
+        }
         fprintf(stderr, "%s: unknown case '%s'\n", argv[0], sel);
         return 2;
     }
@@ -1816,13 +1822,19 @@ main(int argc, char **argv)
      * drafts, each on its own exact-version listener. */
     (void)run_case(MOQ_VERSION_DRAFT_16, "moqt-16", true);
     (void)run_case(MOQ_VERSION_DRAFT_18, "moqt-18", true);
+    /* A draft-22 publisher and two draft-22 subscribers through the relay:
+     * every session here is bound to its connection by the facade before it
+     * starts, on both sides of each connection. */
+    (void)run_case(MOQ_VERSION_DRAFT_22, "moqt-22", true);
     /* Focused whole-object receive regression (legacy / non-production mode). */
     (void)run_case(MOQ_VERSION_DRAFT_18, "moqt-18", false);
-    /* Multi-lane substrate (d18): lane i -> shard i. Same-lane delivers; a
-     * cross-lane subscriber is refused NOT_SUPPORTED (which also proves the
-     * announce replicated across shards over real transport). */
+    /* Multi-lane substrate (d18 and d22): lane i -> shard i. Same-lane
+     * delivers; a cross-lane subscriber is refused NOT_SUPPORTED (which also
+     * proves the announce replicated across shards over real transport). */
     (void)run_lanes_case(MOQ_VERSION_DRAFT_18, "moqt-18", 0);
     (void)run_lanes_case(MOQ_VERSION_DRAFT_18, "moqt-18", 1);
+    (void)run_lanes_case(MOQ_VERSION_DRAFT_22, "moqt-22", 0);
+    (void)run_lanes_case(MOQ_VERSION_DRAFT_22, "moqt-22", 1);
     /* Admission ON, hand-built runtime (production reaches the same admit
      * state via the CLI builder for lanes > 1): the completed cross-shard
      * pump over real transport, both drafts. */

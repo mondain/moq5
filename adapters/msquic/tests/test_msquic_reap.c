@@ -45,6 +45,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "msq_loopback_port.h"
+
 static int failures;
 #define CHECK(c)                                                            \
     do {                                                                    \
@@ -149,7 +151,6 @@ static void t_reap_yields_to_armed_pump(const char *cert, const char *key)
     scfg.alloc = moq_alloc_default();
     scfg.perspective = MOQ_PERSPECTIVE_SERVER;
     scfg.host = "127.0.0.1";
-    scfg.port = 0;
     scfg.cert_path = cert;
     scfg.key_path = key;
     scfg.max_events = 64;
@@ -159,7 +160,7 @@ static void t_reap_yields_to_armed_pump(const char *cert, const char *key)
     scfg.on_lane_pump_user = &sv;
 
     moq_msquic_managed_t *srv = NULL;
-    CHECK(moq_msquic_managed_create(&scfg, &srv) == MOQ_OK);
+    CHECK(msqt_server_create(&scfg, &srv) == MOQ_OK);
     if (srv == NULL)
         return;
     uint16_t port = moq_msquic_managed_port(srv);

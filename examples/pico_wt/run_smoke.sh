@@ -3,8 +3,10 @@
 # Localhost smoke for the pico WT examples: start moq_pico_wt_server,
 # run moq_pico_wt_client against it, and assert the client received the
 # published object end to end over real UDP. The server is always
-# cleaned up (trap on EXIT). Both server and client output are printed
-# on failure.
+# cleaned up (trap on EXIT). Every server attempt's output is printed:
+# a candidate that did not bind as soon as the next one is tried, and the
+# bound server's, including its shutdown, once it has been stopped. The
+# client output is printed on failure and on success.
 #
 # Args: <server-bin> <client-bin> <cert> <key> <base-port>
 set -u
@@ -14,17 +16,23 @@ SERVER="$1"; CLIENT="$2"; CERT="$3"; KEY="$4"; BASE_PORT="$5"
 SRV_PID=""
 SRV_OUT="$(mktemp)"
 CLI_OUT="$(mktemp)"
+emit_server() {
+    echo "=== server output ($1) ==="; cat "$SRV_OUT"
+    echo "=== end of server output ==="
+}
 cleanup() {
+    local rc=$?
     if [ -n "$SRV_PID" ]; then
         kill -INT "$SRV_PID" 2>/dev/null
         wait "$SRV_PID" 2>/dev/null
+        emit_server "port ${PORT:-${cand:-unknown}}, including shutdown"
     fi
     rm -f "$SRV_OUT" "$CLI_OUT"
+    exit "$rc"
 }
 trap cleanup EXIT
 
 dump_logs() {
-    echo "=== server output ==="; cat "$SRV_OUT"
     echo "=== client output ==="; cat "$CLI_OUT"
     echo "====================="
 }
@@ -48,6 +56,7 @@ for off in 0 1000 2000 3000; do
     # Bind failed (server already exited); reap and try the next port.
     wait "$SRV_PID" 2>/dev/null
     SRV_PID=""
+    emit_server "port $cand, did not bind"
 done
 
 if [ -z "$PORT" ]; then

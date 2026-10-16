@@ -51,8 +51,7 @@ install(FILES THIRD_PARTY.md
 target_compile_definitions(moq-msf PRIVATE MOQ_BUILDING)
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-    target_compile_options(moq-msf PRIVATE -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>
-        -Wno-unused-parameter)
+    target_compile_options(moq-msf PRIVATE -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
 endif()
 
 if(MOQ_BUILD_TESTS)
@@ -60,6 +59,10 @@ if(MOQ_BUILD_TESTS)
     target_link_libraries(test_msf PRIVATE moq::msf)
     target_compile_definitions(test_msf PRIVATE
         MOQ_MSF_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_msf PRIVATE -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
     add_test(NAME msf COMMAND test_msf)
 
     # draft-gregoire-moq-msfts catalog fields, against the draft's examples.
@@ -78,6 +81,10 @@ if(MOQ_BUILD_TESTS)
     if(TARGET moq::media-object AND TARGET moq::cmaf AND TARGET moq::loc)
         add_executable(test_msf_media tests/test_msf_media.c)
         target_link_libraries(test_msf_media PRIVATE moq::msf)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_msf_media PRIVATE -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
         add_test(NAME msf_media COMMAND test_msf_media)
     endif()
 
@@ -88,6 +95,10 @@ if(MOQ_BUILD_TESTS)
     target_compile_definitions(test_msf_scaling PRIVATE MOQ_MSF_TESTING MOQ_BUILDING)
     target_include_directories(test_msf_scaling PRIVATE include)
     target_link_libraries(test_msf_scaling PRIVATE moq::core)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_msf_scaling PRIVATE -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
     add_test(NAME msf_scaling COMMAND test_msf_scaling)
 
     # The checked array sizer is hidden in the shipped library, so its boundary
@@ -99,7 +110,7 @@ if(MOQ_BUILD_TESTS)
     target_link_libraries(test_msf_checked_array PRIVATE moq::core)
     if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
         target_compile_options(test_msf_checked_array PRIVATE -Wall -Wextra -Wpedantic
-            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
     endif()
     add_test(NAME msf_checked_array COMMAND test_msf_checked_array)
 endif()

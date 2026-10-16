@@ -4,6 +4,7 @@
 #include <moq/types.h>
 #include <moq/session.h>
 #include <moq/subscriber.h>
+#include <moq/transport_binding.h>
 
 #include <array>
 #include <cstddef>
@@ -132,7 +133,7 @@ public:
 
     std::string_view operator[](size_t i) const noexcept
     {
-        if (i >= count_)
+        if (i >= count_ || i >= parts_.size())
             return {};
         return {reinterpret_cast<const char *>(parts_[i].data), parts_[i].len};
     }
@@ -264,6 +265,14 @@ enum class request_error : uint64_t {
     redirect                   = MOQ_REQUEST_ERROR_REDIRECT,
 };
 
+// Keep the legacy enum's case set stable for exhaustive switch clients.
+namespace request_errors {
+inline constexpr request_error conflicting_filters =
+    static_cast<request_error>(MOQ_REQUEST_ERROR_CONFLICTING_FILTERS);
+inline constexpr request_error invalid_filter =
+    static_cast<request_error>(MOQ_REQUEST_ERROR_INVALID_FILTER);
+} // namespace request_errors
+
 constexpr moq_request_error_t to_c(request_error v) noexcept
 {
     return static_cast<moq_request_error_t>(v);
@@ -289,6 +298,76 @@ constexpr request_family request_family_from_c(moq_request_family_t v) noexcept
     return static_cast<request_family>(v);
 }
 
+/* Why a request ended by a stream signal rather than by a message
+ * (MOQ_REQUEST_TERMINAL_*); `none` when a message ended it or the producer
+ * predates the field. */
+enum class request_terminal_cause : uint32_t {
+    none               = MOQ_REQUEST_TERMINAL_NONE,
+    peer_reset_stream  = MOQ_REQUEST_TERMINAL_PEER_RESET_STREAM,
+    peer_stop_sending  = MOQ_REQUEST_TERMINAL_PEER_STOP_SENDING,
+    missing_response   = MOQ_REQUEST_TERMINAL_MISSING_RESPONSE,
+    truncated_response = MOQ_REQUEST_TERMINAL_TRUNCATED_RESPONSE,
+    peer_fin_complete  = MOQ_REQUEST_TERMINAL_PEER_FIN_COMPLETE,
+    /* This side cancelled a fetch it could not take (FETCH_RESET only). */
+    local_cancel       = MOQ_REQUEST_TERMINAL_LOCAL_CANCEL,
+    /* This side cancelled the request: its Track is malformed (draft-22
+     * §12.1). UNSUBSCRIBED, PUBLISH_FINISHED and FETCH_RESET. */
+    malformed_track    = MOQ_REQUEST_TERMINAL_MALFORMED_TRACK,
+};
+
+constexpr request_terminal_cause request_terminal_cause_from_c(
+    moq_request_terminal_cause_t v) noexcept
+{
+    return static_cast<request_terminal_cause>(v);
+}
+
+enum class track_status_terminal_cause : uint32_t {
+    peer_reset_stream  = MOQ_TRACK_STATUS_PEER_RESET_STREAM,
+    peer_stop_sending  = MOQ_TRACK_STATUS_PEER_STOP_SENDING,
+    missing_response   = MOQ_TRACK_STATUS_MISSING_RESPONSE,
+    truncated_response = MOQ_TRACK_STATUS_TRUNCATED_RESPONSE,
+};
+
+enum class namespace_terminal_cause : uint32_t {
+    peer_fin_complete  = MOQ_NAMESPACE_TERMINAL_PEER_FIN_COMPLETE,
+    peer_reset_stream  = MOQ_NAMESPACE_TERMINAL_PEER_RESET_STREAM,
+    peer_stop_sending  = MOQ_NAMESPACE_TERMINAL_PEER_STOP_SENDING,
+    missing_response   = MOQ_NAMESPACE_TERMINAL_MISSING_RESPONSE,
+    truncated_message  = MOQ_NAMESPACE_TERMINAL_TRUNCATED_MESSAGE,
+    local_capacity     = MOQ_NAMESPACE_TERMINAL_LOCAL_CAPACITY,
+};
+
+/* This endpoint's side of a request (MOQ_REQUEST_ROLE_*). */
+enum class request_role : uint32_t {
+    requester = MOQ_REQUEST_ROLE_REQUESTER,
+    responder = MOQ_REQUEST_ROLE_RESPONDER,
+};
+
+constexpr request_role request_role_from_c(moq_request_role_t v) noexcept
+{
+    return static_cast<request_role>(v);
+}
+
+/* The application error codes a data stream carries in RESET_STREAM or
+ * STOP_SENDING (session.h MOQ_STREAM_ERROR_*): wire values passed through
+ * unchanged, so a caller uses the value its session's draft registers. */
+namespace stream_error {
+inline constexpr uint64_t internal_error        = MOQ_STREAM_ERROR_INTERNAL_ERROR;
+inline constexpr uint64_t cancelled             = MOQ_STREAM_ERROR_CANCELLED;
+inline constexpr uint64_t delivery_timeout      = MOQ_STREAM_ERROR_DELIVERY_TIMEOUT;
+inline constexpr uint64_t session_closed        = MOQ_STREAM_ERROR_SESSION_CLOSED;
+inline constexpr uint64_t malformed_track       = MOQ_STREAM_ERROR_MALFORMED_TRACK;
+/* Drafts 18 and 22 only. */
+inline constexpr uint64_t going_away            = MOQ_STREAM_ERROR_GOING_AWAY;
+inline constexpr uint64_t too_far_behind        = MOQ_STREAM_ERROR_TOO_FAR_BEHIND;
+inline constexpr uint64_t unknown_object_status = MOQ_STREAM_ERROR_UNKNOWN_OBJECT_STATUS;
+inline constexpr uint64_t expired_auth_token    = MOQ_STREAM_ERROR_EXPIRED_AUTH_TOKEN;
+inline constexpr uint64_t excessive_load        = MOQ_STREAM_ERROR_EXCESSIVE_LOAD;
+/* Draft 16's value for UNKNOWN_OBJECT_STATUS. */
+inline constexpr uint64_t d16_unknown_object_status =
+    MOQ_STREAM_ERROR_D16_UNKNOWN_OBJECT_STATUS;
+}  // namespace stream_error
+
 enum class namespace_interest : uint32_t {
     publisher_state = MOQ_NAMESPACE_INTEREST_PUBLISHER_STATE,
     namespace_state = MOQ_NAMESPACE_INTEREST_NAMESPACE_STATE,
@@ -309,6 +388,11 @@ enum class fetch_range_kind {
     non_existent = MOQ_FETCH_RANGE_NON_EXISTENT,
     unknown      = MOQ_FETCH_RANGE_UNKNOWN,
 };
+
+namespace fetch_ranges {
+inline constexpr fetch_range_kind timed_out =
+    static_cast<fetch_range_kind>(MOQ_FETCH_RANGE_TIMED_OUT);
+} // namespace fetch_ranges
 
 constexpr moq_fetch_range_kind_t to_c(fetch_range_kind v) noexcept
 {
@@ -339,10 +423,73 @@ constexpr sub_fetch_item_kind sub_fetch_item_kind_from_c(
     return static_cast<sub_fetch_item_kind>(v);
 }
 
+/* Items of a subscriber-facade fill (subscriber.h moq_sub_fill_item_kind_t). */
+enum class sub_fill_item_kind : uint32_t {
+    object   = MOQ_SUB_FILL_OBJECT,
+    gap      = MOQ_SUB_FILL_GAP,
+    terminal = MOQ_SUB_FILL_TERMINAL,
+    created  = MOQ_SUB_FILL_CREATED,
+};
+
+constexpr sub_fill_item_kind sub_fill_item_kind_from_c(
+    uint32_t v) noexcept
+{
+    return static_cast<sub_fill_item_kind>(v);
+}
+
 enum class sub_status_result_kind {
     ok    = MOQ_SUB_STATUS_OK,
     error = MOQ_SUB_STATUS_ERROR,
 };
+
+/* Semantic location filter kinds (location.h); the enclosing operation
+ * defines omission and inheritance. */
+enum class location_filter_kind : uint32_t {
+    none           = MOQ_LOCATION_FILTER_NONE,
+    relative_group = MOQ_LOCATION_FILTER_RELATIVE_GROUP,
+    absolute_start = MOQ_LOCATION_FILTER_ABSOLUTE_START,
+    group_end      = MOQ_LOCATION_FILTER_GROUP_END,
+    object_end     = MOQ_LOCATION_FILTER_OBJECT_END,
+    next_object    = MOQ_LOCATION_FILTER_NEXT_OBJECT,
+};
+
+constexpr moq_location_filter_kind_t to_c(location_filter_kind v) noexcept
+{
+    return static_cast<moq_location_filter_kind_t>(v);
+}
+constexpr location_filter_kind location_filter_kind_from_c(
+    moq_location_filter_kind_t v) noexcept
+{
+    return static_cast<location_filter_kind>(v);
+}
+
+/* Why a fill ended (MOQ_FILL_*) and the domain its code belongs to
+ * (MOQ_FILL_ERROR_*), from session.h. */
+enum class fill_reason : uint32_t {
+    complete                = MOQ_FILL_COMPLETE,
+    no_stream               = MOQ_FILL_NO_STREAM,
+    local_cancelled         = MOQ_FILL_LOCAL_CANCELLED,
+    peer_cancelled_or_reset = MOQ_FILL_PEER_CANCELLED_OR_RESET,
+    local_aborted           = MOQ_FILL_LOCAL_ABORTED,
+    parent_rejected         = MOQ_FILL_PARENT_REJECTED,
+    parent_terminated       = MOQ_FILL_PARENT_TERMINATED,
+};
+
+enum class fill_error_domain : uint32_t {
+    none           = MOQ_FILL_ERROR_NONE,
+    stream         = MOQ_FILL_ERROR_STREAM,
+    parent_request = MOQ_FILL_ERROR_PARENT_REQUEST,
+    parent_done    = MOQ_FILL_ERROR_PARENT_DONE,
+};
+
+constexpr fill_reason fill_reason_from_c(uint32_t v) noexcept
+{
+    return static_cast<fill_reason>(v);
+}
+constexpr fill_error_domain fill_error_domain_from_c(uint32_t v) noexcept
+{
+    return static_cast<fill_error_domain>(v);
+}
 
 constexpr moq_sub_status_result_kind_t to_c(sub_status_result_kind v) noexcept
 {
@@ -386,8 +533,34 @@ MOQ_DETAIL_HANDLE_(ns_sub_handle,        moq_ns_sub_handle_t,       moq_ns_sub_h
 MOQ_DETAIL_HANDLE_(track_status_handle,  moq_track_status_handle_t, moq_track_status_handle);
 MOQ_DETAIL_HANDLE_(track_sub_handle,     moq_track_sub_handle_t,    moq_track_sub_handle);
 MOQ_DETAIL_HANDLE_(subgroup_handle,      moq_subgroup_handle_t,     moq_subgroup);
+MOQ_DETAIL_HANDLE_(fill_handle,          moq_fill_t,                moq_fill);
 
 #undef MOQ_DETAIL_HANDLE_
+
+/* A fill the subscriber facade requested (subscriber.h moq_sub_fill_t): a
+ * plain value, all-zero when absent, meaningful only to its issuing subscriber.
+ * Stale after native retirement and consumption of all accepted items,
+ * terminal items and local-failure notices release its slot. Never reused
+ * within one linked core library instance, even across subscriber lifetimes.
+ * Other library copies, unload/reload and processes have separate domains:
+ * do not persist or interchange their tokens. Issuance safety does not make a subscriber
+ * thread-safe. */
+class sub_fill_handle {
+    moq_sub_fill_t handle_{};
+
+public:
+    sub_fill_handle() = default;
+    explicit sub_fill_handle(moq_sub_fill_t h) noexcept : handle_(h) {}
+
+    bool     valid() const noexcept { return moq_sub_fill_is_valid(handle_); }
+    bool     operator==(sub_fill_handle o) const noexcept
+    {
+        return moq_sub_fill_eq(handle_, o.handle_);
+    }
+    bool     operator!=(sub_fill_handle o) const noexcept { return !(*this == o); }
+    uint64_t value() const noexcept { return handle_._opaque; }
+    moq_sub_fill_t raw() const noexcept { return handle_; }
+};
 
 } // namespace moq
 
@@ -446,6 +619,22 @@ struct std::hash<moq::subgroup_handle> {
     size_t operator()(moq::subgroup_handle h) const noexcept
     {
         return static_cast<size_t>(h.hash());
+    }
+};
+
+template<>
+struct std::hash<moq::fill_handle> {
+    size_t operator()(moq::fill_handle h) const noexcept
+    {
+        return static_cast<size_t>(h.hash());
+    }
+};
+
+template<>
+struct std::hash<moq::sub_fill_handle> {
+    size_t operator()(moq::sub_fill_handle h) const noexcept
+    {
+        return std::hash<uint64_t>{}(h.value());
     }
 };
 

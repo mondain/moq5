@@ -178,6 +178,8 @@ class Endpoint:
             b"" if config.wt_path is None else config.wt_path.encode("utf-8"),
             int(config.wt_profile),
             config.handshake_timeout_us,
+            int(config.uri_mode),
+            0 if config.preferred_version is None else config.preferred_version,
         )
         return endpoint
 

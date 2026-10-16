@@ -3,6 +3,8 @@
 #include <moq/relay/capacity.h>
 
 #include <moq/rcbuf.h>
+#include "log_internal.h"
+#include "retrieve_internal.h"
 
 #include <stdarg.h>
 #include <stddef.h>
@@ -72,6 +74,7 @@ static uint64_t gpos_hash_cap_for(uint64_t groups);
 #define R_ERR_INVALID_RANGE  0x11u   /* mirrors MOQ_REQUEST_ERROR_INVALID_RANGE */
 #define R_ERR_UNAUTHORIZED   0x1u    /* mirrors MOQ_REQUEST_ERROR_UNAUTHORIZED  */
 #define R_ERR_INTERNAL       0x0u
+#define R_ERR_TIMEOUT        0x2u    /* mirrors MOQ_REQUEST_ERROR_TIMEOUT */
 
 /* PUBLISH_DONE status codes (SUB_DONE / done_subscribe take this registry —
  * a DIFFERENT namespace from REQUEST_ERROR and from stream-reset codes). */
@@ -242,6 +245,10 @@ typedef uint32_t r_track_state_t;
 #define R_TRACK_PENDING 1u
 #define R_TRACK_ACTIVE  2u
 #define R_TRACK_WARM    3u
+/* No source yet: every subscriber is a held rendezvous SUBSCRIBE (§9.20.6)
+ * waiting for an announce or a PUBLISH to supply one. No upstream intent was
+ * issued and no record can arrive. */
+#define R_TRACK_RENDEZVOUS 4u
 
 typedef uint8_t r_track_source_t;
 #define R_TRACK_SOURCE_NONE 0u
@@ -259,6 +266,7 @@ typedef struct r_track {
     uint64_t        track_gen;    /* upstream attempt identity guard       */
     r_track_source_t source_kind;
     bool            has_upstream_binding;
+    bool            metadata_managed; /* sticky for this retained identity */
     uint32_t        up_binding;
     uint32_t        up_binding_gen;
     /* The announce that sourced this track, captured when the upstream was
@@ -281,6 +289,11 @@ typedef struct r_track {
      * was first seen reclaimable (0 = unarmed); any interest change disarms it. */
     uint64_t        interest_seq;
     uint64_t        idle_since_us;
+    /* MAX_CACHE_DURATION (draft-22 §10.3) the source stated, in us: no
+     * Object is started downstream once this long has passed since its
+     * arrival. */
+    bool            has_max_cache;
+    uint64_t        max_cache_us;
 } r_track_t;
 
 typedef uint32_t r_sub_state_t;
@@ -297,8 +310,9 @@ typedef uint32_t r_sub_state_t;
 
 /* Per-(sub, group) scheduling positions: one read index per subgroup list
  * plus one for the datagram list (the last slot). Entries live in a
- * per-sub block of max_groups strides; group_id UINT64_MAX = free. */
+ * per-sub block of max_groups strides; every uint64_t group_id is valid. */
 typedef struct r_gpos {
+    bool occupied;
     uint64_t group_id;
     /* Two parallel per-list arrays packed back-to-back: idx[0..gpos_lists-1]
      * (the next record index per subgroup list + datagram list), then
@@ -309,6 +323,9 @@ typedef struct r_gpos {
      * record. Access emitted via gpos_emit(). */
     uint32_t idx[];
 } r_gpos_t;
+
+_Static_assert(offsetof(r_gpos_t, idx) == sizeof(r_gpos_t),
+               "gpos arrays must follow the complete entry header");
 
 typedef struct r_sub {
     uint32_t      gen;            /* odd = live                            */
@@ -347,16 +364,70 @@ typedef struct r_sub {
                                    * it back. Distinct from R_SUB_PARKED
                                    * (which is "awaiting upstream"). Fills
                                    * existing bool padding — no layout grow. */
+    bool          range_end_holds;/* an exhausted bounded range leaves the
+                                   * sub established and idle instead of
+                                   * retiring it with SUB_DONE (the draft-22
+                                   * subscription contract). Also rides the
+                                   * bool padding.                          */
+    bool          rendezvous;     /* held for a publisher (R_TRACK_RENDEZVOUS)
+                                   * until rendezvous_deadline_us; rides the
+                                   * bool padding too                       */
     r_sub_state_t state;
     uint64_t      start_group;
     uint64_t      start_object;
     bool          has_end;
+    /* The rendezvous deadline passed while the TIMEOUT could not be queued:
+     * the subscription is over and owes that answer; no source resumes it.
+     * Rides has_end's padding. */
+    bool          rendezvous_expired;
     uint64_t      end_group;
+    uint64_t      end_object;
+    /* The track's source ended gracefully (moqr_core_source_finish) while
+     * this sub still had content to deliver: it keeps delivering what was
+     * admitted and retires with `src_done_pd` once nothing is left to send.
+     * `src_abort` is the immediate counterpart (the source failed and the
+     * terminal could not be queued at once): its first scan retires it with
+     * `src_done_pd` before anything else is delivered. */
+    bool          src_done;
+    bool          src_abort;
+    moqr_pd_desc_t src_done_pd;
+    bool          has_location;
+    bool          location_empty;
+    moq_location_filter_cfg_t location; /* owned intent, including while parked */
+    uint8_t      *excluded;       /* one bit per bounded log journal slot */
+    uint32_t      excluded_cap;
     uint8_t       subscriber_priority;
     moqr_group_order_t group_order;
     moqr_filter_type_t filter_type;
     uint64_t      cookie;
+    /* The absolute deadline of a held rendezvous, fixed by the binding at
+     * the request's first receipt. */
+    uint64_t      rendezvous_deadline_us;
 } r_sub_t;
+
+/* A track discovery subscription (SUBSCRIBE_TRACKS): the interest only. */
+typedef struct r_tsub {
+    bool      used;
+    bool      forward;
+    bool      include_properties;
+    bool      held;        /* nothing offered until its acceptance is out */
+    uint32_t  input_gen;   /* advances when its authorization tokens change */
+    uint32_t  binding;
+    uint32_t  binding_gen;
+    moqr_group_order_t group_order;
+    uint64_t  cookie;
+    uint8_t  *prefix;      /* canonical ns-only buffer, as r_ns_sub_t */
+    uint32_t  prefix_len;
+} r_tsub_t;
+
+/* What one track subscription was offered for one track source generation.
+ * Valid only while track_slot_gen and track_gen still name the track's
+ * current identity and source; otherwise nothing was offered. */
+typedef struct r_offer {
+    uint32_t track_slot_gen;
+    uint8_t  state;        /* MOQR_DISCOVERY_* */
+    uint64_t track_gen;
+} r_offer_t;
 
 /* Deep-copied borrowed request material (namespace / name / token bytes),
  * shared by parked-DEFER requests and revalidation grants so the security-
@@ -397,6 +468,9 @@ typedef struct r_parked {
     uint64_t sub_start_group, sub_start_object, sub_end_group_delta;
     uint8_t  sub_priority;
     uint32_t sub_group_order;
+    bool     sub_forward_off;
+    bool     sub_rendezvous;
+    uint64_t sub_rendezvous_deadline_us;
 } r_parked;
 
 /* An active auth grant for a long-lived operation (SUBSCRIBE / announce) whose
@@ -427,6 +501,15 @@ typedef struct r_grant {
     r_material mat;               /* deep-copied ns / name / tokens          */
 } r_grant;
 
+/* The authorization tokens a binding's long-lived request carries. */
+typedef struct r_rtok {
+    bool       used;
+    uint32_t   binding;
+    uint32_t   binding_gen;
+    uint64_t   cookie;
+    r_material mat;
+} r_rtok_t;
+
 /* A force-withdraw publisher cancel awaiting the binding's wire cancel_namespace.
  * Grant-independent, so it lives in its own bounded queue and is merged into the
  * revoked-grant peek/ack surface (see moqr_core_peek_revoked_grants). */
@@ -456,6 +539,7 @@ typedef struct r_binding {
                                    * while this is 0: no begun object anywhere on
                                    * the binding => nothing to reset.           */
     uint64_t cookie;
+    bool     metadata_managed;
     bool     out_active;          /* one outstanding delivery              */
     bool     out_chunked;         /* outstanding delivery is a chunked rec */
     bool     out_abandoned;       /* outstanding delivery is an abandoned
@@ -488,6 +572,15 @@ typedef struct r_binding {
     uint32_t        pin_chunks_cap;    /* allocated entries                 */
     uint32_t        pin_chunk_count;   /* live pinned entries this delivery */
     moqr_delivery_t out_view;          /* replayed on re-peek while held    */
+    /* The outstanding record's subgroup form and gap mark (see
+     * moqr_core_internal_delivery_flags); kept with it across re-peeks. */
+    bool            out_subgroup_properties;
+    bool            out_follows_gap;
+    moqr_reset_desc_t out_gap_reset;
+    /* A track subscription of this binding may have an unoffered match: set
+     * when one is added or changed or a track gains a source, cleared by the
+     * discovery pull that finds nothing. */
+    bool            discovery_dirty;
 } r_binding_t;
 
 /* A retained-hit FETCH cursor (relay.h fetch API). Durable retry state is
@@ -518,6 +611,20 @@ typedef struct r_fetch {
     /* Scalar cursor: next Location to emit is the smallest NORMAL object at
      * Location >= (cur_group, cur_object) within the range. */
     uint64_t cur_group, cur_object;
+    /* Gap reporting (report_gaps): a peek that found the cursor ahead of the
+     * next retained object (or the range end) reported the run's inclusive
+     * end here; the next commit skips past it. Nothing is pinned for a gap
+     * and a re-peek recomputes it. exhausted is set when a committed gap
+     * reached the range end, so the next peek is END. report_unknown also
+     * reports the runs the log has no evidence about, the same way. */
+    bool     report_gaps;
+    bool     report_unknown;
+    /* report_pending: an Object still arriving at the cursor is reported as
+     * a PENDING item (gap_* holds its Location) rather than WOULD_BLOCK. */
+    bool     report_pending;
+    bool     gap_active;
+    uint64_t gap_group, gap_object;
+    bool     exhausted;
     /* Outstanding peeked head (held pinned; reconstructed on re-peek). */
     bool         out_active;
     uint64_t     out_group, out_subgroup, out_object;
@@ -525,6 +632,14 @@ typedef struct r_fetch {
     bool         out_datagram;
     moq_rcbuf_t *pin_payload, *pin_properties;
     uint64_t     pin_bytes;       /* charged against core->fetch_pin_used   */
+    /* A retrieval owner (moqr_core_internal_retrieve_open): start_* and the
+     * adm_end_* below are its admitted range, fixed for its life, while
+     * cur_* and end_* are the current view inside it. adm_end_object is
+     * UINT64_MAX for the whole end group. Its views report every Location
+     * they do not serve and never fail on the retention horizon. */
+    bool         retrieval_owner;
+    uint64_t     adm_end_group, adm_end_object;
+    uint64_t     retrieval_track_gen; /* the source generation admitted    */
 } r_fetch_t;
 
 struct moqr_core {
@@ -565,9 +680,15 @@ struct moqr_core {
     uint32_t       ready_count;
     r_track_t     *tracks;
     r_sub_t       *subs;
+    uint32_t       subs_reserved;   /* free slots held for later requests */
+    uint32_t       intent_reserved; /* intent room held by prepared updates */
     r_trie_node_t *nodes;
     uint32_t       node_count;
     r_ns_sub_t    *ns_subs;
+    r_tsub_t      *tsubs;        /* max_ns_subs track subscriptions        */
+    r_offer_t     *offers;       /* max_ns_subs x max_tracks, by tsub row  */
+    r_rtok_t      *rtoks;
+    uint32_t       max_rtoks;
 
     moqr_intent_t *intents;      /* ring                                   */
     uint32_t       intent_head;
@@ -989,7 +1110,7 @@ sub_resolve(moqr_core_t *c, moqr_sub_t h, uint32_t *out_slot)
 static bool
 intent_space(const moqr_core_t *c, uint32_t need)
 {
-    return c->intent_count + need <= c->max_intents;
+    return (uint64_t)c->intent_count + c->intent_reserved + need <= c->max_intents;
 }
 
 static moqr_intent_t *
@@ -1078,6 +1199,15 @@ ready_word_count(uint32_t max_bindings)
     return (uint32_t)(((uint64_t)max_bindings + 63u) >> 6);
 }
 
+/* Retained request-token slots: one per namespace subscription, track
+ * subscription and announced namespace. */
+static uint32_t
+r_rtok_slots(uint32_t max_ns_subs, uint32_t max_ns_nodes)
+{
+    uint64_t n = 2u * (uint64_t)max_ns_subs + max_ns_nodes;
+    return n > UINT32_MAX ? UINT32_MAX : (uint32_t)n;
+}
+
 moqr_result_t
 moqr_core_create(const moqr_core_relay_cfg_t *cfg, moqr_core_t **out)
 {
@@ -1102,6 +1232,18 @@ moqr_core_create(const moqr_core_relay_cfg_t *cfg, moqr_core_t **out)
                       : 1;
     if (si >= sc || si + 1u > 0xFFFFu) {
         return MOQR_ERR_INVAL;
+    }
+
+    /* The track-discovery offer matrix multiplies two limits; one whose
+     * element or byte count size_t cannot represent is refused before
+     * anything is allocated (on 32-bit targets ordinary limits reach it). */
+    {
+        moqr_core_limits_t lim0;
+        (void)moqr_core_limits_resolve(cfg, &lim0);
+        uint64_t offers = (uint64_t)lim0.max_ns_subs * lim0.max_tracks;
+        if (offers > SIZE_MAX / sizeof(r_offer_t)) {
+            return MOQR_ERR_INVAL;
+        }
     }
 
     moqr_core_t *c = a->alloc(sizeof(*c), a->ctx);
@@ -1202,9 +1344,11 @@ moqr_core_create(const moqr_core_relay_cfg_t *cfg, moqr_core_t **out)
      * must never walk uninitialized entries (pins, generations). */
 #define R_POOL_ALLOC(field, count)                                        \
     do {                                                                  \
-        c->field = r_alloc(c, (size_t)(count) * sizeof(*c->field));       \
+        uint64_t n_ = (uint64_t)(count);                                  \
+        c->field = n_ <= SIZE_MAX / sizeof(*c->field)                     \
+            ? r_alloc(c, (size_t)n_ * sizeof(*c->field)) : NULL;          \
         if (c->field != NULL) {                                           \
-            memset(c->field, 0, (size_t)(count) * sizeof(*c->field));     \
+            memset(c->field, 0, (size_t)n_ * sizeof(*c->field));          \
         }                                                                 \
     } while (0)
     R_POOL_ALLOC(bindings, c->max_bindings);
@@ -1212,6 +1356,10 @@ moqr_core_create(const moqr_core_relay_cfg_t *cfg, moqr_core_t **out)
     R_POOL_ALLOC(subs, c->max_subs);
     R_POOL_ALLOC(nodes, c->max_ns_nodes);
     R_POOL_ALLOC(ns_subs, c->max_ns_subs);
+    R_POOL_ALLOC(tsubs, c->max_ns_subs);
+    R_POOL_ALLOC(offers, (uint64_t)c->max_ns_subs * c->max_tracks);
+    c->max_rtoks = r_rtok_slots(c->max_ns_subs, c->max_ns_nodes);
+    R_POOL_ALLOC(rtoks, c->max_rtoks);
     R_POOL_ALLOC(intents, c->max_intents);
     R_POOL_ALLOC(parked, c->max_parked);
     R_POOL_ALLOC(grants, c->max_grants);
@@ -1230,6 +1378,7 @@ moqr_core_create(const moqr_core_relay_cfg_t *cfg, moqr_core_t **out)
     if (c->bindings == NULL || c->tracks == NULL || c->subs == NULL ||
         c->ready_words == NULL ||
         c->nodes == NULL || c->ns_subs == NULL || c->intents == NULL ||
+        c->tsubs == NULL || c->offers == NULL || c->rtoks == NULL ||
         (c->max_parked != 0 && c->parked == NULL) ||
         (c->max_grants != 0 && c->grants == NULL) ||
         (c->max_cancels != 0 && c->pending_cancels == NULL) ||
@@ -1251,6 +1400,7 @@ moqr_core_create(const moqr_core_relay_cfg_t *cfg, moqr_core_t **out)
 }
 
 static void track_free_slot(moqr_core_t *c, uint32_t slot);
+static void tsub_free(moqr_core_t *c, uint32_t i);
 static void binding_unpin(r_binding_t *b);
 static void gpos_free(moqr_core_t *c, r_sub_t *s);
 static void parked_free_slot(moqr_core_t *c, uint32_t slot);
@@ -1289,6 +1439,24 @@ moqr_core_destroy(moqr_core_t *c)
         }
         a.free(c->ns_subs, (size_t)c->max_ns_subs * sizeof(*c->ns_subs),
                a.ctx);
+    }
+    if (c->tsubs != NULL) {
+        for (uint32_t i = 0; i < c->max_ns_subs; i++) {
+            r_free(c, c->tsubs[i].prefix, c->tsubs[i].prefix_len);
+        }
+        a.free(c->tsubs, (size_t)c->max_ns_subs * sizeof(*c->tsubs), a.ctx);
+    }
+    if (c->offers != NULL) {
+        a.free(c->offers, (size_t)c->max_ns_subs * c->max_tracks *
+                              sizeof(*c->offers), a.ctx);
+    }
+    if (c->rtoks != NULL) {
+        for (uint32_t i = 0; i < c->max_rtoks; i++) {
+            if (c->rtoks[i].used) {
+                r_free_material(c, &c->rtoks[i].mat, &c->intern_used);
+            }
+        }
+        a.free(c->rtoks, (size_t)c->max_rtoks * sizeof(*c->rtoks), a.ctx);
     }
     if (c->bindings != NULL) {
         for (uint32_t i = 0; i < c->max_bindings; i++) {
@@ -2307,7 +2475,8 @@ gpos_acked_words(const r_sub_t *s)
 }
 
 /* Per-(sub, group) position-entry stride for `lists` position lists:
- * group_id + idx[] + emitted[] + seal-acked bit words, rounded up to
+ * entry header + idx[] + emitted[] + seal-acked, gap and lifetime bit
+ * words + the owed-cause record index per list, rounded up to
  * uint64_t alignment so entries beyond the first keep group_id naturally
  * aligned. Shared by the runtime and moqr_core_capacity_describe — the
  * advertised ceiling must never drift from the allocation. */
@@ -2316,8 +2485,8 @@ gpos_stride_for(uint64_t lists)
 {
     /* Computed WIDE; callers reject a stride the runtime's 32-bit layout
      * cannot represent (create and describe share this single formula). */
-    uint64_t raw = (uint64_t)sizeof(uint64_t) + 8u * lists +
-                   4u * ((lists + 31u) / 32u);
+    uint64_t raw = (uint64_t)sizeof(r_gpos_t) + 12u * lists +
+                   3u * 4u * ((lists + 31u) / 32u);
     return (raw + 7u) & ~(uint64_t)7u;   /* 64-bit mask: ~7u would truncate */
 }
 
@@ -2389,11 +2558,120 @@ gpos_seal_ack(const r_sub_t *s, r_gpos_t *e, uint32_t list)
 /* Zero an entry's per-list body — idx[], emitted[], and the seal-acked
  * words: a claimed or reused slot must never inherit stale positions or a
  * stale seal acknowledgement. */
+/* Gap bit words follow the seal-acked words. A set bit = this sub skipped a
+ * record of the list that it never began (an expired Object, draft-22 §10.3),
+ * so the list's next record it delivers is not the next object of the stream
+ * the skipped one would have continued (§11.3.2). Cleared when a record of
+ * the list is delivered. */
+static uint32_t *
+gpos_gap(const r_sub_t *s, r_gpos_t *e)
+{
+    return &gpos_acked(s, e)[gpos_acked_words(s)];
+}
+
+static bool
+gpos_gap_get(const r_sub_t *s, r_gpos_t *e, uint32_t list)
+{
+    return ((gpos_gap(s, e)[list / 32u] >> (list % 32u)) & 1u) != 0;
+}
+
+static void
+gpos_gap_set(const r_sub_t *s, r_gpos_t *e, uint32_t list, bool on)
+{
+    uint32_t bit = 1u << (list % 32u);
+    if (on) {
+        gpos_gap(s, e)[list / 32u] |= bit;
+    } else {
+        gpos_gap(s, e)[list / 32u] &= ~bit;
+    }
+}
+
+/* Lifetime bit words follow the gap words. A set bit = this sub passed
+ * over, as outside its window, the first record of a new upstream stream
+ * lifetime of the list (a record moqr_log_internal_rec_flags marks
+ * follows_gap): the list's next record it delivers opens a new downstream
+ * stream although that record does not mark the boundary itself, and a seal
+ * this sub acknowledged for the earlier lifetime does not cover it. Passing
+ * over a record outside the window is not a missing object, so no gap bit is
+ * set. Cleared when a record of the list is delivered. */
+static uint32_t *
+gpos_renew(const r_sub_t *s, r_gpos_t *e)
+{
+    return &gpos_gap(s, e)[gpos_acked_words(s)];
+}
+
+static bool
+gpos_renew_get(const r_sub_t *s, r_gpos_t *e, uint32_t list)
+{
+    return ((gpos_renew(s, e)[list / 32u] >> (list % 32u)) & 1u) != 0;
+}
+
+static void
+gpos_renew_set(const r_sub_t *s, r_gpos_t *e, uint32_t list, bool on)
+{
+    uint32_t bit = 1u << (list % 32u);
+    if (on) {
+        gpos_renew(s, e)[list / 32u] |= bit;
+    } else {
+        gpos_renew(s, e)[list / 32u] &= ~bit;
+    }
+}
+
+/* The owed-cause words follow the lifetime words, one per list: 1 + the
+ * index of the first record marking a new upstream lifetime that this sub
+ * passed over outside its window since it last delivered a record of the
+ * list (0: none). That record carries how the lifetime of the downstream
+ * stream this sub may still have open ended; a later boundary passed over
+ * belongs to a lifetime never opened downstream. Cleared with the lifetime
+ * bit when a record of the list is delivered. An index, not a pointer: the
+ * record stays where it is for as long as its group's entry lives. */
+static uint32_t *
+gpos_owed(const r_sub_t *s, r_gpos_t *e)
+{
+    return &gpos_renew(s, e)[gpos_acked_words(s)];
+}
+
+/* This sub passes over the list's record at its cursor without beginning
+ * it (outside its window, expired, or abandoned before it began): when the
+ * record opens a new upstream lifetime and none has been passed over since
+ * the sub last delivered a record of the list, it is the boundary that
+ * says how the lifetime of the downstream stream the sub may still have open
+ * ended. True when the record opens a new lifetime. */
+static bool
+gpos_pass_over(const r_sub_t *s, r_gpos_t *e, const moqr_log_t *log, uint64_t g,
+               uint32_t list_ref, uint32_t pos_slot)
+{
+    bool sgp = false, boundary = false;
+    moqr_reset_desc_t br = moqr_reset_desc_none();
+    moqr_log_internal_rec_flags(log, g, list_ref, e->idx[pos_slot], &sgp, &boundary, &br);
+    if (boundary && !gpos_renew_get(s, e, pos_slot)) {
+        gpos_renew_set(s, e, pos_slot, true);
+        gpos_owed(s, e)[pos_slot] = e->idx[pos_slot] + 1u;
+    }
+    return boundary;
+}
+
+/* The cause owed to the downstream stream of the list: false when no
+ * boundary was passed over; otherwise true with the passed-over boundary's
+ * reset in *out (none when that lifetime ended cleanly). */
+static bool
+gpos_owed_cause(const r_sub_t *s, r_gpos_t *e, const moqr_log_t *log, uint64_t g,
+                uint32_t list_ref, uint32_t pos_slot, moqr_reset_desc_t *out)
+{
+    if (!gpos_renew_get(s, e, pos_slot) || gpos_owed(s, e)[pos_slot] == 0)
+        return false;
+    bool sgp = false, boundary = false;
+    *out = moqr_reset_desc_none();
+    moqr_log_internal_rec_flags(log, g, list_ref, gpos_owed(s, e)[pos_slot] - 1u,
+                                &sgp, &boundary, out);
+    return true;
+}
+
 static void
 gpos_body_clear(const r_sub_t *s, r_gpos_t *e)
 {
-    memset(e->idx, 0, 8u * (size_t)s->gpos_lists +
-                          4u * (size_t)gpos_acked_words(s));
+    memset(e->idx, 0, 12u * (size_t)s->gpos_lists +
+                          3u * 4u * (size_t)gpos_acked_words(s));
 }
 
 /* -- Per-sub group_id -> gpos-slot index ---------------------------------------- *
@@ -2427,7 +2705,8 @@ gpos_hash_find(const r_sub_t *s, uint64_t group_id)
         if (slot == R_GPOS_NIL) {
             return R_GPOS_NIL;   /* empty run: not present */
         }
-        if (gpos_at(s, slot)->group_id == group_id) {
+        const r_gpos_t *e = gpos_at(s, slot);
+        if (e->occupied && e->group_id == group_id) {
             return slot;
         }
         i = (i + 1u) & (cap - 1u);
@@ -2459,7 +2738,7 @@ gpos_hash_rebuild(r_sub_t *s)
         s->gpos_hash[i] = R_GPOS_NIL;
     }
     for (uint32_t i = 0; i < s->gpos_groups; i++) {
-        if (gpos_at(s, i)->group_id != UINT64_MAX) {
+        if (gpos_at(s, i)->occupied) {
             gpos_hash_insert(s, gpos_at(s, i)->group_id, i);
         }
     }
@@ -2537,7 +2816,7 @@ gpos_gc(moqr_core_t *c, r_sub_t *s, const moqr_log_t *log)
     bool reclaimed = false;
     for (uint32_t i = 0; i < s->gpos_groups; i++) {
         r_gpos_t *e = gpos_at(s, i);
-        if (e->group_id == UINT64_MAX) {
+        if (!e->occupied) {
             continue;
         }
         if (moqr_log_group_list_count(log, e->group_id) != 0) {
@@ -2556,7 +2835,7 @@ gpos_gc(moqr_core_t *c, r_sub_t *s, const moqr_log_t *log)
             }
         }
         if (!begun) {
-            e->group_id = UINT64_MAX;   /* reclaim */
+            e->occupied = false;   /* reclaim */
             s->pending_skip = true;
             ready_mark(c, s->binding);   /* the skip must be reported */
             reclaimed = true;
@@ -2582,7 +2861,7 @@ gpos_alloc(moqr_core_t *c, r_sub_t *s, const moqr_log_t *log)
         return MOQR_ERR_NOMEM;
     }
     for (uint32_t i = 0; i < s->gpos_groups; i++) {
-        gpos_at(s, i)->group_id = UINT64_MAX;
+        gpos_at(s, i)->occupied = false;
     }
     /* Wide shared resolver; create rejected any cap above UINT32_MAX. */
     uint32_t cap = (uint32_t)gpos_hash_cap_for(s->gpos_groups);
@@ -2596,6 +2875,16 @@ gpos_alloc(moqr_core_t *c, r_sub_t *s, const moqr_log_t *log)
     for (uint32_t i = 0; i < cap; i++) {
         s->gpos_hash[i] = R_GPOS_NIL;
     }
+    if (s->has_location) {
+        s->excluded_cap = log->max_records;
+        size_t n = s->excluded_cap / 8u + (s->excluded_cap % 8u != 0);
+        s->excluded = r_alloc(c, n);
+        if (s->excluded == NULL) {
+            gpos_free(c, s);
+            return MOQR_ERR_NOMEM;
+        }
+        memset(s->excluded, 0, n);
+    }
     /* Start even with the log's eviction watermark: this sub has no entries yet,
      * so there is nothing to reclaim for past evictions. */
     s->gpos_gc_evicted = moqr_log_evicted_groups_total(log);
@@ -2605,6 +2894,11 @@ gpos_alloc(moqr_core_t *c, r_sub_t *s, const moqr_log_t *log)
 static void
 gpos_free(moqr_core_t *c, r_sub_t *s)
 {
+    if (s->excluded != NULL) {
+        r_free(c, s->excluded,
+               s->excluded_cap / 8u + (s->excluded_cap % 8u != 0));
+        s->excluded = NULL;
+    }
     if (s->gpos != NULL) {
         r_free(c, s->gpos, (size_t)s->gpos_groups * gpos_stride(s));
         s->gpos = NULL;
@@ -2633,7 +2927,8 @@ gpos_entry(moqr_core_t *c, r_sub_t *s, const moqr_log_t *log,
      * gpos capacity, so a free slot exists. */
     for (uint32_t i = 0; i < s->gpos_groups; i++) {
         r_gpos_t *e = gpos_at(s, i);
-        if (e->group_id == UINT64_MAX) {
+        if (!e->occupied) {
+            e->occupied = true;
             e->group_id = group_id;
             gpos_body_clear(s, e);
             gpos_hash_insert(s, group_id, i);
@@ -2676,11 +2971,22 @@ sub_resolve_filter(r_sub_t *s, const moqr_filter_t *f, bool has_largest,
 {
     s->filter_type = f->type;
     s->has_end = false;
+    s->end_object = UINT64_MAX;
+    s->location_empty = false;
     switch (f->type) {
     case MOQR_FILTER_LARGEST_OBJECT:
         if (has_largest) {
             s->start_group = lg;
-            s->start_object = lo + 1;
+            s->start_object = lo;
+            if (lo < UINT64_MAX) {
+                s->start_object++;
+            } else if (lg < UINT64_MAX) {
+                /* No later object fits in this group; carry the lower bound. */
+                s->start_group = lg + 1;
+                s->start_object = 0;
+            } else {
+                s->location_empty = true;
+            }
         } else {
             s->start_group = 0;
             s->start_object = 0;
@@ -2688,11 +2994,37 @@ sub_resolve_filter(r_sub_t *s, const moqr_filter_t *f, bool has_largest,
         break;
     case MOQR_FILTER_NEXT_GROUP_START:
         if (has_largest) {
-            s->start_group = lg + 1;
+            s->start_group = lg;
+            s->start_object = 0;
+            if (lg < UINT64_MAX) {
+                s->start_group++;
+            } else {
+                s->location_empty = true;
+            }
+        } else {
+            s->start_group = 0;
+            s->start_object = 0;
+        }
+        break;
+    case MOQR_FILTER_CURRENT_GROUP_START:
+        if (has_largest) {
+            s->start_group = lg;
             s->start_object = 0;
         } else {
             s->start_group = 0;
             s->start_object = 0;
+        }
+        break;
+    case MOQR_FILTER_RELATIVE_START:
+        /* {lg + 1 - N, 0}, clamped to [0, 2^64-1]; with no Largest the
+         * Next Group is {0,0}, and so is every start before it. */
+        s->start_object = 0;
+        if (!has_largest) {
+            s->start_group = 0;
+        } else if (f->start_group == 0) {
+            s->start_group = lg == UINT64_MAX ? UINT64_MAX : lg + 1;
+        } else {
+            s->start_group = f->start_group - 1 > lg ? 0 : lg - (f->start_group - 1);
         }
         break;
     case MOQR_FILTER_ABSOLUTE_RANGE:
@@ -2707,13 +3039,164 @@ sub_resolve_filter(r_sub_t *s, const moqr_filter_t *f, bool has_largest,
     }
 }
 
+static bool
+location_valid(const moq_location_filter_cfg_t *loc)
+{
+    if (loc == NULL || loc->struct_size < MOQ_LOCATION_FILTER_CFG_V0_SIZE) {
+        return false;
+    }
+    switch (loc->kind) {
+    case MOQ_LOCATION_FILTER_NONE:
+    case MOQ_LOCATION_FILTER_NEXT_OBJECT:
+    case MOQ_LOCATION_FILTER_RELATIVE_GROUP:
+    case MOQ_LOCATION_FILTER_ABSOLUTE_START:
+        return true;
+    case MOQ_LOCATION_FILTER_GROUP_END:
+    case MOQ_LOCATION_FILTER_OBJECT_END:
+        return loc->end_group >= loc->start_group;
+    default:
+        return false;
+    }
+}
+
+static bool
+sub_location_passes(const r_sub_t *s, uint64_t group, uint64_t object)
+{
+    return !s->location_empty &&
+           (group > s->start_group ||
+            (group == s->start_group && object >= s->start_object)) &&
+           (!s->has_end || group < s->end_group ||
+            (group == s->end_group && object <= s->end_object));
+}
+
+static void
+sub_resolve_location(r_sub_t *s, bool has, uint64_t lg, uint64_t lo)
+{
+    const moq_location_filter_cfg_t *loc = &s->location;
+    s->start_group = s->start_object = 0;
+    s->end_group = s->end_object = UINT64_MAX;
+    s->has_end = s->location_empty = false;
+    switch (loc->kind) {
+    case MOQ_LOCATION_FILTER_NONE:
+        break;
+    case MOQ_LOCATION_FILTER_NEXT_OBJECT:
+        if (has) {
+            s->start_group = lg;
+            if (lo < UINT64_MAX) {
+                s->start_object = lo + 1;
+            } else if (lg < UINT64_MAX) {
+                s->start_group = lg + 1;
+            } else {
+                s->location_empty = true;
+            }
+        }
+        break;
+    case MOQ_LOCATION_FILTER_RELATIVE_GROUP:
+        if (has) {
+            uint64_t n = loc->relative_group_offset;
+            s->start_group = n == 0 ? (lg == UINT64_MAX ? lg : lg + 1)
+                                   : (n - 1 > lg ? 0 : lg - (n - 1));
+        }
+        break;
+    default:
+        s->start_group = loc->start_group;
+        s->start_object = loc->start_object;
+        if (loc->kind == MOQ_LOCATION_FILTER_GROUP_END ||
+            loc->kind == MOQ_LOCATION_FILTER_OBJECT_END) {
+            s->has_end = true;
+            s->end_group = loc->end_group;
+            if (loc->kind == MOQ_LOCATION_FILTER_OBJECT_END) {
+                s->end_object = loc->end_object;
+                s->location_empty = s->start_group == s->end_group &&
+                                    s->start_object > s->end_object;
+            }
+        }
+        break;
+    }
+}
+
+static void
+sub_exclude(r_sub_t *s, uint64_t seq, bool excluded)
+{
+    uint32_t slot = (uint32_t)(seq % s->excluded_cap);
+    uint8_t mask = (uint8_t)(1u << (slot % 8u));
+    if (excluded) s->excluded[slot / 8u] |= mask;
+    else s->excluded[slot / 8u] &= (uint8_t)~mask;
+}
+
+static bool
+sub_excluded(const r_sub_t *s, uint64_t seq)
+{
+    if (s->excluded == NULL) return false;
+    uint32_t slot = (uint32_t)(seq % s->excluded_cap);
+    return (s->excluded[slot / 8u] & (1u << (slot % 8u))) != 0;
+}
+
+/* Record exclusions before replacing a window, including records behind a
+ * blocked head. Bits survive further updates; new journal occupants overwrite
+ * their bit at ingest, so eviction/reuse cannot inherit an old exclusion. */
+static void
+sub_exclude_retained(r_sub_t *s, const moqr_log_t *log)
+{
+    if (s->excluded == NULL) return;
+    for (uint32_t gi = 0; gi < log->group_count; gi++) {
+        const moqr_group_t *g = &log->groups[gi];
+        for (uint32_t li = 0; li <= g->sg_count; li++) {
+            const moqr_rec_vec_t *v = li == g->sg_count ? &g->dg : &g->sgs[li].v;
+            for (uint32_t i = 0; i < v->count; i++) {
+                const moqr_rec_t *rec = &v->recs[i];
+                if (!sub_location_passes(s, rec->group_id, rec->object_id)) {
+                    sub_exclude(s, rec->arrival_seq, true);
+                }
+            }
+        }
+    }
+}
+
+static void
+track_location_ingest(moqr_core_t *c, r_track_t *t,
+                      const moqr_log_append_desc_t *desc)
+{
+    uint64_t seq = t->log->next_seq - 1u;
+    for (uint32_t i = t->subs_head; i != R_SUB_NIL; i = c->subs[i].track_next) {
+        r_sub_t *s = &c->subs[i];
+        if (s->excluded != NULL) {
+            sub_exclude(s, seq, !sub_location_passes(s, desc->group_id,
+                                                      desc->object_id));
+        }
+    }
+}
+
 /* -- ops: bindings -------------------------------------------------------------------------- */
 
 moqr_result_t
 moqr_core_binding_open(moqr_core_t *c, uint64_t session_cookie,
                        moqr_binding_t *out)
 {
+    return moqr_core_binding_open_with_options(c, session_cookie, NULL, out);
+}
+
+void
+moqr_binding_options_init_sized(moqr_binding_options_t *options, size_t size)
+{
+    if (options == NULL || size < sizeof(uint32_t)) return;
+    size_t n = size < sizeof(*options) ? size : sizeof(*options);
+    memset(options, 0, n);
+    options->struct_size = (uint32_t)n;
+}
+
+moqr_result_t
+moqr_core_binding_open_with_options(moqr_core_t *c, uint64_t session_cookie,
+                                    const moqr_binding_options_t *options,
+                                    moqr_binding_t *out)
+{
     if (c == NULL || out == NULL) {
+        return MOQR_ERR_INVAL;
+    }
+    /* Frozen version-0 prefix, independent of any future struct extension. */
+    if (options != NULL &&
+        (options->struct_size < 8u ||
+         (options->flags & ~MOQR_BINDING_TRACK_METADATA_MANAGED) != 0)) {
         return MOQR_ERR_INVAL;
     }
     *out = MOQR_BINDING_INVALID;
@@ -2729,6 +3212,8 @@ moqr_core_binding_open(moqr_core_t *c, uint64_t session_cookie,
             b->pin_chunks_cap = pin_chunks_cap;
             b->gen = gen;
             b->cookie = session_cookie;
+            b->metadata_managed = options != NULL &&
+                (options->flags & MOQR_BINDING_TRACK_METADATA_MANAGED) != 0;
             b->subs_head = R_SUB_NIL;   /* empty (memset left it 0) */
             out->_opaque = r_pack(c, MOQR_HANDLE_POOL_BINDING, gen, i);
             r_trace(c, MOQR_TRACE_ROUTE_ADD, 0 /* binding */, i,
@@ -3032,6 +3517,8 @@ track_source_failover(moqr_core_t *c, uint32_t tslot, uint32_t excl_bslot,
         t->src_ann_binding = c->nodes[pub_node].ann_binding;
         t->src_ann_binding_gen = c->nodes[pub_node].ann_binding_gen;
         moqr_intent_t *up = intent_push(c, MOQR_INTENT_UPSTREAM_SUBSCRIBE);
+        t->metadata_managed = t->metadata_managed ||
+            c->bindings[t->up_binding].metadata_managed;
         up->binding_cookie = c->bindings[t->up_binding].cookie;
         up->track = track_handle(c, tslot);
         up->track_gen = t->track_gen;
@@ -3200,6 +3687,17 @@ moqr_core_binding_close(moqr_core_t *c, moqr_binding_t bh, uint64_t now_us)
             r_free(c, c->ns_subs[s].prefix, plen);
             r_room_changed(c);
             memset(&c->ns_subs[s], 0, sizeof(c->ns_subs[s]));
+        }
+        if (c->tsubs[s].used && c->tsubs[s].binding == bslot &&
+            c->tsubs[s].binding_gen == b->gen) {
+            tsub_free(c, s);
+        }
+    }
+    for (uint32_t r = 0; r < c->max_rtoks; r++) {
+        if (c->rtoks[r].used && c->rtoks[r].binding == bslot &&
+            c->rtoks[r].binding_gen == b->gen) {
+            r_free_material(c, &c->rtoks[r].mat, &c->intern_used);
+            memset(&c->rtoks[r], 0, sizeof(c->rtoks[r]));
         }
     }
     /* Fetch cursors owned by this binding: unpin (release pin-byte budget) and
@@ -3777,26 +4275,656 @@ moqr_core_ns_unsubscribe(moqr_core_t *c, moqr_binding_t bh, uint64_t cookie)
     return MOQR_ERR_STALE_HANDLE;
 }
 
-/* -- ops: subscribe ------------------------------------------------------------------------------- */
+/* -- ops: namespace subscription update, track discovery, request tokens -- */
 
-void
-moqr_subscribe_req_init(moqr_subscribe_req_t *req)
+/* The canonical ns-only prefix buffer (u32 count | u32 lens | bytes) that
+ * namespace and track subscriptions store. */
+static uint32_t
+prefix_buf_len(moqr_ns_t prefix)
 {
-    if (req == NULL) {
-        return;
+    uint32_t len = 4u * (1u + (uint32_t)prefix.count);
+    for (size_t i = 0; i < prefix.count; i++) {
+        len += (uint32_t)prefix.parts[i].len;
     }
-    memset(req, 0, sizeof(*req));
-    req->struct_size = sizeof(*req);
-    req->filter.type = MOQR_FILTER_LARGEST_OBJECT;
-    req->forward = true;   /* deliver unless the request explicitly pauses */
-    req->subscriber_priority = 128;
+    return len;
+}
+
+static void
+prefix_buf_write(uint8_t *buf, moqr_ns_t prefix)
+{
+    key_wr32(buf, (uint32_t)prefix.count);
+    uint32_t off = 4u * (1u + (uint32_t)prefix.count);
+    for (size_t i = 0; i < prefix.count; i++) {
+        key_wr32(buf + 4u * (1u + i), (uint32_t)prefix.parts[i].len);
+        if (prefix.parts[i].len != 0) {
+            memcpy(buf + off, prefix.parts[i].data, prefix.parts[i].len);
+        }
+        off += (uint32_t)prefix.parts[i].len;
+    }
+}
+
+/* Does the stored prefix buffer prefix the namespace parts? */
+static bool
+prefix_buf_matches(const uint8_t *buf, const moq_bytes_t *parts, uint32_t count)
+{
+    uint32_t pcount = key_rd32(buf);
+    if (pcount > count) {
+        return false;
+    }
+    uint32_t off = 4u * (1u + pcount);
+    for (uint32_t i = 0; i < pcount; i++) {
+        uint32_t plen = key_rd32(buf + 4u * (1u + i));
+        if (parts[i].len != plen ||
+            (plen != 0 && memcmp(parts[i].data, buf + off, plen) != 0)) {
+            return false;
+        }
+        off += plen;
+    }
+    return true;
 }
 
 static uint32_t
-sub_slot_find(moqr_core_t *c)
+ns_sub_find(const moqr_core_t *c, uint32_t bslot, uint32_t bgen, uint64_t cookie)
 {
-    for (uint32_t i = 0; i < c->max_subs; i++) {
-        if (r_gen_openable(c->subs[i].gen)) {
+    for (uint32_t i = 0; i < c->max_ns_subs; i++) {
+        const r_ns_sub_t *n = &c->ns_subs[i];
+        if (n->used && n->binding == bslot && n->binding_gen == bgen &&
+            n->cookie == cookie) {
+            return i;
+        }
+    }
+    return UINT32_MAX;
+}
+
+/* Announces under `probe`'s prefix that `old` (when non-NULL) did not match. */
+static void
+nsub_fanout_new(moqr_core_t *c, const r_ns_sub_t *probe, const r_ns_sub_t *old,
+                uint32_t node, bool counting, uint32_t *count)
+{
+    if (c->nodes[node].has_announce && prefix_matches_node(c, probe, node) &&
+        (old == NULL || !prefix_matches_node(c, old, node))) {
+        if (counting) {
+            (*count)++;
+        } else {
+            moqr_intent_t *it = intent_push(c, MOQR_INTENT_NS_FOUND);
+            it->binding_cookie = c->bindings[probe->binding].cookie;
+            it->cookie = probe->cookie;
+            intent_set_ns_from_node(c, it, node);
+            it->value = key_rd32(probe->prefix);
+        }
+    }
+    for (uint32_t k = c->nodes[node].first_child; k != R_NODE_NIL;
+         k = c->nodes[k].next_sib) {
+        nsub_fanout_new(c, probe, old, k, counting, count);
+    }
+}
+
+moqr_result_t
+moqr_core_ns_update_prepare(moqr_core_t *c, moqr_binding_t bh, uint64_t cookie,
+                            moqr_ns_t prefix, moqr_ns_update_prep_t *prep)
+{
+    if (prep != NULL) {
+        memset(prep, 0, sizeof(*prep));
+    }
+    if (c == NULL || prep == NULL || !ns_view_ok(prefix, 0)) {
+        return MOQR_ERR_INVAL;
+    }
+    uint32_t bslot = 0;
+    r_binding_t *b = binding_resolve(c, bh, &bslot);
+    if (b == NULL) {
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    uint32_t slot = ns_sub_find(c, bslot, b->gen, cookie);
+    if (slot == UINT32_MAX) {
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    r_ns_sub_t *n = &c->ns_subs[slot];
+    uint32_t plen = prefix_buf_len(prefix);
+    if ((uint64_t)c->intern_used - n->prefix_len + plen > c->intern_budget) {
+        return r_refuse(c, MOQR_REFUSE_NAME_BYTES);
+    }
+    uint8_t *pbuf = r_alloc(c, plen);
+    if (pbuf == NULL) {
+        return MOQR_ERR_NOMEM;
+    }
+    prefix_buf_write(pbuf, prefix);
+    r_ns_sub_t probe = *n;
+    probe.prefix = pbuf;
+    probe.prefix_len = plen;
+    uint32_t need = 0;
+    nsub_fanout_new(c, &probe, n, 0, /*counting=*/true, &need);
+    if (!intent_space(c, need)) {
+        r_free(c, pbuf, plen);
+        return MOQR_ERR_WOULD_BLOCK;
+    }
+    c->intent_reserved += need;
+    prep->staged = true;
+    prep->binding = bh;
+    prep->cookie = cookie;
+    prep->prefix_buf = pbuf;
+    prep->prefix_len = plen;
+    prep->intents = need;
+    return MOQR_OK;
+}
+
+void
+moqr_core_ns_update_abort(moqr_core_t *c, moqr_ns_update_prep_t *prep)
+{
+    if (c == NULL || prep == NULL || !prep->staged) {
+        return;
+    }
+    c->intent_reserved -= prep->intents;
+    r_free(c, prep->prefix_buf, prep->prefix_len);
+    memset(prep, 0, sizeof(*prep));
+}
+
+moqr_result_t
+moqr_core_ns_update_commit(moqr_core_t *c, moqr_ns_update_prep_t *prep)
+{
+    if (c == NULL || prep == NULL || !prep->staged) {
+        return MOQR_ERR_INVAL;
+    }
+    uint32_t bslot = 0;
+    r_binding_t *b = binding_resolve(c, prep->binding, &bslot);
+    uint32_t slot = b != NULL ? ns_sub_find(c, bslot, b->gen, prep->cookie)
+                              : UINT32_MAX;
+    if (slot == UINT32_MAX) {
+        moqr_core_ns_update_abort(c, prep);
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    /* The fan-out's intent room was held since prepare. */
+    c->intent_reserved -= prep->intents;
+    uint64_t cookie = prep->cookie;
+    uint8_t *pbuf = prep->prefix_buf;
+    uint32_t plen = prep->prefix_len;
+    memset(prep, 0, sizeof(*prep));
+    r_ns_sub_t *n = &c->ns_subs[slot];
+    /* Queued notifications not yet polled are re-expressed against the new
+     * prefix, or withdrawn with their namespace's membership. Order kept. */
+    uint32_t pcount = key_rd32(pbuf);
+    uint32_t w = 0;
+    for (uint32_t r = 0; r < c->intent_count; r++) {
+        moqr_intent_t *it = &c->intents[(c->intent_head + r) % c->max_intents];
+        bool keep = true;
+        if ((it->kind == MOQR_INTENT_NS_FOUND || it->kind == MOQR_INTENT_NS_GONE) &&
+            it->binding_cookie == b->cookie && it->cookie == cookie) {
+            keep = prefix_buf_matches(pbuf, it->ns_parts, it->ns_count);
+            if (keep) {
+                it->value = (uint64_t)pcount;
+            }
+        }
+        if (keep) {
+            if (w != r) {
+                c->intents[(c->intent_head + w) % c->max_intents] = *it;
+            }
+            w++;
+        }
+    }
+    c->intent_count = w;
+    r_ns_sub_t old = *n;
+    n->prefix = pbuf;
+    n->prefix_len = plen;
+    c->intern_used = c->intern_used - old.prefix_len + plen;
+    /* What the old prefix already reported is not reported again. */
+    nsub_fanout_new(c, n, &old, 0, /*counting=*/false, NULL);
+    r_free(c, old.prefix, old.prefix_len);
+    r_bump_route_epoch(c);
+    r_trace(c, MOQR_TRACE_ROUTE_ADD, 4 /* ns_sub update */, slot, bslot, cookie, 0);
+    return MOQR_OK;
+}
+
+/* Every binding with a track subscription may now have an unoffered match. */
+static void
+discovery_mark_all(moqr_core_t *c)
+{
+    for (uint32_t i = 0; i < c->max_ns_subs; i++) {
+        const r_tsub_t *t = &c->tsubs[i];
+        if (t->used && t->binding < c->max_bindings &&
+            c->bindings[t->binding].gen == t->binding_gen) {
+            c->bindings[t->binding].discovery_dirty = true;
+        }
+    }
+}
+
+static r_offer_t *
+offer_at(moqr_core_t *c, uint32_t tsub, uint32_t tslot)
+{
+    return &c->offers[(size_t)tsub * c->max_tracks + tslot];
+}
+
+static void
+offer_row_clear(moqr_core_t *c, uint32_t tsub)
+{
+    memset(offer_at(c, tsub, 0), 0, (size_t)c->max_tracks * sizeof(r_offer_t));
+}
+
+static uint32_t
+tsub_find(const moqr_core_t *c, uint32_t bslot, uint32_t bgen, uint64_t cookie)
+{
+    for (uint32_t i = 0; i < c->max_ns_subs; i++) {
+        const r_tsub_t *t = &c->tsubs[i];
+        if (t->used && t->binding == bslot && t->binding_gen == bgen &&
+            t->cookie == cookie) {
+            return i;
+        }
+    }
+    return UINT32_MAX;
+}
+
+static void
+tsub_free(moqr_core_t *c, uint32_t i)
+{
+    r_tsub_t *t = &c->tsubs[i];
+    c->intern_used = c->intern_used >= t->prefix_len
+        ? c->intern_used - t->prefix_len : 0;
+    r_free(c, t->prefix, t->prefix_len);
+    memset(t, 0, sizeof(*t));
+    offer_row_clear(c, i);
+}
+
+#define MOQR_TRACKS_REQ_SIZE_THROUGH_GROUP_ORDER                             \
+    (offsetof(moqr_tracks_req_t, group_order) +                             \
+     sizeof(((moqr_tracks_req_t *)0)->group_order))
+
+void
+moqr_tracks_req_init_sized(moqr_tracks_req_t *req, size_t req_size)
+{
+    if (req == NULL || req_size < sizeof(req->struct_size)) {
+        return;
+    }
+    size_t n = req_size < sizeof(*req) ? req_size : sizeof(*req);
+    memset(req, 0, n);
+    req->struct_size = (uint32_t)n;
+    if (n >= offsetof(moqr_tracks_req_t, include_properties) +
+                 sizeof(req->include_properties)) {
+        req->forward = true;
+        req->include_properties = true;
+    }
+}
+
+moqr_result_t
+moqr_core_tracks_subscribe(moqr_core_t *c, moqr_binding_t bh,
+                           const moqr_tracks_req_t *req)
+{
+    if (c == NULL || req == NULL ||
+        req->struct_size < MOQR_TRACKS_REQ_SIZE_THROUGH_GROUP_ORDER ||
+        !ns_view_ok(req->prefix, 0)) {
+        return MOQR_ERR_INVAL;
+    }
+    uint32_t bslot = 0;
+    r_binding_t *b = binding_resolve(c, bh, &bslot);
+    if (b == NULL) {
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    if (tsub_find(c, bslot, b->gen, req->cookie) != UINT32_MAX) {
+        return MOQR_ERR_INVAL;
+    }
+    uint32_t slot = UINT32_MAX;
+    for (uint32_t i = 0; i < c->max_ns_subs; i++) {
+        if (!c->tsubs[i].used) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot == UINT32_MAX) {
+        return r_refuse(c, MOQR_REFUSE_NS_SUBS);
+    }
+    uint32_t plen = prefix_buf_len(req->prefix);
+    if ((uint64_t)c->intern_used + plen > c->intern_budget) {
+        return r_refuse(c, MOQR_REFUSE_NAME_BYTES);
+    }
+    uint8_t *pbuf = r_alloc(c, plen);
+    if (pbuf == NULL) {
+        return MOQR_ERR_NOMEM;
+    }
+    prefix_buf_write(pbuf, req->prefix);
+    r_tsub_t *t = &c->tsubs[slot];
+    memset(t, 0, sizeof(*t));
+    t->used = true;
+    t->binding = bslot;
+    t->binding_gen = b->gen;
+    t->cookie = req->cookie;
+    t->prefix = pbuf;
+    t->prefix_len = plen;
+    t->forward = req->forward;
+    t->include_properties = req->include_properties;
+    t->group_order = req->group_order;
+    t->held = req->struct_size >= offsetof(moqr_tracks_req_t, held) +
+                                      sizeof(req->held) && req->held;
+    offer_row_clear(c, slot);
+    c->intern_used += plen;
+    b->discovery_dirty = true;
+    r_bump_route_epoch(c);
+    r_trace(c, MOQR_TRACE_ROUTE_ADD, 3 /* track sub */, slot, bslot,
+            req->cookie, 0);
+    return MOQR_OK;
+}
+
+moqr_result_t
+moqr_core_tracks_update_prepare(moqr_core_t *c, moqr_binding_t bh, uint64_t cookie,
+                                uint32_t flags, moqr_ns_t prefix, bool forward,
+                                moqr_tracks_update_prep_t *prep)
+{
+    if (prep != NULL) {
+        memset(prep, 0, sizeof(*prep));
+    }
+    if (c == NULL || prep == NULL ||
+        (flags & ~(uint32_t)(MOQR_TRACKS_UPDATE_PREFIX |
+                             MOQR_TRACKS_UPDATE_FORWARD |
+                             MOQR_TRACKS_UPDATE_TOKENS)) != 0 ||
+        ((flags & MOQR_TRACKS_UPDATE_PREFIX) && !ns_view_ok(prefix, 0))) {
+        return MOQR_ERR_INVAL;
+    }
+    uint32_t bslot = 0;
+    r_binding_t *b = binding_resolve(c, bh, &bslot);
+    if (b == NULL) {
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    uint32_t slot = tsub_find(c, bslot, b->gen, cookie);
+    if (slot == UINT32_MAX) {
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    r_tsub_t *t = &c->tsubs[slot];
+    if (flags & MOQR_TRACKS_UPDATE_PREFIX) {
+        uint32_t plen = prefix_buf_len(prefix);
+        if ((uint64_t)c->intern_used - t->prefix_len + plen > c->intern_budget) {
+            return r_refuse(c, MOQR_REFUSE_NAME_BYTES);
+        }
+        uint8_t *pbuf = r_alloc(c, plen);
+        if (pbuf == NULL) {
+            return MOQR_ERR_NOMEM;
+        }
+        prefix_buf_write(pbuf, prefix);
+        prep->prefix_buf = pbuf;
+        prep->prefix_len = plen;
+    }
+    prep->staged = true;
+    prep->binding = bh;
+    prep->cookie = cookie;
+    prep->flags = flags;
+    prep->forward = forward;
+    return MOQR_OK;
+}
+
+void
+moqr_core_tracks_update_abort(moqr_core_t *c, moqr_tracks_update_prep_t *prep)
+{
+    if (c == NULL || prep == NULL || !prep->staged) {
+        return;
+    }
+    if (prep->prefix_buf != NULL) {
+        r_free(c, prep->prefix_buf, prep->prefix_len);
+    }
+    memset(prep, 0, sizeof(*prep));
+}
+
+moqr_result_t
+moqr_core_tracks_update_commit(moqr_core_t *c, moqr_tracks_update_prep_t *prep)
+{
+    if (c == NULL || prep == NULL || !prep->staged) {
+        return MOQR_ERR_INVAL;
+    }
+    uint32_t bslot = 0;
+    r_binding_t *b = binding_resolve(c, prep->binding, &bslot);
+    uint32_t slot = b != NULL ? tsub_find(c, bslot, b->gen, prep->cookie)
+                              : UINT32_MAX;
+    if (slot == UINT32_MAX) {
+        moqr_core_tracks_update_abort(c, prep);
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    r_tsub_t *t = &c->tsubs[slot];
+    if (prep->flags & MOQR_TRACKS_UPDATE_PREFIX) {
+        c->intern_used = c->intern_used - t->prefix_len + prep->prefix_len;
+        r_free(c, t->prefix, t->prefix_len);
+        t->prefix = prep->prefix_buf;
+        t->prefix_len = prep->prefix_len;
+    }
+    if (prep->flags & MOQR_TRACKS_UPDATE_FORWARD) {
+        t->forward = prep->forward;
+    }
+    if (prep->flags & MOQR_TRACKS_UPDATE_TOKENS) {
+        /* A decision made, or still pending, under the old tokens no longer
+         * stands: each such match is decided again (§3.6, §9.5). */
+        t->input_gen++;
+        for (uint32_t k = 0; k < c->max_tracks; k++) {
+            r_offer_t *o = offer_at(c, slot, k);
+            if (o->state == MOQR_DISCOVERY_DECLINED ||
+                o->state == MOQR_DISCOVERY_PENDING ||
+                o->state == MOQR_DISCOVERY_ALLOWED) {
+                memset(o, 0, sizeof(*o));
+            }
+        }
+    }
+    memset(prep, 0, sizeof(*prep));
+    b->discovery_dirty = true;
+    r_bump_route_epoch(c);
+    return MOQR_OK;
+}
+
+moqr_result_t
+moqr_core_tracks_answered(moqr_core_t *c, moqr_binding_t bh, uint64_t cookie)
+{
+    if (c == NULL) {
+        return MOQR_ERR_INVAL;
+    }
+    uint32_t bslot = 0;
+    r_binding_t *b = binding_resolve(c, bh, &bslot);
+    uint32_t slot = b != NULL ? tsub_find(c, bslot, b->gen, cookie) : UINT32_MAX;
+    if (slot == UINT32_MAX) {
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    c->tsubs[slot].held = false;
+    b->discovery_dirty = true;
+    return MOQR_OK;
+}
+
+moqr_result_t
+moqr_core_tracks_unsubscribe(moqr_core_t *c, moqr_binding_t bh, uint64_t cookie)
+{
+    if (c == NULL) {
+        return MOQR_ERR_INVAL;
+    }
+    uint32_t bslot = 0;
+    r_binding_t *b = binding_resolve(c, bh, &bslot);
+    if (b == NULL) {
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    uint32_t slot = tsub_find(c, bslot, b->gen, cookie);
+    if (slot == UINT32_MAX) {
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    tsub_free(c, slot);
+    r_bump_route_epoch(c);
+    r_trace(c, MOQR_TRACE_ROUTE_REMOVE, 3 /* track sub */, slot, bslot, cookie, 0);
+    return MOQR_OK;
+}
+
+/* A track the binding may be offered: a live source that is not the
+ * binding's own (§3.6 excludes the subscriber's own publications). */
+static bool
+track_offerable(const r_track_t *t, uint32_t bslot, uint32_t bgen)
+{
+    if ((t->gen & 1u) == 0 || t->state != R_TRACK_ACTIVE) {
+        return false;
+    }
+    return !(t->has_upstream_binding && t->up_binding == bslot &&
+             t->up_binding_gen == bgen);
+}
+
+moqr_result_t
+moqr_core_next_discovery(moqr_core_t *c, moqr_binding_t bh, moqr_discovery_t *out,
+                         size_t out_size)
+{
+    if (c == NULL || out == NULL || out_size < MOQR_DISCOVERY_V0_SIZE) {
+        return MOQR_ERR_INVAL;
+    }
+    uint32_t bslot = 0;
+    r_binding_t *b = binding_resolve(c, bh, &bslot);
+    if (b == NULL) {
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    if (!b->discovery_dirty) {
+        return MOQR_DONE;
+    }
+    for (uint32_t i = 0; i < c->max_ns_subs; i++) {
+        const r_tsub_t *ts = &c->tsubs[i];
+        if (!ts->used || ts->binding != bslot || ts->binding_gen != b->gen ||
+            ts->held) {
+            continue;
+        }
+        for (uint32_t k = 0; k < c->max_tracks; k++) {
+            const r_track_t *t = &c->tracks[k];
+            if (!track_offerable(t, bslot, b->gen)) {
+                continue;
+            }
+            const r_offer_t *o = offer_at(c, i, k);
+            bool current = o->track_slot_gen == t->gen &&
+                           o->track_gen == t->track_gen;
+            if (o->state != 0 && current &&
+                o->state != MOQR_DISCOVERY_ALLOWED) {
+                continue;
+            }
+            bool authorized = current && o->state == MOQR_DISCOVERY_ALLOWED;
+            uint32_t count = key_part_count(&t->key);
+            if (count > 32) {
+                continue;
+            }
+            moq_bytes_t parts[32];
+            for (uint32_t p = 0; p < count; p++) {
+                parts[p] = key_part(&t->key, p);
+            }
+            if (!prefix_buf_matches(ts->prefix, parts, count)) {
+                continue;
+            }
+            size_t n = out_size < sizeof(*out) ? out_size : sizeof(*out);
+            memset(out, 0, n);
+            out->struct_size = (uint32_t)n;
+            out->cookie = ts->cookie;
+            out->track = track_handle(c, k);
+            out->track_gen = t->track_gen;
+            for (uint32_t p = 0; p < count; p++) {
+                out->ns_parts[p] = parts[p];
+            }
+            out->ns.parts = out->ns_parts;
+            out->ns.count = count;
+            out->name = key_name(&t->key);
+            out->prefix_count = key_rd32(ts->prefix);
+            out->forward = ts->forward;
+            out->include_properties = ts->include_properties;
+            out->group_order = ts->group_order;
+            out->has_largest = t->has_largest;
+            out->largest_group = t->largest_group;
+            out->largest_object = t->largest_object;
+            if (n >= offsetof(moqr_discovery_t, authorized) +
+                         sizeof(out->authorized)) {
+                out->authorized = authorized;
+            }
+            if (n >= offsetof(moqr_discovery_t, input_gen) +
+                         sizeof(out->input_gen)) {
+                out->input_gen = ts->input_gen;
+            }
+            return MOQR_OK;
+        }
+    }
+    b->discovery_dirty = false;
+    return MOQR_DONE;
+}
+
+moqr_result_t
+moqr_core_discovery_done(moqr_core_t *c, moqr_binding_t bh, uint64_t cookie,
+                         moqr_track_t th, uint64_t track_gen, uint32_t input_gen,
+                         uint32_t outcome)
+{
+    if (c == NULL || outcome < MOQR_DISCOVERY_OFFERED ||
+        outcome > MOQR_DISCOVERY_ALLOWED) {
+        return MOQR_ERR_INVAL;
+    }
+    uint32_t bslot = 0;
+    r_binding_t *b = binding_resolve(c, bh, &bslot);
+    if (b == NULL) {
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    uint32_t slot = tsub_find(c, bslot, b->gen, cookie);
+    uint32_t tslot = 0;
+    r_track_t *t = track_resolve(c, th, &tslot);
+    if (slot == UINT32_MAX || t == NULL || t->track_gen != track_gen ||
+        c->tsubs[slot].input_gen != input_gen) {
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    r_offer_t *o = offer_at(c, slot, tslot);
+    o->track_slot_gen = t->gen;
+    o->track_gen = t->track_gen;
+    o->state = (uint8_t)outcome;
+    if (outcome == MOQR_DISCOVERY_ALLOWED) {
+        b->discovery_dirty = true;   /* offer it on the next pull */
+    }
+    return MOQR_OK;
+}
+
+/* Mark `tslot`'s current source as already served to every track
+ * subscription of `bslot`: a SUBSCRIBE held there was resolved by it. */
+static void
+discovery_suppress(moqr_core_t *c, uint32_t bslot, uint32_t bgen, uint32_t tslot)
+{
+    const r_track_t *t = &c->tracks[tslot];
+    for (uint32_t i = 0; i < c->max_ns_subs; i++) {
+        const r_tsub_t *ts = &c->tsubs[i];
+        if (ts->used && ts->binding == bslot && ts->binding_gen == bgen) {
+            r_offer_t *o = offer_at(c, i, tslot);
+            o->track_slot_gen = t->gen;
+            o->track_gen = t->track_gen;
+            o->state = MOQR_DISCOVERY_SUPPRESSED;
+        }
+    }
+}
+
+moqr_result_t
+moqr_core_subscription_prefix(moqr_core_t *c, moqr_binding_t bh, uint64_t cookie,
+                              bool tracks, moq_bytes_t *parts, size_t parts_cap,
+                              moqr_ns_t *out)
+{
+    if (c == NULL || out == NULL || (parts_cap > 0 && parts == NULL)) {
+        return MOQR_ERR_INVAL;
+    }
+    uint32_t bslot = 0;
+    r_binding_t *b = binding_resolve(c, bh, &bslot);
+    if (b == NULL) {
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    const uint8_t *buf = NULL;
+    if (tracks) {
+        uint32_t slot = tsub_find(c, bslot, b->gen, cookie);
+        if (slot != UINT32_MAX) buf = c->tsubs[slot].prefix;
+    } else {
+        uint32_t slot = ns_sub_find(c, bslot, b->gen, cookie);
+        if (slot != UINT32_MAX) buf = c->ns_subs[slot].prefix;
+    }
+    if (buf == NULL) {
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    uint32_t count = key_rd32(buf);
+    if (count > parts_cap) {
+        return MOQR_ERR_CAPACITY;
+    }
+    uint32_t off = 4u * (1u + count);
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t len = key_rd32(buf + 4u * (1u + i));
+        parts[i].data = buf + off;
+        parts[i].len = len;
+        off += len;
+    }
+    out->parts = parts;
+    out->count = count;
+    return MOQR_OK;
+}
+
+static uint32_t
+rtok_find(const moqr_core_t *c, uint32_t bslot, uint32_t bgen, uint64_t cookie)
+{
+    for (uint32_t i = 0; i < c->max_rtoks; i++) {
+        const r_rtok_t *r = &c->rtoks[i];
+        if (r->used && r->binding == bslot && r->binding_gen == bgen &&
+            r->cookie == cookie) {
             return i;
         }
     }
@@ -3804,17 +4932,275 @@ sub_slot_find(moqr_core_t *c)
 }
 
 moqr_result_t
+moqr_core_request_tokens_set(moqr_core_t *c, moqr_binding_t bh, uint64_t cookie,
+                             const moqr_auth_token_t *tokens, size_t token_count)
+{
+    if (c == NULL || (token_count > 0 && tokens == NULL)) {
+        return MOQR_ERR_INVAL;
+    }
+    uint32_t bslot = 0;
+    r_binding_t *b = binding_resolve(c, bh, &bslot);
+    if (b == NULL) {
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    uint32_t slot = rtok_find(c, bslot, b->gen, cookie);
+    if (token_count == 0) {
+        if (slot != UINT32_MAX) {
+            r_free_material(c, &c->rtoks[slot].mat, &c->intern_used);
+            memset(&c->rtoks[slot], 0, sizeof(c->rtoks[slot]));
+        }
+        return MOQR_OK;
+    }
+    uint32_t dst = slot;
+    if (dst == UINT32_MAX) {
+        for (uint32_t i = 0; i < c->max_rtoks; i++) {
+            if (!c->rtoks[i].used) {
+                dst = i;
+                break;
+            }
+        }
+        if (dst == UINT32_MAX) {
+            return r_refuse(c, MOQR_REFUSE_NS_SUBS);
+        }
+    }
+    moqr_park_req_t pr;
+    memset(&pr, 0, sizeof(pr));
+    pr.tokens = tokens;
+    pr.token_count = token_count;
+    /* The replacement is charged before the old copy is released, so a
+     * budget refusal leaves the tokens in effect untouched. */
+    r_material m;
+    moqr_result_t rc = r_copy_material(c, &pr, &c->intern_used,
+                                       c->intern_budget, &m);
+    if (rc != MOQR_OK) {
+        if (rc == MOQR_ERR_CAPACITY) {
+            (void)r_refuse(c, MOQR_REFUSE_NAME_BYTES);
+        }
+        return rc;
+    }
+    r_rtok_t *r = &c->rtoks[dst];
+    if (r->used) {
+        r_free_material(c, &r->mat, &c->intern_used);
+    }
+    r->used = true;
+    r->binding = bslot;
+    r->binding_gen = b->gen;
+    r->cookie = cookie;
+    r->mat = m;
+    return MOQR_OK;
+}
+
+moqr_result_t
+moqr_core_request_tokens_get(moqr_core_t *c, moqr_binding_t bh, uint64_t cookie,
+                             const moqr_auth_token_t **tokens, size_t *token_count)
+{
+    if (c == NULL || tokens == NULL || token_count == NULL) {
+        return MOQR_ERR_INVAL;
+    }
+    *tokens = NULL;
+    *token_count = 0;
+    uint32_t bslot = 0;
+    r_binding_t *b = binding_resolve(c, bh, &bslot);
+    if (b == NULL) {
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    uint32_t slot = rtok_find(c, bslot, b->gen, cookie);
+    if (slot == UINT32_MAX) {
+        return MOQR_DONE;
+    }
+    *tokens = c->rtoks[slot].mat.tokens;
+    *token_count = c->rtoks[slot].mat.token_count;
+    return MOQR_OK;
+}
+
+void
+moqr_core_request_tokens_clear(moqr_core_t *c, moqr_binding_t bh, uint64_t cookie)
+{
+    if (c == NULL) {
+        return;
+    }
+    (void)moqr_core_request_tokens_set(c, bh, cookie, NULL, 0);
+}
+
+/* -- ops: subscribe ------------------------------------------------------------------------------- */
+
+/* The sizeof of the layout through `forward`: what a caller built before
+ * range_end_holds was appended allocates and passes. */
+#define MOQR_SUBSCRIBE_REQ_SIZE_THROUGH_FORWARD                               \
+    ((offsetof(moqr_subscribe_req_t, forward) +                               \
+      sizeof(((moqr_subscribe_req_t *)0)->forward) +                          \
+      (_Alignof(moqr_subscribe_req_t) - 1)) &                                 \
+     ~(_Alignof(moqr_subscribe_req_t) - 1))
+
+/* Clear and stamp `n` bytes (at least through `forward`) and set the defaults,
+ * every one of which lies inside that layout. */
+static void
+subscribe_req_clear(moqr_subscribe_req_t *req, size_t n)
+{
+    memset(req, 0, n);
+    req->struct_size = (uint32_t)n;
+    req->filter.type = MOQR_FILTER_LARGEST_OBJECT;
+    req->forward = true;   /* deliver unless the request explicitly pauses */
+    req->subscriber_priority = 128;
+}
+
+/* Parenthesized: defines the symbol, not the header's sized macro. */
+void
+(moqr_subscribe_req_init)(moqr_subscribe_req_t *req)
+{
+    if (req == NULL) {
+        return;
+    }
+    subscribe_req_clear(req, MOQR_SUBSCRIBE_REQ_SIZE_THROUGH_FORWARD);
+}
+
+void
+moqr_subscribe_req_init_sized(moqr_subscribe_req_t *req, size_t req_size)
+{
+    /* Anything shorter than the layout through `forward` is not a request
+     * the relay accepts, and could not hold the defaults. */
+    if (req == NULL || req_size < MOQR_SUBSCRIBE_REQ_SIZE_THROUGH_FORWARD) {
+        return;
+    }
+    subscribe_req_clear(req, req_size < sizeof(*req) ? req_size : sizeof(*req));
+}
+
+/* A free subscription slot, leaving the ones reserved for later requests. */
+static uint32_t
+sub_slot_find(moqr_core_t *c)
+{
+    uint32_t found = UINT32_MAX, free_slots = 0;
+    for (uint32_t i = 0; i < c->max_subs; i++) {
+        if (r_gen_openable(c->subs[i].gen)) {
+            if (found == UINT32_MAX) found = i;
+            if (c->subs_reserved == 0) return found;
+            if (++free_slots > c->subs_reserved) return found;
+        }
+    }
+    return UINT32_MAX;
+}
+
+moqr_result_t
+moqr_core_internal_sub_reserve(moqr_core_t *c)
+{
+    if (c == NULL) {
+        return MOQR_ERR_INVAL;
+    }
+    if (sub_slot_find(c) == UINT32_MAX) {
+        return r_refuse(c, MOQR_REFUSE_SUBS);
+    }
+    c->subs_reserved++;
+    return MOQR_OK;
+}
+
+void
+moqr_core_internal_sub_release_reserve(moqr_core_t *c)
+{
+    if (c != NULL && c->subs_reserved > 0) {
+        c->subs_reserved--;
+    }
+}
+
+/* Create a sourceless track holding one rendezvous subscription (§9.20.6).
+ * No intent: the request is answered when a publisher appears (ordinary
+ * admission) or at its deadline (TIMEOUT). */
+static moqr_result_t
+rendezvous_hold(moqr_core_t *c, uint32_t bslot, r_binding_t *b,
+                const moqr_subscribe_req_t *req, uint64_t hash,
+                bool forward, bool holds,
+                const moq_location_filter_cfg_t *location, uint64_t deadline_us,
+                moqr_sub_t *out)
+{
+    uint32_t sslot = sub_slot_find(c);
+    if (sslot == UINT32_MAX) {
+        return r_refuse(c, MOQR_REFUSE_SUBS);
+    }
+    uint32_t tslot = UINT32_MAX;
+    moqr_result_t rc = track_create(c, req->ns, req->name, hash, &tslot);
+    if (rc != MOQR_OK) {
+        return rc;
+    }
+    r_track_t *t = &c->tracks[tslot];
+    t->state = R_TRACK_RENDEZVOUS;
+    t->source_kind = R_TRACK_SOURCE_NONE;
+    r_sub_t *s = &c->subs[sslot];
+    uint32_t gen = r_gen_open(s->gen);
+    memset(s, 0, sizeof(*s));
+    s->gen = gen;
+    s->binding = bslot;
+    s->binding_gen = b->gen;
+    s->track = tslot;
+    s->track_gen_slot = t->gen;
+    s->state = R_SUB_PARKED;
+    s->forward = forward;
+    s->range_end_holds = holds;
+    s->subscriber_priority = req->subscriber_priority;
+    s->group_order = req->group_order;
+    s->cookie = req->cookie;
+    s->filter_type = req->filter.type;
+    s->start_group = req->filter.start_group;
+    s->start_object = req->filter.start_object;
+    s->end_group = req->filter.end_group_delta;
+    s->rendezvous = true;
+    s->rendezvous_deadline_us = deadline_us;
+    if (location != NULL) {
+        s->has_location = true;
+        s->location = *location;
+    }
+    rc = gpos_alloc(c, s, t->log);
+    if (rc != MOQR_OK) {
+        s->gen = r_gen_close(s->gen);
+        track_free_slot(c, tslot);
+        return rc;
+    }
+    sub_list_push(c, bslot, sslot);
+    track_sub_link(c, tslot, sslot);
+    r_trace(c, MOQR_TRACE_ROUTE_ADD, 5 /* rendezvous hold */, tslot, bslot,
+            req->cookie, deadline_us);
+    *out = sub_handle(c, sslot);
+    return MOQR_OK;
+}
+
+static moqr_result_t core_subscribe(moqr_core_t *c, moqr_binding_t bh,
+                                    const moqr_subscribe_req_t *req,
+                                    moqr_sub_t *out);
+
+moqr_result_t
 moqr_core_subscribe(moqr_core_t *c, moqr_binding_t bh,
                     const moqr_subscribe_req_t *req, moqr_sub_t *out)
+{
+    /* A request made with a reservation takes the slot it held: released for
+     * this call, and held again when the request fails. */
+    bool reserved = c != NULL && req != NULL &&
+        req->struct_size >= offsetof(moqr_subscribe_req_t, reserved) +
+                                sizeof(req->reserved) &&
+        req->reserved && c->subs_reserved > 0;
+    if (reserved) c->subs_reserved--;
+    moqr_result_t rc = core_subscribe(c, bh, req, out);
+    if (reserved && rc != MOQR_OK) c->subs_reserved++;
+    return rc;
+}
+
+static moqr_result_t
+core_subscribe(moqr_core_t *c, moqr_binding_t bh,
+               const moqr_subscribe_req_t *req, moqr_sub_t *out)
 {
     /* Prefix-size (ABI) contract: `forward` is a trailing field, so a caller
      * that predates it (struct_size ending before `forward`) is still valid and
      * defaults to forward=true. The minimum is everything up to `forward`. */
     if (c == NULL || req == NULL || out == NULL ||
         req->struct_size < offsetof(moqr_subscribe_req_t, forward) ||
-        req->filter.type < MOQR_FILTER_NEXT_GROUP_START ||
-        req->filter.type > MOQR_FILTER_ABSOLUTE_RANGE ||
         !ftn_view_ok(req->ns, req->name)) {
+        return MOQR_ERR_INVAL;
+    }
+    const moq_location_filter_cfg_t *location = NULL;
+    if (req->struct_size >= offsetof(moqr_subscribe_req_t, location) +
+                                sizeof(req->location)) {
+        location = req->location;
+    }
+    if (location != NULL ? !location_valid(location)
+                         : (req->filter.type < MOQR_FILTER_NEXT_GROUP_START ||
+                            req->filter.type > MOQR_FILTER_RELATIVE_START)) {
         return MOQR_ERR_INVAL;
     }
     bool req_forward = true;   /* default when the caller omits the field */
@@ -3822,7 +5208,20 @@ moqr_core_subscribe(moqr_core_t *c, moqr_binding_t bh,
         offsetof(moqr_subscribe_req_t, forward) + sizeof(req->forward)) {
         req_forward = req->forward;
     }
-    if (req->filter.type == MOQR_FILTER_ABSOLUTE_RANGE &&
+    bool req_holds = false;    /* default when the caller omits the field */
+    if (req->struct_size >= offsetof(moqr_subscribe_req_t, range_end_holds) +
+                                sizeof(req->range_end_holds)) {
+        req_holds = req->range_end_holds;
+    }
+    /* Read as one block: a torn tail never holds a request. */
+    bool req_wait = false;
+    uint64_t req_deadline = 0;
+    if (req->struct_size >= offsetof(moqr_subscribe_req_t, rendezvous) +
+                                sizeof(req->rendezvous)) {
+        req_wait = req->rendezvous;
+        req_deadline = req->rendezvous_deadline_us;
+    }
+    if (location == NULL && req->filter.type == MOQR_FILTER_ABSOLUTE_RANGE &&
         req->filter.start_group + req->filter.end_group_delta <
             req->filter.start_group) {
         return MOQR_ERR_INVAL;   /* end-group overflow (spec: violation) */
@@ -3844,6 +5243,12 @@ moqr_core_subscribe(moqr_core_t *c, moqr_binding_t bh,
     if (tslot == UINT32_MAX) {
         /* New track: needs an announced publisher. */
         uint32_t pub_node = trie_longest_announce(c, req->ns);
+        if (pub_node == UINT32_MAX && req_wait) {
+            /* §9.20.6: hold the subscription, without an answer, until a
+             * publisher appears or its one deadline passes. */
+            return rendezvous_hold(c, bslot, b, req, hash, req_forward,
+                                   req_holds, location, req_deadline, out);
+        }
         if (pub_node == UINT32_MAX) {
             moqr_intent_t *it = intent_push(c, MOQR_INTENT_REJECT_SUB);
             it->binding_cookie = b->cookie;
@@ -3873,6 +5278,7 @@ moqr_core_subscribe(moqr_core_t *c, moqr_binding_t bh,
         t->src_ann_binding = c->nodes[pub_node].ann_binding;
         t->src_ann_binding_gen = c->nodes[pub_node].ann_binding_gen;
 
+        t->metadata_managed = c->bindings[t->up_binding].metadata_managed;
         r_sub_t *s = &c->subs[sslot];
         uint32_t gen = r_gen_open(s->gen);
         memset(s, 0, sizeof(*s));
@@ -3883,6 +5289,7 @@ moqr_core_subscribe(moqr_core_t *c, moqr_binding_t bh,
         s->track_gen_slot = t->gen;
         s->state = R_SUB_PARKED;
         s->forward = req_forward;   /* initial Forward, carried atomically */
+        s->range_end_holds = req_holds;
         s->subscriber_priority = req->subscriber_priority;
         s->group_order = req->group_order;
         s->cookie = req->cookie;
@@ -3891,6 +5298,10 @@ moqr_core_subscribe(moqr_core_t *c, moqr_binding_t bh,
         s->start_group = req->filter.start_group;
         s->start_object = req->filter.start_object;
         s->end_group = req->filter.end_group_delta;   /* delta until resolve */
+        if (location != NULL) {
+            s->has_location = true;
+            s->location = *location;
+        }
         rc = gpos_alloc(c, s, t->log);
         if (rc != MOQR_OK) {
             s->gen = r_gen_close(s->gen);
@@ -3912,6 +5323,14 @@ moqr_core_subscribe(moqr_core_t *c, moqr_binding_t bh,
 
     /* Existing track. */
     r_track_t *t = &c->tracks[tslot];
+    if (t->state == R_TRACK_RENDEZVOUS && !req_wait) {
+        /* Others wait for this track's publisher; this request does not. */
+        moqr_intent_t *it = intent_push(c, MOQR_INTENT_REJECT_SUB);
+        it->binding_cookie = b->cookie;
+        it->cookie = req->cookie;
+        it->error_code = R_ERR_DOES_NOT_EXIST;
+        return MOQR_OK;
+    }
     uint32_t sslot = sub_slot_find(c);
     if (sslot == UINT32_MAX) {
         return r_refuse(c, MOQR_REFUSE_SUBS);
@@ -3925,9 +5344,14 @@ moqr_core_subscribe(moqr_core_t *c, moqr_binding_t bh,
     s->track = tslot;
     s->track_gen_slot = t->gen;
     s->forward = req_forward;   /* initial Forward, carried atomically */
+    s->range_end_holds = req_holds;
     s->subscriber_priority = req->subscriber_priority;
     s->group_order = req->group_order;
     s->cookie = req->cookie;
+    if (location != NULL) {
+        s->has_location = true;
+        s->location = *location;
+    }
     moqr_result_t crc = gpos_alloc(c, s, t->log);
     if (crc != MOQR_OK) {
         s->gen = r_gen_close(s->gen);
@@ -3937,12 +5361,16 @@ moqr_core_subscribe(moqr_core_t *c, moqr_binding_t bh,
     track_sub_link(c, tslot, sslot);
     t->linger_deadline_us = 0;   /* subscriber present again */
 
-    if (t->state == R_TRACK_PENDING) {
+    if (t->state == R_TRACK_PENDING || t->state == R_TRACK_RENDEZVOUS) {
         s->state = R_SUB_PARKED;
         s->filter_type = req->filter.type;
         s->start_group = req->filter.start_group;
         s->start_object = req->filter.start_object;
         s->end_group = req->filter.end_group_delta;
+        if (t->state == R_TRACK_RENDEZVOUS) {
+            s->rendezvous = true;
+            s->rendezvous_deadline_us = req_deadline;
+        }
         *out = sub_handle(c, sslot);
         return MOQR_OK;
     }
@@ -3950,8 +5378,13 @@ moqr_core_subscribe(moqr_core_t *c, moqr_binding_t bh,
     /* ACTIVE or WARM: accept immediately from track state. */
     s->state = R_SUB_ACTIVE;
     ready_mark(c, bslot);   /* retained content is deliverable at once */
-    sub_resolve_filter(s, &req->filter, t->has_largest, t->largest_group,
-                       t->largest_object);
+    if (s->has_location) {
+        sub_resolve_location(s, t->has_largest, t->largest_group, t->largest_object);
+        sub_exclude_retained(s, t->log);
+    } else {
+        sub_resolve_filter(s, &req->filter, t->has_largest, t->largest_group,
+                           t->largest_object);
+    }
     moqr_intent_t *it = intent_push(c, MOQR_INTENT_ACCEPT_SUB);
     it->binding_cookie = b->cookie;
     it->cookie = req->cookie;
@@ -3973,6 +5406,8 @@ moqr_core_subscribe(moqr_core_t *c, moqr_binding_t bh,
             track_src_set(c, t, pub_node);
             t->src_ann_binding = c->nodes[pub_node].ann_binding;
             t->src_ann_binding_gen = c->nodes[pub_node].ann_binding_gen;
+            t->metadata_managed = t->metadata_managed ||
+                c->bindings[t->up_binding].metadata_managed;
             moqr_intent_t *up = intent_push(c,
                                             MOQR_INTENT_UPSTREAM_SUBSCRIBE);
             up->binding_cookie = c->bindings[t->up_binding].cookie;
@@ -4000,6 +5435,30 @@ moqr_core_unsubscribe(moqr_core_t *c, moqr_sub_t sh, uint64_t now_us)
     }
     sub_retire(c, slot, now_us);
     return MOQR_OK;
+}
+
+moqr_result_t
+moqr_core_sub_find(const moqr_core_t *c, moqr_binding_t bh, uint64_t cookie,
+                   moqr_sub_t *out)
+{
+    if (c == NULL || out == NULL) {
+        return MOQR_ERR_INVAL;
+    }
+    *out = MOQR_SUB_INVALID;
+    uint32_t bslot = 0;
+    const r_binding_t *b = binding_resolve((moqr_core_t *)c, bh, &bslot);
+    if (b == NULL) {
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    for (uint32_t i = 0; i < c->max_subs; i++) {
+        const r_sub_t *s = &c->subs[i];
+        if ((s->gen & 1u) != 0 && s->binding == bslot &&
+            s->binding_gen == b->gen && s->cookie == cookie) {
+            *out = sub_handle((moqr_core_t *)c, i);
+            return MOQR_OK;
+        }
+    }
+    return MOQR_ERR_STALE_HANDLE;
 }
 
 moqr_result_t
@@ -4036,6 +5495,102 @@ moqr_core_sub_set_forward(moqr_core_t *c, moqr_sub_t sh, bool forward,
          * reconsidered on the next pump and delivered exactly once. */
         ready_mark(c, s->binding);
     }
+    return MOQR_OK;
+}
+
+moqr_result_t
+moqr_core_sub_set_filter(moqr_core_t *c, moqr_sub_t sh,
+                         const moqr_filter_t *filter, uint64_t now_us)
+{
+    (void)now_us;
+    if (c == NULL || filter == NULL ||
+        filter->type < MOQR_FILTER_NEXT_GROUP_START ||
+        filter->type > MOQR_FILTER_RELATIVE_START) {
+        return MOQR_ERR_INVAL;
+    }
+    if (filter->type == MOQR_FILTER_ABSOLUTE_RANGE &&
+        filter->start_group + filter->end_group_delta < filter->start_group) {
+        return MOQR_ERR_INVAL;   /* end-group overflow (spec: violation) */
+    }
+    uint32_t slot = 0;
+    r_sub_t *s = sub_resolve(c, sh, &slot);
+    if (s == NULL) {
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    if (s->state == R_SUB_PARKED) {
+        /* Resolves at upstream acceptance, like the request's own filter. */
+        s->has_location = false;
+        s->filter_type = filter->type;
+        s->start_group = filter->start_group;
+        s->start_object = filter->start_object;
+        s->end_group = filter->end_group_delta;
+        return MOQR_OK;
+    }
+    const r_track_t *t = &c->tracks[s->track];
+    sub_exclude_retained(s, t->log);
+    uint64_t old_sg = s->start_group, old_so = s->start_object;
+    bool old_empty = s->location_empty;
+    sub_resolve_filter(s, filter, t->has_largest, t->largest_group,
+                       t->largest_object);
+    /* The frontier never moves back: records the scan has passed (delivered,
+     * or consumed below the former start) are not revisited, so a lowered
+     * start keeps the former one. */
+    if (s->start_group < old_sg ||
+        (s->start_group == old_sg && s->start_object < old_so)) {
+        s->start_group = old_sg;
+        s->start_object = old_so;
+    }
+    /* Beyond-last is also a lower bound: only typed replacement may reopen it. */
+    s->location_empty = s->location_empty || old_empty;
+    sub_exclude_retained(s, t->log);
+    r_binding_t *b = &c->bindings[s->binding];
+    if (s->location_empty && b->out_active && b->out_sub == slot &&
+        b->out_notice == MOQR_DELIVERY_NOTICE_NONE && !b->out_abandoned) {
+        uint32_t pos = gpos_hash_find(s, b->out_group);
+        bool begun = pos != R_GPOS_NIL &&
+                     gpos_emit(s, gpos_at(s, pos))[b->out_list] != 0;
+        if (!begun) binding_drop_held(b);
+    }
+    /* The scan reads the window live; re-arm the owning binding so what the
+     * new window admits is considered at once. */
+    ready_mark(c, s->binding);
+    return MOQR_OK;
+}
+
+moqr_result_t
+moqr_core_sub_set_location_filter(moqr_core_t *c, moqr_sub_t sh,
+                                  const moq_location_filter_cfg_t *location,
+                                  uint64_t now_us)
+{
+    (void)now_us;
+    if (c == NULL || !location_valid(location)) return MOQR_ERR_INVAL;
+    r_sub_t *s = sub_resolve(c, sh, NULL);
+    if (s == NULL) return MOQR_ERR_STALE_HANDLE;
+    const r_track_t *t = &c->tracks[s->track];
+    if (s->excluded == NULL) {
+        size_t n = t->log->max_records / 8u + (t->log->max_records % 8u != 0);
+        uint8_t *bits = r_alloc(c, n);
+        if (bits == NULL) return MOQR_ERR_NOMEM;
+        memset(bits, 0, n);
+        s->excluded = bits;
+        s->excluded_cap = t->log->max_records;
+    }
+    if (s->state != R_SUB_PARKED) sub_exclude_retained(s, t->log);
+    s->location = *location;
+    s->has_location = true;
+    if (s->state == R_SUB_PARKED) return MOQR_OK;
+    sub_resolve_location(s, t->has_largest, t->largest_group, t->largest_object);
+    sub_exclude_retained(s, t->log);
+    r_binding_t *b = &c->bindings[s->binding];
+    if (b->out_active && b->out_sub == (uint32_t)(s - c->subs) &&
+        b->out_notice == MOQR_DELIVERY_NOTICE_NONE && !b->out_abandoned &&
+        sub_excluded(s, b->out_view.rec.arrival_seq)) {
+        uint32_t slot = gpos_hash_find(s, b->out_group);
+        bool begun = slot != R_GPOS_NIL &&
+                     gpos_emit(s, gpos_at(s, slot))[b->out_list] != 0;
+        if (!begun) binding_drop_held(b);
+    }
+    ready_mark(c, s->binding);
     return MOQR_OK;
 }
 
@@ -4118,6 +5673,75 @@ moqr_core_sub_track(moqr_core_t *c, moqr_sub_t sh, moqr_track_t *track,
     if (track_gen != NULL) {
         *track_gen = c->tracks[s->track].track_gen;
     }
+    return MOQR_OK;
+}
+
+moqr_result_t
+moqr_core_track_current_generation(const moqr_core_t *c, moqr_track_t th,
+                                   uint64_t *out_track_gen)
+{
+    if (c == NULL || out_track_gen == NULL) return MOQR_ERR_INVAL;
+    const r_track_t *t = track_resolve((moqr_core_t *)(void *)c, th, NULL);
+    if (t == NULL) return MOQR_ERR_STALE_HANDLE;
+    *out_track_gen = t->track_gen;
+    return MOQR_OK;
+}
+
+moqr_result_t
+moqr_core_track_metadata_managed(const moqr_core_t *c, moqr_track_t th,
+                                bool *out_managed)
+{
+    if (c == NULL || out_managed == NULL) return MOQR_ERR_INVAL;
+    const r_track_t *t = track_resolve((moqr_core_t *)(void *)c, th, NULL);
+    if (t == NULL) return MOQR_ERR_STALE_HANDLE;
+    *out_managed = t->metadata_managed;
+    return MOQR_OK;
+}
+
+moqr_result_t
+moqr_core_track_key(const moqr_core_t *c, moqr_track_t th, uint64_t track_gen,
+                    moq_bytes_t *parts, size_t parts_cap, moqr_ns_t *ns,
+                    moq_bytes_t *name)
+{
+    if (c == NULL || ns == NULL || name == NULL ||
+        (parts == NULL && parts_cap != 0)) {
+        return MOQR_ERR_INVAL;
+    }
+    uint32_t tslot = 0;
+    const r_track_t *t = track_resolve((moqr_core_t *)(void *)c, th, &tslot);
+    if (t == NULL || t->track_gen != track_gen) {
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    uint32_t count = key_part_count(&t->key);
+    if ((size_t)count > parts_cap) {
+        return MOQR_ERR_CAPACITY;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        parts[i] = key_part(&t->key, i);
+    }
+    ns->parts = parts;
+    ns->count = count;
+    *name = key_name(&t->key);
+    return MOQR_OK;
+}
+
+moqr_result_t
+moqr_core_track_largest(const moqr_core_t *c, moqr_track_t th,
+                        uint64_t track_gen, bool *has_largest,
+                        uint64_t *largest_group, uint64_t *largest_object)
+{
+    if (c == NULL || has_largest == NULL || largest_group == NULL ||
+        largest_object == NULL) {
+        return MOQR_ERR_INVAL;
+    }
+    uint32_t tslot = 0;
+    const r_track_t *t = track_resolve((moqr_core_t *)(void *)c, th, &tslot);
+    if (t == NULL || t->track_gen != track_gen) {
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    *has_largest = t->has_largest;
+    *largest_group = t->has_largest ? t->largest_group : 0;
+    *largest_object = t->has_largest ? t->largest_object : 0;
     return MOQR_OK;
 }
 
@@ -4225,6 +5849,7 @@ moqr_core_upstream_ok(moqr_core_t *c, moqr_track_t th, uint64_t track_gen,
 
     t->state = R_TRACK_ACTIVE;
     t->upstream_cookie = upstream_cookie;
+    discovery_mark_all(c);
     if (has_largest &&
         (!t->has_largest || lg > t->largest_group ||
          (lg == t->largest_group && lo > t->largest_object))) {
@@ -4249,8 +5874,14 @@ moqr_core_upstream_ok(moqr_core_t *c, moqr_track_t th, uint64_t track_gen,
         };
         s->state = R_SUB_ACTIVE;
         ready_mark(c, s->binding);
-        sub_resolve_filter(s, &f, t->has_largest, t->largest_group,
-                           t->largest_object);
+        if (s->has_location) {
+            sub_resolve_location(s, t->has_largest, t->largest_group,
+                                  t->largest_object);
+            sub_exclude_retained(s, t->log);
+        } else {
+            sub_resolve_filter(s, &f, t->has_largest, t->largest_group,
+                               t->largest_object);
+        }
         moqr_intent_t *it = intent_push(c, MOQR_INTENT_ACCEPT_SUB);
         it->binding_cookie = c->bindings[s->binding].cookie;
         it->cookie = s->cookie;
@@ -4389,6 +6020,75 @@ track_set_push_source(moqr_core_t *c, r_track_t *t, moqr_ns_t ns, uint32_t bslot
     }
 }
 
+/* A PUBLISH supplies the source held rendezvous subscriptions wait for
+ * (§7.6, §9.20.6): the track becomes an ACTIVE pushed track, the PUBLISH is
+ * accepted, and each held SUBSCRIBE proceeds normally -- accepted from the
+ * new source -- while that subscriber's track subscriptions are not also
+ * offered this PUBLISH. One intent per held subscription plus the accept,
+ * reserved first. */
+static bool rendezvous_timeout_owed(const moqr_core_t *c, uint32_t tslot);
+
+static moqr_result_t
+rendezvous_publish(moqr_core_t *c, uint32_t tslot, uint32_t bslot,
+                   r_binding_t *b, moqr_ns_t ns, uint64_t cookie,
+                   moqr_track_t *out)
+{
+    r_track_t *t = &c->tracks[tslot];
+    uint32_t held = track_sub_count(c, tslot);
+    if (!intent_space(c, held + 1u) || rendezvous_timeout_owed(c, tslot)) {
+        return MOQR_ERR_WOULD_BLOCK;
+    }
+    t->state = R_TRACK_ACTIVE;
+    t->source_kind = R_TRACK_SOURCE_PUSH;
+    t->metadata_managed = b->metadata_managed;
+    t->track_gen++;
+    t->has_upstream_binding = true;
+    t->up_binding = bslot;
+    t->up_binding_gen = b->gen;
+    track_set_push_source(c, t, ns, bslot, b->gen);
+    moqr_intent_t *acc = intent_push(c, MOQR_INTENT_ACCEPT_PUBLISH);
+    acc->binding_cookie = b->cookie;
+    acc->cookie = cookie;
+    acc->track = track_handle(c, tslot);
+    acc->track_gen = t->track_gen;
+    *out = acc->track;
+    for (uint32_t k = t->subs_head; k != R_SUB_NIL; k = c->subs[k].track_next) {
+        r_sub_t *s = &c->subs[k];
+        if ((s->gen & 1u) == 0 || s->state != R_SUB_PARKED) {
+            continue;
+        }
+        s->rendezvous = false;
+        s->state = R_SUB_ACTIVE;
+        ready_mark(c, s->binding);
+        if (s->has_location) {
+            sub_resolve_location(s, t->has_largest, t->largest_group,
+                                 t->largest_object);
+            sub_exclude_retained(s, t->log);
+        } else {
+            moqr_filter_t f = {
+                .type = s->filter_type,
+                .start_group = s->start_group,
+                .start_object = s->start_object,
+                .end_group_delta = s->end_group,
+            };
+            sub_resolve_filter(s, &f, t->has_largest, t->largest_group,
+                               t->largest_object);
+        }
+        discovery_suppress(c, s->binding, s->binding_gen, tslot);
+        moqr_intent_t *it = intent_push(c, MOQR_INTENT_ACCEPT_SUB);
+        it->binding_cookie = c->bindings[s->binding].cookie;
+        it->cookie = s->cookie;
+        it->sub = sub_handle(c, k);
+        it->has_largest = t->has_largest;
+        it->largest_group = t->largest_group;
+        it->largest_object = t->largest_object;
+    }
+    discovery_mark_all(c);
+    r_trace(c, MOQR_TRACE_UPSTREAM_RESOLVE, 2 /* rendezvous publish */, tslot,
+            t->track_gen, held, 0);
+    return MOQR_OK;
+}
+
 moqr_result_t
 moqr_core_publish_open(moqr_core_t *c, moqr_binding_t bh, moqr_ns_t ns,
                        moq_bytes_t name, uint64_t cookie, moqr_track_t *out)
@@ -4410,6 +6110,9 @@ moqr_core_publish_open(moqr_core_t *c, moqr_binding_t bh, moqr_ns_t ns,
     moqr_result_t rc;
     if (tslot != UINT32_MAX) {
         r_track_t *t = &c->tracks[tslot];
+        if (t->state == R_TRACK_RENDEZVOUS) {
+            return rendezvous_publish(c, tslot, bslot, b, ns, cookie, out);
+        }
         if (t->state != R_TRACK_WARM) {
             moqr_intent_t *it = intent_push(c, MOQR_INTENT_REJECT_PUBLISH);
             it->binding_cookie = b->cookie;
@@ -4486,6 +6189,7 @@ moqr_core_publish_open(moqr_core_t *c, moqr_binding_t bh, moqr_ns_t ns,
         }
         t->state = R_TRACK_ACTIVE;
         t->source_kind = R_TRACK_SOURCE_PUSH;
+        t->metadata_managed = b->metadata_managed;
         t->track_gen++;
         t->has_upstream_binding = true;
         t->up_binding = bslot;
@@ -4497,6 +6201,7 @@ moqr_core_publish_open(moqr_core_t *c, moqr_binding_t bh, moqr_ns_t ns,
         it->track = track_handle(c, tslot);
         it->track_gen = t->track_gen;
         *out = it->track;
+        discovery_mark_all(c);
         return MOQR_OK;
     }
     rc = track_create(c, ns, name, hash, &tslot);
@@ -4506,6 +6211,7 @@ moqr_core_publish_open(moqr_core_t *c, moqr_binding_t bh, moqr_ns_t ns,
     r_track_t *t = &c->tracks[tslot];
     t->state = R_TRACK_ACTIVE;
     t->source_kind = R_TRACK_SOURCE_PUSH;
+    t->metadata_managed = b->metadata_managed;
     t->track_gen = 1;
     t->has_upstream_binding = true;
     t->up_binding = bslot;
@@ -4517,7 +6223,20 @@ moqr_core_publish_open(moqr_core_t *c, moqr_binding_t bh, moqr_ns_t ns,
     it->track = track_handle(c, tslot);
     it->track_gen = t->track_gen;
     *out = it->track;
+    discovery_mark_all(c);
     return MOQR_OK;
+}
+
+/* Raise the track's Largest Object to (g, o) if that is past it. */
+static void
+track_note_largest(r_track_t *t, uint64_t g, uint64_t o)
+{
+    if (!t->has_largest || g > t->largest_group ||
+        (g == t->largest_group && o > t->largest_object)) {
+        t->has_largest = true;
+        t->largest_group = g;
+        t->largest_object = o;
+    }
 }
 
 moqr_result_t
@@ -4535,13 +6254,15 @@ moqr_core_ingest(moqr_core_t *c, moqr_track_t th,
     if (t->state != R_TRACK_ACTIVE) {
         return MOQR_ERR_WRONG_STATE;
     }
-    /* OPEN begins an incrementally-filled record (chunk-through): the object is
-     * not yet complete, so it does NOT advance the track's largest -- that waits
-     * for moqr_core_complete_record. Whole-object COMPLETE appends advance it as
-     * before. */
+    /* OPEN begins an incrementally-filled record (chunk-through). The Largest
+     * Object advances when the first byte of an Object past it arrives
+     * (draft-22 3.1.4), so an Object still arriving can be the Largest; what
+     * is served up to the Largest waits for it to complete (fetch peek). */
     if (desc->obj_state == MOQR_OBJ_OPEN) {
         moqr_result_t orc = moqr_log_open_record(t->log, desc);
         if (orc == MOQR_OK) {
+            track_note_largest(t, desc->group_id, desc->object_id);
+            track_location_ingest(c, t, desc);
             ready_mark_track(c, tslot);   /* a live-edge head is selectable */
         }
         return orc;
@@ -4550,13 +6271,8 @@ moqr_core_ingest(moqr_core_t *c, moqr_track_t th,
     if (rc != MOQR_OK) {
         return rc;
     }
-    if (!t->has_largest || desc->group_id > t->largest_group ||
-        (desc->group_id == t->largest_group &&
-         desc->object_id > t->largest_object)) {
-        t->has_largest = true;
-        t->largest_group = desc->group_id;
-        t->largest_object = desc->object_id;
-    }
+    track_note_largest(t, desc->group_id, desc->object_id);
+    track_location_ingest(c, t, desc);
     c->ingested_total++;
     ready_mark_track(c, tslot);
     return MOQR_OK;
@@ -4609,14 +6325,9 @@ moqr_core_complete_record(moqr_core_t *c, moqr_track_t th, uint64_t group_id,
     if (rc != MOQR_OK) {
         return rc;
     }
-    /* Now a delivered/fetchable object: advance the track largest (deferred from
-     * open). */
-    if (!t->has_largest || group_id > t->largest_group ||
-        (group_id == t->largest_group && object_id > t->largest_object)) {
-        t->has_largest = true;
-        t->largest_group = group_id;
-        t->largest_object = object_id;
-    }
+    /* Now a delivered/fetchable object. The Largest already counts it from its
+     * open; noting it again never lowers it. */
+    track_note_largest(t, group_id, object_id);
     c->ingested_total++;
     ready_mark_track(c, tslot);
     return MOQR_OK;
@@ -4709,6 +6420,106 @@ moqr_core_reset_subgroup(moqr_core_t *c, moqr_track_t th, uint64_t group_id,
 }
 
 moqr_result_t
+moqr_core_internal_note_gap(moqr_core_t *c, moqr_track_t th, uint64_t group_id,
+                   uint64_t subgroup_id)
+{
+    if (c == NULL) {
+        return MOQR_ERR_INVAL;
+    }
+    uint32_t tslot = 0;
+    r_track_t *t = track_resolve(c, th, &tslot);
+    if (t == NULL) {
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    return moqr_log_note_gap(t->log, group_id, subgroup_id);
+}
+
+uint32_t
+moqr_core_internal_duplicate(moqr_core_t *c, moqr_track_t th,
+                    const moqr_log_append_desc_t *desc)
+{
+    if (c == NULL || desc == NULL) {
+        return MOQR_LOG_DUP_NONE;
+    }
+    uint32_t tslot = 0;
+    r_track_t *t = track_resolve(c, th, &tslot);
+    if (t == NULL) {
+        return MOQR_LOG_DUP_NONE;
+    }
+    return moqr_log_duplicate(t->log, desc);
+}
+
+uint32_t
+moqr_core_internal_duplicate_range(moqr_core_t *c, moqr_track_t th,
+                                   uint64_t group_id, uint64_t subgroup_id,
+                                   uint64_t object_id, uint64_t offset,
+                                   const uint8_t *data, size_t len)
+{
+    if (c == NULL || (data == NULL && len > 0)) {
+        return MOQR_LOG_RANGE_UNKNOWN;
+    }
+    uint32_t tslot = 0;
+    r_track_t *t = track_resolve(c, th, &tslot);
+    if (t == NULL) {
+        return MOQR_LOG_RANGE_UNKNOWN;
+    }
+    return moqr_log_duplicate_range(t->log, group_id, subgroup_id, object_id,
+                                    offset, data, len);
+}
+
+moqr_result_t
+moqr_core_internal_set_opener(moqr_core_t *c, moqr_track_t th, uint64_t group_id,
+                              uint64_t subgroup_id, uint64_t object_id,
+                              uint32_t conn, uint64_t src)
+{
+    if (c == NULL) {
+        return MOQR_ERR_INVAL;
+    }
+    uint32_t tslot = 0;
+    r_track_t *t = track_resolve(c, th, &tslot);
+    if (t == NULL) {
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    return moqr_log_set_opener(t->log, group_id, subgroup_id, object_id, conn, src);
+}
+
+bool
+moqr_core_internal_open_by_other(moqr_core_t *c, moqr_track_t th, uint64_t group_id,
+                                 uint64_t subgroup_id, uint64_t object_id,
+                                 uint32_t conn, uint64_t src)
+{
+    if (c == NULL) {
+        return false;
+    }
+    uint32_t tslot = 0;
+    r_track_t *t = track_resolve(c, th, &tslot);
+    if (t == NULL) {
+        return false;
+    }
+    return moqr_log_open_by_other(t->log, group_id, subgroup_id, object_id, conn, src);
+}
+
+moqr_result_t
+moqr_core_internal_set_max_cache_duration(moqr_core_t *c, moqr_track_t th,
+                                 bool has_duration, uint64_t duration_ms)
+{
+    if (c == NULL) {
+        return MOQR_ERR_INVAL;
+    }
+    uint32_t tslot = 0;
+    r_track_t *t = track_resolve(c, th, &tslot);
+    if (t == NULL) {
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    t->has_max_cache = has_duration;
+    t->max_cache_us = !has_duration ? 0
+                      : duration_ms > UINT64_MAX / 1000u ? UINT64_MAX
+                                                          : duration_ms * 1000u;
+    ready_mark_track(c, tslot);   /* an expiry may change what is deliverable */
+    return MOQR_OK;
+}
+
+moqr_result_t
 moqr_core_note_track_evicted_below(moqr_core_t *c, moqr_track_t th,
                                    uint64_t oldest_retained)
 {
@@ -4775,7 +6586,7 @@ moqr_core_track_status(moqr_core_t *c, moqr_binding_t bh, moqr_ns_t ns,
         return MOQR_OK;
     }
     r_track_t *t = &c->tracks[tslot];
-    if (t->state == R_TRACK_PENDING) {
+    if (t->state == R_TRACK_PENDING || t->state == R_TRACK_RENDEZVOUS) {
         /* No established knowledge yet; answering OK would fabricate
          * status (forwarding the request upstream is future work). */
         moqr_intent_t *it = intent_push(c, MOQR_INTENT_TRACK_STATUS_ERROR);
@@ -4787,6 +6598,10 @@ moqr_core_track_status(moqr_core_t *c, moqr_binding_t bh, moqr_ns_t ns,
     moqr_intent_t *it = intent_push(c, MOQR_INTENT_TRACK_STATUS_OK);
     it->binding_cookie = b->cookie;
     it->cookie = cookie;
+    /* The answer states the track's properties: the binding resolves them
+     * from this identity. */
+    it->track = track_handle(c, tslot);
+    it->track_gen = t->track_gen;
     it->has_largest = t->has_largest;
     it->largest_group = t->largest_group;
     it->largest_object = t->largest_object;
@@ -4929,6 +6744,132 @@ grant_tick(moqr_core_t *c, uint64_t now_us)
 
 /* -- tick ------------------------------------------------------------------------------------------------ */
 
+/* Every held rendezvous whose deadline has passed at `now_us` ends with
+ * TIMEOUT (§9.20.6) -- before any source that arrives at that time could
+ * resume it. A TIMEOUT the intent ring cannot take now stays owed
+ * (rendezvous_expired) and is retried here. */
+static void
+rendezvous_expire(moqr_core_t *c, uint64_t now_us)
+{
+    for (uint32_t k = 0; k < c->max_subs; k++) {
+        r_sub_t *sub = &c->subs[k];
+        if ((sub->gen & 1u) == 0 || !sub->rendezvous ||
+            (now_us < sub->rendezvous_deadline_us && !sub->rendezvous_expired)) {
+            continue;
+        }
+        if (!intent_space(c, 1)) {
+            sub->rendezvous_expired = true;
+            continue;
+        }
+        moqr_intent_t *it = intent_push(c, MOQR_INTENT_REJECT_SUB);
+        it->binding_cookie = c->bindings[sub->binding].cookie;
+        it->cookie = sub->cookie;
+        it->error_code = R_ERR_TIMEOUT;
+        sub_retire(c, k, now_us);
+    }
+}
+
+/* A held subscription of `tslot` whose TIMEOUT is still owed: the track
+ * waits for it before a source may resume the others. */
+static bool
+rendezvous_timeout_owed(const moqr_core_t *c, uint32_t tslot)
+{
+    const r_track_t *t = &c->tracks[tslot];
+    for (uint32_t k = t->subs_head; k != R_SUB_NIL; k = c->subs[k].track_next) {
+        if ((c->subs[k].gen & 1u) != 0 && c->subs[k].rendezvous_expired) {
+            return true;
+        }
+    }
+    return false;
+}
+
+moqr_result_t
+moqr_core_internal_rendezvous_expire(moqr_core_t *c, uint64_t now_us)
+{
+    if (c == NULL) {
+        return MOQR_ERR_INVAL;
+    }
+    rendezvous_expire(c, now_us);
+    return MOQR_OK;
+}
+
+/* Held rendezvous subscriptions (§9.20.6), one track at a time, each unit
+ * reserving its own intents so a short ring only delays the rest:
+ *  - a track whose namespace now has an announced publisher resumes ordinary
+ *    admission (one UPSTREAM_SUBSCRIBE; the subscriptions stay parked and are
+ *    answered by the upstream's outcome, never early);
+ *  - otherwise each subscription whose deadline has passed is refused with
+ *    TIMEOUT and retired;
+ *  - a track left with no subscription is freed. */
+static void
+rendezvous_sweep(moqr_core_t *c, uint64_t now_us)
+{
+    rendezvous_expire(c, now_us);
+    for (uint32_t i = 0; i < c->max_tracks; i++) {
+        r_track_t *t = &c->tracks[i];
+        if ((t->gen & 1u) == 0 || t->state != R_TRACK_RENDEZVOUS) {
+            continue;
+        }
+        if (track_sub_count(c, i) == 0) {
+            track_free_slot(c, i);
+            continue;
+        }
+        if (rendezvous_timeout_owed(c, i)) {
+            continue;   /* its TIMEOUTs go first */
+        }
+        moq_bytes_t parts[32];
+        uint32_t count = key_part_count(&t->key);
+        for (uint32_t p = 0; p < count && p < 32; p++) {
+            parts[p] = key_part(&t->key, p);
+        }
+        moqr_ns_t ns = { .parts = parts, .count = count < 32 ? count : 32 };
+        uint32_t pub_node = trie_longest_announce(c, ns);
+        if (pub_node != UINT32_MAX) {
+            if (!intent_space(c, 1)) {
+                continue;   /* next tick; the deadline does not move */
+            }
+            t->state = R_TRACK_PENDING;
+            t->source_kind = R_TRACK_SOURCE_PULL;
+            t->track_gen++;
+            t->has_upstream_binding = true;
+            t->up_binding = c->nodes[pub_node].ann_binding;
+            t->up_binding_gen = c->nodes[pub_node].ann_binding_gen;
+            t->src_ann_node = pub_node;
+            t->src_ann_binding = c->nodes[pub_node].ann_binding;
+            t->src_ann_binding_gen = c->nodes[pub_node].ann_binding_gen;
+            t->metadata_managed = c->bindings[t->up_binding].metadata_managed;
+            for (uint32_t k = t->subs_head; k != R_SUB_NIL;
+                 k = c->subs[k].track_next) {
+                c->subs[k].rendezvous = false;
+            }
+            moqr_intent_t *up = intent_push(c, MOQR_INTENT_UPSTREAM_SUBSCRIBE);
+            up->binding_cookie = c->bindings[t->up_binding].cookie;
+            up->track = track_handle(c, i);
+            up->track_gen = t->track_gen;
+            intent_set_ns_from_key(up, &t->key);
+            r_trace(c, MOQR_TRACE_UPSTREAM_SUBSCRIBE, 3 /* rendezvous */, i,
+                    t->track_gen, t->up_binding, 0);
+            continue;
+        }
+        for (uint32_t k = t->subs_head; k != R_SUB_NIL;) {
+            uint32_t next = c->subs[k].track_next;
+            r_sub_t *sub = &c->subs[k];
+            if ((sub->gen & 1u) != 0 && sub->rendezvous &&
+                now_us >= sub->rendezvous_deadline_us && intent_space(c, 1)) {
+                moqr_intent_t *it = intent_push(c, MOQR_INTENT_REJECT_SUB);
+                it->binding_cookie = c->bindings[sub->binding].cookie;
+                it->cookie = sub->cookie;
+                it->error_code = R_ERR_TIMEOUT;
+                sub_retire(c, k, now_us);
+            }
+            k = next;
+        }
+        if (track_sub_count(c, i) == 0) {
+            track_free_slot(c, i);
+        }
+    }
+}
+
 moqr_result_t
 moqr_core_tick(moqr_core_t *c, uint64_t now_us)
 {
@@ -4936,6 +6877,7 @@ moqr_core_tick(moqr_core_t *c, uint64_t now_us)
         return MOQR_ERR_INVAL;
     }
     grant_tick(c, now_us);
+    rendezvous_sweep(c, now_us);
     for (uint32_t i = 0; i < c->max_tracks; i++) {
         r_track_t *t = &c->tracks[i];
         if ((t->gen & 1u) == 0) {
@@ -5013,6 +6955,14 @@ moqr_core_next_deadline_us(const moqr_core_t *c)
         return UINT64_MAX;
     }
     uint64_t dl = UINT64_MAX;
+    /* A held rendezvous subscription is answered TIMEOUT at its deadline. */
+    for (uint32_t i = 0; i < c->max_subs; i++) {
+        const r_sub_t *s = &c->subs[i];
+        if ((s->gen & 1u) != 0 && s->rendezvous &&
+            s->rendezvous_deadline_us < dl) {
+            dl = s->rendezvous_deadline_us;
+        }
+    }
     for (uint32_t i = 0; i < c->max_tracks; i++) {
         const r_track_t *t = &c->tracks[i];
         if ((t->gen & 1u) == 0) {
@@ -5051,8 +7001,12 @@ rec_passes(const r_sub_t *s, const moqr_record_view_t *v)
      * scheduling path AROUND this helper (sub_best_candidate selects an OPEN head
      * with new chunks and surfaces a begun ABANDONED head for reset, which
      * carries the terminal reset code forwarded downstream). */
-    if (v->obj_state != MOQR_OBJ_COMPLETE) {
+    if (v->obj_state != MOQR_OBJ_COMPLETE || s->location_empty) {
         return false;
+    }
+    if (s->excluded != NULL) {
+        return sub_location_passes(s, v->group_id, v->object_id) &&
+               !sub_excluded(s, v->arrival_seq);
     }
     if (v->group_id < s->start_group ||
         (v->group_id == s->start_group && v->object_id < s->start_object)) {
@@ -5078,6 +7032,11 @@ typedef struct r_cand {
     uint32_t           emitted;   /* this sub's live-edge watermark for the
                                    * list: the batch (and pin) base        */
     moqr_record_view_t view;
+    bool               subgroup_properties;  /* upstream header PROPERTIES */
+    moqr_reset_desc_t  gap_reset;            /* owed to the stream it does not
+                                              * continue: an upstream RESET  */
+    bool               follows_gap;          /* not the next object of the
+                                              * stream its list continues  */
 } r_cand_t;
 
 /* Spec §7.1.1 within one subscription: publisher priority, then group
@@ -5129,10 +7088,20 @@ typedef struct r_seal_note {
  * the scan already reads every list head, so late-FIN detection costs one
  * acked-bit test on drained lists and a sealed lookup only when that bit is
  * clear. */
+/* The Object a record holds may no longer start downstream: the source's
+ * MAX_CACHE_DURATION has passed since it arrived (draft-22 §10.3). */
+static bool
+track_rec_expired(const r_track_t *t, const moqr_record_view_t *v,
+                  uint64_t now_us)
+{
+    return t->has_max_cache && now_us >= v->arrival_us &&
+           now_us - v->arrival_us >= t->max_cache_us;
+}
+
 static bool
 sub_best_candidate(moqr_core_t *c, r_sub_t *s, const moqr_log_t *log,
                    r_cand_t *out, bool *out_range_done,
-                   r_seal_note_t *out_seal)
+                   r_seal_note_t *out_seal, uint64_t now_us)
 {
     uint32_t gn = moqr_log_group_count(log);
     *out_range_done = false;
@@ -5146,10 +7115,11 @@ sub_best_candidate(moqr_core_t *c, r_sub_t *s, const moqr_log_t *log,
 
     for (uint32_t gi = 0; gi < gn; gi++) {
         uint64_t g = moqr_log_group_id_at(log, gi);
-        if (g < s->start_group) {
+        if (s->excluded == NULL && !s->location_empty && g < s->start_group) {
             continue;
         }
-        if (s->has_end && g > s->end_group) {
+        if (s->excluded == NULL && !s->location_empty && s->has_end &&
+            g > s->end_group) {
             break;   /* ids ascend; nothing further can be in range */
         }
         any_in_range = true;
@@ -5193,22 +7163,57 @@ sub_best_candidate(moqr_core_t *c, r_sub_t *s, const moqr_log_t *log,
                              * acknowledgement; the flavor only decides how
                              * the bind closes downstream. */
                             out_seal->reset_desc = moqr_reset_desc_none();
-                            out_seal->reset = moqr_log_subgroup_reset(
-                                log, g, slot, &out_seal->reset_desc);
+                            /* After a lifetime boundary passed over, the
+                             * stream this terminal closes is the one this
+                             * sub last had open: it ends as that lifetime
+                             * ended, not as the list's latest one did. */
+                            moqr_reset_desc_t owed;
+                            if (gpos_owed_cause(s, e, log, g, list_ref, pos_slot, &owed)) {
+                                out_seal->reset_desc = owed;
+                                out_seal->reset = owed.tag != MOQR_CODE_NONE;
+                            } else {
+                                out_seal->reset = moqr_log_subgroup_reset(
+                                    log, g, slot, &out_seal->reset_desc);
+                            }
+                            /* This sub skipped an object it never began
+                             * after the last one it delivered -- expired, or
+                             * omitted for a paused subscription whose source
+                             * finished: its stream misses that object, so
+                             * whatever the upstream terminal, it is reset,
+                             * never FINed (draft-22 §10.3, §11.3.2). The
+                             * omission is the subscription ending early
+                             * (CANCELLED); an expiry is this relay falling
+                             * behind. */
+                            if (!out_seal->reset &&
+                                gpos_gap_get(s, e, pos_slot) &&
+                                ((s->src_done && !s->forward)
+                                     ? moqr_reset_desc_local(
+                                           MOQR_RESET_CANCELLED,
+                                           &out_seal->reset_desc)
+                                     : moqr_reset_desc_internal(
+                                           MOQR_RESET_CODE_EVICTED,
+                                           &out_seal->reset_desc)) == MOQR_OK) {
+                                out_seal->reset = true;
+                            }
                         }
                     }
                     break;
                 }
-                /* Below the sub's start filter: skip permanently (any state). */
-                if (v.group_id < s->start_group ||
-                    (v.group_id == s->start_group &&
-                     v.object_id < s->start_object)) {
+                uint32_t emit_raw = gpos_emit(s, e)[pos_slot];
+                uint32_t emitted = emit_raw & GPOS_EMIT_MASK;
+                bool begun = emit_raw != 0;
+                /* A begun object must still finish/reset after a window change.
+                 * Excluded unbegun records advance only their actual cursor. */
+                bool excluded = s->excluded != NULL
+                    ? sub_excluded(s, v.arrival_seq) ||
+                      !sub_location_passes(s, v.group_id, v.object_id)
+                    : s->location_empty || v.group_id < s->start_group ||
+                      (v.group_id == s->start_group && v.object_id < s->start_object);
+                if (excluded && !begun) {
+                    if (!dg) gpos_pass_over(s, e, log, g, list_ref, pos_slot);
                     e->idx[pos_slot]++;
                     continue;
                 }
-                uint32_t emit_raw = gpos_emit(s, e)[pos_slot];
-                uint32_t emitted = emit_raw & GPOS_EMIT_MASK;   /* chunk count */
-                bool begun = emit_raw != 0;   /* header shipped downstream */
                 /* Live edge: an OPEN head (the last record in this
                  * list) is selectable only while it has grown past what this sub
                  * already scheduled downstream. Once drained, HOLD the cursor (no
@@ -5229,6 +7234,40 @@ sub_best_candidate(moqr_core_t *c, r_sub_t *s, const moqr_log_t *log,
                  * downstream subgroup. `begun` is tracked separately from the
                  * chunk count precisely so a begin-with-zero-chunks still resets. */
                 if (v.obj_state == MOQR_OBJ_ABANDONED && !begun) {
+                    if (!dg) gpos_pass_over(s, e, log, g, list_ref, pos_slot);
+                    e->idx[pos_slot]++;
+                    continue;
+                }
+                /* An expired Object is not started (§10.3). Within a subgroup
+                 * that leaves a hole: the sub's next record of the list must
+                 * not continue the stream (§7.4, §11.3.2). */
+                if (!begun && track_rec_expired(&c->tracks[s->track], &v, now_us)) {
+                    if (!dg) {
+                        /* The missing object is a hole in the lifetime it
+                         * belongs to: in the one whose downstream stream this
+                         * sub has open only while no boundary has been passed
+                         * over, otherwise in a later lifetime it never opened
+                         * downstream, whose terminal is not this stream's. */
+                        bool later = gpos_renew_get(s, e, pos_slot);
+                        if (gpos_pass_over(s, e, log, g, list_ref, pos_slot)) later = true;
+                        if (!later) gpos_gap_set(s, e, pos_slot, true);
+                    }
+                    e->idx[pos_slot]++;
+                    continue;
+                }
+                /* A paused subscription (Forward=0) whose source finished
+                 * asked for nothing more: an Object it never began is never
+                 * sent. Like an expired one it leaves a hole, so the stream
+                 * the sub has open for the list ends with a reset, never a FIN
+                 * (draft-18 section 11.4.3, draft-22 section 11.3.2: omitting
+                 * a Subgroup Object for the Forward State), delivered as the
+                 * list's seal before the subscription's terminal. */
+                if (!begun && s->src_done && !s->forward) {
+                    if (!dg) {
+                        bool later = gpos_renew_get(s, e, pos_slot);
+                        if (gpos_pass_over(s, e, log, g, list_ref, pos_slot)) later = true;
+                        if (!later) gpos_gap_set(s, e, pos_slot, true);
+                    }
                     e->idx[pos_slot]++;
                     continue;
                 }
@@ -5238,6 +7277,20 @@ sub_best_candidate(moqr_core_t *c, r_sub_t *s, const moqr_log_t *log,
                                   .list = pos_slot,
                                   .emitted = emitted,
                                   .view = v };
+                moqr_log_internal_rec_flags(log, g, list_ref, e->idx[pos_slot],
+                                            &cand.subgroup_properties,
+                                            &cand.follows_gap, &cand.gap_reset);
+                if (!dg && (gpos_gap_get(s, e, pos_slot) ||
+                            gpos_renew_get(s, e, pos_slot)))
+                    cand.follows_gap = true;
+                /* After a boundary passed over outside the window, the
+                 * stream this record does not continue is the one this sub
+                 * last had open, and it ends as its upstream lifetime ended:
+                 * the cause the first such boundary carries, not that of any
+                 * later lifetime it never opened. */
+                if (!dg)
+                    (void)gpos_owed_cause(s, e, log, g, list_ref, pos_slot,
+                                          &cand.gap_reset);
                 if (cand_better(s, &cand, &best)) {
                     best = cand;
                 }
@@ -5253,9 +7306,16 @@ sub_best_candidate(moqr_core_t *c, r_sub_t *s, const moqr_log_t *log,
      * in-range record remains deliverable — but NOT while an in-range OPEN head
      * is still pending (it must complete or be reset/abandoned first, else a
      * begun downstream object would be left without a terminal). */
-    if (s->has_end && !blocked_open && gn > 0 &&
-        moqr_log_group_id_at(log, gn - 1) > s->end_group) {
-        *out_range_done = true;   /* live edge passed the range end */
+    if (s->has_end && !blocked_open) {
+        const r_track_t *t = &c->tracks[s->track];
+        if (s->excluded != NULL) {
+            *out_range_done = t->has_largest &&
+                (t->largest_group > s->end_group ||
+                 (t->largest_group == s->end_group &&
+                  t->largest_object > s->end_object));
+        } else if (gn > 0 && moqr_log_group_id_at(log, gn - 1) > s->end_group) {
+            *out_range_done = true;
+        }
     }
     (void)any_in_range;
     return false;
@@ -5273,7 +7333,7 @@ sub_evicted_begun_group(r_sub_t *s, const moqr_log_t *log, uint64_t *out_group)
     }
     for (uint32_t i = 0; i < s->gpos_groups; i++) {
         r_gpos_t *e = gpos_at(s, i);
-        if (e->group_id == UINT64_MAX) {
+        if (!e->occupied) {
             continue;
         }
         bool begun = false;
@@ -5520,6 +7580,22 @@ moqr_core_next_delivery(moqr_core_t *c, moqr_binding_t bh, uint64_t now_us,
             i = next;
             continue;
         }
+        if (s->src_abort) {
+            /* Its source failed: nothing more is delivered, the terminal goes
+             * out as soon as the ring has room. */
+            if (!intent_space(c, 1)) {
+                ready_mark(c, bslot);   /* retire on a later scan */
+            } else {
+                moqr_intent_t *it = intent_push(c, MOQR_INTENT_SUB_DONE);
+                it->binding_cookie = b->cookie;
+                it->cookie = s->cookie;
+                it->sub = sub_handle(c, i);
+                it->pd = s->src_done_pd;
+                sub_retire(c, i, now_us);
+            }
+            i = next;
+            continue;
+        }
         if (s->pending_skip) {
             if (NTC_BETTER(c, i, ntc_sub)) {
                 ntc_sub = i;
@@ -5532,22 +7608,8 @@ moqr_core_next_delivery(moqr_core_t *c, moqr_binding_t bh, uint64_t now_us,
         bool range_done = false;
         r_seal_note_t seal;
         memset(&seal, 0, sizeof(seal));
-        if (!sub_best_candidate(c, s, t->log, &cand, &range_done, &seal)) {
-            if (range_done && s->forward && intent_space(c, 1)) {
-                /* Range-completion retirement is a delivery outcome, not stream
-                 * maintenance — hold it while paused (Forward=0); resume re-runs
-                 * the scan and retires then. The wire status is PUBLISH_DONE
-                 * SUBSCRIPTION_ENDED: the filter range is exhausted. */
-                moqr_intent_t *it = intent_push(c, MOQR_INTENT_SUB_DONE);
-                it->binding_cookie = b->cookie;
-                it->cookie = s->cookie;
-                it->sub = sub_handle(c, i);
-                it->error_code = R_DONE_SUB_ENDED;
-                it->pd = core_local_done(MOQR_PD_SUBSCRIPTION_ENDED);
-                sub_retire(c, i, now_us);
-                i = next;
-                continue;   /* retired: its SUB_DONE supersedes any notice */
-            }
+        if (!sub_best_candidate(c, s, t->log, &cand, &range_done, &seal,
+                                now_us)) {
             if (s->pending_skip) {
                 /* Fresh jump found by the scan's gpos_gc: EVICT_WATERMARK
                  * precedes any SEAL for the same sub. */
@@ -5555,10 +7617,52 @@ moqr_core_next_delivery(moqr_core_t *c, moqr_binding_t bh, uint64_t now_us,
                     ntc_sub = i;
                     ntc_kind = MOQR_DELIVERY_NOTICE_EVICT_WATERMARK;
                 }
-            } else if (seal.have && NTC_BETTER(c, i, ntc_sub)) {
-                ntc_sub = i;
-                ntc_kind = MOQR_DELIVERY_NOTICE_SEAL;
-                ntc_seal = seal;
+            } else if (seal.have) {
+                /* An owed seal holds this sub open whether or not it wins
+                 * this pass: its close (a FIN or the upstream reset) must
+                 * reach the subscriber before any terminal retires it. */
+                if (NTC_BETTER(c, i, ntc_sub)) {
+                    ntc_sub = i;
+                    ntc_kind = MOQR_DELIVERY_NOTICE_SEAL;
+                    ntc_seal = seal;
+                }
+            } else if (range_done && !s->range_end_holds && s->forward) {
+                /* Range-completion retirement is a delivery outcome, not stream
+                 * maintenance — hold it while paused (Forward=0); resume re-runs
+                 * the scan and retires then. Like every terminal it waits
+                 * behind the notices still owed above, so a stream of the
+                 * range is closed as its upstream ended (a reset stays a
+                 * reset) before the subscription ends. The wire status is
+                 * PUBLISH_DONE SUBSCRIPTION_ENDED: the filter range is
+                 * exhausted, whether or not the source has also finished. A
+                 * sub whose range end holds is never retired here: it stays
+                 * established with nothing left to schedule, and only the
+                 * subscriber or the track's end (below) finishes it. */
+                if (!intent_space(c, 1)) {
+                    ready_mark(c, bslot);   /* retire on a later scan */
+                } else {
+                    moqr_intent_t *it = intent_push(c, MOQR_INTENT_SUB_DONE);
+                    it->binding_cookie = b->cookie;
+                    it->cookie = s->cookie;
+                    it->sub = sub_handle(c, i);
+                    it->error_code = R_DONE_SUB_ENDED;
+                    it->pd = core_local_done(MOQR_PD_SUBSCRIPTION_ENDED);
+                    sub_retire(c, i, now_us);
+                }
+            } else if (s->src_done) {
+                /* The source finished and everything admitted for this sub
+                 * -- records, seals, skips -- has gone out: send the
+                 * forwarded terminal, after the data it closes. */
+                if (!intent_space(c, 1)) {
+                    ready_mark(c, bslot);   /* retire on a later scan */
+                } else {
+                    moqr_intent_t *it = intent_push(c, MOQR_INTENT_SUB_DONE);
+                    it->binding_cookie = b->cookie;
+                    it->cookie = s->cookie;
+                    it->sub = sub_handle(c, i);
+                    it->pd = s->src_done_pd;
+                    sub_retire(c, i, now_us);
+                }
             } else if (s->forward && sub_eot_complete(c, s, t->log) &&
                        intent_space(c, 1)) {
                 /* The track ENDED and every in-range position is delivered
@@ -5610,7 +7714,21 @@ moqr_core_next_delivery(moqr_core_t *c, moqr_binding_t bh, uint64_t now_us,
              * already dropped never-begun abandons), which is stream
              * maintenance too — it stays eligible while paused. Siblings are
              * unaffected; resume re-arms and re-derives the record from the
-             * unadvanced cursor. */
+             * unadvanced cursor. Once its source has finished, a paused sub
+             * asked for nothing more: with its maintenance notices done (they
+             * were taken above), it retires instead of holding the drain. */
+            if (s->src_done) {
+                if (!intent_space(c, 1)) {
+                    ready_mark(c, bslot);   /* retire on a later scan */
+                } else {
+                    moqr_intent_t *it = intent_push(c, MOQR_INTENT_SUB_DONE);
+                    it->binding_cookie = b->cookie;
+                    it->cookie = s->cookie;
+                    it->sub = sub_handle(c, i);
+                    it->pd = s->src_done_pd;
+                    sub_retire(c, i, now_us);
+                }
+            }
             i = next;
             continue;
         }
@@ -5739,6 +7857,9 @@ moqr_core_next_delivery(moqr_core_t *c, moqr_binding_t bh, uint64_t now_us,
                                                  best.view.properties);
     }
     b->out_active = true;
+    b->out_subgroup_properties = best.subgroup_properties;
+    b->out_follows_gap = best.follows_gap;
+    b->out_gap_reset = best.gap_reset;
     out->sub = sub_handle(c, best_slot);
     out->sub_cookie = ws->cookie;
     out->rec = best.view;
@@ -5770,6 +7891,31 @@ moqr_core_next_delivery(moqr_core_t *c, moqr_binding_t bh, uint64_t now_us,
          * head replays so the bind can retry a WOULD_BLOCKed reset. */
         b->out_view = *out;
     }
+    return MOQR_OK;
+}
+
+moqr_result_t
+moqr_core_internal_delivery_flags(const moqr_core_t *c, moqr_binding_t bh,
+                                  bool *subgroup_properties, bool *follows_gap,
+                                  moqr_reset_desc_t *gap_reset)
+{
+    if (c == NULL || subgroup_properties == NULL || follows_gap == NULL ||
+        gap_reset == NULL) {
+        return MOQR_ERR_INVAL;
+    }
+    *subgroup_properties = false;
+    *follows_gap = false;
+    *gap_reset = moqr_reset_desc_none();
+    r_binding_t *b = binding_resolve((moqr_core_t *)(uintptr_t)c, bh, NULL);
+    if (b == NULL) {
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    if (!b->out_active || b->out_notice != MOQR_DELIVERY_NOTICE_NONE) {
+        return MOQR_ERR_WRONG_STATE;
+    }
+    *subgroup_properties = b->out_subgroup_properties;
+    *follows_gap = b->out_follows_gap;
+    *gap_reset = b->out_gap_reset;
     return MOQR_OK;
 }
 
@@ -5861,6 +8007,9 @@ moqr_core_delivery_done(moqr_core_t *c, moqr_binding_t bh,
             if (notice == MOQR_DELIVERY_NOTICE_SEAL) {
                 if (pe != NULL) {
                     gpos_seal_ack(s, pe, b->out_list);
+                    /* The owed lifetime's terminal is delivered. */
+                    gpos_renew_set(s, pe, b->out_list, false);
+                    gpos_owed(s, pe)[b->out_list] = 0;
                 }
                 r_trace(c, MOQR_TRACE_DELIVERY, 1, bslot, b->out_sub,
                         b->out_group, 0);
@@ -5882,6 +8031,15 @@ moqr_core_delivery_done(moqr_core_t *c, moqr_binding_t bh,
             }
             pe->idx[b->out_list]++;                /* advance to next record  */
             gpos_emit(s, pe)[b->out_list] = 0;     /* reset live-edge cursor  */
+            gpos_gap_set(s, pe, b->out_list, false);
+            gpos_renew_set(s, pe, b->out_list, false);
+            gpos_owed(s, pe)[b->out_list] = 0;
+            /* A record that does not continue the earlier stream opens a new
+             * downstream stream, which owes its own terminal: a seal this sub
+             * acknowledged belonged to the stream before it. */
+            if (b->out_follows_gap && b->out_list < s->gpos_lists - 1) {
+                gpos_acked(s, pe)[b->out_list / 32u] &= ~(1u << (b->out_list % 32u));
+            }
         }
         c->delivered_total++;
         r_trace(c, MOQR_TRACE_DELIVERY, 0, bslot, b->out_sub, b->out_group, 0);
@@ -5914,7 +8072,7 @@ moqr_core_delivery_done(moqr_core_t *c, moqr_binding_t bh,
                         sub_begun_sub(c, s);   /* clearing this begun position */
                     }
                 }
-                pe->group_id = UINT64_MAX;
+                pe->occupied = false;
                 gpos_body_clear(s, pe);
                 s->pending_skip = true;
                 ready_mark(c, s->binding);   /* the skip must be reported */
@@ -6013,14 +8171,34 @@ moqr_fetch_eq(moqr_fetch_t a, moqr_fetch_t b)
     return a._opaque == b._opaque;
 }
 
+/* The sizeof of the layout through `cookie`: what a caller built before
+ * report_gaps was appended allocates and passes. */
+#define MOQR_FETCH_REQ_SIZE_THROUGH_COOKIE                                    \
+    ((offsetof(moqr_fetch_req_t, cookie) +                                    \
+      sizeof(((moqr_fetch_req_t *)0)->cookie) +                               \
+      (_Alignof(moqr_fetch_req_t) - 1)) &                                     \
+     ~(_Alignof(moqr_fetch_req_t) - 1))
+
+/* Parenthesized: defines the symbol, not the header's sized macro. */
 void
-moqr_fetch_req_init(moqr_fetch_req_t *req)
+(moqr_fetch_req_init)(moqr_fetch_req_t *req)
 {
     if (req == NULL) {
         return;
     }
-    memset(req, 0, sizeof(*req));
-    req->struct_size = (uint32_t)sizeof(*req);
+    memset(req, 0, MOQR_FETCH_REQ_SIZE_THROUGH_COOKIE);
+    req->struct_size = (uint32_t)MOQR_FETCH_REQ_SIZE_THROUGH_COOKIE;
+}
+
+void
+moqr_fetch_req_init_sized(moqr_fetch_req_t *req, size_t req_size)
+{
+    if (req == NULL || req_size < sizeof(req->struct_size)) {
+        return;   /* too small to even stamp */
+    }
+    size_t n = req_size < sizeof(*req) ? req_size : sizeof(*req);
+    memset(req, 0, n);
+    req->struct_size = (uint32_t)n;
 }
 
 static uint32_t
@@ -6061,6 +8239,7 @@ fetch_unpin(moqr_core_t *c, r_fetch_t *f)
  * object_id; the first group (ascending) with an in-range NORMAL object wins. */
 static moqr_result_t
 fetch_scan_next(const moqr_log_t *log, const r_fetch_t *f,
+                const r_track_t *t, uint64_t now_us,
                 moqr_record_view_t *out)
 {
     uint32_t gn = moqr_log_group_count(log);
@@ -6104,6 +8283,9 @@ fetch_scan_next(const moqr_log_t *log, const r_fetch_t *f,
                 if (v.object_id < floor_obj || v.object_id > ceil_obj) {
                     continue;
                 }
+                if (track_rec_expired(t, &v, now_us)) {
+                    continue;   /* expired from cache: its state is unknown */
+                }
                 if (!have || v.object_id < best.object_id) {
                     best = v;
                     have = true;
@@ -6119,27 +8301,193 @@ fetch_scan_next(const moqr_log_t *log, const r_fetch_t *f,
     return MOQR_DONE;
 }
 
-moqr_result_t
-moqr_core_fetch_open(moqr_core_t *c, moqr_binding_t bh,
-                     const moqr_fetch_req_t *req, uint64_t now_us,
-                     moqr_fetch_t *out, moqr_fetch_plan_t *out_plan)
+/* Whether `bslot` at generation `gen` is a live shard pseudo-binding: the
+ * stand-in for another shard of the same relay. */
+static bool
+binding_is_shard(const moqr_core_t *c, uint32_t bslot, uint32_t gen)
 {
-    (void)now_us;
+    return bslot < c->max_bindings && c->bindings[bslot].gen == gen &&
+           (gen & 1u) != 0 &&
+           c->bindings[bslot].cookie >= MOQR_SHARD_COOKIE_BASE;
+}
+
+/* Whether the namespace's longest announced prefix was announced here by
+ * another shard (a mirror): its tracks are that shard's. */
+static bool
+ns_held_by_shard(const moqr_core_t *c, moqr_ns_t ns)
+{
+    uint32_t n = trie_longest_announce(c, ns);
+    return n != UINT32_MAX &&
+           binding_is_shard(c, c->nodes[n].ann_binding,
+                            c->nodes[n].ann_binding_gen);
+}
+
+/* Whether this core's Largest Object for the track is the relay's. It is when
+ * the track's source is a connection of this core's own -- the publisher,
+ * an upstream subscription, or none left and the log its own -- and when
+ * another shard owns the track and feeds it here: from that shard's
+ * acceptance, which carries its Largest, every later Object follows, so the
+ * Largest here keeps up with the owner's. A copy that shard is not feeding
+ * -- not yet accepted, or no longer fed -- can lag it. */
+static bool
+track_largest_is_relays(const moqr_core_t *c, const r_track_t *t)
+{
+    if (t->has_upstream_binding &&
+        binding_is_shard(c, t->up_binding, t->up_binding_gen)) {
+        return t->state == R_TRACK_ACTIVE;
+    }
+    if (!t->has_upstream_binding && t->src_ann_node != UINT32_MAX &&
+        binding_is_shard(c, t->src_ann_binding, t->src_ann_binding_gen)) {
+        return false;
+    }
+    return true;
+}
+
+/* The smallest Location at or after the cursor and within the fetch's range
+ * holding an Object still arriving: a NORMAL record whose first bytes are in
+ * the log and that is not yet complete. Read-only, the same walk as
+ * fetch_scan_next. */
+static bool
+fetch_scan_pending(const moqr_log_t *log, const r_fetch_t *f, uint64_t *pg,
+                   uint64_t *po)
+{
+    uint32_t gn = moqr_log_group_count(log);
+    for (uint32_t gi = 0; gi < gn; gi++) {
+        uint64_t g = moqr_log_group_id_at(log, gi);
+        if (g < f->cur_group) {
+            continue;
+        }
+        if (g > f->end_group) {
+            break;
+        }
+        uint64_t floor_obj = (g == f->cur_group) ? f->cur_object : 0;
+        uint64_t ceil_obj =
+            (g == f->end_group && !f->end_whole) ? f->end_object : UINT64_MAX;
+        if (floor_obj > ceil_obj) {
+            continue;
+        }
+        bool have = false;
+        uint64_t best = 0;
+        uint32_t lists = moqr_log_group_list_count(log, g);
+        for (uint32_t slot = 0; slot <= lists; slot++) {
+            uint32_t list_ref =
+                (slot == lists) ? MOQR_LOG_LIST_DATAGRAM : slot;
+            for (uint32_t idx = 0;; idx++) {
+                moqr_record_view_t v;
+                if (moqr_log_read_rec(log, g, list_ref, idx, &v) != MOQR_OK) {
+                    break;
+                }
+                if (v.status != MOQR_OBJ_NORMAL ||
+                    v.obj_state != MOQR_OBJ_OPEN ||
+                    v.object_id < floor_obj || v.object_id > ceil_obj) {
+                    continue;
+                }
+                if (!have || v.object_id < best) {
+                    best = v.object_id;
+                    have = true;
+                }
+            }
+        }
+        if (have) {
+            *pg = g;
+            *po = best;
+            return true;
+        }
+    }
+    return false;
+}
+
+static int loc_cmp(uint64_t ag, uint64_t ao, uint64_t bg, uint64_t bo);
+
+/* The shard binding a track or namespace this core only mirrors routes to:
+ * its cookie, or 0 when this core is the track's own. */
+static uint64_t
+track_remote_cookie(const moqr_core_t *c, const r_track_t *t)
+{
+    if (t->has_upstream_binding &&
+        binding_is_shard(c, t->up_binding, t->up_binding_gen)) {
+        return c->bindings[t->up_binding].cookie;
+    }
+    if (!t->has_upstream_binding && t->src_ann_node != UINT32_MAX &&
+        binding_is_shard(c, t->src_ann_binding, t->src_ann_binding_gen)) {
+        return c->bindings[t->src_ann_binding].cookie;
+    }
+    return 0;
+}
+
+static uint64_t
+ns_remote_cookie(const moqr_core_t *c, moqr_ns_t ns)
+{
+    uint32_t n = trie_longest_announce(c, ns);
+    if (n == UINT32_MAX ||
+        !binding_is_shard(c, c->nodes[n].ann_binding, c->nodes[n].ann_binding_gen)) {
+        return 0;
+    }
+    return c->bindings[c->nodes[n].ann_binding].cookie;
+}
+
+/* Plan a standalone FETCH and, on ACCEPT, open its cursor slot. With
+ * `retrieval` set this admits a retrieval owner instead (see
+ * retrieve_internal.h): descending order is allowed, a range the log does not
+ * hold is accepted for upstream retrieval, and a track another shard owns is
+ * that shard's. */
+static moqr_result_t
+core_fetch_admit(moqr_core_t *c, moqr_binding_t bh, const moqr_fetch_req_t *req,
+                 moqr_fetch_t *out, moqr_fetch_plan_t *out_plan,
+                 moqr_core_retrieve_plan_t *retrieval)
+{
+    /* Prefix-size (ABI) contract: report_gaps is a trailing field, so a caller
+     * whose struct ends before it is valid and reports no gaps. */
     if (c == NULL || out == NULL || out_plan == NULL || req == NULL ||
-        req->struct_size < sizeof(moqr_fetch_req_t) ||
+        req->struct_size < offsetof(moqr_fetch_req_t, report_gaps) ||
         !ftn_view_ok(req->ns, req->name)) {
         return MOQR_ERR_INVAL;
     }
+    bool req_gaps = false;
+    if (req->struct_size >=
+        offsetof(moqr_fetch_req_t, report_gaps) + sizeof(req->report_gaps)) {
+        req_gaps = req->report_gaps;
+    }
+    bool req_unknown = false;
+    if (req_gaps &&
+        req->struct_size >= offsetof(moqr_fetch_req_t, report_unknown) +
+                                sizeof(req->report_unknown)) {
+        req_unknown = req->report_unknown;
+    }
+#define FETCH_REQ_HAS(f) \
+    (req->struct_size >= offsetof(moqr_fetch_req_t, f) + sizeof(req->f))
+    const uint32_t form = FETCH_REQ_HAS(range_form) ? req->range_form : 0u;
+    const uint64_t rel_start =
+        FETCH_REQ_HAS(relative_start) ? req->relative_start : 0u;
+    const bool req_pending =
+        FETCH_REQ_HAS(report_pending) ? req->report_pending : false;
+#undef FETCH_REQ_HAS
+    if ((form & ~(MOQR_FETCH_START_RELATIVE | MOQR_FETCH_START_NEXT_OBJECT |
+                  MOQR_FETCH_END_AT_LARGEST)) != 0 ||
+        ((form & MOQR_FETCH_START_RELATIVE) != 0 &&
+         (form & MOQR_FETCH_START_NEXT_OBJECT) != 0)) {
+        return MOQR_ERR_INVAL;   /* unknown bits, or two starts */
+    }
     *out = MOQR_FETCH_INVALID;
     memset(out_plan, 0, sizeof(*out_plan));
+    if (retrieval != NULL) {
+        memset(retrieval, 0, sizeof(*retrieval));
+    }
     uint32_t bslot = 0;
     r_binding_t *b = binding_resolve(c, bh, &bslot);
     if (b == NULL) {
         return MOQR_ERR_STALE_HANDLE;
     }
     /* Standalone + ascending only (DEFAULT == ascending). The binding
-     * rejects joining/descending before this call; the core guards anyway. */
-    if (req->group_order == MOQR_GROUP_ORDER_DESCENDING) {
+     * rejects joining/descending before this call; the core guards anyway.
+     * A retrieval owner's view is ascending within one group at a time, so
+     * it admits descending group order as well. */
+    if (retrieval == NULL && req->group_order == MOQR_GROUP_ORDER_DESCENDING) {
+        return MOQR_ERR_UNSUPPORTED;
+    }
+    if (retrieval != NULL && req->group_order != MOQR_GROUP_ORDER_DEFAULT &&
+        req->group_order != MOQR_GROUP_ORDER_ASCENDING &&
+        req->group_order != MOQR_GROUP_ORDER_DESCENDING) {
         return MOQR_ERR_UNSUPPORTED;
     }
 
@@ -6147,19 +8495,73 @@ moqr_core_fetch_open(moqr_core_t *c, moqr_binding_t bh,
 
     if (tslot == UINT32_MAX) {
         out_plan->admit = MOQR_FETCH_REJECT;
-        out_plan->error_code = R_ERR_DOES_NOT_EXIST;   /* fetch-on-miss seam */
+        /* fetch-on-miss seam. A namespace another shard announced here names
+         * a track that shard may hold: not this core's to deny. */
+        out_plan->error_code = ns_held_by_shard(c, req->ns)
+                                   ? R_ERR_INTERNAL
+                                   : R_ERR_DOES_NOT_EXIST;
+        if (retrieval != NULL) {
+            retrieval->remote_cookie = ns_remote_cookie(c, req->ns);
+        }
         return MOQR_OK;
     }
     r_track_t *t = &c->tracks[tslot];
+    if (retrieval != NULL && track_remote_cookie(c, t) != 0) {
+        /* A copy another shard feeds here: that shard holds the track, its
+         * Largest Object and its upstream. */
+        out_plan->admit = MOQR_FETCH_REJECT;
+        out_plan->error_code = R_ERR_INTERNAL;
+        retrieval->remote_cookie = track_remote_cookie(c, t);
+        return MOQR_OK;
+    }
+    if (!track_largest_is_relays(c, t)) {
+        /* A copy another shard feeds, while it is not being fed: its Largest
+         * can lag the owner's, so no range is resolved or bounded by it. */
+        out_plan->admit = MOQR_FETCH_REJECT;
+        out_plan->error_code = R_ERR_INTERNAL;
+        return MOQR_OK;
+    }
     if (!t->has_largest) {
         out_plan->admit = MOQR_FETCH_REJECT;
         out_plan->error_code = R_ERR_INVALID_RANGE;   /* empty track */
         return MOQR_OK;
     }
+    /* The parts of the range stated relative to the Largest Object resolve
+     * against this core's Largest, here, so the range is planned against the
+     * same Largest it was resolved with. A start that would lie past any
+     * representable Location is past the Largest Object. */
+    uint64_t req_sg = req->start_group, req_so = req->start_object;
+    uint64_t req_eg = req->end_group, req_eo = req->end_object;
+    {
+        const uint64_t lg = t->largest_group, lo = t->largest_object;
+        bool start_past = false;
+        if ((form & MOQR_FETCH_START_RELATIVE) != 0) {
+            req_so = 0;
+            if (rel_start == 0) {
+                start_past = lg == UINT64_MAX;
+                req_sg = start_past ? lg : lg + 1u;
+            } else {
+                req_sg = rel_start - 1u > lg ? 0 : lg - (rel_start - 1u);
+            }
+        } else if ((form & MOQR_FETCH_START_NEXT_OBJECT) != 0) {
+            start_past = lo == UINT64_MAX;
+            req_sg = lg;
+            req_so = start_past ? lo : lo + 1u;
+        }
+        if ((form & MOQR_FETCH_END_AT_LARGEST) != 0) {
+            req_eg = lg;
+            req_eo = lo == UINT64_MAX ? 0 : lo + 1u;   /* raw wire: last + 1 */
+        }
+        if (start_past) {
+            out_plan->admit = MOQR_FETCH_REJECT;
+            out_plan->error_code = R_ERR_INVALID_RANGE;
+            return MOQR_OK;
+        }
+    }
     /* Start past the largest object -> INVALID_RANGE (draft §FETCH). */
-    if (req->start_group > t->largest_group ||
-        (req->start_group == t->largest_group &&
-         req->start_object > t->largest_object)) {
+    if (req_sg > t->largest_group ||
+        (req_sg == t->largest_group &&
+         req_so > t->largest_object)) {
         out_plan->admit = MOQR_FETCH_REJECT;
         out_plan->error_code = R_ERR_INVALID_RANGE;
         return MOQR_OK;
@@ -6167,8 +8569,10 @@ moqr_core_fetch_open(moqr_core_t *c, moqr_binding_t bh,
     moqr_log_stats_t ls;
     moqr_log_get_stats(t->log, &ls);
     /* Fully-evicted log: no oldest retained group to anchor a marker to, so a
-     * Start below the horizon has no servable suffix -> reject. */
-    if (ls.oldest_group_id == UINT64_MAX) {
+     * Start below the horizon has no servable suffix -> reject. A retrieval
+     * owner retrieves what the log does not hold instead, and its views
+     * report those Locations as unknown rather than skip them. */
+    if (ls.group_count == 0 && retrieval == NULL) {
         out_plan->admit = MOQR_FETCH_REJECT;
         out_plan->error_code = R_ERR_INVALID_RANGE;
         return MOQR_OK;
@@ -6177,12 +8581,12 @@ moqr_core_fetch_open(moqr_core_t *c, moqr_binding_t bh,
      * retained suffix led by one UNKNOWN marker -- but only if the range still
      * reaches retained data (checked once the effective End is known, below).
      * Start >= oldest is the normal fully-retained path. */
-    bool evicted_prefix = (req->start_group < ls.oldest_group_id);
+    bool evicted_prefix = retrieval == NULL && req_sg < ls.oldest_group_id;
 
     /* Decode the raw-wire End Location to an inclusive last object. */
-    bool req_whole = (req->end_object == 0);
-    uint64_t req_g = req->end_group;
-    uint64_t req_o = req_whole ? 0 : req->end_object - 1;
+    bool req_whole = (req_eo == 0);
+    uint64_t req_g = req_eg;
+    uint64_t req_o = req_whole ? 0 : req_eo - 1;
     /* Effective inclusive last = min(requested, track largest). */
     bool req_le_largest;
     if (req_g != t->largest_group) {
@@ -6197,12 +8601,12 @@ moqr_core_fetch_open(moqr_core_t *c, moqr_binding_t bh,
     uint64_t eff_o = req_le_largest ? req_o : t->largest_object;
     /* End MUST be >= Start (draft): reject an empty/inverted range. */
     bool eff_lt_start;
-    if (eff_g != req->start_group) {
-        eff_lt_start = eff_g < req->start_group;
+    if (eff_g != req_sg) {
+        eff_lt_start = eff_g < req_sg;
     } else if (eff_whole) {
         eff_lt_start = false;
     } else {
-        eff_lt_start = eff_o < req->start_object;
+        eff_lt_start = eff_o < req_so;
     }
     if (eff_lt_start) {
         out_plan->admit = MOQR_FETCH_REJECT;
@@ -6233,13 +8637,25 @@ moqr_core_fetch_open(moqr_core_t *c, moqr_binding_t bh,
     t->fetch_count++;
     track_touch(c, tslot);
     f->cookie = req->cookie;
-    f->start_group = req->start_group;
-    f->start_object = req->start_object;
+    f->start_group = req_sg;
+    f->start_object = req_so;
     f->end_group = eff_g;
     f->end_object = eff_o;
     f->end_whole = eff_whole;
     f->group_order = req->group_order;
     f->subscriber_priority = req->subscriber_priority;
+    f->report_gaps = req_gaps;
+    f->report_unknown = req_unknown;
+    f->report_pending = req_pending;
+    if (retrieval != NULL) {
+        f->retrieval_owner = true;
+        f->report_gaps = true;
+        f->report_unknown = true;
+        f->report_pending = true;
+        f->adm_end_group = eff_g;
+        f->adm_end_object = eff_whole ? UINT64_MAX : eff_o;
+        f->retrieval_track_gen = t->track_gen;
+    }
     if (evicted_prefix) {
         /* Skip the evicted prefix: serve from the oldest retained group, led by
          * one UNKNOWN marker emitted immediately before it. */
@@ -6248,8 +8664,8 @@ moqr_core_fetch_open(moqr_core_t *c, moqr_binding_t bh,
         f->cur_group = ls.oldest_group_id;
         f->cur_object = 0;
     } else {
-        f->cur_group = req->start_group;
-        f->cur_object = req->start_object;
+        f->cur_group = req_sg;
+        f->cur_object = req_so;
     }
 
     out_plan->admit = MOQR_FETCH_ACCEPT;
@@ -6262,7 +8678,76 @@ moqr_core_fetch_open(moqr_core_t *c, moqr_binding_t bh,
         ls.end_of_track && eff_g == t->largest_group &&
         (eff_whole || eff_o == t->largest_object);
 
+    if (retrieval != NULL) {
+        retrieval->track = track_handle(c, tslot);
+        retrieval->track_gen = t->track_gen;
+        retrieval->start_group = req_sg;
+        retrieval->start_object = req_so;
+        retrieval->end_group = eff_g;
+        retrieval->end_object = eff_whole ? UINT64_MAX : eff_o;
+    }
     *out = fetch_handle(c, fslot);
+    return MOQR_OK;
+}
+
+moqr_result_t
+moqr_core_fetch_open(moqr_core_t *c, moqr_binding_t bh,
+                     const moqr_fetch_req_t *req, uint64_t now_us,
+                     moqr_fetch_t *out, moqr_fetch_plan_t *out_plan)
+{
+    (void)now_us;
+    return core_fetch_admit(c, bh, req, out, out_plan, NULL);
+}
+
+moqr_result_t
+moqr_core_internal_retrieve_open(moqr_core_t *c, moqr_binding_t bh,
+                                 const moqr_fetch_req_t *req, uint64_t now_us,
+                                 moqr_fetch_t *owner,
+                                 moqr_core_retrieve_plan_t *plan)
+{
+    (void)now_us;
+    if (plan == NULL) {
+        return MOQR_ERR_INVAL;
+    }
+    moqr_fetch_plan_t wire;
+    moqr_result_t rc = core_fetch_admit(c, bh, req, owner, &wire, plan);
+    if (rc == MOQR_OK) {
+        plan->wire = wire;
+    }
+    return rc;
+}
+
+moqr_result_t
+moqr_core_internal_retrieve_view(moqr_core_t *c, moqr_fetch_t owner,
+                                 uint64_t start_group, uint64_t start_object,
+                                 uint64_t end_group, uint64_t end_object)
+{
+    if (c == NULL) {
+        return MOQR_ERR_INVAL;
+    }
+    r_fetch_t *f = fetch_resolve(c, owner, NULL);
+    if (f == NULL || !f->retrieval_owner) {
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    const r_track_t *t = &c->tracks[f->track];
+    if ((t->gen & 1u) == 0 || t->gen != f->track_gen_slot ||
+        t->track_gen != f->retrieval_track_gen) {
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    if (loc_cmp(start_group, start_object, end_group, end_object) > 0 ||
+        loc_cmp(start_group, start_object, f->start_group, f->start_object) < 0 ||
+        loc_cmp(end_group, end_object, f->adm_end_group, f->adm_end_object) > 0) {
+        return MOQR_ERR_INVAL;
+    }
+    fetch_unpin(c, f);
+    f->cur_group = start_group;
+    f->cur_object = start_object;
+    f->end_group = end_group;
+    f->end_whole = end_object == UINT64_MAX;
+    f->end_object = f->end_whole ? 0 : end_object;
+    f->lead_marker = false;
+    f->gap_active = false;
+    f->exhausted = false;
     return MOQR_OK;
 }
 
@@ -6330,11 +8815,209 @@ fetch_coalesce_chunks(moqr_core_t *c, const moqr_log_t *log,
     return MOQR_OK;
 }
 
+/* Location order: negative, zero, positive. */
+static int
+loc_cmp(uint64_t ag, uint64_t ao, uint64_t bg, uint64_t bo)
+{
+    if (ag != bg) {
+        return ag < bg ? -1 : 1;
+    }
+    if (ao != bo) {
+        return ao < bo ? -1 : 1;
+    }
+    return 0;
+}
+
+/* What lies between the cursor and the next retained object `x` (or, with no
+ * object left in range, the range end). */
+typedef enum fetch_run {
+    FETCH_RUN_NONE = 0,   /* nothing: the cursor is at x, or past the range  */
+    FETCH_RUN_HOLE,       /* Locations not held that the log has evidence for */
+    FETCH_RUN_UNKNOWN,    /* Locations the log has no evidence about          */
+} fetch_run_t;
+
+static void fetch_range_end(const r_fetch_t *f, uint64_t *eg, uint64_t *eo);
+
+/* An UNKNOWN run starting at (g, o): it covers the rest of g and every group
+ * the log does not hold after it, so it ends just before the next retained
+ * group, or at the range end when that comes first. Bounded by the retained
+ * group count. */
+static fetch_run_t
+fetch_unknown_run(const moqr_log_t *log, const r_fetch_t *f, uint64_t g,
+                  uint64_t *eg, uint64_t *eo)
+{
+    uint64_t rg, ro;
+    fetch_range_end(f, &rg, &ro);
+    uint64_t ng = UINT64_MAX;
+    bool have_next = false;
+    uint32_t gn = moqr_log_group_count(log);
+    for (uint32_t gi = 0; gi < gn; gi++) {
+        uint64_t id = moqr_log_group_id_at(log, gi);
+        if (id > g) {
+            ng = id;
+            have_next = true;
+            break;   /* ids ascend */
+        }
+    }
+    uint64_t end_g = rg, end_o = ro;
+    if (have_next && loc_cmp(ng - 1u, UINT64_MAX, rg, ro) < 0) {
+        end_g = ng - 1u;
+        end_o = UINT64_MAX;
+    }
+    *eg = end_g;
+    *eo = end_o;
+    return FETCH_RUN_UNKNOWN;
+}
+
+/* Classify what precedes `x` from the cursor and write a run's inclusive end.
+ *
+ * A hole is a Location the log can expect: one inside a retained group's
+ * extent (at or below the greatest id any record of that group carries) that
+ * no retained object accounts for. A Location holding a status object is a
+ * known non-object and is stepped over; an abandoned record counts as not
+ * held. The caller bounds `x` at the first Object still arriving, so none is
+ * met here.
+ *
+ * Past a group's extent the answer depends on what the log knows of the
+ * group's end. Past a known final (moqr_log_group_final) no object exists,
+ * so nothing there is a run. Otherwise -- and everywhere in a group the log
+ * never saw -- a gap in observed ids conveys nothing about the skipped
+ * Locations unless their non-existence is signalled (2.1.2); the log does
+ * not read the Prior Group/Object ID Gap properties, so a known final is the
+ * only such signal it has. They are a run of unknown state when the fetch
+ * reports those (report_unknown), and passed over otherwise. Bounded by the
+ * retained records stepped over. */
+/* Whether the Object at (g, o) has expired from the cache (§10.3): its
+ * record is retained but it may no longer be served, so its state is
+ * unknown. */
+static bool
+fetch_loc_expired(const moqr_log_t *log, const r_track_t *t, uint64_t g,
+                  uint64_t o, uint64_t now_us)
+{
+    moqr_record_view_t v;
+    memset(&v, 0, sizeof(v));
+    return t->has_max_cache &&
+           moqr_log_internal_object_arrival(log, g, o, &v.arrival_us) &&
+           track_rec_expired(t, &v, now_us);
+}
+
+static fetch_run_t
+fetch_run_before(const moqr_log_t *log, const r_fetch_t *f, const r_track_t *t,
+                 uint64_t now_us, bool have_x, const moqr_record_view_t *x,
+                 uint64_t *eg, uint64_t *eo)
+{
+    uint64_t rg, ro;
+    fetch_range_end(f, &rg, &ro);
+    uint64_t g = f->cur_group, o = f->cur_object;
+    uint64_t last = 0;
+    for (;;) {
+        if (have_x ? loc_cmp(g, o, x->group_id, x->object_id) >= 0
+                   : loc_cmp(g, o, rg, ro) > 0) {
+            return FETCH_RUN_NONE;
+        }
+        if (!moqr_log_group_last(log, g, &last)) {
+            /* Nothing retained in this group. */
+            if (f->report_unknown) {
+                return fetch_unknown_run(log, f, g, eg, eo);
+            }
+            if (have_x && x->group_id > g) {
+                g = x->group_id;   /* the next object's group may open with
+                                    * a hole */
+                o = 0;
+                continue;
+            }
+            return FETCH_RUN_NONE;
+        }
+        if (o > last) {
+            uint64_t fin = 0;
+            if (f->report_unknown && !moqr_log_group_final(log, g, &fin)) {
+                return fetch_unknown_run(log, f, g, eg, eo);
+            }
+            if (g == UINT64_MAX) {
+                return FETCH_RUN_NONE;
+            }
+            g++;
+            o = 0;
+            continue;
+        }
+        moqr_obj_status_t st;
+        moqr_obj_state_t state;
+        if (!moqr_log_object_status(log, g, o, &st, &state)) {
+            break;   /* a hole inside the group's extent */
+        }
+        if (st == MOQR_OBJ_NORMAL) {
+            if (state != MOQR_OBJ_COMPLETE) {
+                break;   /* in progress or abandoned: not held */
+            }
+            if (!fetch_loc_expired(log, t, g, o, now_us)) {
+                return FETCH_RUN_NONE;   /* the next retained object itself */
+            }
+            /* Expired from the cache: neither served nor known not to
+             * exist. Reported as unknown, through the expired Objects
+             * that follow it, or passed over as other unknown Locations
+             * are when those are not reported. */
+            if (f->report_unknown) {
+                uint64_t e = o;
+                while (e < last && !(g == rg && e >= ro) &&
+                       !(have_x && x->group_id == g && e + 1u >= x->object_id) &&
+                       moqr_log_object_status(log, g, e + 1u, &st, &state) &&
+                       st == MOQR_OBJ_NORMAL && state == MOQR_OBJ_COMPLETE &&
+                       fetch_loc_expired(log, t, g, e + 1u, now_us)) {
+                    e++;
+                }
+                *eg = g;
+                *eo = e;
+                return FETCH_RUN_UNKNOWN;
+            }
+        }
+        /* A status record is not an object or a hole. Carry at the last
+         * Object ID rather than revisiting this group's first location. */
+        if (o == UINT64_MAX) {
+            if (g == UINT64_MAX) {
+                return FETCH_RUN_NONE;
+            }
+            g++;
+            o = 0;
+        } else {
+            o++;
+        }
+    }
+    /* The hole starts at (g, o) and ends before the next object, or at the
+     * range end, never past the group's extent; a status object at the end
+     * is not part of it. */
+    uint64_t end_o;
+    if (have_x) {
+        end_o = (x->group_id == g && x->object_id > 0) ? x->object_id - 1 : last;
+    } else {
+        end_o = (rg == g && ro < last) ? ro : last;
+    }
+    for (;;) {
+        moqr_obj_status_t st;
+        moqr_obj_state_t state;
+        if (end_o <= o || !moqr_log_object_status(log, g, end_o, &st, &state) ||
+            st == MOQR_OBJ_NORMAL) {
+            break;
+        }
+        end_o--;
+    }
+    *eg = g;
+    *eo = end_o;
+    return FETCH_RUN_HOLE;
+}
+
+/* The range's inclusive last Location; a whole-group end runs to the group's
+ * last possible id. */
+static void
+fetch_range_end(const r_fetch_t *f, uint64_t *eg, uint64_t *eo)
+{
+    *eg = f->end_group;
+    *eo = f->end_whole ? UINT64_MAX : f->end_object;
+}
+
 moqr_result_t
 moqr_core_fetch_peek(moqr_core_t *c, moqr_fetch_t fh, uint64_t now_us,
                      moqr_fetch_item_t *out)
 {
-    (void)now_us;
     if (c == NULL || out == NULL) {
         return MOQR_ERR_INVAL;
     }
@@ -6343,6 +9026,11 @@ moqr_core_fetch_peek(moqr_core_t *c, moqr_fetch_t fh, uint64_t now_us,
         return MOQR_ERR_STALE_HANDLE;
     }
     memset(out, 0, sizeof(*out));
+    f->gap_active = false;
+    if (f->exhausted) {
+        out->kind = MOQR_FETCH_ITEM_END;
+        return MOQR_OK;
+    }
 
     /* Idempotent re-peek: reconstruct the held OBJECT from stored scalars +
      * pins, so eviction of the underlying record between pumps is harmless. */
@@ -6375,7 +9063,8 @@ moqr_core_fetch_peek(moqr_core_t *c, moqr_fetch_t fh, uint64_t now_us,
      * resets the fetch stream) rather than fabricate a silent gap. */
     moqr_log_stats_t ls;
     moqr_log_get_stats(log, &ls);
-    if (ls.oldest_group_id != UINT64_MAX && f->cur_group < ls.oldest_group_id) {
+    if (!f->retrieval_owner && ls.group_count != 0 &&
+        f->cur_group < ls.oldest_group_id) {
         return MOQR_ERR_TOO_OLD;
     }
 
@@ -6392,13 +9081,59 @@ moqr_core_fetch_peek(moqr_core_t *c, moqr_fetch_t fh, uint64_t now_us,
     }
 
     moqr_record_view_t v;
-    moqr_result_t rc = fetch_scan_next(log, f, &v);
+    moqr_result_t rc = fetch_scan_next(log, f, &c->tracks[f->track], now_us, &v);
+    if (rc != MOQR_OK && rc != MOQR_DONE) {
+        return rc;   /* defensive terminal */
+    }
+    /* An Object still arriving before the next whole one is the next thing
+     * the range serves: it is included in full once it completes (draft-22
+     * 3.2), so nothing past it is served or reported before it. */
+    uint64_t pg = 0, po = 0;
+    const bool pending =
+        fetch_scan_pending(log, f, &pg, &po) &&
+        (rc == MOQR_DONE || loc_cmp(pg, po, v.group_id, v.object_id) < 0);
+    moqr_record_view_t bound = v;
+    if (pending) {
+        memset(&bound, 0, sizeof(bound));
+        bound.group_id = pg;
+        bound.object_id = po;
+    }
+    if (f->report_gaps) {
+        /* A run the log does not hold before the next object (or the range
+         * end) is reported first; the object is served once nothing the log
+         * can expect, or (report_unknown) has no evidence about, precedes
+         * it. */
+        uint64_t eg = 0, eo = 0;
+        fetch_run_t run = fetch_run_before(log, f, &c->tracks[f->track], now_us,
+                                           rc == MOQR_OK || pending, &bound,
+                                           &eg, &eo);
+        if (run != FETCH_RUN_NONE) {
+            f->gap_active = true;
+            f->gap_group = eg;
+            f->gap_object = eo;
+            out->kind = run == FETCH_RUN_HOLE ? MOQR_FETCH_ITEM_GAP
+                                              : MOQR_FETCH_ITEM_UNKNOWN;
+            out->rec.group_id = eg;
+            out->rec.object_id = eo;
+            return MOQR_OK;
+        }
+    }
+    if (pending) {
+        if (!f->report_pending) {
+            return MOQR_ERR_WOULD_BLOCK;   /* retry once it is whole */
+        }
+        /* Committing it gives it up: the cursor moves past its Location. */
+        f->gap_active = true;
+        f->gap_group = pg;
+        f->gap_object = po;
+        out->kind = MOQR_FETCH_ITEM_PENDING;
+        out->rec.group_id = pg;
+        out->rec.object_id = po;
+        return MOQR_OK;
+    }
     if (rc == MOQR_DONE) {
         out->kind = MOQR_FETCH_ITEM_END;
         return MOQR_OK;
-    }
-    if (rc != MOQR_OK) {
-        return rc;   /* defensive terminal */
     }
 
     /* Pin budget: a single object is guaranteed to fit an idle budget (the
@@ -6469,15 +9204,63 @@ moqr_core_fetch_commit(moqr_core_t *c, moqr_fetch_t fh)
         f->lead_marker = false;
         return MOQR_OK;
     }
+    if (f->gap_active) {
+        /* Skip past the reported run. A run ending at the range end exhausts
+         * the fetch; one ending at a group's last id resumes at the next
+         * group. */
+        f->gap_active = false;
+        uint64_t eg, eo;
+        fetch_range_end(f, &eg, &eo);
+        if (loc_cmp(f->gap_group, f->gap_object, eg, eo) >= 0) {
+            f->exhausted = true;
+            return MOQR_OK;
+        }
+        if (f->gap_object == UINT64_MAX) {
+            f->cur_group = f->gap_group + 1;
+            f->cur_object = 0;
+        } else {
+            f->cur_group = f->gap_group;
+            f->cur_object = f->gap_object + 1;
+        }
+        return MOQR_OK;
+    }
     if (!f->out_active) {
         return MOQR_ERR_WRONG_STATE;   /* commit without a peeked object */
     }
-    /* Advance strictly past the emitted object; the scan moves to the next
-     * group once the current group's window is exhausted. object_id is a
-     * varint < 2^62 (log rejects UINT64_MAX), so +1 never wraps. */
-    f->cur_group = f->out_group;
-    f->cur_object = f->out_object + 1;
+    /* Advance strictly past a full-width Object ID. The range check also
+     * prevents carrying beyond the last representable Group ID. */
+    uint64_t eg, eo;
+    fetch_range_end(f, &eg, &eo);
+    if (loc_cmp(f->out_group, f->out_object, eg, eo) >= 0) {
+        f->exhausted = true;
+    } else if (f->out_object == UINT64_MAX) {
+        f->cur_group = f->out_group + 1;
+        f->cur_object = 0;
+    } else {
+        f->cur_group = f->out_group;
+        f->cur_object = f->out_object + 1;
+    }
     fetch_unpin(c, f);
+    return MOQR_OK;
+}
+
+moqr_result_t
+moqr_core_internal_fetch_track(const moqr_core_t *c, moqr_fetch_t fh,
+                               moqr_track_t *track, uint64_t *track_gen)
+{
+    if (c == NULL || track == NULL || track_gen == NULL) {
+        return MOQR_ERR_INVAL;
+    }
+    const r_fetch_t *f = fetch_resolve((moqr_core_t *)(void *)c, fh, NULL);
+    if (f == NULL) {
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    const r_track_t *t = &c->tracks[f->track];
+    if ((t->gen & 1u) == 0 || t->gen != f->track_gen_slot) {
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    *track = track_handle(c, f->track);
+    *track_gen = t->track_gen;
     return MOQR_OK;
 }
 
@@ -6690,6 +9473,94 @@ moqr_core_source_done(moqr_core_t *c, moqr_track_t th, uint64_t track_gen,
     return MOQR_OK;
 }
 
+/* End the track's source with every terminal produced by the delivery
+ * scans; `abort` selects the immediate ending (below) over the graceful one.
+ *
+ * Graceful: the track's SOURCE finished and no further objects will be
+ * admitted for it. Every forwarding downstream subscriber keeps what was
+ * already admitted -- its pending records, notices and FINs are delivered in
+ * their usual order -- and retires with a SUB_DONE carrying `status` from
+ * moqr_core_next_delivery once nothing is left to deliver for it, so the
+ * terminal follows the data (draft-18 section 10.11, draft-22 section 9.9:
+ * the publisher sends PUBLISH_DONE after closing its streams, and a relay
+ * forwarding that subscription is that publisher for its subscribers). A
+ * paused subscriber (Forward=0) has asked for nothing further and retires on
+ * its binding's next delivery scan. Every terminal is produced by that scan,
+ * so finishing queues no intent and cannot be refused for intent room: the
+ * caller never has to keep a finished source alive to retry. The source is
+ * released exactly as by moqr_core_source_done (in either ending). */
+static moqr_result_t
+source_end_by_scan(moqr_core_t *c, moqr_track_t th, uint64_t track_gen,
+                   moqr_pd_desc_t status, bool abort)
+{
+    if (c == NULL) {
+        return MOQR_ERR_INVAL;
+    }
+    if (!moqr_pd_desc_valid(status)) {
+        return MOQR_ERR_INVAL;
+    }
+    uint32_t tslot = 0;
+    r_track_t *t = track_resolve(c, th, &tslot);
+    if (t == NULL || t->track_gen != track_gen) {
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    if (t->state != R_TRACK_ACTIVE) {
+        return MOQR_ERR_WRONG_STATE;
+    }
+    uint32_t tgen = c->tracks[tslot].gen;
+    for (uint32_t i = 0; i < c->max_subs; i++) {
+        r_sub_t *s = &c->subs[i];
+        if ((s->gen & 1u) == 0 || s->track != tslot ||
+            s->track_gen_slot != tgen) {
+            continue;
+        }
+        s->src_done = true;
+        s->src_abort = abort;
+        s->src_done_pd = status;
+        /* Its terminal is now a delivery outcome: the binding must scan it
+         * even when nothing is left to send. */
+        if (s->binding < c->max_bindings &&
+            c->bindings[s->binding].gen == s->binding_gen) {
+            ready_mark(c, s->binding);
+        }
+    }
+    t->has_upstream_binding = false;
+    t->source_kind = R_TRACK_SOURCE_NONE;
+    t->track_gen++;
+    moqr_log_stats_t ls;
+    moqr_log_get_stats(t->log, &ls);
+    if (ls.record_count == 0 && track_sub_count(c, tslot) == 0 &&
+        track_fetch_count(c, tslot) == 0) {
+        track_free_slot(c, tslot);
+    } else {
+        t->state = R_TRACK_WARM;
+        track_touch(c, tslot);   /* source released: last use */
+        r_room_changed(c);
+    }
+    return MOQR_OK;
+}
+
+moqr_result_t
+moqr_core_source_finish(moqr_core_t *c, moqr_track_t th, uint64_t track_gen,
+                        moqr_pd_desc_t status, uint64_t now_us)
+{
+    (void)now_us;   /* nothing retires here; the scans own the timing */
+    return source_end_by_scan(c, th, track_gen, status, false);
+}
+
+/* The immediate end of a failed source when moqr_core_source_done cannot
+ * queue its terminals: the subscriptions are marked so that each binding's
+ * next delivery scan retires them before delivering anything else (or keeps
+ * the binding marked until the ring has room), and the source is released
+ * now, so no ACTIVE source is left without an owner to retry it. Queues no
+ * intent; never WOULD_BLOCK. */
+moqr_result_t
+moqr_core_internal_source_abort(moqr_core_t *c, moqr_track_t th,
+                                uint64_t track_gen, moqr_pd_desc_t status)
+{
+    return source_end_by_scan(c, th, track_gen, status, true);
+}
+
 #ifdef MOQR_CORE_TESTING
 /* Test-only: read BOTH halves of the begun ledger for one live subscription —
  * its own begun_count and the begun_subs tally on its owning binding. They are
@@ -6775,6 +9646,10 @@ moqr_core_capacity_describe(const moqr_core_relay_cfg_t *cfg,
     if (moqr_core_limits_resolve(cfg, &lim) != MOQR_OK) {
         return MOQR_ERR_INVAL;
     }
+    /* Refused by create too: an unrepresentable offer matrix. */
+    if ((uint64_t)lim.max_ns_subs * lim.max_tracks > SIZE_MAX / sizeof(r_offer_t)) {
+        return MOQR_ERR_INVAL;
+    }
     uint64_t bindings = lim.max_bindings;
     uint64_t tracks = lim.max_tracks;
     uint64_t subs = lim.max_subs;
@@ -6799,14 +9674,22 @@ moqr_core_capacity_describe(const moqr_core_relay_cfg_t *cfg,
     s = moqr_cap_add(s, moqr_cap_mul(subs, sizeof(r_sub_t)));
     s = moqr_cap_add(s, moqr_cap_mul(nodes, sizeof(r_trie_node_t)));
     s = moqr_cap_add(s, moqr_cap_mul(ns_subs, sizeof(r_ns_sub_t)));
+    /* Track discovery: the subscriptions, their per-track offer rows, and the
+     * retained request-token slots (their bytes are in the name budget). */
+    s = moqr_cap_add(s, moqr_cap_mul(ns_subs, sizeof(r_tsub_t)));
+    s = moqr_cap_add(s, moqr_cap_mul(moqr_cap_mul(ns_subs, tracks),
+                                     sizeof(r_offer_t)));
+    s = moqr_cap_add(s, moqr_cap_mul(r_rtok_slots(lim.max_ns_subs,
+                                                  lim.max_ns_nodes),
+                                     sizeof(r_rtok_t)));
     s = moqr_cap_add(s, moqr_cap_mul(intents, sizeof(moqr_intent_t)));
     s = moqr_cap_add(s, moqr_cap_mul(parked, sizeof(r_parked)));
     s = moqr_cap_add(s, moqr_cap_mul(grants, sizeof(r_grant)));
     s = moqr_cap_add(s, moqr_cap_mul(cancels, sizeof(r_pending_cancel)));
     s = moqr_cap_add(s, moqr_cap_mul(fetches, sizeof(r_fetch_t)));
     s = moqr_cap_add(s, intern);   /* interned names + trie parts + ns-sub prefixes */
-    /* Per-sub scheduling positions at full occupancy (stride ceiling:
-     * max_groups entries of (u64 + u32 per list), 8-aligned). */
+    /* Per-sub scheduling positions at full occupancy: max_groups bounded
+     * entries, including presence, positions, emitted counts and seal acks. */
     moqr_log_cfg_t lc;
     moqr_log_cfg_init_sized(&lc, sizeof(lc), cfg->alloc);
     if (RELAY_CFG_HAS(cfg, log_budget)) {
@@ -6844,6 +9727,9 @@ moqr_core_capacity_describe(const moqr_core_relay_cfg_t *cfg,
         return MOQR_ERR_INVAL;   /* the runtime's u32 index cannot hold it */
     }
     s = moqr_cap_add(s, moqr_cap_mul(moqr_cap_mul(subs, gpos_hash_cap), sizeof(uint32_t)));
+    /* Semantic filter history: one exclusion bit per bounded journal slot. */
+    s = moqr_cap_add(s, moqr_cap_mul(subs, MOQR_LOG_DEF_MAX_RECORDS / 8u +
+                                         (MOQR_LOG_DEF_MAX_RECORDS % 8u != 0)));
 
     /* Worst-case per-binding chunk-pin storage: a chunked delivery pins every
      * chunk of the in-flight record (ref + length) so eviction cannot truncate
@@ -7085,12 +9971,29 @@ parked_find(const moqr_core_t *c, uint64_t t)
     return -1;
 }
 
+/* The sizeof of the park-request layout through sub_group_order: what a
+ * caller built before sub_forward_off was appended allocates and passes. */
+#define MOQR_PARK_REQ_SIZE_THROUGH_GROUP_ORDER                               \
+    ((offsetof(moqr_park_req_t, sub_group_order) +                           \
+      sizeof(((moqr_park_req_t *)0)->sub_group_order) +                      \
+      (_Alignof(moqr_park_req_t) - 1)) &                                     \
+     ~(_Alignof(moqr_park_req_t) - 1))
+
 moqr_result_t
-moqr_core_park(moqr_core_t *c, const moqr_park_req_t *req, uint64_t ext_ticket,
-               uint64_t now_us)
+moqr_core_park(moqr_core_t *c, const moqr_park_req_t *req,
+               uint64_t ext_ticket, uint64_t now_us)
+{
+    return moqr_core_park_sized(c, req, MOQR_PARK_REQ_SIZE_THROUGH_GROUP_ORDER,
+                                ext_ticket, now_us);
+}
+
+moqr_result_t
+moqr_core_park_sized(moqr_core_t *c, const moqr_park_req_t *req,
+                     size_t req_size, uint64_t ext_ticket, uint64_t now_us)
 {
     (void)now_us;
-    if (c == NULL || req == NULL) {
+    if (c == NULL || req == NULL ||
+        req_size < MOQR_PARK_REQ_SIZE_THROUGH_GROUP_ORDER) {
         return MOQR_ERR_INVAL;
     }
     if (ext_ticket == 0) {
@@ -7130,6 +10033,15 @@ moqr_core_park(moqr_core_t *c, const moqr_park_req_t *req, uint64_t ext_ticket,
     p->sub_end_group_delta = req->sub_end_group_delta;
     p->sub_priority = req->sub_priority;
     p->sub_group_order = req->sub_group_order;
+    p->sub_forward_off =
+        req_size >= offsetof(moqr_park_req_t, sub_forward_off) +
+                        sizeof(req->sub_forward_off) &&
+        req->sub_forward_off;
+    if (req_size >= offsetof(moqr_park_req_t, sub_rendezvous) +
+                        sizeof(req->sub_rendezvous)) {
+        p->sub_rendezvous = req->sub_rendezvous;
+        p->sub_rendezvous_deadline_us = req->sub_rendezvous_deadline_us;
+    }
     return MOQR_OK;
 }
 
@@ -7137,6 +10049,18 @@ moqr_result_t
 moqr_core_auth_begin_resolve(moqr_core_t *c, uint64_t ext_ticket,
                              const moqr_auth_verdict_t *result, uint64_t now_us,
                              moqr_auth_verdict_t *verdict, moqr_park_req_t *view)
+{
+    return moqr_core_auth_begin_resolve_sized(
+        c, ext_ticket, result, now_us, verdict, view,
+        MOQR_PARK_REQ_SIZE_THROUGH_GROUP_ORDER);
+}
+
+moqr_result_t
+moqr_core_auth_begin_resolve_sized(moqr_core_t *c, uint64_t ext_ticket,
+                                   const moqr_auth_verdict_t *result,
+                                   uint64_t now_us,
+                                   moqr_auth_verdict_t *verdict,
+                                   moqr_park_req_t *view, size_t view_size)
 {
     (void)now_us;
     /* Fail-closed default: any early/error return leaves DENY, so a caller that
@@ -7146,7 +10070,8 @@ moqr_core_auth_begin_resolve(moqr_core_t *c, uint64_t ext_ticket,
         verdict->decision = MOQR_AUTH_DENY;
         verdict->reason = MOQR_AUTH_REASON_POLICY;
     }
-    if (c == NULL || view == NULL) {
+    if (c == NULL || view == NULL ||
+        view_size < MOQR_PARK_REQ_SIZE_THROUGH_GROUP_ORDER) {
         return MOQR_ERR_INVAL;
     }
     int slot = parked_find(c, ext_ticket);
@@ -7184,22 +10109,29 @@ moqr_core_auth_begin_resolve(moqr_core_t *c, uint64_t ext_ticket,
         verdict->revalidate_after_us = d == MOQR_AUTH_ALLOW ? reval : 0;
     }
     p->pinned = true;
-    memset(view, 0, sizeof(*view));
-    view->action = p->action;
-    view->binding_cookie = p->binding_cookie;
-    view->session_cookie = p->session_cookie;
-    view->ns.parts = p->mat.ns_parts;
-    view->ns.count = p->mat.ns_count;
-    view->name.data = p->mat.name;
-    view->name.len = p->mat.name_len;
-    view->tokens = p->mat.tokens;
-    view->token_count = p->mat.token_count;
-    view->sub_filter_type = p->sub_filter_type;
-    view->sub_start_group = p->sub_start_group;
-    view->sub_start_object = p->sub_start_object;
-    view->sub_end_group_delta = p->sub_end_group_delta;
-    view->sub_priority = p->sub_priority;
-    view->sub_group_order = p->sub_group_order;
+    /* Built whole, then copied up to the caller's size: nothing is written
+     * past a view that ends before a later field. */
+    moqr_park_req_t v;
+    memset(&v, 0, sizeof(v));
+    v.action = p->action;
+    v.binding_cookie = p->binding_cookie;
+    v.session_cookie = p->session_cookie;
+    v.ns.parts = p->mat.ns_parts;
+    v.ns.count = p->mat.ns_count;
+    v.name.data = p->mat.name;
+    v.name.len = p->mat.name_len;
+    v.tokens = p->mat.tokens;
+    v.token_count = p->mat.token_count;
+    v.sub_filter_type = p->sub_filter_type;
+    v.sub_start_group = p->sub_start_group;
+    v.sub_start_object = p->sub_start_object;
+    v.sub_end_group_delta = p->sub_end_group_delta;
+    v.sub_priority = p->sub_priority;
+    v.sub_group_order = p->sub_group_order;
+    v.sub_forward_off = p->sub_forward_off;
+    v.sub_rendezvous = p->sub_rendezvous;
+    v.sub_rendezvous_deadline_us = p->sub_rendezvous_deadline_us;
+    memcpy(view, &v, view_size < sizeof(v) ? view_size : sizeof(v));
     return MOQR_OK;
 }
 
@@ -7330,6 +10262,23 @@ moqr_core_grant_abort(moqr_core_t *c, moqr_grant_res_t res)
     r_grant *g = &c->grants[res.slot];
     if ((g->gen & 1u) != 0 && g->gen == res.gen && !g->committed) {
         grant_free_slot(c, res.slot);
+    }
+}
+
+void
+moqr_core_grant_release(moqr_core_t *c, uint64_t binding_cookie,
+                        uint64_t session_cookie)
+{
+    if (c == NULL) {
+        return;
+    }
+    for (uint32_t gi = 0; gi < c->max_grants; gi++) {
+        r_grant *g = &c->grants[gi];
+        if ((g->gen & 1u) != 0 && g->committed && !g->revoked &&
+            g->binding_cookie == binding_cookie &&
+            g->session_cookie == session_cookie) {
+            grant_free_slot(c, gi);
+        }
     }
 }
 
@@ -7571,8 +10520,8 @@ rd_prefix(rd_writer_t *w, const uint8_t *prefix, bool json)
  * owe this subscription a filter-passing record, and the oldest such group
  * (the delivery frontier). Mirrors sub_best_candidate's deliverability test
  * against the persisted cursor indices WITHOUT mutating them — a local copy
- * of the read position skips below-start records. `frontier` is UINT64_MAX
- * when nothing is owed (caught up, parked, or empty log).
+ * of the read position skips below-start records. `frontier` is meaningful
+ * only when `lag_groups` is nonzero; UINT64_MAX is a valid owed group.
  */
 static void
 sub_backlog(const moqr_core_t *c, const r_sub_t *s, const moqr_log_t *log,
@@ -7593,7 +10542,7 @@ sub_backlog(const moqr_core_t *c, const r_sub_t *s, const moqr_log_t *log,
         const r_gpos_t *e = NULL;
         for (uint32_t i = 0; i < s->gpos_groups; i++) {
             const r_gpos_t *cand = gpos_at(s, i);
-            if (cand->group_id == g) {
+            if (cand->occupied && cand->group_id == g) {
                 e = cand;
                 break;
             }
@@ -7619,7 +10568,7 @@ sub_backlog(const moqr_core_t *c, const r_sub_t *s, const moqr_log_t *log,
         }
         if (owed) {
             (*lag_groups)++;
-            if (*frontier == UINT64_MAX) {
+            if (*lag_groups == 1) {
                 *frontier = g;
             }
         }
@@ -7633,6 +10582,7 @@ track_state_name(r_track_state_t st)
     case R_TRACK_PENDING: return "pending";
     case R_TRACK_ACTIVE:  return "active";
     case R_TRACK_WARM:    return "warm";
+    case R_TRACK_RENDEZVOUS: return "rendezvous";
     default:              return "unknown";
     }
 }
@@ -7648,9 +10598,9 @@ sub_state_name(r_sub_state_t st)
 }
 
 static void
-rd_group_id(rd_writer_t *w, uint64_t id)
+rd_group_id(rd_writer_t *w, uint64_t id, bool present)
 {
-    if (id == UINT64_MAX) {
+    if (!present) {
         rd_addf(w, "null");
     } else {
         rd_addf(w, "%llu", (unsigned long long)id);
@@ -7734,9 +10684,9 @@ moqr_core_route_dump_json(const moqr_core_t *c, char *buf, size_t cap,
         moqr_log_stats_t ls;
         moqr_log_get_stats(tr->log, &ls);
         rd_addf(&w, ",\"log\":{\"oldest_group\":");
-        rd_group_id(&w, ls.oldest_group_id);
+        rd_group_id(&w, ls.oldest_group_id, ls.group_count != 0);
         rd_addf(&w, ",\"newest_group\":");
-        rd_group_id(&w, ls.newest_group_id);
+        rd_group_id(&w, ls.newest_group_id, ls.group_count != 0);
         rd_addf(&w,
                 ",\"groups\":%u,\"records\":%llu,\"retained_bytes\":%llu,"
                 "\"end_of_track\":%s}",
@@ -7770,11 +10720,11 @@ moqr_core_route_dump_json(const moqr_core_t *c, char *buf, size_t cap,
             uint64_t lag = 0;
             sub_backlog(c, s, tr->log, &frontier, &lag);
             bool before_ret = s->state == R_SUB_ACTIVE &&
-                              ls.oldest_group_id != UINT64_MAX &&
+                              ls.group_count != 0 &&
                               s->start_group < ls.oldest_group_id;
             rd_addf(&w, ",\"lag_groups\":%llu,\"frontier_group\":",
                     (unsigned long long)lag);
-            rd_group_id(&w, frontier);
+            rd_group_id(&w, frontier, lag != 0);
             rd_addf(&w,
                     ",\"skip_pending\":%s,\"start_before_retention\":%s}",
                     s->pending_skip ? "true" : "false",
@@ -7866,9 +10816,9 @@ moqr_core_route_dump_text(const moqr_core_t *c, char *buf, size_t cap,
         rd_addf(&w, "    log: groups=%u records=%llu bytes=%llu oldest=",
                 ls.group_count, (unsigned long long)ls.record_count,
                 (unsigned long long)ls.retained_bytes);
-        rd_group_id(&w, ls.oldest_group_id);
+        rd_group_id(&w, ls.oldest_group_id, ls.group_count != 0);
         rd_addf(&w, " newest=");
-        rd_group_id(&w, ls.newest_group_id);
+        rd_group_id(&w, ls.newest_group_id, ls.group_count != 0);
         rd_addf(&w, " eot=%d\n", ls.end_of_track ? 1 : 0);
 
         rd_addf(&w, "    subs:\n");
@@ -7884,7 +10834,7 @@ moqr_core_route_dump_text(const moqr_core_t *c, char *buf, size_t cap,
             uint64_t lag = 0;
             sub_backlog(c, s, tr->log, &frontier, &lag);
             bool before_ret = s->state == R_SUB_ACTIVE &&
-                              ls.oldest_group_id != UINT64_MAX &&
+                              ls.group_count != 0 &&
                               s->start_group < ls.oldest_group_id;
             rd_addf(&w,
                     "      binding=%llu state=%s start=%llu/%llu end=",
@@ -7898,7 +10848,7 @@ moqr_core_route_dump_text(const moqr_core_t *c, char *buf, size_t cap,
                 rd_addf(&w, "-");
             }
             rd_addf(&w, " lag_groups=%llu frontier=", (unsigned long long)lag);
-            rd_group_id(&w, frontier);
+            rd_group_id(&w, frontier, lag != 0);
             rd_addf(&w, " skip_pending=%d start_before_retention=%d\n",
                     s->pending_skip ? 1 : 0, before_ret ? 1 : 0);
         }

@@ -2087,15 +2087,17 @@ main(void)
     moqr_cli_config_t cfg;
     char err[128];
 
-    /* Minimal valid config: port only; defaults fill the rest. The msquic
-     * listener is exact-version, so the default is ONE offer (the newest). */
+    /* Minimal valid config: port only; defaults fill the rest. The default
+     * offer is every supported draft, newest first, one ALPN each. */
     MOQ_TEST_CHECK(parse("{\"listener\":{\"port\":4443}}", &cfg, err,
                          sizeof(err)) == MOQR_OK);
     MOQ_TEST_CHECK_EQ_INT(cfg.port, 4443);
     MOQ_TEST_CHECK(strcmp(cfg.host, "0.0.0.0") == 0);
-    MOQ_TEST_CHECK_EQ_SIZE(cfg.alpn_count, (size_t)1);
-    MOQ_TEST_CHECK(strcmp(cfg.alpns[0], "moqt-18") == 0);
-    MOQ_TEST_CHECK_EQ_U64(cfg.version, 18);
+    MOQ_TEST_CHECK_EQ_SIZE(cfg.alpn_count, (size_t)3);
+    MOQ_TEST_CHECK(strcmp(cfg.alpns[0], "moqt-22") == 0);
+    MOQ_TEST_CHECK(strcmp(cfg.alpns[1], "moqt-18") == 0);
+    MOQ_TEST_CHECK(strcmp(cfg.alpns[2], "moqt-16") == 0);
+    MOQ_TEST_CHECK_EQ_U64(cfg.version, 22);
     MOQ_TEST_CHECK_EQ_U64(cfg.lanes, 1);   /* default single-lane */
     MOQ_TEST_CHECK(!cfg.insecure_skip_verify);
 
@@ -2180,10 +2182,35 @@ main(void)
         parse("{\"listener\":{\"port\":1,\"versions\":[18,16,18,16,18]}}",
               &cfg, err, sizeof(err)) == MOQR_ERR_INVAL);
 
-    /* Default is exactly [18], and one entry keeps exact-listener semantics:
-     * the label is the bare ALPN and the plan carries no list. */
+    /* The native default is every supported draft, newest first -- [22, 18,
+     * 16] with all three built -- and its plan hands that ordered list over. */
     MOQ_TEST_CHECK(parse("{\"listener\":{\"port\":1}}", &cfg, err,
                          sizeof(err)) == MOQR_OK);
+    MOQ_TEST_CHECK(moq_version_supported(MOQ_VERSION_DRAFT_22));
+    MOQ_TEST_CHECK(moq_version_supported(MOQ_VERSION_DRAFT_18));
+    MOQ_TEST_CHECK(moq_version_supported(MOQ_VERSION_DRAFT_16));
+    MOQ_TEST_CHECK(cfg.version_count == 3);
+    if (cfg.version_count == 3) {
+        MOQ_TEST_CHECK(cfg.versions[0] == MOQ_VERSION_DRAFT_22);
+        MOQ_TEST_CHECK(cfg.versions[1] == MOQ_VERSION_DRAFT_18);
+        MOQ_TEST_CHECK(cfg.versions[2] == MOQ_VERSION_DRAFT_16);
+    }
+    MOQ_TEST_CHECK(strcmp(cfg.alpn_set, "moqt-22+moqt-18+moqt-16") == 0);
+    MOQ_TEST_CHECK(cfg.version == 22);
+    {
+        moqr_cli_version_plan_t pl;
+        moqr_cli_version_plan(&cfg, &pl);
+        MOQ_TEST_CHECK(pl.exact == 0 && pl.count == 3 && pl.list != NULL);
+        if (pl.list != NULL && pl.count == 3) {
+            MOQ_TEST_CHECK(pl.list[0] == MOQ_VERSION_DRAFT_22);
+            MOQ_TEST_CHECK(pl.list[1] == MOQ_VERSION_DRAFT_18);
+            MOQ_TEST_CHECK(pl.list[2] == MOQ_VERSION_DRAFT_16);
+        }
+    }
+    /* One entry keeps exact-listener semantics: the label is the bare ALPN
+     * and the plan carries no list. */
+    MOQ_TEST_CHECK(parse("{\"listener\":{\"port\":1,\"versions\":[18]}}",
+                         &cfg, err, sizeof(err)) == MOQR_OK);
     MOQ_TEST_CHECK(cfg.version_count == 1);
     MOQ_TEST_CHECK(cfg.versions[0] == MOQ_VERSION_DRAFT_18);
     MOQ_TEST_CHECK(strcmp(cfg.alpn_set, "moqt-18") == 0);
@@ -2241,6 +2268,101 @@ main(void)
         MOQ_TEST_CHECK(cfg.versions[1] == MOQ_VERSION_DRAFT_18);
     }
     MOQ_TEST_CHECK(strcmp(cfg.alpn_set, "moqt-16+moqt-18") == 0);
+
+    /* Draft-22 is a known draft on both listeners: exact and in a list, in
+     * any order, labelled moqt-22. A user who asks for 22 alone gets exactly
+     * moqt-22 offered. */
+    MOQ_TEST_CHECK(parse("{\"listener\":{\"port\":1,\"versions\":[22]}}",
+                         &cfg, err, sizeof(err)) == MOQR_OK);
+    MOQ_TEST_CHECK(cfg.version_count == 1);
+    MOQ_TEST_CHECK(cfg.versions[0] == MOQ_VERSION_DRAFT_22);
+    MOQ_TEST_CHECK(cfg.version == 22);
+    MOQ_TEST_CHECK(strcmp(cfg.alpn_set, "moqt-22") == 0);
+    {
+        moqr_cli_version_plan_t pl;
+        moqr_cli_version_plan(&cfg, &pl);
+        MOQ_TEST_CHECK(pl.exact == MOQ_VERSION_DRAFT_22);
+        MOQ_TEST_CHECK(pl.count == 0);
+    }
+    MOQ_TEST_CHECK(parse("{\"listener\":{\"port\":1,\"versions\":[22,18,16]}}",
+                         &cfg, err, sizeof(err)) == MOQR_OK);
+    MOQ_TEST_CHECK(cfg.version_count == 3);
+    if (cfg.version_count == 3) {
+        MOQ_TEST_CHECK(cfg.versions[0] == MOQ_VERSION_DRAFT_22);
+        MOQ_TEST_CHECK(cfg.versions[1] == MOQ_VERSION_DRAFT_18);
+        MOQ_TEST_CHECK(cfg.versions[2] == MOQ_VERSION_DRAFT_16);
+    }
+    MOQ_TEST_CHECK(strcmp(cfg.alpn_set, "moqt-22+moqt-18+moqt-16") == 0);
+    {
+        moqr_cli_version_plan_t pl;
+        moqr_cli_version_plan(&cfg, &pl);
+        MOQ_TEST_CHECK(pl.exact == 0 && pl.count == 3 && pl.list != NULL);
+        if (pl.list != NULL && pl.count == 3) {
+            MOQ_TEST_CHECK(pl.list[0] == MOQ_VERSION_DRAFT_22);
+        }
+    }
+    MOQ_TEST_CHECK(parse("{\"listener\":{\"port\":1,\"versions\":[18,22]}}",
+                         &cfg, err, sizeof(err)) == MOQR_OK);
+    MOQ_TEST_CHECK(strcmp(cfg.alpn_set, "moqt-18+moqt-22") == 0);
+    MOQ_TEST_CHECK(parse("{\"listener\":{\"port\":1,\"versions\":[22,22]}}",
+                         &cfg, err, sizeof(err)) == MOQR_ERR_INVAL);
+    MOQ_TEST_CHECK(strstr(err, "duplicate") != NULL);
+    /* Drafts between and beyond the known set stay refused. */
+    MOQ_TEST_CHECK(parse("{\"listener\":{\"port\":1,\"versions\":[20]}}",
+                         &cfg, err, sizeof(err)) == MOQR_ERR_INVAL);
+    MOQ_TEST_CHECK(parse("{\"listener\":{\"port\":1,\"versions\":[23]}}",
+                         &cfg, err, sizeof(err)) == MOQR_ERR_INVAL);
+    /* The WebTransport listener keeps explicit order; its default set is
+     * every supported draft, newest first. */
+    MOQ_TEST_CHECK(parse("{\"listener\":{\"port\":1},"
+                         "\"webtransport\":{\"port\":2,\"cert\":\"c\",\"key\":\"k\","
+                         "\"versions\":[22,18]}}",
+                         &cfg, err, sizeof(err)) == MOQR_OK);
+    MOQ_TEST_CHECK(cfg.wt.version_count == 2);
+    if (cfg.wt.version_count == 2) {
+        MOQ_TEST_CHECK(cfg.wt.versions[0] == MOQ_VERSION_DRAFT_22);
+        MOQ_TEST_CHECK(cfg.wt.versions[1] == MOQ_VERSION_DRAFT_18);
+        MOQ_TEST_CHECK(strcmp(cfg.wt.subprotos[0], "moqt-22") == 0);
+        MOQ_TEST_CHECK(strcmp(cfg.wt.subprotos[1], "moqt-18") == 0);
+    }
+    MOQ_TEST_CHECK(parse("{\"listener\":{\"port\":1},"
+                         "\"webtransport\":{\"port\":2,\"cert\":\"c\",\"key\":\"k\","
+                         "\"versions\":[20]}}",
+                         &cfg, err, sizeof(err)) == MOQR_ERR_INVAL);
+    MOQ_TEST_CHECK(parse("{\"listener\":{\"port\":1},"
+                         "\"webtransport\":{\"port\":2,\"cert\":\"c\",\"key\":\"k\"}}",
+                         &cfg, err, sizeof(err)) == MOQR_OK);
+    MOQ_TEST_CHECK(cfg.wt.version_count == 3 &&
+                   cfg.wt.versions[0] == MOQ_VERSION_DRAFT_22 &&
+                   cfg.wt.versions[1] == MOQ_VERSION_DRAFT_18 &&
+                   cfg.wt.versions[2] == MOQ_VERSION_DRAFT_16);
+    MOQ_TEST_CHECK(strcmp(cfg.wt.subprotos[0], "moqt-22") == 0);
+    MOQ_TEST_CHECK(strcmp(cfg.wt.subprotos[2], "moqt-16") == 0);
+    MOQ_TEST_CHECK(strcmp(cfg.wt.alpn_set, "moqt-22+moqt-18+moqt-16") == 0);
+
+    /* The two defaults agree: with both listeners omitted-versions, each
+     * offers [22, 18, 16]. */
+    MOQ_TEST_CHECK(parse("{\"listener\":{\"port\":1},"
+                         "\"webtransport\":{\"port\":2,\"cert\":\"c\",\"key\":\"k\"}}",
+                         &cfg, err, sizeof(err)) == MOQR_OK);
+    MOQ_TEST_CHECK(cfg.version_count == 3 &&
+                   cfg.versions[0] == MOQ_VERSION_DRAFT_22 &&
+                   cfg.versions[1] == MOQ_VERSION_DRAFT_18 &&
+                   cfg.versions[2] == MOQ_VERSION_DRAFT_16);
+    MOQ_TEST_CHECK(strcmp(cfg.alpn_set, "moqt-22+moqt-18+moqt-16") == 0);
+    MOQ_TEST_CHECK(cfg.wt.version_count == 3 &&
+                   cfg.wt.versions[0] == MOQ_VERSION_DRAFT_22 &&
+                   cfg.wt.versions[1] == MOQ_VERSION_DRAFT_18 &&
+                   cfg.wt.versions[2] == MOQ_VERSION_DRAFT_16);
+    MOQ_TEST_CHECK(strcmp(cfg.wt.alpn_set, "moqt-22+moqt-18+moqt-16") == 0);
+    MOQ_TEST_CHECK(strcmp(cfg.wt.alpn_set, cfg.alpn_set) == 0);
+    /* An explicit native list is honoured as written. */
+    MOQ_TEST_CHECK(parse("{\"listener\":{\"port\":1,\"versions\":[18,16]}}",
+                         &cfg, err, sizeof(err)) == MOQR_OK);
+    MOQ_TEST_CHECK(cfg.version_count == 2 &&
+                   cfg.versions[0] == MOQ_VERSION_DRAFT_18 &&
+                   cfg.versions[1] == MOQ_VERSION_DRAFT_16);
+    MOQ_TEST_CHECK(strcmp(cfg.alpn_set, "moqt-18+moqt-16") == 0);
 
     /* Bad port. */
     MOQ_TEST_CHECK(parse("{\"listener\":{\"port\":70000}}", &cfg, err,
@@ -2567,11 +2689,23 @@ main(void)
         uint64_t delta = cap_on.shards_structure_bytes -
                          cap_off.shards_structure_bytes;
         MOQ_TEST_CHECK(delta > 0);
-        /* Only the shard structure moves: every other term is byte-equal. */
+        /* Besides the shard structure, only the canon term moves: by one
+         * full-track key (4232 bytes) per requester retrieval slot, the key
+         * a routed standalone FETCH holds until its REQ carries it --
+         * K x fetches x 4232. Every other term is byte-equal. */
+        uint64_t keys = 0;
+        {
+            moqr_core_limits_t kl;
+            MOQ_TEST_CHECK(moqr_core_limits_resolve(&on.core_cfg, &kl) ==
+                           MOQR_OK);
+            keys = (uint64_t)on.shards * kl.max_fetches * 4232u;
+        }
+        MOQ_TEST_CHECK(keys > 0);
         MOQ_TEST_CHECK_EQ_U64(cap_on.channel_byte_ceiling,
                               cap_off.channel_byte_ceiling);
-        MOQ_TEST_CHECK_EQ_U64(cap_on.canon_byte_ceiling,
-                              cap_off.canon_byte_ceiling);
+        MOQ_TEST_CHECK_EQ_U64(cap_on.canon_byte_ceiling -
+                                  cap_off.canon_byte_ceiling,
+                              keys);
         MOQ_TEST_CHECK_EQ_U64(cap_on.staging_byte_ceiling,
                               cap_off.staging_byte_ceiling);
         MOQ_TEST_CHECK_EQ_U64(cap_on.core_structure_bytes,
@@ -2584,7 +2718,7 @@ main(void)
         /* The ceiling moves by exactly the admission delta. */
         MOQ_TEST_CHECK_EQ_U64(cap_on.relay_alloc_ceiling -
                                   cap_off.relay_alloc_ceiling,
-                              delta);
+                              delta + keys);
         /* The CLI total moves by exactly the same delta (cli_runtime is
          * admission-independent). */
         moqr_cli_capacity_t con;
@@ -2597,7 +2731,7 @@ main(void)
         MOQ_TEST_CHECK_EQ_U64(con.total_bytes -
                                   (cap_off.relay_alloc_ceiling +
                                    con.cli_runtime_bytes),
-                              delta);
+                              delta + keys);
         /* K-linearity: the same delta at lanes=2 is EXACTLY half (the
          * per-shard progress storage times K). */
         {
@@ -2618,13 +2752,39 @@ main(void)
             /* delta(K=4)/4 == delta(K=2)/2 (constant per shard). */
             MOQ_TEST_CHECK_EQ_U64(delta * 2u, d2 * 4u);
         }
-        /* Subgroup-slot linearity, EXACT: the admission term is
-         * K·(2·pend·sg·psg + pend). Doubling subgroup_slots doubles the
-         * 2·pend·sg part while the flat +pend part is unchanged, so
-         *   sdelta == 2·delta − K·pend
-         * must hold to the byte. This pins the term SHAPE (an affine function
-         * of sg with the right slope-doubling and intercept), independent of
-         * the private progress-slot size. */
+        /* Subgroup-slot and fetch-pool linearity, EXACT: the admission term
+         * is K·(2·pend·sg·psg + pend + fetches·fr), where fr is the private
+         * size of one fill-retrieval slot pair (requester + owner) and
+         * fetches the resolved core fetch-cursor pool. Doubling the pool
+         * adds the K·fetches·fr part once more and nothing else, which
+         * isolates it (fill_term); doubling subgroup_slots doubles the
+         * 2·pend·sg part while the flat +pend and +fill parts are unchanged,
+         * so
+         *   sdelta == 2·delta − K·pend − fill_term
+         * must hold to the byte. This pins the term SHAPE (affine in sg with
+         * the right slope-doubling and intercept, linear in the fetch pool),
+         * independent of the private slot sizes. */
+        uint64_t fill_term = 0;
+        {
+            moqr_core_limits_t clim;
+            MOQ_TEST_CHECK(moqr_core_limits_resolve(&on.core_cfg, &clim) ==
+                           MOQR_OK);
+            moqr_shards_cfg_t fon = on, foff;
+            fon.core_cfg.max_fetches = 2u * clim.max_fetches;
+            foff = fon;
+            foff.admit_remote_demand = false;
+            moqr_shards_capacity_t fcon, fcoff;
+            MOQ_TEST_CHECK(moqr_shards_capacity_describe(&fon, &fcon) ==
+                           MOQR_OK);
+            MOQ_TEST_CHECK(moqr_shards_capacity_describe(&foff, &fcoff) ==
+                           MOQR_OK);
+            uint64_t fdelta = fcon.shards_structure_bytes -
+                              fcoff.shards_structure_bytes;
+            MOQ_TEST_CHECK(fdelta > delta);
+            fill_term = fdelta - delta;
+            MOQ_TEST_CHECK_EQ_U64(fill_term % 4u, 0);
+            MOQ_TEST_CHECK_EQ_U64(fill_term % clim.max_fetches, 0);
+        }
         {
             moqr_shards_limits_t blim;
             MOQ_TEST_CHECK(moqr_shards_cfg_resolve(&on, &blim) == MOQR_OK);
@@ -2652,7 +2812,8 @@ main(void)
                               scoff.shards_structure_bytes;
             MOQ_TEST_CHECK_EQ_U64(sdelta,
                                   2u * delta -
-                                      (uint64_t)slim.shards * slim.pend_cap);
+                                      (uint64_t)slim.shards * slim.pend_cap -
+                                      fill_term);
         }
 
         /* Independent, NON-CIRCULAR pin: a live K>1 runtime requests exactly

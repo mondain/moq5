@@ -55,8 +55,10 @@ moq_result_t moq_msquic_managed_create(const moq_msquic_managed_cfg_t *cfg,
     CHECK(cfg->alloc != NULL && cfg->perspective == MOQ_PERSPECTIVE_SERVER);
     CHECK(!strcmp(cfg->host, "127.0.0.1") && cfg->port == 0);
     CHECK(!strcmp(cfg->cert_path, "cert") && !strcmp(cfg->key_path, "key"));
-    CHECK(cfg->version == 0 && cfg->version_count == 2);
-    CHECK(cfg->versions[0] == MOQ_VERSION_DRAFT_18 && cfg->versions[1] == MOQ_VERSION_DRAFT_16);
+    CHECK(cfg->version == 0 && cfg->version_count == 3);
+    CHECK(cfg->versions[0] == MOQ_VERSION_DRAFT_22 &&
+          cfg->versions[1] == MOQ_VERSION_DRAFT_18 &&
+          cfg->versions[2] == MOQ_VERSION_DRAFT_16);
     CHECK(cfg->lane_count == 1 && cfg->max_connections == 16);
     CHECK(cfg->on_lane_pump == pump && cfg->send_request_capacity);
     CHECK(cfg->initial_request_capacity == 1024);
@@ -187,6 +189,7 @@ int main(void)
     CHECK(parse_port("65535", &port) && port == 65535);
     pump_cases(MOQ_VERSION_DRAFT_16);
     pump_cases(MOQ_VERSION_DRAFT_18);
+    pump_cases(MOQ_VERSION_DRAFT_22);
     for (unsigned mode = 0; mode < 3; ++mode) {
         char *argv[] = {"relay", "cert", "key", "0", NULL};
         creates = stops = destroys = 0;

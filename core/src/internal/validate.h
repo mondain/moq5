@@ -58,13 +58,16 @@ static moq_result_t moq_validate_full_track_name(
     return moq_validate_full_track_name_min_fields(ns, track_name, 1);
 }
 
+/* A caller's authorization tokens: a non-NULL array when any are given, a
+ * value span with bytes when it has a length, and a Token Type no wider than
+ * the selected profile carries (type_max: its integer encoding's ceiling). */
 MOQ_VALIDATE_UNUSED
 static moq_result_t moq_validate_auth_tokens(const moq_auth_token_t *tokens,
-                                               size_t count)
+                                               size_t count, uint64_t type_max)
 {
     if (count > 0 && !tokens) return MOQ_ERR_INVAL;
     for (size_t i = 0; i < count; i++) {
-        if (tokens[i].token_type > MOQ_QUIC_VARINT_MAX)
+        if (tokens[i].token_type > type_max)
             return MOQ_ERR_INVAL;
         if (tokens[i].token_value.len > 0 && !tokens[i].token_value.data)
             return MOQ_ERR_INVAL;

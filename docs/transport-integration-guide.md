@@ -34,11 +34,11 @@ C++ attach mode for callers that already own a `proxygen::WebTransport`
 
 | | Transport | Stack | Deps | Installed / stable today | Managed C facade | Best fit |
 |---|---|---|---|---|---|---|
-| **picoquic raw** | raw QUIC (ALPN `moqt-16`) | picoquic (C) | light (C, picotls, OpenSSL or mbedTLS) | yes — `moq/picoquic.h` installed; threaded helper installed when `MOQ_BUILD_PQ_THREADED=ON` | `moq_pq_threaded_t` | default for native apps; smallest dependency footprint |
+| **picoquic raw** | raw QUIC (ALPN `moqt-16` / `moqt-18` / `moqt-22`) | picoquic (C) | light (C, picotls, OpenSSL or mbedTLS) | yes — `moq/picoquic.h` installed; threaded helper installed when `MOQ_BUILD_PQ_THREADED=ON` | `moq_pq_threaded_t` | default for native apps; smallest dependency footprint |
 | **picoquic WebTransport** | WebTransport over HTTP/3 (ALPN `h3`) | picoquic h3zero/picowt (C) | light (same as picoquic + HTTP/3) | yes (experimental) — `moq/pico_wt.h` installs (CMake + `libmoq-pico-wt.pc`); `moq/pico_wt_managed.h` installs (CMake + `libmoq-pico-wt-managed.pc`) when `MOQ_BUILD_PICO_WT_MANAGED=ON` | `moq_pico_wt_managed_t` (experimental) | browser/WebTransport interop |
-| **mvfst raw** | raw QUIC (ALPN `moqt-16`) | Meta mvfst (C++/folly) | heavy (folly, fizz, mvfst, C++ toolchain) | yes — installed, but **CMake-only** (no `pkg-config` entry) | `moq_mvfst_managed_t` | servers/relays already in the folly ecosystem; multi-connection server |
+| **mvfst raw** | raw QUIC (one ALPN of `moqt-16` / `moqt-18` / `moqt-22`) | Meta mvfst (C++/folly) | heavy (folly, fizz, mvfst, C++ toolchain) | yes — installed, but **CMake-only** (no `pkg-config` entry) | `moq_mvfst_managed_t` | servers/relays already in the folly ecosystem; multi-connection server |
 | **proxygen WebTransport** | WebTransport | proxygen (C++) | heavy (proxygen/folly) | yes (experimental) — installed as **CMake-only** components `adapter-proxygen-wt` (attach) + `adapter-proxygen-wt-managed` (managed), no `.pc` | `moq_proxygen_wt_managed_t` (experimental) | WebTransport in a proxygen/folly C++ service — see §10 |
-| **wtquic Network.framework** | WebTransport over HTTP/3 (Network.framework) | wtquic `network` component (C, Apple-only) | light (wtquic; no MsQuic for this path) | yes (experimental, Apple-only) — `moq/wtquic_network_managed.h` installs (CMake component `adapter-wtquic-network-managed` + `libmoq-wtquic-network-managed.pc`) when `MOQ_BUILD_WTQUIC_NETWORK_MANAGED=ON` | `moq_wtquic_network_managed_t` (experimental; client-only, lane API, serial-queue domain — no worker thread) | Apple apps wanting WT on the system network stack |
+| **wtquic Network.framework** | WebTransport over HTTP/3 (Network.framework) | wtquic `network` component (C, Apple-only) | light (wtquic; no MsQuic for this path) | packaged, but creation is refused — `moq/wtquic_network_managed.h` installs (CMake component `adapter-wtquic-network-managed` + `libmoq-wtquic-network-managed.pc`) when `MOQ_BUILD_WTQUIC_NETWORK_MANAGED=ON` | `moq_wtquic_network_managed_t` returns `MOQ_ERR_UNSUPPORTED` for valid configurations on every draft | Unavailable under the current receive-admission policy |
 | **wtquic MsQuic** | WebTransport over HTTP/3 (MsQuic) | wtquic `msquic` component (C) | MsQuic + wtquic (C) | yes (experimental) — `moq/wtquic_msquic_managed.h` installs (CMake component `adapter-wtquic-msquic-managed` + `libmoq-wtquic-msquic-managed.pc`) when `MOQ_BUILD_WTQUIC_MSQUIC_MANAGED=ON` | `moq_wtquic_msquic_managed_t` (experimental; lane API, coordinator + doorbell worker threads; service-tier client-only) | cross-platform WebTransport over MsQuic; real multi-version negotiation |
 
 Quick rules of thumb:
@@ -54,11 +54,10 @@ Quick rules of thumb:
   WT CONNECT, owns the thread + session; explicit-select only — see §10), or
   a C++ attach mode where you own the `proxygen::WebTransport*` and the
   session lifecycle yourself. Installable CMake-only (no `.pc`).
-- **Apple app, WebTransport on the system stack →** wtquic
-  Network.framework client (`moq_wtquic_network_managed_t`): client-only, one
-  lane/one connection, no worker thread (wtquic's serial queue is the
-  session domain — actor-friendly for Swift hosts). Not raw QUIC and not
-  a server.
+- **WebTransport on Apple's system stack is currently unavailable through
+  LibMoQ.** `moq_wtquic_network_managed_t` refuses creation before allocation
+  or network startup, including when draft-22 is selected. The retained
+  lifecycle examples below do not provide a working connection or fallback.
 - **Cross-platform WebTransport over MsQuic →** wtquic MsQuic managed facade
   (`moq_wtquic_msquic_managed_t`): WebTransport with real per-connection
   multi-version WT-Protocol negotiation, owns its coordinator + doorbell worker
@@ -71,7 +70,7 @@ Quick rules of thumb:
 
 ## 2. The common managed-consumer pattern
 
-Every managed facade follows the same shape. Names differ by a prefix
+Available managed facades follow the same shape. Names differ by a prefix
 (`moq_pq_threaded_`, `moq_pico_wt_managed_`, `moq_mvfst_managed_`,
 `moq_msquic_managed_`); the flow is identical.
 
@@ -684,45 +683,58 @@ config and expose a transport-neutral pump handle.
 
 libmoq is strict about the MoQ wire version (the "profile"). A session
 binds to exactly one profile at create time via
-`moq_session_cfg_t.version` (`0` = the draft-16 default), and it is
-immutable thereafter. There is **no** auto-detection — libmoq never tries
-multiple decoders to guess the version. An unsupported value fails
-`moq_session_create` with `MOQ_ERR_INVAL`.
+`moq_session_cfg_t.version` (`0` = draft-16), and it is immutable
+thereafter. There is **no** auto-detection: libmoq never tries several
+decoders to guess the version. An unsupported value fails
+`moq_session_create` with `MOQ_ERR_INVAL`. This build speaks draft-16,
+draft-18 and draft-22; `moq_versions_supported()` lists them newest first.
 
-The version is decided by **transport negotiation**, and which surface
-carries it depends on how you run MoQ:
+The version is decided by **transport negotiation**:
 
-- **Native MoQ-over-QUIC** (picoquic raw/threaded, mvfst): the QUIC ALPN
-  *is* the MoQ version. `moqt-16` ⇒ draft-16. Today's managed adapters
-  negotiate `moqt-16` and create draft-16 sessions.
-- **H3 WebTransport** (pico_wt and proxygen WT — the in-tree WebTransport
-  adapters): the QUIC ALPN is `h3`, **not** a MoQ ALPN. The MoQ version
-  is negotiated by the WebTransport protocol layer
-  (`WT-Available-Protocols`). Automatic wiring of that into `cfg.version`
-  is future work; the H3-WT adapters create draft-16 sessions today.
-- **WebTransport-over-QUIC** (a MoQ ALPN such as `moqt-16` carried
-  directly over a `QuicWebTransport`-style stack, e.g. proxygen's): the
-  QUIC ALPN *is* the MoQ version, selected the same way as native. This
-  is **not** a transport shape any in-tree adapter uses today — noted
-  only for integrators wiring such a stack themselves.
+- **Native MoQ over QUIC** (picoquic raw, mvfst, MsQuic): the QUIC ALPN is
+  the version: `moqt-16`, `moqt-18`, `moqt-22`.
+- **WebTransport over HTTP/3** (pico_wt, wtquic, proxygen): the QUIC ALPN is
+  `h3`; the MoQ version is the WebTransport protocol token the two sides
+  agree on (`moqt-22`, `moqt-18`, `moqt-16`), offered in preference order.
 
-Who sets `cfg.version`:
+What each managed facade does with an offer:
 
-- **Attach-mode hosts own the handshake** and therefore know the
-  negotiated transport version. Set `cfg.version` to match the ALPN /
-  WT protocol you negotiated. For a `moqt-16` connection leave it `0`
-  (or `MOQ_VERSION_DRAFT_16`). libmoq cannot infer it for you.
-- **Managed native/QuicWebTransport adapters** negotiate the ALPN
-  themselves; reading the negotiated ALPN back into `cfg.version` (and
-  failing a connection whose ALPN is unknown/mismatched before any SETUP
-  byte is parsed) is future work — the managed adapters create draft-16
-  sessions today.
+| Facade | Offer |
+| --- | --- |
+| `moq_pq_threaded_t` | `alpn_list`: a client creates its session once the handshake picked an ALPN; a server selects per connection. Without a list, the single `moqt-16`. |
+| `moq_mvfst_managed_t` | Exact version: one ALPN; a multi-entry offer is `MOQ_ERR_UNSUPPORTED` (the session is created before TLS). |
+| `moq_msquic_managed_t` | Client: one ALPN (`cfg.version`). Server: one ALPN or an ordered `versions` list, selected per connection. |
+| `moq_pico_wt_managed_t`, `moq_wtquic_msquic_managed_t`, `moq_proxygen_wt_managed_t` | A WebTransport protocol offer in preference order (`wt_protocols` on pico_wt and wtquic, `alpn_list` on proxygen); the selected token decides the session version. |
 
-Legacy peers: drafts ≤14 used the `moq-00` ALPN and carried a version
+The service endpoint builds the offer for you. Its AUTO policy offers every
+supported version, newest first ({22, 18, 16}).
+`moq_endpoint_cfg_t.preferred_version` moves a supported version to the front
+(set it after `moq_endpoint_cfg_init_sized()`); a LIST or EXACT policy states
+the order outright. The mvfst and MsQuic facades create their
+session before the handshake, so they accept only a single offered version:
+an AUTO offer through them is `MOQ_ERR_UNSUPPORTED` at create rather than
+silently narrowed.
+
+**Draft-22 needs a transport binding.** Before a draft-22 session starts it
+must be told how it is carried (`moq_session_bind_transport()`): raw QUIC or
+WebTransport, the QUIC DATAGRAM facts, and, for a raw-QUIC client, the
+authority and path its SETUP sends. Managed facades that admit the configuration
+bind for you from their target configuration (the service supplies its URL
+target); WT servers use the accepted CONNECT target. Draft-16 and draft-18
+accept the same binding optionally, and the managed facades bind them too,
+so a raw-QUIC client names its URI target in SETUP on every draft. The Network.framework
+facade refuses creation on every draft and never reaches this binding path.
+Most attach-mode hosts bind themselves; direct MsQuic binds at CONNECTED. See
+[adapters.md](adapters.md#transport-binding).
+
+Attach-mode hosts own the handshake and therefore know the negotiated
+version: set `cfg.version` to match the ALPN or WebTransport token. libmoq
+cannot infer it.
+
+Legacy peers: drafts up to 14 used the `moq-00` ALPN and carried a version
 list inside the client's setup message. Draft-16 removed the version list
 (ALPN is the sole version surface), so such a setup is rejected by the
 strict parser. The server emits an advisory close reason noting the bytes
 look like a legacy version-list setup and that draft-16 negotiates the
-version via ALPN (expecting `moqt-16`) — pointing at the likely ALPN
-mismatch. The rejection itself is unchanged; only the diagnostic is more
-specific.
+version via ALPN (expecting `moqt-16`), pointing at the likely ALPN
+mismatch.

@@ -450,6 +450,19 @@ static void test_alpn_version_config(void)
         m = NULL;
     }
 
+    /* Single "moqt-22" ALPN accepted: the session waits for the handshake
+     * before it is bound and started, so lifecycle-only never establishes. */
+    {
+        static const char *const alpn[] = { "moqt-22" };
+        moq_mvfst_managed_cfg_t cfg = make_cfg(pump_forever, NULL);
+        cfg.alpn_list = alpn;
+        cfg.alpn_count = 1;
+        MVFST_CHECK(moq_mvfst_managed_create(&cfg, &m) == MOQ_OK);
+        MVFST_CHECK(moq_mvfst_managed_negotiated_version(m) == 0);
+        moq_mvfst_managed_destroy(m);
+        m = NULL;
+    }
+
     /* Multi-version offer (AUTO) rejected: this is an exact-version adapter. */
     {
         static const char *const alpn[] = { "moqt-18", "moqt-16" };
@@ -457,6 +470,51 @@ static void test_alpn_version_config(void)
         cfg.alpn_list = alpn;
         cfg.alpn_count = 2;
         MVFST_CHECK(moq_mvfst_managed_create(&cfg, &m) == MOQ_ERR_UNSUPPORTED);
+    }
+    {
+        static const char *const alpn[] = { "moqt-22", "moqt-18", "moqt-16" };
+        moq_mvfst_managed_cfg_t cfg = make_cfg(pump_exit, NULL);
+        cfg.alpn_list = alpn;
+        cfg.alpn_count = 3;
+        MVFST_CHECK(moq_mvfst_managed_create(&cfg, &m) == MOQ_ERR_UNSUPPORTED);
+    }
+
+    /* A malformed connection target is refused at create. */
+    {
+        static const char *const alpn[] = { "moqt-22" };
+        moq_connection_target_t bad;
+        memset(&bad, 0, sizeof(bad));
+        bad.struct_size = sizeof(bad);
+        bad.target_present = 0x8;             /* unknown presence bit */
+        moq_mvfst_managed_cfg_t cfg = make_cfg(pump_exit, NULL);
+        cfg.alpn_list = alpn;
+        cfg.alpn_count = 1;
+        cfg.target = &bad;
+        MVFST_CHECK(moq_mvfst_managed_create(&cfg, &m) == MOQ_ERR_INVAL);
+    }
+
+    /* A client with no target is identified by its dial parameters; one
+     * whose host:port authority does not fit the derivation (1023 bytes
+     * here, one over its 1022-byte bound) is refused at create, never left
+     * unidentified. */
+    {
+        static const char *const alpn[] = { "moqt-22" };
+        static char host[1020];
+        memset(host, 'h', 1019);
+        host[1019] = '\0';
+        moq_mvfst_managed_cfg_t cfg = make_cfg(pump_exit, NULL);
+        cfg.alpn_list = alpn;
+        cfg.alpn_count = 1;
+        cfg.host = host;
+        cfg.port = 443;
+        m = NULL;
+        MVFST_CHECK(moq_mvfst_managed_create(&cfg, &m) == MOQ_ERR_INVAL);
+        MVFST_CHECK(m == NULL);
+        if (m) {
+            moq_mvfst_managed_stop(m);
+            moq_mvfst_managed_destroy(m);
+            m = NULL;
+        }
     }
 
     /* Unknown / non-MoQ ALPN rejected. */
@@ -561,6 +619,38 @@ static void test_alpn_version_config(void)
         char dirty[sizeof(moq_mvfst_managed_cfg_t)];
         memset(dirty, 0xFF, sizeof(dirty));
         memcpy(dirty, &prefix, old_size);   /* tail past old_size stays 0xFF */
+        moq_mvfst_managed_cfg_t *old = (moq_mvfst_managed_cfg_t *)dirty;
+
+        MVFST_CHECK(moq_mvfst_managed_create(old, &m) == MOQ_OK);
+        moq_mvfst_managed_destroy(m);
+        m = NULL;
+    }
+
+    /* Old caller whose struct ends at app_deadline_ctx, the layout before
+     * `target` was appended: struct_size is that layout's sizeof (the end of
+     * app_deadline_ctx rounded to the struct's alignment) and every byte
+     * past app_deadline_ctx is dirty. The dirty bytes would be a wild
+     * target pointer on a draft that binds the transport; create must use
+     * no target. */
+    {
+        enum { END = offsetof(moq_mvfst_managed_cfg_t, app_deadline_ctx) +
+                     sizeof(void *) };
+        const size_t align = _Alignof(moq_mvfst_managed_cfg_t);
+        const size_t old_size = (END + align - 1) / align * align;
+        _Static_assert(offsetof(moq_mvfst_managed_cfg_t, target) >=
+                       (END + _Alignof(moq_mvfst_managed_cfg_t) - 1) /
+                       _Alignof(moq_mvfst_managed_cfg_t) *
+                       _Alignof(moq_mvfst_managed_cfg_t),
+                       "target starts past the sizeof through app_deadline_ctx");
+        static const char *const alpn[] = { "moqt-22" };
+        moq_mvfst_managed_cfg_t prefix = make_cfg(pump_exit, NULL);
+        prefix.alpn_list = alpn;
+        prefix.alpn_count = 1;
+        prefix.struct_size = (uint32_t)old_size;
+
+        char dirty[sizeof(moq_mvfst_managed_cfg_t)];
+        memset(dirty, 0xFF, sizeof(dirty));
+        memcpy(dirty, &prefix, END);        /* tail past the last field stays 0xFF */
         moq_mvfst_managed_cfg_t *old = (moq_mvfst_managed_cfg_t *)dirty;
 
         MVFST_CHECK(moq_mvfst_managed_create(old, &m) == MOQ_OK);

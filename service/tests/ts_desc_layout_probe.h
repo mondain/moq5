@@ -107,4 +107,41 @@ typedef struct ts_old_object {
 } ts_old_object_t;
 _Static_assert(offsetof(moq_media_object_t, has_loss_report) >= sizeof(ts_old_object_t),
                "loss report overlaps original object padding");
+/* The track event through the delivery-failure block, declared on its own:
+ * the fill loss summary starts at this layout's complete sizeof, never in
+ * its tail padding, on every data model and enum width. */
+typedef struct ts_event_before_fill_loss {
+    uint32_t                      struct_size;
+    moq_media_track_event_kind_t  kind;
+    moq_media_track_t            *track;
+    const moq_media_track_desc_t *desc;
+    uint32_t                      config_generation;
+    uint8_t                       reserved_track_ev[4];
+    bool                          has_largest;
+    uint64_t                      largest_group;
+    uint64_t                      largest_object;
+    bool                          has_expires;
+    uint64_t                      expires_ms;
+    moq_media_parse_drop_class_t  parse_drop_class;
+    uint64_t                      parse_drops_total;
+    uint64_t                      parse_drops_delta;
+    int32_t                       local_result;
+    uint32_t                      reserved_local_failure;
+    uint64_t                      initiating_request_id;
+    uint32_t                      fill_reason;
+    uint32_t                      fill_error_domain;
+    uint64_t                      fill_error_code;
+    uint32_t                      delivery_origin;
+    uint32_t                      reserved_delivery;
+    uint64_t                      delivery_initiating_request_id;
+} ts_event_before_fill_loss_t;
+_Static_assert(offsetof(moq_media_track_event_t, delivery_initiating_request_id) ==
+               offsetof(ts_event_before_fill_loss_t, delivery_initiating_request_id),
+               "delivery failure block moved");
+_Static_assert(offsetof(moq_media_track_event_t, fill_unreported_loss_causes) ==
+               sizeof(ts_event_before_fill_loss_t),
+               "fill loss summary must start at the complete preceding sizeof");
+_Static_assert(sizeof(moq_media_track_event_t) ==
+               sizeof(ts_event_before_fill_loss_t) + 24,
+               "fill loss summary is 24 bytes with no padding");
 #endif

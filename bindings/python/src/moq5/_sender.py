@@ -9,6 +9,7 @@ from . import _native, _send_track
 from ._endpoint import (Endpoint, MoqError, TrackNameBusy, _call,
                         _endpoint_handle, _sliced_wait)
 from ._values import (
+    _loc_metadata_arguments,
     SendObject,
     WaitResult,
     SenderStats,
@@ -105,6 +106,7 @@ class Sender:
             config.publish_tracks,
             config.drop_without_demand,
             config.catalog_refresh_interval_us,
+            int(config.companion_profile),
         )
         return sender
 
@@ -149,6 +151,8 @@ class Sender:
                 config.samplerate,
                 config.channel_config,
                 config.track_duration_ms,
+                config.track_properties,
+                config.dynamic_groups,
             )
             # Only the NATIVE activation result is translated, and only here.
             try:
@@ -203,6 +207,7 @@ class Sender:
             object.presentation_time_us,
             object.capture_time_us,
             None if object.sap_type is None else int(object.sap_type),
+            _loc_metadata_arguments(object.loc_metadata),
         )
         return WriteOutcome(_call(_native.sender_write, self.__handle,
                                   _send_track._handle_of(track), *arguments))
@@ -320,6 +325,20 @@ class Sender:
         service rather than recomputed here.
         """
         return _call(_native.sender_has_subscriber, self.__handle,
+                     self.__track_handle(track))
+
+    def take_new_group_request(self, track: "_send_track.SendTrack") -> int | None:
+        """Take the new-group request pending on a track added with
+        `dynamic_groups`, or None when none is pending.
+
+        A subscriber asked for a new group (draft-22 section 9.20.19) with a
+        value that warrants one; the publisher "SHOULD end the current Group
+        and begin a new Group as soon as practical", so write the next object
+        as a group-starting keyframe. The value is the largest group the
+        subscriber knows plus one, 0 when it knows none. Taking clears it;
+        requests not yet taken coalesce into the latest.
+        """
+        return _call(_native.sender_take_new_group_request, self.__handle,
                      self.__track_handle(track))
 
     def has_media_subscriber(self) -> bool:

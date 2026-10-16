@@ -133,6 +133,12 @@ int main(void)
             return 1;
     }
     moq_msquic_managed_drain(NULL);
+    {
+        moq_result_t (*poll_flush)(const moq_msquic_managed_t *) =
+            moq_msquic_managed_poll_flush;
+        if (poll_flush(NULL) != MOQ_ERR_INVAL)
+            return 1;
+    }
     if (moq_msquic_managed_conn_count(NULL) != 0)
         return 1;
     if (moq_msquic_managed_is_fatal(NULL) ||

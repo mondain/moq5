@@ -23,6 +23,7 @@
 #include <moq/wtquic.h>
 
 #include <wtquic/wtquic_msquic.h>
+#include "wtq_loopback_port.h"
 
 static int failures = 0;
 
@@ -294,14 +295,13 @@ static void test_pubsub_over_msquic(void)
 
     wtq_msquic_listener_cfg_t lcfg = WTQ_MSQUIC_LISTENER_CFG_INIT;
     lcfg.bind_address = "127.0.0.1";
-    lcfg.port = 0;
     lcfg.cert_file = cert_path;
     lcfg.key_file = key_path;
     lcfg.paths = &serve;
     lcfg.path_count = 1;
     lcfg.events = wtq_test_attach_events();
     lcfg.user = &sv.attach;
-    CHECK(wtq_msquic_listener_start(env, &lcfg, &listener) == WTQ_OK);
+    CHECK(wtqt_listener_start(env, &lcfg, &listener) == WTQ_OK);
     if (listener == NULL)
         goto out;
 
@@ -407,14 +407,13 @@ static void test_version_mismatch_refused(void)
 
     wtq_msquic_listener_cfg_t lcfg = WTQ_MSQUIC_LISTENER_CFG_INIT;
     lcfg.bind_address = "127.0.0.1";
-    lcfg.port = 0;
     lcfg.cert_file = cert_path;
     lcfg.key_file = key_path;
     lcfg.paths = &serve;
     lcfg.path_count = 1;
     lcfg.events = wtq_test_attach_events();
     lcfg.user = &sv.attach;
-    CHECK(wtq_msquic_listener_start(env, &lcfg, &listener) == WTQ_OK);
+    CHECK(wtqt_listener_start(env, &lcfg, &listener) == WTQ_OK);
     if (listener == NULL)
         goto out;
 
@@ -609,14 +608,13 @@ static void test_garbage_control_torn_down(void)
 
     wtq_msquic_listener_cfg_t lcfg = WTQ_MSQUIC_LISTENER_CFG_INIT;
     lcfg.bind_address = "127.0.0.1";
-    lcfg.port = 0;
     lcfg.cert_file = cert_path;
     lcfg.key_file = key_path;
     lcfg.paths = &serve;
     lcfg.path_count = 1;
     lcfg.events = wtq_test_attach_events();
     lcfg.user = &sv.attach;
-    CHECK(wtq_msquic_listener_start(env, &lcfg, &listener) == WTQ_OK);
+    CHECK(wtqt_listener_start(env, &lcfg, &listener) == WTQ_OK);
     if (listener == NULL)
         goto out;
 

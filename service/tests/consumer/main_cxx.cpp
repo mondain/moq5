@@ -27,6 +27,27 @@ static_assert(MOQ_MEDIA_PACKAGING_RAW == 1u && MOQ_MEDIA_PACKAGING_CMAF == 2u &&
 static_assert(MOQ_MEDIA_DROP_MALFORMED_LOC == 1u &&
               MOQ_MEDIA_DROP_KEYFRAME_WAIT == 7u &&
               MOQ_MEDIA_DROP_MALFORMED_MPEG2TS == 8u, "drop reason values");
+#include <cstring>
+
+/* Complete receiver config before the MPEG2TS and companion tails were
+ * appended. */
+struct receiver_cfg_v0 {
+    uint32_t struct_size;
+    const moq_endpoint_cfg_t *endpoint;
+    moq_namespace_t namespace_;
+    moq_bytes_t catalog_track;
+    bool auto_subscribe;
+    moq_media_time_mode_t time_mode;
+    moq_media_overflow_cfg_t overflow;
+    uint32_t max_track_events;
+};
+
+struct track_cfg_v0 {
+    uint32_t struct_size;
+    moq_media_start_mode_t start;
+    bool has_priority;
+    uint8_t priority;
+};
 
 static moq_tls_certificate_verdict_t consumerVerifyCertificate(
     void *ctx, moq_bytes_t serverName,
@@ -66,13 +87,29 @@ int main()
     if (ec.verify_certificate != consumerVerifyCertificate)
         return 1;
 
+    /* Exact frozen stamp, with no write into the appended tails. */
     moq_media_receiver_cfg_t rcfg;
+    std::memset(&rcfg, 0xa5, sizeof(rcfg));
     moq_media_receiver_cfg_init_live(&rcfg);
-    if (rcfg.struct_size != MOQ_MEDIA_RECEIVER_CFG_V0_SIZE)
+    if (rcfg.struct_size != MOQ_MEDIA_RECEIVER_CFG_V0_SIZE ||
+        rcfg.struct_size != sizeof(receiver_cfg_v0) ||
+        rcfg.overflow.policy != MOQ_MEDIA_OVERFLOW_DROP_TO_KEYFRAME)
+        return 2;
+    for (size_t i = sizeof(receiver_cfg_v0); i < sizeof(rcfg); ++i)
+        if (reinterpret_cast<const unsigned char *>(&rcfg)[i] != 0xa5)
+            return 2;
+    moq_media_receiver_cfg_init_sized(&rcfg, sizeof(rcfg));
+    if (rcfg.struct_size != sizeof(rcfg) || rcfg.overflow.policy != MOQ_MEDIA_OVERFLOW_UNSET ||
+        rcfg.companion_profile != MOQ_MEDIA_COMPANION_AUTO)
+        return 2;
+    moq_media_receiver_cfg_init_flow_control_sized(&rcfg, sizeof(rcfg));
+    if (rcfg.struct_size != sizeof(rcfg) || rcfg.overflow.policy != MOQ_MEDIA_OVERFLOW_FLOW_CONTROL)
         return 2;
     moq_media_receiver_cfg_init_live_sized(&rcfg, sizeof(rcfg));
-    if (rcfg.struct_size != sizeof(rcfg) ||
-        rcfg.overflow.policy != MOQ_MEDIA_OVERFLOW_DROP_TO_KEYFRAME)
+    if (rcfg.struct_size != sizeof(rcfg) || rcfg.overflow.policy != MOQ_MEDIA_OVERFLOW_DROP_TO_KEYFRAME)
+        return 2;
+    rcfg.companion_profile = MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC;
+    if (rcfg.companion_profile != MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC)
         return 2;
     rcfg.mpeg2ts_reorder_slots = 32;
     rcfg.mpeg2ts_reorder_window_us = 200000;
@@ -183,6 +220,15 @@ int main()
     if (moq_media_sender_get_track_stats(nullptr, nullptr, &tst, sizeof(tst)) !=
         MOQ_ERR_INVAL)
         return 17;
+
+    moq_media_receiver_track_subscribe_cfg_t receive;
+    moq_media_receiver_track_subscribe_cfg_init(&receive);
+    if (receive.struct_size != sizeof(track_cfg_v0) ||
+        receive.start != MOQ_MEDIA_START_CURRENT)
+        return 12;
+    moq_media_receiver_track_subscribe_cfg_init_sized(&receive, sizeof(receive));
+    if (receive.struct_size != sizeof(receive) || receive.location || receive.fill)
+        return 12;
 
     return 0;
 }

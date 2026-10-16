@@ -11,6 +11,12 @@
  * picoquic's packet buffer. write returns WOULD_BLOCK when the queue's byte
  * cap is reached, so the bridge retains and retries.
  *
+ * Reliable reset: reset_stream_at keeps the MoQ stream header with
+ * RESET_STREAM_AT. The reliable size on the wire is the WebTransport stream
+ * preamble plus the MoQ bytes, never the MoQ bytes alone. picoquic accepts a
+ * reliable size only up to what it has sent, so a prefix still queued is kept
+ * (the rest dropped) and the frame is issued once picoquic has pulled it.
+ *
  * Datagram bridge: push send_datagram() buffers one datagram;
  * the pull provide_datagram callback flushes it. Single-slot,
  * lossy — excess datagrams are DROPPED.
@@ -35,6 +41,12 @@ static moq_transport_result_t ep_open_uni(void *ctx, uint64_t *out_id)
     h3zero_stream_ctx_t *sc = picowt_create_local_stream(
         ep->cnx, 0, ep->h3_ctx, ep->control_stream_id);
     if (!sc) return MOQ_TRANSPORT_ERROR;
+#if defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) && PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1
+    if (picoquic_enable_stream_send_commit(ep->cnx, sc->stream_id) != 0) {
+        h3zero_delete_stream(ep->cnx, ep->h3_ctx, sc);
+        return MOQ_TRANSPORT_ERROR;
+    }
+#endif
     sc->path_callback = ep->app_callback;
     sc->path_callback_ctx = ep->app_callback_ctx;
     *out_id = sc->stream_id;
@@ -115,37 +127,17 @@ int (*pw_test_reset_stream_at)(picoquic_cnx_t *, uint64_t, uint64_t,
     picoquic_reset_stream_at(cnx, sid, err, rs)
 #endif
 
-int pico_wt_endpoint_flush_resets(pico_wt_endpoint_ctx_t *ep)
+static void wt_retire_local_uni(pico_wt_endpoint_ctx_t *ep, uint64_t sid, int rc)
 {
-    if (!ep || !ep->cnx) return 0;
-    int failed = 0;
-    size_t w = 0;
-    for (size_t r = 0; r < ep->deferred_count; r++) {
-        pico_wt_deferred_reset_t d = ep->deferred[r];
-        int rc = PW_RESET_STREAM_AT(ep->cnx, d.sid, d.wt_code, d.reliable_size);
-        if (rc == PICOQUIC_ERROR_OFFSET_TOO_BIG) {
-            ep->deferred[w++] = d;            /* preamble still unsent */
-        } else if (rc == 0) {
-            /* Issued: the send side is finished, as picowt_reset_stream
-             * records it. */
-            h3zero_stream_ctx_t *sc = h3zero_find_stream(ep->h3_ctx, d.sid);
-            if (sc) sc->ps.stream_state.is_fin_sent = 1;
-        } else if (rc == PICOQUIC_ERROR_INVALID_STREAM_ID ||
-                   rc == PICOQUIC_ERROR_STREAM_ALREADY_CLOSED) {
-            /* The stream already ended and retired: nothing is owed. */
-        } else {
-            /* picoquic may already have latched the reset before failing to
-             * queue its frame, so a retry could not prove it was sent. */
-            failed = 1;
-        }
+#if defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) && PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1
+    if (rc == 0 && (sid & 2u) &&
+        ((sid ^ (unsigned)picoquic_is_client(ep->cnx)) & 1u)) {
+        h3zero_stream_ctx_t *sc = h3zero_find_stream(ep->h3_ctx, sid);
+        if (sc) h3zero_delete_stream(ep->cnx, ep->h3_ctx, sc);
     }
-    ep->deferred_count = w;
-    return failed ? -1 : 0;
-}
-
-void pico_wt_endpoint_settle_deferred(pico_wt_endpoint_ctx_t *ep)
-{
-    if (ep) ep->deferred_count = 0;
+#else
+    (void)ep; (void)sid; (void)rc;
+#endif
 }
 
 static moq_transport_result_t ep_reset(void *ctx, uint64_t stream_id,
@@ -198,7 +190,10 @@ static moq_transport_result_t ep_reset(void *ctx, uint64_t stream_id,
         ep->last_reset_reliable_size = preamble;
         int fin_sent = sc->ps.stream_state.is_fin_sent;
         int rc = picowt_reset_stream(ep->cnx, sc, wt_code);
-        if (rc == 0) return MOQ_TRANSPORT_OK;
+        if (rc == 0) {
+            wt_retire_local_uni(ep, stream_id, rc);
+            return MOQ_TRANSPORT_OK;
+        }
         /* picoquic takes a Reliable Size only up to the bytes it has sent,
          * and a stream reset right after it opened may still hold its
          * preamble in picoquic's queue. WebTransport requires RESET_STREAM_AT
@@ -236,7 +231,134 @@ static moq_transport_result_t ep_reset(void *ctx, uint64_t stream_id,
         return MOQ_TRANSPORT_ERROR;
     int rc = picoquic_reset_stream(ep->cnx, sc->stream_id, wt_code);
     sc->ps.stream_state.is_fin_sent = 1;
+    wt_retire_local_uni(ep, stream_id, rc);
     return rc == 0 ? MOQ_TRANSPORT_OK : MOQ_TRANSPORT_ERROR;
+}
+
+/* The WebTransport preamble picowt writes on a local stream (stream type
+ * plus session id): the part of every reset picowt itself keeps. */
+static uint64_t wt_preamble_len(const pico_wt_endpoint_ctx_t *ep)
+{
+    return 2 + picoquic_frames_varint_encode_length(ep->control_stream_id);
+}
+
+/* RESET_STREAM_AT is usable: advertised locally, and genuinely by the peer
+ * (a synthesized peer parameter does not make it negotiated, see ep_reset). */
+static bool wt_reset_at_negotiated(const pico_wt_endpoint_ctx_t *ep)
+{
+    const picoquic_tp_t *ltp = picoquic_get_transport_parameters(ep->cnx, 1);
+    const picoquic_tp_t *rtp = picoquic_get_transport_parameters(ep->cnx, 0);
+    return ltp && rtp && ltp->is_reset_stream_at_enabled &&
+           rtp->is_reset_stream_at_enabled && !ep->reset_stream_at_synthesized;
+}
+
+/* The prefix has been sent: reset keeping it. Should picoquic refuse, the
+ * stream still ends, with a plain RESET_STREAM. */
+static int wt_issue_reset_at(pico_wt_endpoint_ctx_t *ep, uint64_t sid,
+                             uint64_t wt_code, uint64_t reliable_size)
+{
+    moq_pq_send_queue_drop(ep->queue, sid);
+    picoquic_mark_active_stream(ep->cnx, sid, 0, NULL);
+    h3zero_stream_ctx_t *sc = h3zero_find_stream(ep->h3_ctx, sid);
+    if (sc) sc->ps.stream_state.is_fin_sent = 1;
+    if (picoquic_reset_stream_at(ep->cnx, sid, wt_code, reliable_size) == 0) {
+        ep->last_reset_reliable_size = (size_t)reliable_size;
+        ep->reliable_resets++;
+        wt_retire_local_uni(ep, sid, 0);
+        return 0;
+    }
+    ep->last_reset_reliable_size = 0;
+    int rc = picoquic_reset_stream(ep->cnx, sid, wt_code);
+    wt_retire_local_uni(ep, sid, rc);
+    return rc;
+}
+
+static moq_transport_result_t ep_reset_at(void *ctx, uint64_t stream_id,
+                                          uint64_t error_code,
+                                          uint64_t reliable_size)
+{
+    pico_wt_endpoint_ctx_t *ep = (pico_wt_endpoint_ctx_t *)ctx;
+    uint64_t wt_code;
+    if (!pico_wt_moq_err_to_wt(error_code, &wt_code))
+        return MOQ_TRANSPORT_ERROR;
+    if (!ep->cnx || !wt_reset_at_negotiated(ep))
+        return MOQ_TRANSPORT_DROPPED;
+    /* Only a local WebTransport stream carries the preamble this size
+     * extends; anything else takes the plain path. */
+    h3zero_stream_ctx_t *sc = h3zero_find_stream(ep->h3_ctx, stream_id);
+    unsigned client_mode = (unsigned)(picoquic_is_client(ep->cnx) != 0);
+    if (!sc || ((stream_id ^ client_mode) & 1u) == 0)
+        return MOQ_TRANSPORT_DROPPED;
+    uint64_t total = wt_preamble_len(ep) + reliable_size;
+    if (moq_pq_send_queue_truncate(ep->queue, stream_id, reliable_size) == 0)
+        return wt_issue_reset_at(ep, stream_id, wt_code, total) == 0
+            ? MOQ_TRANSPORT_OK : MOQ_TRANSPORT_ERROR;
+    if (ep->deferred_at_count == ep->deferred_at_cap) {
+        size_t ncap = ep->deferred_at_cap ? ep->deferred_at_cap * 2 : 4;
+        pico_wt_deferred_reset_t *n = (pico_wt_deferred_reset_t *)ep->alloc.realloc(
+            ep->deferred_at, ep->deferred_at_cap * sizeof(*n), ncap * sizeof(*n),
+            ep->alloc.ctx);
+        if (!n) return MOQ_TRANSPORT_ERROR;
+        ep->deferred_at = n;
+        ep->deferred_at_cap = ncap;
+    }
+    ep->deferred_at[ep->deferred_at_count++] = (pico_wt_deferred_reset_t){
+        .sid = stream_id, .wt_code = wt_code, .reliable_size = total };
+    return MOQ_TRANSPORT_OK;
+}
+
+int pico_wt_endpoint_flush_resets(pico_wt_endpoint_ctx_t *ep)
+{
+    if (!ep || !ep->cnx) return 0;
+
+    /* MoQ reliable resets: issued once the stream's queued prefix has been
+     * handed to picoquic. */
+    int failed = 0;
+    size_t w = 0;
+    for (size_t r = 0; r < ep->deferred_at_count; r++) {
+        pico_wt_deferred_reset_t d = ep->deferred_at[r];
+        if (moq_pq_send_queue_has_data(ep->queue, d.sid)) {
+            ep->deferred_at[w++] = d;
+            continue;
+        }
+        /* Refused both as RESET_STREAM_AT and as a plain reset: the stream
+         * cannot be ended. */
+        if (wt_issue_reset_at(ep, d.sid, d.wt_code, d.reliable_size) != 0)
+            failed = 1;
+    }
+    ep->deferred_at_count = w;
+
+    /* Plain stream resets: issued once picoquic has sent the preamble. */
+    w = 0;
+    for (size_t r = 0; r < ep->deferred_count; r++) {
+        pico_wt_deferred_reset_t d = ep->deferred[r];
+        int rc = PW_RESET_STREAM_AT(ep->cnx, d.sid, d.wt_code, d.reliable_size);
+        if (rc == PICOQUIC_ERROR_OFFSET_TOO_BIG) {
+            ep->deferred[w++] = d;            /* preamble still unsent */
+        } else if (rc == 0) {
+            /* Issued: the send side is finished, as picowt_reset_stream
+             * records it. */
+            h3zero_stream_ctx_t *sc = h3zero_find_stream(ep->h3_ctx, d.sid);
+            if (sc) sc->ps.stream_state.is_fin_sent = 1;
+            wt_retire_local_uni(ep, d.sid, rc);
+        } else if (rc == PICOQUIC_ERROR_INVALID_STREAM_ID ||
+                   rc == PICOQUIC_ERROR_STREAM_ALREADY_CLOSED) {
+            /* The stream already ended and retired: nothing is owed. */
+        } else {
+            /* picoquic may already have latched the reset before failing to
+             * queue its frame, so a retry could not prove it was sent. */
+            failed = 1;
+        }
+    }
+    ep->deferred_count = w;
+    return failed ? -1 : 0;
+}
+
+void pico_wt_endpoint_settle_deferred(pico_wt_endpoint_ctx_t *ep)
+{
+    if (!ep) return;
+    ep->deferred_count = 0;
+    ep->deferred_at_count = 0;
 }
 
 int pico_wt_endpoint_on_provide_data(pico_wt_endpoint_ctx_t *ep,
@@ -266,6 +388,16 @@ static moq_transport_result_t ep_stop_sending(void *ctx,
     uint64_t wt_code;
     if (!pico_wt_moq_err_to_wt(error_code, &wt_code))
         return MOQ_TRANSPORT_ERROR;
+    /* The adapter's own record shows the receive half already terminal at
+     * the transport (every byte and the FIN delivered): STOP_SENDING has
+     * nothing left to stop, and picoquic may already have released the
+     * stream, so its refusal would not be a failure of this cancellation.
+     * The adapter discarded what it held; the stop is complete with no
+     * frame. Only that positive fact skips the call: any refusal of a STOP
+     * picoquic does receive stays an ERROR. */
+    if (ep->rx_terminal_discard &&
+        ep->rx_terminal_discard(ep->cb_ctx, stream_id))
+        return MOQ_TRANSPORT_OK;
     int rc = picoquic_stop_sending(ep->cnx, stream_id, wt_code);
     if (rc != 0)
         return MOQ_TRANSPORT_ERROR;   /* nothing sent: receive state untouched */
@@ -359,6 +491,7 @@ int pico_wt_endpoint_init(moq_transport_endpoint_ops_t *ops,
     ctx->control_stream_id = control_stream_ctx->stream_id;
     ctx->pending_dg_len = 0;
 
+    ctx->alloc = *alloc;
     ctx->queue = moq_pq_send_queue_create(alloc, 0);
     if (!ctx->queue) return -1;
 
@@ -366,7 +499,8 @@ int pico_wt_endpoint_init(moq_transport_endpoint_ops_t *ops,
         .struct_size     = sizeof(moq_transport_endpoint_ops_t),
         .capabilities    = MOQ_TRANSPORT_CAP_DATAGRAM |
                            MOQ_TRANSPORT_CAP_WRITE_PAYLOAD |
-                           MOQ_TRANSPORT_CAP_HOLD_INPUT,
+                           MOQ_TRANSPORT_CAP_HOLD_INPUT |
+                           MOQ_TRANSPORT_CAP_RELIABLE_RESET,
         .open_uni        = ep_open_uni,
         .set_stream_priority = ep_priority,
         .open_bidi       = ep_open_bidi,
@@ -377,7 +511,11 @@ int pico_wt_endpoint_init(moq_transport_endpoint_ops_t *ops,
         .send_datagram   = ep_send_datagram,
         .max_datagram_size = NULL,
         .close_transport = ep_close,
+        .reset_stream_at = ep_reset_at,
     };
+#if defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) && PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1
+    ops->capabilities |= MOQ_TRANSPORT_CAP_COMMIT_REPORT;
+#endif
     return 0;
 }
 
@@ -388,6 +526,12 @@ void pico_wt_endpoint_cleanup(pico_wt_endpoint_ctx_t *ctx)
     moq_pq_send_queue_destroy(ctx->queue);
     ctx->queue = NULL;
     ctx->deferred_count = 0;
+    if (ctx->deferred_at)
+        ctx->alloc.free(ctx->deferred_at,
+                        ctx->deferred_at_cap * sizeof(*ctx->deferred_at),
+                        ctx->alloc.ctx);
+    ctx->deferred_at = NULL;
+    ctx->deferred_at_count = ctx->deferred_at_cap = 0;
 }
 
 int pico_wt_endpoint_provide_datagram(pico_wt_endpoint_ctx_t *ctx,

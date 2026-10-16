@@ -140,12 +140,44 @@ static void test_old_struct_size_abi(void)
     CHECK(moq_proxygen_wt_managed_create(old, &m) == MOQ_ERR_INVAL);
 }
 
+/* A caller built before `target` was appended: its struct ends at the
+ * layout through goaway_timeout_us. The initializer symbol it calls clears
+ * and stamps exactly that, and create() reads nothing past it -- the poisoned
+ * bytes there would be a wild target pointer. */
+static void test_target_old_caller(void)
+{
+    constexpr size_t end = offsetof(moq_proxygen_wt_managed_cfg_t, goaway_timeout_us) +
+                           sizeof(uint64_t);
+    constexpr size_t align = alignof(moq_proxygen_wt_managed_cfg_t);
+    constexpr size_t old = (end + align - 1) & ~(align - 1);
+    static_assert(offsetof(moq_proxygen_wt_managed_cfg_t, target) >= old,
+                  "target starts past the sizeof through goaway_timeout_us");
+
+    unsigned char buf[sizeof(moq_proxygen_wt_managed_cfg_t) + 16];
+    std::memset(buf, 0xA5, sizeof(buf));
+    (moq_proxygen_wt_managed_cfg_init)(
+        reinterpret_cast<moq_proxygen_wt_managed_cfg_t *>(buf));
+    uint32_t stamped;
+    std::memcpy(&stamped, buf, sizeof(stamped));
+    CHECK(stamped == old);
+    for (size_t i = old; i < sizeof(buf); i++) CHECK(buf[i] == 0xA5);
+
+    moq_proxygen_wt_managed_cfg_t c = base_cfg();
+    c.host = NULL;               /* -> INVAL before any connect attempt */
+    std::memset(reinterpret_cast<unsigned char *>(&c) + end, 0xA5, sizeof(c) - end);
+    c.struct_size = static_cast<uint32_t>(old);
+    moq_proxygen_wt_managed_t *m = NULL;
+    CHECK(moq_proxygen_wt_managed_create(&c, &m) == MOQ_ERR_INVAL);
+    CHECK(m == NULL);
+}
+
 int main(void)
 {
     test_cfg_init();
     test_invalid_config();
     test_alpn_offer();
     test_old_struct_size_abi();
+    test_target_old_caller();
     std::printf("%s: %d failures\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

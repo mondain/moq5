@@ -81,6 +81,23 @@ struct moq_msq_stream {
                                   held_input: MsQuic cannot hold a bare
                                   FIN, so the adapter owns it and feeds it
                                   once the held bytes are accepted */
+    uint64_t sent_total;       /* bytes StreamSend accepted on this stream:
+                                  bounds a reliable reset's offset */
+    uint64_t acked_total;      /* bytes whose sends completed without being
+                                  canceled: with send buffering off and
+                                  in-order completion, the acknowledged
+                                  prefix */
+    bool send_canceled;        /* a send on this stream completed canceled:
+                                  the rest of its bytes will never be
+                                  acknowledged */
+    bool fin_sent;             /* native send/GRACEFUL accepted our FIN */
+    bool fin_acked;            /* graceful SEND_SHUTDOWN_COMPLETE, either direction */
+    bool commit_reported;      /* graceful ACK-through-FIN won, once */
+    bool reset_sent;           /* native ABORT_SEND accepted, not a refusal */
+    bool send_shutdown_aborted;/* non-graceful terminal/peer STOP won */
+    bool flush_control;        /* session-control role captured before retirement */
+    bool flush_withdrawn;      /* ordinary send intent superseded by reset/STOP */
+    bool send_shutdown_complete; /* either completion kind, not STOP/acceptance */
 };
 
 /* One accepted datagram send: the bridge's datagram contract is
@@ -125,6 +142,7 @@ struct moq_msquic_conn {
     moq_msquic_guard_fn guard_enter; /* both set or both NULL */
     moq_msquic_guard_fn guard_leave;
     void *guard_user;
+    const moq_connection_target_t *target; /* borrowed; see msquic.h */
 
     struct moq_msq_stream *streams;
     struct moq_msq_batch_rec *rec_free; /* pooled batch records */
@@ -144,6 +162,10 @@ struct moq_msquic_conn {
     struct moq_msq_stream *building_ms;
     bool building_fin;
     bool flush_failed;                  /* deferred fatal (fed by service) */
+    bool flush_output_lost;             /* sticky unexplained loss, not fatal */
+    bool peer_closed;                   /* MsQuic refused an op because the
+                                           peer already closed; its shutdown
+                                           event is still to come */
 
     /* local stream-id allocation (QUIC numbering: type + (count<<2));
      * MsQuic assigns ids asynchronously, so the adapter computes them
@@ -174,11 +196,21 @@ struct moq_msquic_conn {
     bool close_clean;
     uint64_t close_code;
     bool shutdown_complete;        /* conn SHUTDOWN_COMPLETE observed */
+    /* QUIC_CONNECTION_EVENT_RELIABLE_RESET_NEGOTIATED said yes: data-stream
+     * resets may keep a prefix (RESET_STREAM_AT). */
+    bool reliable_reset;
+    /* Depth of this connection's MsQuic callbacks on the stack: nonzero means
+     * the code runs on the connection's worker, where MsQuic executes
+     * SetParam inline instead of queueing it and blocking the caller. */
+    int on_worker;
+    uint64_t reliable_resets;      /* reliable resets issued (test witness) */
 #ifdef MOQ_MSQUIC_TESTING
     /* Number of close feeds that crossed conn_feed_close's pending/fed guard.
      * Tests use this to distinguish one committed bridge call from a boolean
      * that merely says at least one feed was attempted. */
     uint32_t test_close_feed_commits;
+    uint32_t test_stream_commit_reports;
+    uint64_t test_last_committed_stream;
 #endif
 
     moq_transport_endpoint_ops_t ops;

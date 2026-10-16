@@ -1,4 +1,5 @@
 #include "session_internal.h"
+#include "request_stream_internal.h"
 #include "../internal/validate.h"
 
 /*
@@ -48,43 +49,65 @@ static moq_track_sub_handle_t track_sub_make_handle(moq_session_t *s, size_t slo
 void track_sub_free_entry(moq_session_t *s, int slot)
 {
     moq_track_sub_entry_t *e = &s->track_subs[slot];
-    if (e->request_stream_ref._v != 0)
-        request_registry_remove_by_streamref(s, e->request_stream_ref);
+    if (e->rs.ref._v != 0)
+        request_registry_remove_by_streamref(s, e->rs.ref);
     moq_prefix_free(s, &e->prefix_buf, &e->prefix_buf_len,
                     &e->prefix_parts, &e->prefix_count);
     process_auth_tokens_free_staging(s, e->resolved_tokens,
         e->token_staged, e->token_count);
     if (!e->auth_committed)
         process_auth_tokens_abort_txn(s, &e->auth_txn);
+    ns_update_release(s, &e->update);
     uint32_t next_gen = e->generation + 1;
     /* Preserve the co-allocated request-bidi receive buffer across reuse. */
-    uint8_t *recv_buf = e->req_recv_buf;
-    size_t   recv_cap = e->req_recv_cap;
+    uint8_t *recv_buf = e->rs.recv_buf;
+    size_t   recv_cap = e->rs.recv_cap;
     memset(e, 0, sizeof(*e));
     e->state = MOQ_TRACK_SUB_FREE;
     e->generation = next_gen;
-    e->req_recv_buf = recv_buf;
-    e->req_recv_cap = recv_cap;
+    e->rs.recv_buf = recv_buf;
+    e->rs.recv_cap = recv_cap;
 }
 
 void track_sub_destroy_all(moq_session_t *s)
 {
     for (size_t i = 0; i < s->track_sub_cap; i++) {
         moq_track_sub_entry_t *e = &s->track_subs[i];
+        ns_update_release(s, &e->update);
         moq_prefix_free(s, &e->prefix_buf, &e->prefix_buf_len,
                         &e->prefix_parts, &e->prefix_count);
     }
 }
 
-/* Independent overlap space (§10.19): scan only the track-sub pool. */
+/* Independent overlap space (§10.19, draft-22 §9.5.2): scan only the
+ * track-sub pool, and only the requests of `role` -- the ones this side made
+ * (SUBSCRIBER) or the ones the peer made of it (PUBLISHER). PREFIX_OVERLAP
+ * compares one subscriber's SUBSCRIBE_TRACKS at one publisher (draft-22 §3.6:
+ * "if a publisher receives a SUBSCRIBE_TRACKS with a Track Namespace Prefix
+ * that shares a common prefix with an established SUBSCRIBE_TRACKS"); a
+ * request in the other direction has the other subscriber. A prefix an owed
+ * or outstanding update would install is claimed as well, so neither a later
+ * request nor a second update can take an overlapping one before that update
+ * concludes. */
 bool track_sub_prefix_conflicts(moq_session_t *s, const moq_bytes_t *parts,
-                                size_t count, int exclude_slot)
+                                size_t count, moq_track_sub_role_t role,
+                                int exclude_slot)
 {
     for (size_t i = 0; i < s->track_sub_cap; i++) {
-        if (s->track_subs[i].state == MOQ_TRACK_SUB_FREE) continue;
+        const moq_track_sub_entry_t *e = &s->track_subs[i];
+        if (e->state == MOQ_TRACK_SUB_FREE) continue;
         if ((int)i == exclude_slot) continue;
-        if (moq_prefix_overlaps(s->track_subs[i].prefix_parts,
-                s->track_subs[i].prefix_count, parts, count))
+        if (e->role != role) continue;
+        if (moq_prefix_overlaps(e->prefix_parts, e->prefix_count, parts, count))
+            return true;
+        if (e->update.owed && (e->update.owed_flags & MOQ_NAMESPACE_UPDATE_PREFIX) &&
+            moq_prefix_overlaps(e->update.owed_prefix_parts,
+                                e->update.owed_prefix_count, parts, count))
+            return true;
+        if (e->update.outstanding &&
+            (e->update.out_flags & MOQ_NAMESPACE_UPDATE_PREFIX) &&
+            moq_prefix_overlaps(e->update.out_prefix_parts,
+                                e->update.out_prefix_count, parts, count))
             return true;
     }
     return false;
@@ -95,21 +118,16 @@ bool track_sub_prefix_conflicts(moq_session_t *s, const moq_bytes_t *parts,
 /* Emit a terminal REQUEST_ERROR + FIN for a pre-commit reject on the request
  * bidi, retiring the bidi via the drain ring when the requester has not yet
  * closed its half. Mirrors the track-status reject path. */
-static moq_result_t track_sub_reject_request(moq_session_t *s,
-    const moq_request_endpoint_t *ep, uint64_t error_code, bool reject_drain,
-    const char *reason, size_t reason_len)
+static moq_result_t track_sub_reject_request_args(moq_session_t *s,
+    const moq_request_endpoint_t *ep, bool reject_drain,
+    const moq_request_error_encode_args_t *args)
 {
     if (reject_drain && s->drain_ref_count >= s->drain_ref_cap)
         return MOQ_ERR_WOULD_BLOCK;
     uint8_t err_buf[256];
     moq_buf_writer_t ew;
     moq_buf_writer_init(&ew, err_buf, sizeof(err_buf));
-    moq_result_t rc = s->profile->encode_request_error(s, &ew,
-        &(moq_request_error_encode_args_t){
-            .request_id = ep->request_id,
-            .error_code = error_code,
-            .reason = (const uint8_t *)reason,
-            .reason_len = reason_len });
+    moq_result_t rc = s->profile->encode_request_error(s, &ew, args);
     if (rc < 0) return rc;
     rc = queue_send_bidi(s, ep->stream_ref, err_buf,
                          moq_buf_writer_offset(&ew), true);
@@ -117,6 +135,18 @@ static moq_result_t track_sub_reject_request(moq_session_t *s,
     if (reject_drain)
         (void)drain_ref_add(s, ep->stream_ref);   /* slot reserved above */
     return MOQ_OK;
+}
+
+static moq_result_t track_sub_reject_request(moq_session_t *s,
+    const moq_request_endpoint_t *ep, uint64_t error_code, bool reject_drain,
+    const char *reason, size_t reason_len)
+{
+    return track_sub_reject_request_args(s, ep, reject_drain,
+        &(moq_request_error_encode_args_t){
+            .request_id = ep->request_id,
+            .error_code = error_code,
+            .reason = (const uint8_t *)reason,
+            .reason_len = reason_len });
 }
 
 /* -- Inbound SUBSCRIBE_TRACKS request ------------------------------ */
@@ -157,7 +187,8 @@ moq_result_t session_core_on_subscribe_tracks(moq_session_t *s,
     /* Independent overlap space (§10.19): a prefix sharing a common prefix with
      * an established SUBSCRIBE_TRACKS is rejected with PREFIX_OVERLAP. */
     if (track_sub_prefix_conflicts(s, d->track_namespace_prefix.parts,
-                                   d->track_namespace_prefix.count, -1)) {
+                                   d->track_namespace_prefix.count,
+                                   MOQ_TRACK_SUB_ROLE_PUBLISHER, -1)) {
         rc = track_sub_reject_request(s, &d->endpoint,
                                       MOQ_REQUEST_ERROR_PREFIX_OVERLAP,
                                       reject_drain, NULL, 0);
@@ -171,8 +202,9 @@ moq_result_t session_core_on_subscribe_tracks(moq_session_t *s,
 
     slot = track_sub_find_free(s);
     if (slot < 0) {
-        rc = track_sub_reject_request(s, &d->endpoint, 0x0, reject_drain,
-                                      "subscribe-tracks pool full", 26);
+        moq_request_error_encode_args_t full = session_capacity_request_error(
+            s, d->endpoint.request_id, "subscribe-tracks pool full", 26);
+        rc = track_sub_reject_request_args(s, &d->endpoint, reject_drain, &full);
         if (rc < 0) { result = rc; goto cleanup_all; }
         slot = -1;
         s->profile->commit_inbound_request(s, &d->endpoint);
@@ -262,6 +294,18 @@ moq_result_t session_core_on_subscribe_tracks(moq_session_t *s,
     e.u.subscribe_tracks_request.forward = d->forward;
     e.u.subscribe_tracks_request.tokens = ev_tokens;
     e.u.subscribe_tracks_request.token_count = d->token_count;
+    if (s->profile->subscribe_tracks_options) {
+        moq_subscribe_tracks_options_t *options = event_scratch_alloc_aligned(s,
+            sizeof(*options), _Alignof(moq_subscribe_tracks_options_t));
+        if (!options) {
+            s->event_scratch_len = scratch_saved;
+            result = scratch_saved == 0 ? close_with_error(s, 0x1,
+                "event scratch permanently too small") : MOQ_ERR_BUFFER;
+            goto cleanup_all;
+        }
+        *options = d->options;
+        e.u.subscribe_tracks_request.options = options;
+    }
 
     rc = push_event(s, &e);
     if (rc < 0) {
@@ -276,13 +320,14 @@ moq_result_t session_core_on_subscribe_tracks(moq_session_t *s,
     entry->handle = handle;
     entry->request_id = d->endpoint.request_id;
     entry->forward = d->forward;
+    entry->options = d->options;
     d->endpoint.kind = MOQ_REQ_SUBSCRIBE_TRACKS;
     d->endpoint.slot = slot;
     /* Hand the request bidi off from the staging sub slot to this track-sub
      * slot: re-key the stream-ref to (SUBSCRIBE_TRACKS, slot). The request-stream
      * handler frees the staging slot afterwards. */
     request_registry_remove_by_streamref(s, d->endpoint.stream_ref);
-    entry->request_stream_ref = d->endpoint.stream_ref;
+    entry->rs.ref = d->endpoint.stream_ref;
     request_registry_insert_by_streamref(s, d->endpoint.stream_ref, d->endpoint);
     s->profile->commit_inbound_request(s, &d->endpoint);
     auth_committed = true;
@@ -330,13 +375,29 @@ moq_result_t session_core_on_subscribe_tracks_ok(moq_session_t *s, int slot)
 
 moq_result_t session_core_on_subscribe_tracks_error(moq_session_t *s, int slot,
     uint64_t error_code, bool can_retry, uint64_t retry_after_ms,
-    const uint8_t *reason, size_t reason_len)
+    const uint8_t *reason, size_t reason_len,
+    const moq_decoded_redirect_t *redirect)
 {
     if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
     /* The subscription failed; close our send half so the publisher retires its
      * request bidi promptly (otherwise its drain ref lingers until the session
      * ends). Reserve the close action up front for retryability. */
     if (action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+
+    moq_track_sub_entry_t *e = &s->track_subs[slot];
+    if (redirect) {
+        /* The redirect event stands in for the family's error event; the
+         * emitter reports a terminal close as MOQ_OK, so the teardown below
+         * runs only while the session is still open. */
+        moq_result_t rrc = session_core_emit_request_redirect(s,
+            MOQ_REQUEST_FAMILY_SUBSCRIBE_TRACKS, e->handle._opaque, redirect,
+            error_code, can_retry, retry_after_ms, reason, reason_len);
+        if (rrc < 0 || s->state == MOQ_SESS_CLOSED) return rrc;
+        if (e->rs.ref._v != 0)
+            (void)queue_close_bidi(s, e->rs.ref);
+        e->state = MOQ_TRACK_SUB_DRAINING_RESPONSE;
+        return MOQ_OK;
+    }
 
     size_t scratch_saved = s->event_scratch_len;
     moq_bytes_t ev_reason = {0};
@@ -351,8 +412,6 @@ moq_result_t session_core_on_subscribe_tracks_error(moq_session_t *s, int slot,
             return MOQ_ERR_BUFFER;
         }
     }
-
-    moq_track_sub_entry_t *e = &s->track_subs[slot];
 
     moq_event_t ev;
     memset(&ev, 0, sizeof(ev));
@@ -374,8 +433,8 @@ moq_result_t session_core_on_subscribe_tracks_error(moq_session_t *s, int slot,
 
     /* Close our send half (action slot reserved above): nothing more to send on a
      * failed subscription, and this lets the publisher retire its request bidi. */
-    if (e->request_stream_ref._v != 0)
-        (void)queue_close_bidi(s, e->request_stream_ref);
+    if (e->rs.ref._v != 0)
+        (void)queue_close_bidi(s, e->rs.ref);
 
     /* Terminal: keep the bidi drainable until its FIN (the request-stream handler
      * frees the entry on FIN, or immediately if the FIN already arrived). */
@@ -432,7 +491,8 @@ moq_result_t session_core_on_publish_blocked(moq_session_t *s, int slot,
 /* -- Peer teardown (RESET/STOP or FIN on the request bidi) --------- */
 
 moq_result_t session_core_on_subscribe_tracks_torn_down(moq_session_t *s,
-                                                        int slot)
+                                                        int slot,
+                                                        moq_request_terminal_t term)
 {
     moq_track_sub_entry_t *e = &s->track_subs[slot];
 
@@ -450,6 +510,8 @@ moq_result_t session_core_on_subscribe_tracks_torn_down(moq_session_t *s,
     ev.detail_size = (uint32_t)sizeof(moq_subscribe_tracks_cancelled_event_t);
     ev.borrow_epoch = s->borrow_epoch;
     ev.u.subscribe_tracks_cancelled.handle = e->handle;
+    ev.u.subscribe_tracks_cancelled.cause = term.cause;
+    ev.u.subscribe_tracks_cancelled.stream_error_code = term.error_code;
     (void)push_event(s, &ev);
     track_sub_free_entry(s, slot);
     return MOQ_OK;
@@ -472,7 +534,7 @@ moq_result_t session_core_on_track_sub_update_rejected(moq_session_t *s,
         &(moq_request_error_encode_args_t){
             .error_code = MOQ_REQUEST_ERROR_NOT_SUPPORTED });
     if (rc < 0) return rc;
-    moq_stream_ref_t ref = s->track_subs[slot].request_stream_ref;
+    moq_stream_ref_t ref = s->track_subs[slot].rs.ref;
     rc = queue_send_bidi(s, ref, err_buf, moq_buf_writer_offset(&ew), true);
     if (rc < 0) return rc;        /* WOULD_BLOCK: retryable, nothing mutated */
     s->profile->commit_inbound_request(s, uep);
@@ -484,11 +546,22 @@ moq_result_t session_core_on_track_sub_update_rejected(moq_session_t *s,
 
 /* -- Outbound subscribe_tracks (subscriber side) ------------------- */
 
-void moq_subscribe_tracks_cfg_init(moq_subscribe_tracks_cfg_t *cfg)
+void (moq_subscribe_tracks_cfg_init)(moq_subscribe_tracks_cfg_t *cfg)
+{
+    moq_subscribe_tracks_cfg_init_sized(cfg,
+        offsetof(moq_subscribe_tracks_cfg_t, options_flags));
+}
+
+void moq_subscribe_tracks_cfg_init_sized(moq_subscribe_tracks_cfg_t *cfg,
+                                         size_t cfg_size)
 {
     if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(*cfg);
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    if (n < sizeof(cfg->struct_size)) return;
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
+    if (n >= offsetof(moq_subscribe_tracks_cfg_t, include_properties) + sizeof(cfg->include_properties))
+        cfg->include_properties = true;
 }
 
 moq_result_t moq_session_subscribe_tracks(moq_session_t *s,
@@ -513,8 +586,29 @@ moq_result_t moq_session_subscribe_tracks(moq_session_t *s,
         auth_tokens = cfg->auth_tokens;
         auth_token_count = cfg->auth_token_count;
     }
-    if (moq_validate_auth_tokens(auth_tokens, auth_token_count) < 0)
+    if (moq_validate_auth_tokens(auth_tokens, auth_token_count,
+                                 s->profile->auth_token_type_max) < 0)
         return MOQ_ERR_INVAL;
+    uint32_t options_flags = 0;
+    moq_group_order_t group_order = MOQ_GROUP_ORDER_DEFAULT;
+    bool include_properties = true;
+    if (ST_CFG_HAS(include_properties)) {
+        options_flags = cfg->options_flags;
+        if (options_flags & ~(MOQ_SUBSCRIBE_TRACKS_GROUP_ORDER | MOQ_SUBSCRIBE_TRACKS_INCLUDE_PROPERTIES))
+            return MOQ_ERR_INVAL;
+        if (options_flags && !s->profile->subscribe_tracks_options)
+            return MOQ_ERR_UNSUPPORTED;
+        if (options_flags & MOQ_SUBSCRIBE_TRACKS_GROUP_ORDER) {
+            /* A selected GROUP_ORDER travels as 1 or 2 (§9.20.8); the
+             * publisher's default is the omitted parameter. */
+            group_order = cfg->group_order;
+            if (group_order != MOQ_GROUP_ORDER_ASCENDING &&
+                group_order != MOQ_GROUP_ORDER_DESCENDING)
+                return MOQ_ERR_INVAL;
+        }
+        if (options_flags & MOQ_SUBSCRIBE_TRACKS_INCLUDE_PROPERTIES)
+            include_properties = cfg->include_properties;
+    }
 #undef ST_CFG_HAS
 #undef ST_CFG_MIN
 
@@ -539,7 +633,8 @@ moq_result_t moq_session_subscribe_tracks(moq_session_t *s,
         }
     }
     if (track_sub_prefix_conflicts(s, cfg->track_namespace_prefix.parts,
-                                   cfg->track_namespace_prefix.count, -1))
+                                   cfg->track_namespace_prefix.count,
+                                   MOQ_TRACK_SUB_ROLE_SUBSCRIBER, -1))
         return MOQ_ERR_INVAL;
 
     moq_request_endpoint_t req_ep;
@@ -577,6 +672,9 @@ moq_result_t moq_session_subscribe_tracks(moq_session_t *s,
         .forward = forward,
         .auth_tokens = auth_tokens,
         .auth_token_count = auth_token_count,
+        .options_flags = options_flags,
+        .group_order = group_order,
+        .include_properties = include_properties,
     };
     moq_result_t rc = s->profile->encode_subscribe_tracks(s, &w, &enc_args);
     if (rc < 0) {
@@ -613,7 +711,13 @@ moq_result_t moq_session_subscribe_tracks(moq_session_t *s,
     e->role = MOQ_TRACK_SUB_ROLE_SUBSCRIBER;
     e->request_id = req_ep.request_id;
     e->forward = forward;
-    e->request_stream_ref = ref;
+    e->options = (moq_subscribe_tracks_options_t){
+        .struct_size = sizeof(moq_subscribe_tracks_options_t),
+        .flags = options_flags,
+        .group_order = group_order,
+        .include_properties = include_properties,
+    };
+    e->rs.ref = ref;
     e->handle = track_sub_make_handle(s, (size_t)slot, live_gen);
 
     req_ep.kind = MOQ_REQ_SUBSCRIBE_TRACKS;
@@ -658,7 +762,7 @@ moq_result_t moq_session_accept_subscribe_tracks(moq_session_t *s,
     moq_result_t rc = s->profile->encode_request_ok(s, &w, e->request_id);
     if (rc < 0) return rc;
     /* No FIN: the bidi stays open for PUBLISH_BLOCKED (and future PUBLISH). */
-    rc = queue_send_bidi(s, e->request_stream_ref, buf,
+    rc = queue_send_bidi(s, e->rs.ref, buf,
                          moq_buf_writer_offset(&w), false);
     if (rc < 0) return rc;
 
@@ -682,8 +786,10 @@ moq_result_t moq_session_reject_subscribe_tracks(moq_session_t *s,
     if (!s || !cfg) return MOQ_ERR_INVAL;
     if (cfg->struct_size < sizeof(*cfg)) return MOQ_ERR_INVAL;
     if (cfg->reason.len > 0 && !cfg->reason.data) return MOQ_ERR_INVAL;
-    /* SUBSCRIBE_TRACKS is not REDIRECT-eligible (§10.6); refuse a REDIRECT code. */
-    if (cfg->error_code == MOQ_REQUEST_ERROR_REDIRECT) return MOQ_ERR_INVAL;
+    /* REDIRECT answers SUBSCRIBE_TRACKS only where the profile allows it. */
+    if (cfg->error_code == MOQ_REQUEST_ERROR_REDIRECT &&
+        !s->profile->redirect_on_any_request)
+        return MOQ_ERR_INVAL;
     /* The code must be representable in THIS profile's wire encoding; refuse
      * before any mutation rather than truncate (draft-16 encodes a QUIC
      * varint, draft-18 a vi64 spanning the full 64-bit range). */
@@ -704,22 +810,54 @@ moq_result_t moq_session_reject_subscribe_tracks(moq_session_t *s,
     if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
         return MOQ_ERR_WOULD_BLOCK;
 
+    /* A complete update the requester pipelined behind the request is
+     * cancelled with it, but it consumed a Request ID and may carry token
+     * registrations: admit both with the rejection. */
+    moq_decoded_request_update_t pending;
+    memset(&pending, 0, sizeof(pending));
+    if (e->rs.recv_len > 0 && s->profile->request_codec &&
+        s->profile->request_codec->decode_namespace_update) {
+        moq_result_t prc = moq_request_stream_prepare_pending_reject(s, &e->rs,
+            MOQ_REQUEST_FAMILY_SUBSCRIBE_TRACKS, track_sub_peer_fin_observed(e),
+            &pending);
+        if (prc < 0 || s->state == MOQ_SESS_CLOSED) {
+            process_auth_tokens_free_staging(s, pending.tokens,
+                pending.token_staged, pending.token_count);
+            process_auth_tokens_abort_txn(s, &pending.auth_txn);
+            return prc < 0 ? prc : MOQ_OK;
+        }
+    }
+
     uint8_t err_buf[1152];
     moq_buf_writer_t ew;
     moq_buf_writer_init(&ew, err_buf, sizeof(err_buf));
-    moq_result_t rc = s->profile->encode_request_error(s, &ew,
-        &(moq_request_error_encode_args_t){
-            .request_id = e->request_id,
-            .error_code = cfg->error_code,
-            .reason = cfg->reason.data,
-            .reason_len = cfg->reason.len });
-    if (rc < 0) return rc;
-    rc = queue_send_bidi(s, e->request_stream_ref, err_buf,
-                         moq_buf_writer_offset(&ew), true);
-    if (rc < 0) return rc;
+    moq_request_error_encode_args_t err_args = {
+        .request_id = e->request_id,
+        .error_code = cfg->error_code,
+        .reason = cfg->reason.data,
+        .reason_len = cfg->reason.len };
+    /* A REDIRECT without a target: the all-empty tail means "same session,
+     * same request" (the config carries no redirect target). */
+    moq_result_t rc = reject_apply_redirect(s, &err_args, NULL, true);
+    if (rc >= 0) rc = s->profile->encode_request_error(s, &ew, &err_args);
+    if (rc >= 0)
+        rc = queue_send_bidi(s, e->rs.ref, err_buf,
+                             moq_buf_writer_offset(&ew), true);
+    if (rc < 0) {
+        process_auth_tokens_free_staging(s, pending.tokens,
+            pending.token_staged, pending.token_count);
+        process_auth_tokens_abort_txn(s, &pending.auth_txn);
+        return rc;
+    }
+    if (pending.endpoint.has_request_id) {
+        s->profile->commit_inbound_request(s, &pending.endpoint);
+        process_auth_tokens_commit_txn(s, &pending.auth_txn);
+    }
+    process_auth_tokens_free_staging(s, pending.tokens, pending.token_staged,
+                                     pending.token_count);
 
-    if (need_drain && e->request_stream_ref._v != 0)
-        (void)drain_ref_add(s, e->request_stream_ref);   /* slot reserved above */
+    if (need_drain && e->rs.ref._v != 0)
+        (void)drain_ref_add(s, e->rs.ref);   /* slot reserved above */
     track_sub_free_entry(s, slot);
     return MOQ_OK;
 }
@@ -761,7 +899,7 @@ moq_result_t moq_session_send_publish_blocked(moq_session_t *s,
     moq_result_t rc = s->profile->encode_publish_blocked(s, &w,
         track_namespace_suffix, track_name);
     if (rc < 0) return rc;
-    return queue_send_bidi(s, e->request_stream_ref, pbuf,
+    return queue_send_bidi(s, e->rs.ref, pbuf,
                            moq_buf_writer_offset(&w), false);
 }
 
@@ -779,4 +917,249 @@ moq_result_t moq_session_request_goaway_subscribe_tracks(
     if (slot < 0) return MOQ_ERR_STALE_HANDLE;
     return session_core_send_request_goaway(s, MOQ_REQUEST_FAMILY_SUBSCRIBE_TRACKS, slot,
         cfg->new_session_uri.data, cfg->new_session_uri.len, cfg->timeout_ms);
+}
+
+/* -- Draft-22 namespace updates (§9.5, §9.5.2) ----------------------- *
+ * SUBSCRIBE_TRACKS's update carries AUTHORIZATION_TOKEN, FORWARD and
+ * TRACK_NAMESPACE_PREFIX (TRACK_PROPERTY_FILTER is a Range Filter, refused at
+ * the advertised zero limit). A prefix or FORWARD change governs only the
+ * subscriptions discovery creates from now on (§9.5.2, §9.20.18). */
+
+static bool track_sub_updates_supported(const moq_session_t *s)
+{
+    return s->profile->request_codec &&
+           s->profile->request_codec->decode_namespace_update &&
+           s->profile->encode_namespace_update;
+}
+
+/* REQUEST_ERROR + FIN closes the request on this side: the publisher-side
+ * entry is retired and the requester's direction is drained. Event, action
+ * and drain room are reserved before anything is committed. */
+static moq_result_t track_sub_update_terminal(moq_session_t *s, int slot,
+    uint64_t request_id, uint64_t code, const uint8_t *reason, size_t reason_len,
+    bool report_refused)
+{
+    moq_track_sub_entry_t *e = &s->track_subs[slot];
+    bool need_drain = !track_sub_peer_fin_observed(e) && e->rs.ref._v != 0;
+    if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
+        return MOQ_ERR_WOULD_BLOCK;
+    if (report_refused && event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+    uint8_t buf[1152];
+    size_t len = 0;
+    moq_result_t rc = ns_update_encode_error(s, request_id, code, reason,
+                                             reason_len, buf, sizeof(buf), &len);
+    if (rc < 0) return rc;
+    rc = queue_send_bidi(s, e->rs.ref, buf, len, true);
+    if (rc < 0) return rc;
+    if (report_refused)
+        (void)ns_update_push_result_event(s, MOQ_REQUEST_FAMILY_SUBSCRIBE_TRACKS,
+            e->handle._opaque, request_id, MOQ_NAMESPACE_UPDATE_OUTCOME_REFUSED,
+            MOQ_REQUEST_ROLE_RESPONDER, code, NULL, 0, false, 0);
+    if (need_drain) (void)drain_ref_add(s, e->rs.ref);   /* slot reserved above */
+    return MOQ_OK;
+}
+
+moq_result_t track_sub_on_namespace_update(moq_session_t *s, int slot,
+                                           const moq_request_envelope_t *env)
+{
+    moq_track_sub_entry_t *e = &s->track_subs[slot];
+    if (e->update.owed)
+        return close_with_error(s, s->profile->request_updates_exceeded_error,
+                                "too many outstanding REQUEST_UPDATEs");
+    ns_update_admission_t a;
+    moq_result_t rc = ns_update_admit(s, MOQ_REQUEST_FAMILY_SUBSCRIBE_TRACKS,
+                                      e->rs.ref, env, &a);
+    if (rc < 0 || s->state == MOQ_SESS_CLOSED) return rc;
+    uint64_t refuse = a.refuse_code;
+    if (!refuse && a.d.has_prefix &&
+        track_sub_prefix_conflicts(s, a.d.prefix.parts, a.d.prefix.count,
+                                   MOQ_TRACK_SUB_ROLE_PUBLISHER, slot))
+        refuse = MOQ_REQUEST_ERROR_PREFIX_OVERLAP;
+    if (refuse) {
+        rc = track_sub_update_terminal(s, slot, a.d.request_id, refuse, NULL, 0,
+                                       true);
+        if (rc < 0 || s->state == MOQ_SESS_CLOSED) {
+            ns_update_admission_abort(s, &a);
+            return rc;
+        }
+        ns_update_admission_commit(s, &a);
+        track_sub_free_entry(s, slot);
+        return MOQ_OK;
+    }
+    rc = ns_update_defer(s, MOQ_REQUEST_FAMILY_SUBSCRIBE_TRACKS,
+                         e->handle._opaque, &e->update, &a);
+    if (rc < 0 || s->state == MOQ_SESS_CLOSED) ns_update_admission_abort(s, &a);
+    return rc;
+}
+
+/* Updates not left to the application: admitted exactly as a deferred one
+ * (Request ID, token-cache transactions, parameter limits such as
+ * MAX_FILTER_RANGES) and refused with the admission's code, else
+ * NOT_SUPPORTED. No event, as before updates could be deferred. */
+moq_result_t track_sub_refuse_namespace_update(moq_session_t *s, int slot,
+                                               const moq_request_envelope_t *env)
+{
+    ns_update_admission_t a;
+    moq_result_t rc = ns_update_admit(s, MOQ_REQUEST_FAMILY_SUBSCRIBE_TRACKS,
+                                      s->track_subs[slot].rs.ref, env, &a);
+    if (rc < 0 || s->state == MOQ_SESS_CLOSED) return rc;
+    uint64_t code = a.refuse_code ? a.refuse_code : MOQ_REQUEST_ERROR_NOT_SUPPORTED;
+    rc = track_sub_update_terminal(s, slot, a.d.request_id, code, NULL, 0, false);
+    if (rc < 0 || s->state == MOQ_SESS_CLOSED) {
+        ns_update_admission_abort(s, &a);
+        return rc;
+    }
+    ns_update_admission_commit(s, &a);
+    track_sub_free_entry(s, slot);
+    return MOQ_OK;
+}
+
+moq_result_t track_sub_on_update_response(moq_session_t *s, int slot, bool ok,
+    uint64_t error_code, const uint8_t *reason, size_t reason_len,
+    bool has_expires, uint64_t expires_ms)
+{
+    moq_track_sub_entry_t *e = &s->track_subs[slot];
+    moq_ns_update_t *u = &e->update;
+    moq_result_t rc = ns_update_push_result_event(s,
+        MOQ_REQUEST_FAMILY_SUBSCRIBE_TRACKS, e->handle._opaque, u->out_request_id,
+        ok ? MOQ_NAMESPACE_UPDATE_OUTCOME_OK : MOQ_NAMESPACE_UPDATE_OUTCOME_ERROR,
+        MOQ_REQUEST_ROLE_REQUESTER,
+        ok ? 0 : s->profile->semantic_request_error(error_code),
+        ok ? NULL : reason, ok ? 0 : reason_len, has_expires, expires_ms);
+    if (rc < 0 || s->state == MOQ_SESS_CLOSED) return rc;
+    if (ok) {
+        /* The barrier: the new prefix names later PUBLISH_SKIPPED suffixes. */
+        if (u->out_flags & MOQ_NAMESPACE_UPDATE_PREFIX) {
+            moq_prefix_free(s, &e->prefix_buf, &e->prefix_buf_len,
+                            &e->prefix_parts, &e->prefix_count);
+            ns_update_take_out_prefix(u, &e->prefix_buf, &e->prefix_buf_len,
+                                      &e->prefix_parts, &e->prefix_count);
+        }
+        if (u->out_flags & MOQ_NAMESPACE_UPDATE_FORWARD)
+            e->forward = u->out_forward;
+    } else {
+        u->failed = true;
+    }
+    ns_update_clear_outstanding(s, u);
+    return MOQ_OK;
+}
+
+moq_result_t moq_session_update_subscribe_tracks(moq_session_t *s,
+    moq_track_sub_handle_t handle, const moq_namespace_update_cfg_t *cfg,
+    uint64_t now_us, uint64_t *out_update_request_id)
+{
+    if (!s || !cfg) return MOQ_ERR_INVAL;
+    if (!track_sub_updates_supported(s)) return MOQ_ERR_UNSUPPORTED;
+    moq_namespace_update_encode_args_t args;
+    moq_result_t rc = ns_update_cfg_read(s, cfg,
+        MOQ_REQUEST_FAMILY_SUBSCRIBE_TRACKS, &args);
+    if (rc < 0) return rc;
+    session_begin_advance(s, now_us);
+    if (!session_is_active(s)) return MOQ_ERR_CLOSED;
+    int slot = track_sub_resolve_handle(s, handle);
+    if (slot < 0) return MOQ_ERR_STALE_HANDLE;
+    moq_track_sub_entry_t *e = &s->track_subs[slot];
+    if (e->role != MOQ_TRACK_SUB_ROLE_SUBSCRIBER ||
+        e->state != MOQ_TRACK_SUB_ESTABLISHED || e->update.failed ||
+        e->goaway_sent)
+        return MOQ_ERR_WRONG_STATE;
+    if (s->goaway_received) return MOQ_ERR_GOAWAY;
+    if (e->update.outstanding) return MOQ_ERR_REQUEST_BLOCKED;
+    if (args.has_prefix &&
+        track_sub_prefix_conflicts(s, args.prefix.parts, args.prefix.count,
+                                   MOQ_TRACK_SUB_ROLE_SUBSCRIBER, slot))
+        return MOQ_ERR_INVAL;
+    return ns_update_send(s, e->rs.ref, &e->update, &args, out_update_request_id);
+}
+
+static moq_result_t track_sub_owed_slot(moq_session_t *s,
+    moq_track_sub_handle_t handle, int *out_slot)
+{
+    int slot = track_sub_resolve_handle(s, handle);
+    if (slot < 0) return MOQ_ERR_STALE_HANDLE;
+    if (s->track_subs[slot].role != MOQ_TRACK_SUB_ROLE_PUBLISHER)
+        return MOQ_ERR_WRONG_STATE;
+    *out_slot = slot;
+    return MOQ_OK;
+}
+
+moq_result_t moq_session_accept_subscribe_tracks_update(moq_session_t *s,
+    moq_track_sub_handle_t handle, const moq_accept_subscription_update_cfg_t *cfg,
+    uint64_t now_us)
+{
+    if (!s || !cfg) return MOQ_ERR_INVAL;
+    if (!track_sub_updates_supported(s)) return MOQ_ERR_UNSUPPORTED;
+    session_begin_advance(s, now_us);
+    if (!session_is_active(s)) return MOQ_ERR_CLOSED;
+    int slot = -1;
+    moq_result_t rc = track_sub_owed_slot(s, handle, &slot);
+    if (rc < 0) return rc;
+    moq_track_sub_entry_t *e = &s->track_subs[slot];
+    moq_ns_update_t *u = &e->update;
+    rc = ns_update_check_accept(s, u, cfg);
+    if (rc < 0) return rc;
+    /* A request retired after this answer also finishes this side's
+     * direction and, after the peer's GOAWAY without its FIN, drains. */
+    bool retire = u->retire_after_answer;
+    bool retire_drain = retire && u->retire_goaway_received &&
+                        !track_sub_peer_fin_observed(e);
+    if (retire && (action_queue_avail(s) < 2 ||
+                   (retire_drain && s->drain_ref_count >= s->drain_ref_cap)))
+        return MOQ_ERR_WOULD_BLOCK;
+    uint8_t buf[64];
+    size_t len = 0;
+    rc = ns_update_encode_ok(s, u->owed_request_id, buf, sizeof(buf), &len);
+    if (rc < 0) return rc;
+    rc = queue_send_bidi(s, e->rs.ref, buf, len, false);
+    if (rc < 0) return rc;
+    /* The prefix storage was reserved when the update was admitted. */
+    if (u->owed_flags & MOQ_NAMESPACE_UPDATE_PREFIX) {
+        moq_prefix_free(s, &e->prefix_buf, &e->prefix_buf_len,
+                        &e->prefix_parts, &e->prefix_count);
+        ns_update_take_owed_prefix(u, &e->prefix_buf, &e->prefix_buf_len,
+                                   &e->prefix_parts, &e->prefix_count);
+    }
+    if (u->owed_flags & MOQ_NAMESPACE_UPDATE_FORWARD)
+        e->forward = u->owed_forward;
+    ns_update_clear_owed(s, u);
+    if (retire) {
+        if (u->retire_close_half) (void)queue_close_bidi(s, e->rs.ref);
+        if (retire_drain) (void)drain_ref_add_goaway_received(s, e->rs.ref);
+        track_sub_free_entry(s, slot);
+    }
+    return MOQ_OK;
+}
+
+moq_result_t moq_session_reject_subscribe_tracks_update(moq_session_t *s,
+    moq_track_sub_handle_t handle, const moq_reject_subscription_update_cfg_t *cfg,
+    uint64_t now_us)
+{
+    if (!s || !cfg) return MOQ_ERR_INVAL;
+    if (!track_sub_updates_supported(s)) return MOQ_ERR_UNSUPPORTED;
+    session_begin_advance(s, now_us);
+    if (!session_is_active(s)) return MOQ_ERR_CLOSED;
+    int slot = -1;
+    moq_result_t rc = track_sub_owed_slot(s, handle, &slot);
+    if (rc < 0) return rc;
+    moq_track_sub_entry_t *e = &s->track_subs[slot];
+    rc = ns_update_check_reject(s, &e->update, cfg);
+    if (rc < 0) return rc;
+    rc = track_sub_update_terminal(s, slot, e->update.owed_request_id,
+        cfg->error_code, cfg->reason.data, cfg->reason.len, false);
+    if (rc < 0) return rc;
+    track_sub_free_entry(s, slot);
+    return MOQ_OK;
+}
+
+moq_result_t moq_session_subscribe_tracks_owed_update(moq_session_t *s,
+    moq_track_sub_handle_t handle, moq_namespace_update_record_t *out,
+    size_t out_size)
+{
+    if (!s || !out || out_size < MOQ_NAMESPACE_UPDATE_RECORD_V0_SIZE)
+        return MOQ_ERR_INVAL;
+    if (!track_sub_updates_supported(s)) return MOQ_ERR_UNSUPPORTED;
+    int slot = -1;
+    moq_result_t rc = track_sub_owed_slot(s, handle, &slot);
+    if (rc < 0) return rc;
+    return ns_update_owed_query(&s->track_subs[slot].update, out, out_size);
 }

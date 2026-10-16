@@ -33,6 +33,8 @@
 
 #include <moq/msquic_managed.h>
 
+#include "msq_loopback_port.h"
+
 static int failures = 0;
 
 #define CHECK(expr) do { \
@@ -199,7 +201,6 @@ static void run_arm_sized(const char *cert, const char *key, enum pool_arm arm)
     cfg.alloc = moq_alloc_default();
     cfg.perspective = MOQ_PERSPECTIVE_SERVER;
     cfg.host = "127.0.0.1";
-    cfg.port = 0;
     cfg.cert_path = cert;
     cfg.key_path = key;
     cfg.send_request_capacity = true;
@@ -220,7 +221,7 @@ static void run_arm_sized(const char *cert, const char *key, enum pool_arm arm)
     cfg.on_lane_pump_user = &po;
 
     moq_msquic_managed_t *srv = NULL;
-    CHECK(moq_msquic_managed_create(&cfg, &srv) == MOQ_OK);
+    CHECK(msqt_server_create(&cfg, &srv) == MOQ_OK);
     if (srv == NULL)
         return;
     uint16_t port = moq_msquic_managed_port(srv);

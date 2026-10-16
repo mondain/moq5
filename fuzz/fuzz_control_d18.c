@@ -182,25 +182,35 @@ static void fuzz_one_envelope(const moq_control_envelope_t *env)
     switch (env->msg_type) {
     case MOQ_D18_STREAM_SETUP: {
         moq_d18_setup_opts_t opts;
-        moq_result_t rc = moq_d18_decode_setup_opts(p, plen, &opts);
+        moq_result_t rc = moq_d18_decode_setup_opts(p, plen, &opts, sizeof(opts));
         check_rc_kvp(rc);
         if (rc == MOQ_OK) {
             if (opts.auth_token_count > MOQ_D18_MAX_AUTH_TOKENS)
                 __builtin_trap();
-            for (size_t i = 0; i < opts.auth_token_count; i++)
+            bool alias_ref = false;
+            for (size_t i = 0; i < opts.auth_token_count; i++) {
                 check_bytes_in(p, plen, opts.auth_tokens[i].token_value);
+                alias_ref |= opts.auth_tokens[i].alias_type ==
+                                 MOQ_AUTH_TOKEN_DELETE ||
+                             opts.auth_tokens[i].alias_type ==
+                                 MOQ_AUTH_TOKEN_USE_ALIAS;
+            }
+            if (opts.has_path) check_bytes_in(p, plen, opts.path);
+            if (opts.has_authority) check_bytes_in(p, plen, opts.authority);
 
+            /* The known options re-encode (unknown ones are dropped) and
+             * decode back to the same PATH, AUTHORITY, cache size and token
+             * count; a token naming an alias cannot be sent in SETUP. */
             moq_buf_writer_init(&w, scratch, sizeof(scratch));
-            moq_result_t erc = moq_d18_encode_setup_opts(&w, &opts);
-            if (opts.has_path || opts.has_authority ||
-                opts.auth_token_count > 0) {
+            moq_result_t erc = moq_d18_encode_setup_opts(&w, &opts, sizeof(opts));
+            if (alias_ref) {
                 if (erc != MOQ_ERR_INVAL || w.pos != 0)
                     __builtin_trap();
             } else {
                 if (erc != MOQ_OK)
                     __builtin_trap();
                 CHECK_SHORT_ROLLBACK(
-                    moq_d18_encode_setup_opts(&tw, &opts),
+                    moq_d18_encode_setup_opts(&tw, &opts, sizeof(opts)),
                     moq_buf_writer_offset(&w));
                 moq_buf_reader_init(&rr, scratch, moq_buf_writer_offset(&w));
                 if (moq_d18_decode_envelope(&rr, &env2) != MOQ_OK ||
@@ -208,12 +218,22 @@ static void fuzz_one_envelope(const moq_control_envelope_t *env)
                     __builtin_trap();
                 moq_d18_setup_opts_t opts2;
                 if (moq_d18_decode_setup_opts(env2.payload, env2.payload_len,
-                                              &opts2) != MOQ_OK)
+                                              &opts2, sizeof(opts2)) != MOQ_OK)
                     __builtin_trap();
                 if (opts2.has_max_auth_token_cache_size !=
                     opts.has_max_auth_token_cache_size ||
                     opts2.max_auth_token_cache_size !=
-                    opts.max_auth_token_cache_size)
+                    opts.max_auth_token_cache_size ||
+                    opts2.auth_token_count != opts.auth_token_count ||
+                    opts2.has_path != opts.has_path ||
+                    opts2.has_authority != opts.has_authority ||
+                    opts2.path.len != opts.path.len ||
+                    opts2.authority.len != opts.authority.len ||
+                    (opts.path.len &&
+                     memcmp(opts2.path.data, opts.path.data, opts.path.len)) ||
+                    (opts.authority.len &&
+                     memcmp(opts2.authority.data, opts.authority.data,
+                            opts.authority.len)))
                     __builtin_trap();
             }
         }

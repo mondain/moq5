@@ -1,5 +1,7 @@
 #include "moq/kvp.h"
 #include "moq/wire.h"
+#include "moq/buf.h"
+#include "kvp_internal.h"
 #include <string.h>
 
 /* -- Decoder ------------------------------------------------------- */
@@ -219,4 +221,132 @@ size_t moq_kvp_encode_varint_entry(uint64_t prev_type,
     pos += moq_quic_varint_encode(delta, buf + pos, buf_len - pos);
     pos += moq_quic_varint_encode(value, buf + pos, buf_len - pos);
     return pos;
+}
+
+/* -- List edit (internal) ------------------------------------------ */
+
+static moq_result_t kvp_read_int(moq_buf_reader_t *r, bool vi64, uint64_t *v)
+{
+    moq_result_t rc = vi64 ? moq_buf_read_vi64(r, v) : moq_buf_read_varint(r, v);
+    return rc < 0 ? MOQ_ERR_INVAL : MOQ_OK;
+}
+
+static moq_result_t kvp_write_int(moq_buf_writer_t *w, bool vi64, uint64_t v)
+{
+    moq_result_t rc = vi64 ? moq_buf_write_vi64(w, v) : moq_buf_write_varint(w, v);
+    return rc == MOQ_ERR_BUFFER ? MOQ_ERR_BUFFER : (rc < 0 ? MOQ_ERR_INVAL : MOQ_OK);
+}
+
+/* Count the instances of the even-typed integer `type` in the list and, one
+ * level down, inside the bodies of the odd-typed `container` pairs; the
+ * first instance's value goes to *first. A list that does not parse is
+ * MOQ_ERR_INVAL. */
+static moq_result_t kvp_count_int(const uint8_t *in, size_t len, bool vi64,
+                                  uint64_t type, uint64_t container, bool top,
+                                  size_t *count, uint64_t *first)
+{
+    moq_buf_reader_t r;
+    moq_buf_reader_init(&r, in, len);
+    uint64_t prev = 0;
+    while (moq_buf_reader_remaining(&r) > 0) {
+        uint64_t delta;
+        if (kvp_read_int(&r, vi64, &delta) < 0 || delta > UINT64_MAX - prev)
+            return MOQ_ERR_INVAL;
+        const uint64_t at = prev + delta;
+        if (at & 1u) {
+            uint64_t n;
+            if (kvp_read_int(&r, vi64, &n) < 0 || n > moq_buf_reader_remaining(&r))
+                return MOQ_ERR_INVAL;
+            if (top && container != 0 && at == container) {
+                moq_result_t rc = kvp_count_int(in + moq_buf_reader_offset(&r), (size_t)n,
+                                                vi64, type, 0, false, count, first);
+                if (rc < 0) return rc;
+            }
+            r.pos += (size_t)n;
+        } else {
+            uint64_t v;
+            if (kvp_read_int(&r, vi64, &v) < 0) return MOQ_ERR_INVAL;
+            if (at == type) {
+                if (*count == 0) *first = v;
+                (*count)++;
+            }
+        }
+        prev = at;
+    }
+    return MOQ_OK;
+}
+
+moq_result_t moq_kvp_list_merge_int(const uint8_t *in, size_t len, bool vi64,
+                                    uint64_t type, uint64_t value, uint64_t container,
+                                    uint8_t *out, size_t cap, size_t *out_len)
+{
+    if ((len > 0 && !in) || (cap > 0 && !out) || !out_len || (type & 1u) ||
+        (container != 0 && !(container & 1u)))
+        return MOQ_ERR_INVAL;
+    *out_len = 0;
+    size_t count = 0;
+    uint64_t first = 0;
+    moq_result_t rc = kvp_count_int(in, len, vi64, type, container, true, &count, &first);
+    if (rc < 0) return rc;
+    if (count == 0) return moq_kvp_list_add_int(in, len, vi64, type, value, out, cap, out_len);
+    if (count > 1 || first != value) return MOQ_ERR_INVAL;
+    if (len > cap) return MOQ_ERR_BUFFER;
+    if (len) memcpy(out, in, len);
+    *out_len = len;
+    return MOQ_OK;
+}
+
+moq_result_t moq_kvp_list_add_int(const uint8_t *in, size_t len, bool vi64,
+                                  uint64_t type, uint64_t value,
+                                  uint8_t *out, size_t cap, size_t *out_len)
+{
+    if ((len > 0 && !in) || (cap > 0 && !out) || !out_len || (type & 1u))
+        return MOQ_ERR_INVAL;
+    *out_len = 0;
+    moq_buf_reader_t r;
+    moq_buf_reader_init(&r, in, len);
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, out, cap);
+    uint64_t prev = 0;
+    bool placed = false;
+    moq_result_t rc;
+    while (moq_buf_reader_remaining(&r) > 0) {
+        uint64_t delta;
+        if (kvp_read_int(&r, vi64, &delta) < 0 || delta > UINT64_MAX - prev)
+            return MOQ_ERR_INVAL;
+        const uint64_t at = prev + delta;
+        const size_t body = moq_buf_reader_offset(&r);   /* after the type */
+        if (at & 1u) {
+            uint64_t n;
+            if (kvp_read_int(&r, vi64, &n) < 0 || n > moq_buf_reader_remaining(&r))
+                return MOQ_ERR_INVAL;
+            r.pos += (size_t)n;
+        } else {
+            uint64_t v;
+            if (kvp_read_int(&r, vi64, &v) < 0) return MOQ_ERR_INVAL;
+            if (at == type) {
+                if (v != value) return MOQ_ERR_INVAL;
+                placed = true;   /* already present: the list stays as it is */
+            }
+        }
+        if (!placed && at > type) {
+            rc = kvp_write_int(&w, vi64, type - prev);
+            if (rc == MOQ_OK) rc = kvp_write_int(&w, vi64, value);
+            if (rc == MOQ_OK) rc = kvp_write_int(&w, vi64, at - type);
+            placed = true;
+        } else {
+            rc = kvp_write_int(&w, vi64, delta);
+        }
+        if (rc == MOQ_OK)
+            rc = moq_buf_write_raw(&w, in + body, moq_buf_reader_offset(&r) - body);
+        if (rc < 0) return rc == MOQ_ERR_BUFFER ? MOQ_ERR_BUFFER : MOQ_ERR_INVAL;
+        prev = at;
+    }
+    if (!placed) {
+        rc = kvp_write_int(&w, vi64, type - prev);
+        if (rc == MOQ_OK) rc = kvp_write_int(&w, vi64, value);
+        if (rc < 0) return rc;
+    }
+    *out_len = moq_buf_writer_offset(&w);
+    return MOQ_OK;
 }

@@ -31,6 +31,8 @@ PyObject *test_new_track(PyObject *, PyObject *);
 PyObject *test_send_track_state(PyObject *, PyObject *);
 PyObject *test_subscribe_result(PyObject *, PyObject *);
 PyObject *test_subscriptions(PyObject *, PyObject *);
+PyObject *test_receiver_options(PyObject *, PyObject *);
+PyObject *test_receiver_cancellations(PyObject *, PyObject *);
 PyObject *test_stats_result(PyObject *, PyObject *);
 PyObject *test_terminal_result(PyObject *, PyObject *);
 PyObject *test_track_desc(PyObject *, PyObject *);
@@ -125,6 +127,7 @@ PyObject *test_send_track_cfg_shape(PyObject *, PyObject *);
 PyObject *test_send_track_reset(PyObject *, PyObject *);
 PyObject *test_send_track_counts(PyObject *, PyObject *);
 PyObject *test_send_track_config(PyObject *, PyObject *);
+PyObject *test_send_track_new_group(PyObject *, PyObject *);
 PyObject *test_send_track_results(PyObject *, PyObject *);
 PyObject *test_track_state(PyObject *, PyObject *);
 PyObject *test_sender_simulate_attach(PyObject *, PyObject *);
@@ -174,6 +177,8 @@ PyObject *moq5_test_track_capsule(PyObject *receiver_capsule, struct moq_media_t
     {"_test_track_state", test_track_state, METH_VARARGS, NULL}, \
     {"_test_subscribe_result", test_subscribe_result, METH_O, NULL}, \
     {"_test_subscriptions", test_subscriptions, METH_NOARGS, NULL}, \
+    {"_test_receiver_options", test_receiver_options, METH_NOARGS, NULL}, \
+    {"_test_receiver_cancellations", test_receiver_cancellations, METH_NOARGS, NULL}, \
     {"_test_stats_result", test_stats_result, METH_O, NULL}, \
     {"_test_terminal_result", test_terminal_result, METH_O, NULL}, \
     {"_test_track_desc", test_track_desc, METH_VARARGS, NULL}, \
@@ -267,6 +272,7 @@ PyObject *moq5_test_track_capsule(PyObject *receiver_capsule, struct moq_media_t
     {"_test_send_track_reset", test_send_track_reset, METH_NOARGS, NULL}, \
     {"_test_send_track_counts", test_send_track_counts, METH_NOARGS, NULL}, \
     {"_test_send_track_config", test_send_track_config, METH_NOARGS, NULL}, \
+    {"_test_send_track_new_group", test_send_track_new_group, METH_VARARGS, NULL}, \
     {"_test_send_track_results", test_send_track_results, METH_VARARGS, NULL}, \
     {"_test_send_track_state", test_send_track_state, METH_VARARGS, NULL}, \
     {"_test_sender_simulate_attach", test_sender_simulate_attach, METH_VARARGS, NULL}, \

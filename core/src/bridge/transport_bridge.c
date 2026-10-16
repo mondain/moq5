@@ -101,6 +101,14 @@ moq_result_t moq_transport_bridge_create(
     uint32_t max_p = cfg->max_pending    ? cfg->max_pending    : BRIDGE_DEFAULT_MAX_PENDING;
     uint32_t max_t = cfg->max_tombstones ? cfg->max_tombstones : BRIDGE_DEFAULT_MAX_TOMBSTONES;
 
+    /* A unidirectional control pair (drafts 18 and 22) keeps one stream-map
+     * entry per control stream for the whole session, so a map of fewer than
+     * two entries could never complete setup. Refused before anything is
+     * allocated or any endpoint call is made. */
+    if (max_s < 2 && moq_session_uses_uni_control(session))
+        return MOQ_ERR_INVAL;
+
+    moq_result_t rc = MOQ_ERR_NOMEM;
     moq_transport_bridge_t *b = bridge_alloc(a, sizeof(*b));
     if (!b) return MOQ_ERR_NOMEM;
     memset(b, 0, sizeof(*b));
@@ -134,24 +142,46 @@ moq_result_t moq_transport_bridge_create(
     if (!b->tombstones) goto fail;
     memset(b->tombstones, 0, max_t * sizeof(uint64_t));
 
+    /* Held-stream records, sized from max_pending but separate from the
+     * outbound pending queue. */
+    if (ops->capabilities & MOQ_TRANSPORT_CAP_HOLD_BIDI_INPUT) {
+        b->holds = bridge_alloc(a, max_p * sizeof(bridge_hold_t));
+        if (!b->holds) goto fail;
+        memset(b->holds, 0, max_p * sizeof(bridge_hold_t));
+        b->max_holds = max_p;
+    }
+
+    /* One transport owner per session, registered after every fallible
+     * allocation: a refused registration frees only this bridge's storage
+     * and leaves the session and its existing owner untouched. */
+    if (moq_session_register_transport_owner(session, b) != MOQ_OK) {
+        rc = MOQ_ERR_WRONG_STATE;
+        goto fail;
+    }
+
     *out = b;
     return MOQ_OK;
 
 fail:
+    if (b->holds)      bridge_free(a, b->holds, max_p * sizeof(bridge_hold_t));
     if (b->tombstones) bridge_free(a, b->tombstones, max_t * sizeof(uint64_t));
     if (b->pending)    bridge_free(a, b->pending, max_p * sizeof(bridge_pending_item_t));
     if (b->streams)    bridge_free(a, b->streams, max_s * sizeof(bridge_stream_entry_t));
     bridge_free(a, b, sizeof(*b));
-    return MOQ_ERR_NOMEM;
+    return rc;
 }
 
 void moq_transport_bridge_destroy(moq_transport_bridge_t *b)
 {
     if (!b) return;
 
+    /* The session outlives its bridge (see moq_transport_bridge_create), so
+     * releasing the exclusive registration here is a valid access. */
+    moq_session_unregister_transport_owner(b->session, b);
     bridge_cleanup_all_pending(b);
 
     const moq_alloc_t *a = &b->alloc;
+    if (b->holds) bridge_free(a, b->holds, b->max_holds * sizeof(bridge_hold_t));
     bridge_free(a, b->tombstones, b->max_tombstones * sizeof(uint64_t));
     bridge_free(a, b->pending, b->max_pending * sizeof(bridge_pending_item_t));
     bridge_free(a, b->streams, b->max_streams * sizeof(bridge_stream_entry_t));
@@ -327,6 +357,10 @@ static void bridge_clear_all_state(moq_transport_bridge_t *b)
             bridge_deactivate_stream(&b->streams[i]);
     }
     b->tombstone_count = 0;
+    if (b->holds) {
+        memset(b->holds, 0, b->max_holds * sizeof(bridge_hold_t));
+        moq_session_set_owner_deadline(b->session, b, false, 0);
+    }
 }
 
 /* -- Fatal ---------------------------------------------------------- */
@@ -533,8 +567,257 @@ bool bridge_stream_has_inbound_pending(const bridge_stream_entry_t *e)
            e->pending_reset || e->pending_stop || e->pending_admission;
 }
 
-static moq_result_t bridge_hold_admission(bridge_stream_entry_t *e, size_t len)
+/* -- Held peer streams ------------------------------------------------ */
+
+static bridge_hold_t *bridge_hold_find(const moq_transport_bridge_t *b,
+                                       uint64_t transport_id)
 {
+    if (!b->holds) return NULL;
+    for (uint32_t i = 0; i < b->max_holds; i++)
+        if (b->holds[i].state != BRIDGE_HOLD_FREE &&
+            b->holds[i].transport_id == transport_id)
+            return &b->holds[i];
+    return NULL;
+}
+
+/* A RECORDED hold of this class (mapped: uni admission; unmapped: request
+ * bidi without a stream mapping) is waiting: a new arrival of the same class
+ * queues behind it. */
+static bool bridge_hold_class_waiting(const moq_transport_bridge_t *b,
+                                      bool mapped)
+{
+    if (!b->holds) return false;
+    for (uint32_t i = 0; i < b->max_holds; i++)
+        if (b->holds[i].state == BRIDGE_HOLD_RECORDED &&
+            b->holds[i].mapped == mapped)
+            return true;
+    return false;
+}
+
+/* Publish the earliest hold age of every RECORDED hold to the session, or
+ * clear it. CANCELLING holds have no time deadline: their owed operations
+ * retry on every service pass. */
+static void bridge_hold_publish_deadline(moq_transport_bridge_t *b)
+{
+    if (!b->holds) return;
+    bool has = false;
+    uint64_t d = UINT64_MAX;
+    for (uint32_t i = 0; i < b->max_holds; i++) {
+        const bridge_hold_t *h = &b->holds[i];
+        if (h->state != BRIDGE_HOLD_RECORDED) continue;
+        uint64_t due = h->first_refusal_us > UINT64_MAX - BRIDGE_HOLD_AGE_US
+            ? UINT64_MAX : h->first_refusal_us + BRIDGE_HOLD_AGE_US;
+        if (!has || due < d) d = due;
+        has = true;
+    }
+    moq_session_set_owner_deadline(b->session, b, has, d);
+}
+
+/* Record a newly refused stream. NULL when every record is in use. */
+static bridge_hold_t *bridge_hold_record(moq_transport_bridge_t *b,
+                                         uint64_t transport_id,
+                                         bridge_stream_kind_t kind,
+                                         bool mapped, size_t len,
+                                         uint64_t now_us)
+{
+    for (uint32_t i = 0; i < b->max_holds; i++) {
+        bridge_hold_t *h = &b->holds[i];
+        if (h->state != BRIDGE_HOLD_FREE) continue;
+        memset(h, 0, sizeof(*h));
+        h->state = BRIDGE_HOLD_RECORDED;
+        h->kind = (uint8_t)kind;
+        h->mapped = mapped;
+        h->held_payload = len > 0;
+        h->transport_id = transport_id;
+        h->first_refusal_us = now_us;
+        h->seq = ++b->hold_seq;
+        bridge_hold_publish_deadline(b);
+        return h;
+    }
+    return NULL;
+}
+
+static void bridge_hold_release(moq_transport_bridge_t *b, bridge_hold_t *h)
+{
+    if (!h) return;
+    memset(h, 0, sizeof(*h));
+    bridge_hold_publish_deadline(b);
+}
+
+/* Stream mappings still owed to the control channel on a uni-pair profile:
+ * our own control stream until it has been mapped once (keyed on its stream
+ * id, which its FIN does not clear), and the peer's until it is identified.
+ * Each control stream keeps its mapping for the whole session (draft-22
+ * section 6.3, draft-18 section 3.3). */
+static uint32_t bridge_control_reserve(const moq_transport_bridge_t *b)
+{
+    if (b->control_mode != BRIDGE_CONTROL_UNI_PAIR) return 0;
+    return (b->local_ctrl_uni_stream_id == UINT64_MAX ? 1u : 0u) +
+           (b->peer_ctrl_uni_open ? 0u : 1u);
+}
+
+/* Free stream mappings a new held-capable peer stream (a request stream, or
+ * a classified data stream) may take: only those beyond the control reserve,
+ * so holding and admission never take an entry a control stream needs. */
+static bool bridge_can_map_peer_stream(const moq_transport_bridge_t *b)
+{
+    uint32_t free_entries = 0;
+    for (uint32_t i = 0; i < b->max_streams; i++)
+        if (!b->streams[i].active) free_entries++;
+    return free_entries > bridge_control_reserve(b);
+}
+
+/* The stream error code a held stream is cancelled with at the resource
+ * limit (draft-22 section 15.5, draft-18 13.5, draft-16 12.1: the endpoint
+ * MUST cancel a stream). Drafts 18 and 22 define EXCESSIVE_LOAD (0x9, "the
+ * endpoint is overloaded and is resetting this stream"; draft-18 section
+ * 3.3.3, draft-22 section 12.5). Draft-16 defines no such code; its
+ * CANCELLED (0x1) covers a cancellation the receiver requested with
+ * STOP_SENDING (draft-16 section 10.4.3). */
+static uint64_t bridge_cancel_code(const moq_transport_bridge_t *b)
+{
+    return moq_session_version(b->session) == MOQ_VERSION_DRAFT_16
+        ? MOQ_STREAM_ERROR_CANCELLED : MOQ_STREAM_ERROR_EXCESSIVE_LOAD;
+}
+
+/* A hold leaves RECORDED for CANCELLING: every half it still has open is
+ * cancelled with the profile's code (bridge_cancel_code; draft-22 section
+ * 15.5: an endpoint MUST cancel a stream after reaching a resource limit). */
+static void bridge_hold_cancel(moq_transport_bridge_t *b, bridge_hold_t *h,
+                               bool receive_terminal)
+{
+    h->state = BRIDGE_HOLD_CANCELLING;
+    h->offered = false;
+    h->stop_owed = !receive_terminal;
+    h->reset_owed = h->kind == BRIDGE_STREAM_BIDI;
+    bridge_hold_publish_deadline(b);
+}
+
+/* Perform the owed halves of a CANCELLING hold in its own slot. MOQ_OK when
+ * the record was settled and freed or is still waiting on a WOULD_BLOCK;
+ * MOQ_ERR_INTERNAL when the endpoint failed (fatal). */
+static moq_result_t bridge_hold_drive_cancel(moq_transport_bridge_t *b,
+                                             bridge_hold_t *h, bool *progress)
+{
+    const moq_transport_endpoint_ops_t *ops = b->ops;
+    uint64_t id = h->transport_id;
+    uint64_t code = bridge_cancel_code(b);
+    if (h->stop_owed && h->reset_owed && HAS_FIELD(ops, abort_stream) &&
+        ops->abort_stream) {
+        moq_transport_result_t r = sanitize_stream_result(
+            ops->abort_stream(b->endpoint_ctx, id, code));
+        if (r == MOQ_TRANSPORT_WOULD_BLOCK) return MOQ_OK;
+        if (r != MOQ_TRANSPORT_OK) {
+            bridge_set_fatal(b, 0x1);
+            return MOQ_ERR_INTERNAL;
+        }
+        h->stop_owed = h->reset_owed = false;
+        *progress = true;
+    }
+    if (h->reset_owed) {
+        moq_transport_result_t r = sanitize_stream_result(
+            ops->reset_stream(b->endpoint_ctx, id, code));
+        if (r == MOQ_TRANSPORT_WOULD_BLOCK) return MOQ_OK;
+        if (r != MOQ_TRANSPORT_OK) {
+            bridge_set_fatal(b, 0x1);
+            return MOQ_ERR_INTERNAL;
+        }
+        h->reset_owed = false;
+        *progress = true;
+    }
+    if (h->stop_owed) {
+        moq_transport_result_t r = sanitize_stream_result(
+            ops->stop_sending(b->endpoint_ctx, id, code));
+        if (r == MOQ_TRANSPORT_WOULD_BLOCK) return MOQ_OK;
+        if (r != MOQ_TRANSPORT_OK) {
+            bridge_set_fatal(b, 0x1);
+            return MOQ_ERR_INTERNAL;
+        }
+        h->stop_owed = false;
+        *progress = true;
+    }
+    /* Both halves settled: the stream's bridge state goes with the record;
+     * the adapter dropped the held chunk when it took the cancellation. */
+    if (h->mapped) {
+        bridge_stream_entry_t *e = bridge_find_by_id(b, id);
+        if (e) bridge_deactivate_stream(e);
+    }
+    bridge_hold_release(b, h);
+    return MOQ_OK;
+}
+
+/* Hold maintenance, run on every service pass before any deadline is
+ * ticked: expire holds that reached the hold age, drive owed cancellations,
+ * and offer readiness to the oldest waiting hold of each class whose
+ * resource is free. Sets *progress when anything moved. */
+static moq_result_t bridge_hold_maintain(moq_transport_bridge_t *b,
+                                         uint64_t now_us, bool *progress)
+{
+    if (!b->holds) return MOQ_OK;
+    for (uint32_t i = 0; i < b->max_holds; i++) {
+        bridge_hold_t *h = &b->holds[i];
+        if (h->state != BRIDGE_HOLD_RECORDED) continue;
+        if (h->first_refusal_us <= UINT64_MAX - BRIDGE_HOLD_AGE_US &&
+            now_us >= h->first_refusal_us + BRIDGE_HOLD_AGE_US) {
+            bridge_hold_cancel(b, h, false);
+            *progress = true;
+        }
+    }
+    for (uint32_t i = 0; i < b->max_holds && !b->fatal; i++) {
+        bridge_hold_t *h = &b->holds[i];
+        if (h->state != BRIDGE_HOLD_CANCELLING) continue;
+        moq_result_t rc = bridge_hold_drive_cancel(b, h, progress);
+        if (rc < 0) return rc;
+    }
+    for (int mapped = 0; mapped < 2; mapped++) {
+        bridge_hold_t *oldest = NULL;
+        bool outstanding = false;
+        for (uint32_t i = 0; i < b->max_holds; i++) {
+            bridge_hold_t *h = &b->holds[i];
+            if (h->state != BRIDGE_HOLD_RECORDED || h->mapped != (mapped != 0))
+                continue;
+            if (h->offered) { outstanding = true; break; }
+            if (!oldest || h->seq < oldest->seq) oldest = h;
+        }
+        if (outstanding || !oldest) continue;
+        bool ready = mapped ? moq_session_can_admit_data_stream(b->session)
+                            : bridge_can_map_peer_stream(b);
+        if (!ready) continue;
+        oldest->offered = true;
+        if (mapped) {
+            bridge_stream_entry_t *e = bridge_find_by_id(b, oldest->transport_id);
+            if (e) e->pending_admission = false;
+        }
+        *progress = true;
+    }
+    bridge_hold_publish_deadline(b);
+    return MOQ_OK;
+}
+
+/* A new peer uni data stream the session cannot admit: the adapter keeps the
+ * exact chunk (MOQ_ERR_INPUT_NOT_CONSUMED). With held-stream records the
+ * stream also takes one -- or, every record being in use, is refused for the
+ * adapter to cancel (MOQ_BRIDGE_INGRESS_REFUSE_CANCEL), its bridge state
+ * (including any classified prefix) released at once. */
+static moq_result_t bridge_hold_admission(moq_transport_bridge_t *b,
+                                          bridge_stream_entry_t *e,
+                                          size_t len, uint64_t now_us)
+{
+    if (b->holds) {
+        bridge_hold_t *h = bridge_hold_find(b, e->transport_id);
+        if (!h) {
+            h = bridge_hold_record(b, e->transport_id, BRIDGE_STREAM_UNI,
+                                   true, len, now_us);
+            if (!h) {
+                bridge_deactivate_stream(e);
+                return MOQ_BRIDGE_INGRESS_REFUSE_CANCEL;
+            }
+        } else {
+            h->offered = false;      /* readiness was not a reservation */
+            h->mapped = true;        /* it has a stream entry now; age kept */
+            if (len > 0) h->held_payload = true;
+        }
+    }
     e->pending_admission = true;
     e->held_input = true;
     if (len > 0) e->held_payload = true;
@@ -542,38 +825,144 @@ static moq_result_t bridge_hold_admission(bridge_stream_entry_t *e, size_t len)
 }
 
 /* Admission preflight for a NEW peer uni data stream (one the session does
- * not own yet): when the
- * session has no receive entry to admit it, refuse the whole chunk -- bytes
- * and FIN -- without feeding it, so the adapter keeps it and redelivers it
- * later. Returns true when the chunk was refused this way. Streams the
- * session already owns, and terminal
- * sessions (the query reports admissible so the input reaches the terminal
- * path) are never refused here. */
-static bool bridge_admission_refused(moq_transport_bridge_t *b,
-                                     bridge_stream_entry_t *e,
-                                     moq_stream_ref_t ref, size_t len)
+ * not own yet): when the session has no receive entry to admit it -- or,
+ * with held-stream records, when older held streams are waiting or the
+ * stream has not been offered yet -- refuse the whole chunk, bytes and FIN,
+ * without feeding it. Returns 0 when the chunk may be fed, else the result
+ * to return (MOQ_ERR_INPUT_NOT_CONSUMED or MOQ_BRIDGE_INGRESS_REFUSE_CANCEL).
+ * Streams the session already owns, and terminal sessions (the query reports
+ * admissible so the input reaches the terminal path) are never refused. */
+static moq_result_t bridge_admission_refused(moq_transport_bridge_t *b,
+                                             bridge_stream_entry_t *e,
+                                             moq_stream_ref_t ref, size_t len,
+                                             uint64_t now_us)
 {
     /* The adapter still owes a chunk that carried bytes: an empty delivery
      * (a FIN-only notification) cannot overtake it, ready or not. */
     if (e->held_input && e->held_payload && len == 0)
-        return true;
+        return MOQ_ERR_INPUT_NOT_CONSUMED;
     if (moq_session_has_transport_stream(b->session, ref))
-        return false;
+        return 0;
+    if (b->holds) {
+        bridge_hold_t *h = bridge_hold_find(b, e->transport_id);
+        if (h && h->state == BRIDGE_HOLD_CANCELLING)
+            return MOQ_ERR_INPUT_NOT_CONSUMED;
+        bool queued = h ? !h->offered : bridge_hold_class_waiting(b, true);
+        if (!queued && moq_session_can_admit_data_stream(b->session)) {
+            e->pending_admission = false;
+            return 0;
+        }
+        return bridge_hold_admission(b, e, len, now_us);
+    }
     if (moq_session_can_admit_data_stream(b->session)) {
         e->pending_admission = false;
-        return false;
+        return 0;
     }
-    (void)bridge_hold_admission(e, len);
+    return bridge_hold_admission(b, e, len, now_us);
+}
+
+/* A NEW peer uni data stream on a bidi-control profile (draft-16: every
+ * peer uni stream is data) that finds no free stream mapping, with
+ * held-stream records: its exact chunk is held without a mapping (zero bytes
+ * and no FIN consumed), offered oldest first when a mapping frees, refused
+ * for the adapter to cancel when every record is in use, and cancelled when
+ * it reaches the hold age. Returns true with *out set when it handled the
+ * delivery; false when the stream is mapped now or may be mapped. */
+static bool bridge_hold_unmapped_uni(moq_transport_bridge_t *b,
+                                     uint64_t stream_id, size_t len,
+                                     uint64_t now_us, moq_result_t *out)
+{
+    if (!b->holds || b->control_mode != BRIDGE_CONTROL_BIDI) return false;
+    bridge_hold_t *h = bridge_hold_find(b, stream_id);
+    if (h && h->state == BRIDGE_HOLD_CANCELLING) {
+        *out = MOQ_ERR_INPUT_NOT_CONSUMED;
+        return true;
+    }
+    bool queued = h ? !h->offered : bridge_hold_class_waiting(b, false);
+    if (h && h->held_payload && len == 0) queued = true;
+    if (!queued && bridge_can_map_peer_stream(b)) return false;
+    if (h) {
+        h->offered = false;
+        if (len > 0) h->held_payload = true;
+        *out = MOQ_ERR_INPUT_NOT_CONSUMED;
+        return true;
+    }
+    *out = bridge_hold_record(b, stream_id, BRIDGE_STREAM_UNI, false, len,
+                              now_us)
+        ? MOQ_ERR_INPUT_NOT_CONSUMED : MOQ_BRIDGE_INGRESS_REFUSE_CANCEL;
+    return true;
+}
+
+/* A NEW peer uni stream on a uni-pair profile (drafts 18 and 22), with
+ * held-stream records, is placed by the class of its first chunk before it
+ * takes a stream mapping:
+ *   - a complete data type that finds no mapping free beyond the control
+ *     reserve, or finds an older stream held without a mapping, is held the
+ *     same way as on a bidi-control profile (zero bytes and no FIN consumed,
+ *     offered oldest first, refused for the adapter to cancel when every
+ *     record is in use, cancelled at the hold age);
+ *   - a complete padding type that finds no mapping free beyond the reserve
+ *     is refused for the adapter to cancel; it is never held (draft-22 and
+ *     draft-18 section 11.5.1: a padding stream may be cancelled at any time);
+ *   - a control type, an incomplete type and an unknown type are left to the
+ *     classifying path below. A stream that may be the control stream is
+ *     never held or cancelled here (draft-22 section 6.3, draft-18 section
+ *     3.3: a control stream is never closed during the session).
+ * Each cancellation is the stream-local response to a resource limit
+ * (draft-22 section 15.5, draft-18 section 13.5), whatever the setup state.
+ * Returns true with *out set when it handled the delivery; false when the
+ * stream takes the classifying path now. */
+static bool bridge_uni_pair_place_unmapped(moq_transport_bridge_t *b,
+                                           uint64_t stream_id,
+                                           const uint8_t *data, size_t len,
+                                           uint64_t now_us, moq_result_t *out)
+{
+    if (!b->holds || b->control_mode != BRIDGE_CONTROL_UNI_PAIR) return false;
+    bridge_hold_t *h = bridge_hold_find(b, stream_id);
+    if (h) {
+        /* Only a complete data type is ever held here, and the adapter
+         * redelivers that exact chunk, so it is not classified again. */
+        if (h->state == BRIDGE_HOLD_CANCELLING) {
+            *out = MOQ_ERR_INPUT_NOT_CONSUMED;
+            return true;
+        }
+        bool queued = !h->offered || (h->held_payload && len == 0);
+        if (!queued && bridge_can_map_peer_stream(b)) return false;
+        h->offered = false;
+        if (len > 0) h->held_payload = true;
+        *out = MOQ_ERR_INPUT_NOT_CONSUMED;
+        return true;
+    }
+    uint8_t tmp[9];
+    size_t tn = len < sizeof(tmp) ? len : sizeof(tmp);
+    if (tn > 0) memcpy(tmp, data, tn);
+    moq_uni_class_t cls = moq_session_classify_peer_uni(b->session, tmp, tn);
+    if (cls == MOQ_UNI_CLASS_PADDING) {
+        if (bridge_can_map_peer_stream(b)) return false;
+        *out = MOQ_BRIDGE_INGRESS_REFUSE_CANCEL;
+        return true;
+    }
+    if (cls != MOQ_UNI_CLASS_DATA) return false;
+    if (!bridge_hold_class_waiting(b, false) && bridge_can_map_peer_stream(b))
+        return false;
+    *out = bridge_hold_record(b, stream_id, BRIDGE_STREAM_UNI, false, len,
+                              now_us)
+        ? MOQ_ERR_INPUT_NOT_CONSUMED : MOQ_BRIDGE_INGRESS_REFUSE_CANCEL;
     return true;
 }
 
 /* The session took the stream's input (consumed, or retained under its own
- * backpressure): the adapter's held-chunk obligation, if any, is discharged. */
-static void bridge_admission_accepted(bridge_stream_entry_t *e)
+ * backpressure): the adapter's held-chunk obligation, if any, is discharged,
+ * and with it the stream's hold record -- the stream mapping, if it
+ * continues, is not acceptance's concern. */
+static void bridge_admission_accepted(moq_transport_bridge_t *b,
+                                      bridge_stream_entry_t *e)
 {
     e->held_input = false;
     e->held_payload = false;
     e->pending_admission = false;
+    bridge_hold_t *h = bridge_hold_find(b, e->transport_id);
+    if (h && h->state == BRIDGE_HOLD_RECORDED) bridge_hold_release(b, h);
 }
 
 /* -- State queries -------------------------------------------------- */
@@ -618,6 +1007,11 @@ bool moq_transport_bridge_has_pending(const moq_transport_bridge_t *b)
         if (b->streams[i].active && bridge_stream_has_inbound_pending(&b->streams[i]))
             return true;
     }
+    for (uint32_t i = 0; b->holds && i < b->max_holds; i++) {
+        if (b->holds[i].state == BRIDGE_HOLD_CANCELLING ||
+            (b->holds[i].state == BRIDGE_HOLD_RECORDED && !b->holds[i].offered))
+            return true;
+    }
     return false;
 }
 
@@ -632,7 +1026,33 @@ bool moq_transport_bridge_has_outbound_pending(const moq_transport_bridge_t *b)
      * (freeing the session's receive queue), NOT by send capacity. Arming
      * connection-write-ready on inbound pending would spin, since connections
      * are almost always write-ready. */
-    return b->pending_count > 0 || b->needs_close;
+    if (b->pending_count > 0 || b->needs_close) return true;
+    /* An owed cancellation of a held stream is send-side work. */
+    for (uint32_t i = 0; b->holds && i < b->max_holds; i++)
+        if (b->holds[i].state == BRIDGE_HOLD_CANCELLING)
+            return true;
+    return false;
+}
+
+/* Readiness, not identity: while the session drains buffered control input
+ * on a uni-pair profile, bridge_uni_pair_inbound refuses every peer uni
+ * chunk except the control stream's, and this answers "not ready yet" for
+ * any stream such a refusal could concern: a mapped peer uni stream, or an
+ * id the bridge has no mapping for. A mapped bidi stream or a stream this
+ * side opened is never refused there and is excluded. An unmapped id is
+ * answered conservatively -- the bridge cannot tell a refused peer uni
+ * stream from any other unknown id -- so the answer neither identifies a
+ * peer uni stream nor says that anything is retained: an adapter asks only
+ * about streams whose receive records it polls, and the input stays its
+ * own. */
+static bool bridge_uni_deferred(const moq_transport_bridge_t *b,
+                                uint64_t stream_id,
+                                const bridge_stream_entry_t *e)
+{
+    return b->pending_control && b->control_mode == BRIDGE_CONTROL_UNI_PAIR &&
+           stream_id != b->pending_control_stream_id &&
+           (!e || (e->kind == BRIDGE_STREAM_UNI &&
+                   e->origin == BRIDGE_ORIGIN_PEER));
 }
 
 bool moq_transport_bridge_stream_has_pending(
@@ -641,11 +1061,17 @@ bool moq_transport_bridge_stream_has_pending(
     if (!b) return false;
     if (b->pending_control && b->pending_control_stream_id == stream_id)
         return true;
-    for (uint32_t i = 0; i < b->max_streams; i++) {
-        if (b->streams[i].active && b->streams[i].transport_id == stream_id)
-            return bridge_stream_has_inbound_pending(&b->streams[i]);
+    const bridge_stream_entry_t *e = bridge_find_by_id_const(b, stream_id);
+    {
+        const bridge_hold_t *h = bridge_hold_find(b, stream_id);
+        if (h) {
+            if (h->state == BRIDGE_HOLD_CANCELLING || !h->offered) return true;
+            return h->kind == BRIDGE_STREAM_UNI &&
+                   bridge_uni_deferred(b, stream_id, e);
+        }
     }
-    return false;
+    if (e && bridge_stream_has_inbound_pending(e)) return true;
+    return bridge_uni_deferred(b, stream_id, e);
 }
 
 uint64_t moq_transport_bridge_event_progress_token(
@@ -799,10 +1225,61 @@ static bool bridge_enqueue_pending(moq_transport_bridge_t *b,
     return true;
 }
 
+/* Control bytes on a unidirectional control-channel pair go out on the local
+ * uni control stream. Until that stream is open they wait as a pending
+ * control item behind the open that will create it. */
+static moq_result_t send_control_on_local_uni(moq_transport_bridge_t *b,
+                                              moq_action_t *act)
+{
+    const moq_send_control_action_t *sc = &act->u.send_control;
+
+    if (!b->local_ctrl_uni_open) {
+        bridge_pending_item_t p;
+        memset(&p, 0, sizeof(p));
+        p.kind = PENDING_OPEN_CONTROL;
+        p.data = bridge_alloc(&b->alloc, sc->len);
+        if (!p.data) { bridge_set_fatal(b, 0x1); return MOQ_ERR_NOMEM; }
+        memcpy(p.data, sc->data, sc->len);
+        p.data_len = sc->len;
+        moq_action_cleanup(act);
+        if (!bridge_enqueue_pending(b, &p))
+            return bridge_retention_failed(b, &p);
+        return MOQ_OK;
+    }
+
+    moq_transport_result_t wr = sanitize_stream_result(
+        b->ops->write(b->endpoint_ctx, b->local_ctrl_uni_stream_id,
+                       sc->data, sc->len, false));
+    if (wr == MOQ_TRANSPORT_WOULD_BLOCK) {
+        bridge_pending_item_t p;
+        memset(&p, 0, sizeof(p));
+        p.kind = PENDING_COPIED_WRITE;
+        bridge_item_set_sid(&p, b->local_ctrl_uni_stream_id);
+        p.stream_ref = b->local_ctrl_uni_ref;
+        p.data = bridge_alloc(&b->alloc, sc->len);
+        if (!p.data) { bridge_set_fatal(b, 0x1); return MOQ_ERR_NOMEM; }
+        memcpy(p.data, sc->data, sc->len);
+        p.data_len = sc->len;
+        moq_action_cleanup(act);
+        if (!bridge_enqueue_pending(b, &p))
+            return bridge_retention_failed(b, &p);
+        return MOQ_OK;
+    }
+    moq_action_cleanup(act);
+    if (wr == MOQ_TRANSPORT_ERROR) {
+        bridge_set_fatal(b, 0x1);
+        return MOQ_ERR_INTERNAL;
+    }
+    return MOQ_OK;
+}
+
 static moq_result_t dispatch_send_control(moq_transport_bridge_t *b,
                                            moq_action_t *act)
 {
     const moq_send_control_action_t *sc = &act->u.send_control;
+
+    if (b->control_mode == BRIDGE_CONTROL_UNI_PAIR)
+        return send_control_on_local_uni(b, act);
 
     if (!b->control_open) {
         if (b->is_client) {
@@ -917,6 +1394,22 @@ static moq_result_t dispatch_close_session(moq_transport_bridge_t *b,
     return MOQ_OK;
 }
 
+/* The FIN of a local unidirectional data stream has been written. An
+ * adapter that reports "all data committed" keeps the mapping until that
+ * report (or a RESET) so the session's FIN-started timer can still reach the
+ * stream; otherwise the stream is retired here. */
+static void bridge_local_data_fin_done(moq_transport_bridge_t *b, moq_stream_ref_t ref)
+{
+    bridge_mark_local_close(b, ref);
+    bridge_stream_entry_t *e = bridge_find_by_ref(b, ref);
+    if (e && e->kind == BRIDGE_STREAM_UNI && e->origin == BRIDGE_ORIGIN_LOCAL &&
+        (b->ops->capabilities & MOQ_TRANSPORT_CAP_COMMIT_REPORT)) {
+        e->awaiting_commit = true;
+        return;
+    }
+    bridge_retire_or_tombstone(b, ref);
+}
+
 /* -- SEND_DATA: two-phase header+payload ---------------------------- */
 
 /*
@@ -930,10 +1423,27 @@ static moq_result_t dispatch_close_session(moq_transport_bridge_t *b,
  * On WOULD_BLOCK: item is enqueued in pending (caller must not free).
  * On error: item is cleaned up, bridge goes fatal.
  *
+ * `e` is the stream's entry when the caller already holds it, else NULL; the
+ * bytes the endpoint accepts are counted on it (bytes_sent).
+ *
  * Returns MOQ_OK or error.
  */
+static void bridge_count_sent(moq_transport_bridge_t *b,
+                              const bridge_pending_item_t *p,
+                              bridge_stream_entry_t **e, uint64_t n)
+{
+    if (*e == NULL) *e = bridge_find_by_ref(b, p->stream_ref);
+    if (*e != NULL) {
+        if ((*e)->bytes_sent == 0 && p->kind == PENDING_HEADER_PAYLOAD)
+            (*e)->subgroup_header_len =
+                bridge_session_subgroup_header_size(b->session, &p->act.u.send_data);
+        (*e)->bytes_sent += n;
+    }
+}
+
 static moq_result_t bridge_try_send_data(moq_transport_bridge_t *b,
-                                          bridge_pending_item_t *p)
+                                          bridge_pending_item_t *p,
+                                          bridge_stream_entry_t *e)
 {
     moq_send_data_action_t *sd = &p->act.u.send_data;
     uint64_t sid = p->stream_id;
@@ -981,10 +1491,10 @@ static moq_result_t bridge_try_send_data(moq_transport_bridge_t *b,
             bridge_set_fatal(b, 0x1);
             return MOQ_ERR_INTERNAL;
         }
+        bridge_count_sent(b, p, &e, sd->header_len);
 
         if (fin_on_hdr) {
-            bridge_mark_local_close(b, p->stream_ref);
-            bridge_retire_or_tombstone(b, p->stream_ref);
+            bridge_local_data_fin_done(b, p->stream_ref);
             bridge_cleanup_pending_item(&b->alloc, p);
             return MOQ_OK;
         }
@@ -1022,6 +1532,7 @@ static moq_result_t bridge_try_send_data(moq_transport_bridge_t *b,
             bridge_set_fatal(b, 0x1);
             return MOQ_ERR_INTERNAL;
         }
+        bridge_count_sent(b, p, &e, moq_rcbuf_len(sd->payload));
     } else if (sd->header_len == 0 && sd->fin) {
         /* Empty FIN-only (close subgroup) */
         moq_transport_result_t wr = sanitize_stream_result(
@@ -1041,10 +1552,8 @@ static moq_result_t bridge_try_send_data(moq_transport_bridge_t *b,
     }
 
     /* Success — stream done if FIN */
-    if (sd->fin) {
-        bridge_mark_local_close(b, p->stream_ref);
-        bridge_retire_or_tombstone(b, p->stream_ref);
-    }
+    if (sd->fin)
+        bridge_local_data_fin_done(b, p->stream_ref);
     bridge_cleanup_pending_item(&b->alloc, p);
     return MOQ_OK;
 }
@@ -1294,7 +1803,7 @@ static moq_result_t dispatch_send_data(moq_transport_bridge_t *b,
     bridge_item_set_sid(&p, e->transport_id);
     bridge_pending_take_action(&p, act);
 
-    moq_result_t rc = bridge_try_send_data(b, &p);
+    moq_result_t rc = bridge_try_send_data(b, &p, e);
     if (rc < 0) return rc;
 
     /* If item was not fully consumed, it's already in pending queue */
@@ -1302,6 +1811,52 @@ static moq_result_t dispatch_send_data(moq_transport_bridge_t *b,
 }
 
 /* -- RESET_DATA / STOP_DATA dispatch -------------------------------- */
+
+/*
+ * Reset a local unidirectional data stream, keeping its first `reliable`
+ * bytes when the endpoint offers reset_stream_at and this connection can use
+ * it (RESET_STREAM_AT). Otherwise -- no capability, a reliable size of 0, or
+ * the endpoint answering DROPPED -- a plain RESET_STREAM, which the protocol
+ * is designed to work with.
+ */
+static moq_transport_result_t bridge_reset_uni(moq_transport_bridge_t *b,
+                                               uint64_t sid, uint64_t error_code,
+                                               uint64_t reliable)
+{
+    if (reliable > 0 &&
+        (b->ops->capabilities & MOQ_TRANSPORT_CAP_RELIABLE_RESET) &&
+        HAS_FIELD(b->ops, reset_stream_at) && b->ops->reset_stream_at) {
+        moq_transport_result_t r =
+            b->ops->reset_stream_at(b->endpoint_ctx, sid, error_code, reliable);
+        if (r != MOQ_TRANSPORT_DROPPED)
+            return sanitize_stream_result(r);
+    }
+    return sanitize_stream_result(
+        b->ops->reset_stream(b->endpoint_ctx, sid, error_code));
+}
+
+/* Bytes the retained SEND_DATA work of one stream will hand the endpoint:
+ * writes are all-or-nothing, so a retained header or payload goes out whole
+ * ahead of anything queued behind it on that stream. */
+static uint64_t bridge_pending_stream_bytes(const moq_transport_bridge_t *b,
+                                            moq_stream_ref_t ref, uint64_t sid,
+                                            bool have_sid)
+{
+    uint64_t n = 0;
+    for (uint32_t i = 0; i < b->pending_count; i++) {
+        const bridge_pending_item_t *p = &b->pending[i];
+        bool same = (ref._v != 0 && p->canon_ref == ref._v) ||
+                    (have_sid && p->canon_have_sid && p->canon_sid == sid);
+        if (!same) continue;
+        const moq_send_data_action_t *sd = &p->act.u.send_data;
+        uint64_t pay = sd->payload ? moq_rcbuf_len(sd->payload) : 0;
+        if (p->kind == PENDING_OPEN_UNI_DATA || p->kind == PENDING_HEADER_PAYLOAD)
+            n += sd->header_len + pay;
+        else if (p->kind == PENDING_PAYLOAD_ONLY)
+            n += pay;
+    }
+    return n;
+}
 
 static moq_result_t dispatch_reset_data(moq_transport_bridge_t *b,
                                          moq_action_t *act)
@@ -1315,12 +1870,41 @@ static moq_result_t dispatch_reset_data(moq_transport_bridge_t *b,
         ? act->u.reset_bidi_stream.stream_ref : act->u.reset_data.stream_ref;
     uint64_t error_code = is_bidi
         ? act->u.reset_bidi_stream.error_code : act->u.reset_data.error_code;
+    /* The reliable size the session asks for, read only where the action's
+     * detail carries it; an older producer's reset is a plain one. */
+    uint64_t reliable = 0;
+    if (!is_bidi &&
+        act->detail_size >= offsetof(moq_reset_data_action_t, reliable_size) +
+                            sizeof(act->u.reset_data.reliable_size))
+        reliable = act->u.reset_data.reliable_size;
     moq_action_cleanup(act);
 
     bridge_stream_entry_t *e = bridge_find_by_ref(b, ref);
-    if (!e) return MOQ_OK;
+    if (!e) {
+        /* The stream has no mapping yet. If its open is still retained
+         * (an open_uni that returned WOULD_BLOCK), the reset waits behind it
+         * and resolves the stream once that work has run: the stream header
+         * goes out before the reset, which then keeps it. A stream with no
+         * retained work was never opened and has nothing to reset. */
+        if (is_bidi) return MOQ_OK;
+        uint64_t queued = bridge_pending_stream_bytes(b, ref, 0, false);
+        if (queued == 0) return MOQ_OK;
+        bridge_pending_item_t p;
+        memset(&p, 0, sizeof(p));
+        p.kind = PENDING_RESET_STREAM;
+        p.stream_ref = ref;
+        p.error_code = error_code;
+        p.uni_reset = true;
+        p.reliable_size = reliable < queued ? reliable : queued;
+        if (!bridge_enqueue_pending(b, &p))
+            return bridge_retention_failed(b, &p);
+        return MOQ_OK;
+    }
 
     uint64_t sid = e->transport_id;
+    if (!is_bidi && e->fin_reset_pending) return MOQ_OK;
+    const bool retained_fin = !is_bidi && e->awaiting_commit &&
+                              e->subgroup_header_len != 0;
 
     /* A RESET_STREAM closes only OUR sending direction (RFC 9000 §3.5). For a
      * request bidi the peer's sending direction stays independently capable of
@@ -1332,17 +1916,31 @@ static moq_result_t dispatch_reset_data(moq_transport_bridge_t *b,
      * moq_session_on_bidi_stream_reset(), which releases the exact drain
      * reference and retires the mapping exactly once.
      *
-     * A unidirectional RESET_DATA has no peer send half to await, so it retires
-     * its mapping immediately, as before. */
-    if (!is_bidi)
-        bridge_deactivate_stream(e);
+     * A subgroup FIN awaiting commit stays mapped through a blocked reset.
+     * Other unidirectional RESET_DATA lifetimes are unchanged. */
+    /* A reliable size never exceeds what the stream is handed before the
+     * reset: the bytes the endpoint accepted plus any SEND_DATA still
+     * retained for it, which goes out first (per-stream order). */
+    if (!is_bidi) {
+        uint64_t handed = e->bytes_sent +
+                          bridge_pending_stream_bytes(b, ref, sid, true);
+        if (reliable > handed) reliable = handed;
+        if (retained_fin) {
+            e->awaiting_commit = false;
+            e->fin_reset_pending = true;
+        } else {
+            bridge_deactivate_stream(e);
+        }
+    }
 
     moq_transport_result_t r =
         /* sid came from the live entry above, so it is known */
         bridge_domain_blocked(b, ref, sid, true)
             ? MOQ_TRANSPORT_WOULD_BLOCK
-            : sanitize_stream_result(
-                  b->ops->reset_stream(b->endpoint_ctx, sid, error_code));
+        : is_bidi
+            ? sanitize_stream_result(
+                  b->ops->reset_stream(b->endpoint_ctx, sid, error_code))
+            : bridge_reset_uni(b, sid, error_code, reliable);
 
     if (r == MOQ_TRANSPORT_WOULD_BLOCK) {
         bridge_pending_item_t p;
@@ -1350,11 +1948,13 @@ static moq_result_t dispatch_reset_data(moq_transport_bridge_t *b,
         p.kind = PENDING_RESET_STREAM;
         bridge_item_set_sid(&p, sid);
         p.error_code = error_code;
+        p.uni_reset = !is_bidi;
+        p.reliable_size = reliable;
         /* Defer the bidi local-close/retire decision until the endpoint has
          * actually accepted the reset -- never before. Carry the ref so the
-         * retry applies it exactly once against the still-live mapping. A uni
-         * reset already retired, so it carries no ref. */
-        if (is_bidi) p.stream_ref = ref;
+         * retry applies it exactly once against the still-live mapping. A
+         * retained subgroup FIN uses the same accepted-reset boundary. */
+        if (is_bidi || retained_fin) p.stream_ref = ref;
         if (!bridge_enqueue_pending(b, &p))
             return bridge_retention_failed(b, &p);
         return MOQ_OK;
@@ -1363,7 +1963,7 @@ static moq_result_t dispatch_reset_data(moq_transport_bridge_t *b,
         bridge_set_fatal(b, 0x1);
         return MOQ_ERR_INTERNAL;
     }
-    if (is_bidi) {
+    if (is_bidi || retained_fin) {
         bridge_mark_local_close(b, ref);
         bridge_retire_or_tombstone(b, ref);
     }
@@ -2048,6 +2648,22 @@ static moq_result_t bridge_retry_outbound_pending(moq_transport_bridge_t *b)
 
         switch (p->kind) {
         case PENDING_OPEN_CONTROL: {
+            if (b->control_mode == BRIDGE_CONTROL_UNI_PAIR) {
+                /* Waiting for the local uni control stream, which an earlier
+                 * pending open creates; retry the write once it exists. */
+                if (!b->local_ctrl_uni_open) goto stop;
+                moq_transport_result_t uw = sanitize_stream_result(
+                    b->ops->write(b->endpoint_ctx, b->local_ctrl_uni_stream_id,
+                                   p->data, p->data_len, false));
+                if (uw == MOQ_TRANSPORT_WOULD_BLOCK) goto stop;
+                if (uw == MOQ_TRANSPORT_ERROR) {
+                    bridge_set_fatal(b, 0x1);
+                    rc = MOQ_ERR_INTERNAL;
+                    goto cleanup;
+                }
+                bridge_cleanup_pending_item(&b->alloc, p);
+                break;
+            }
             if (!b->control_open) {
                 if (b->is_client) {
                     uint64_t bidi_id = 0;
@@ -2132,9 +2748,32 @@ static moq_result_t bridge_retry_outbound_pending(moq_transport_bridge_t *b)
         }
 
         case PENDING_RESET_STREAM: {
-            moq_transport_result_t r = sanitize_stream_result(
-                b->ops->reset_stream(b->endpoint_ctx, p->stream_id,
-                                      p->error_code));
+            if (p->uni_reset && !p->has_stream_id) {
+                /* Retained before its stream existed: the open and every
+                 * write ahead of it have run (FIFO), so resolve the stream
+                 * now and retire its mapping, as an immediate reset does. */
+                bridge_stream_entry_t *ue = bridge_find_by_ref(b, p->stream_ref);
+                if (!ue) {
+                    bridge_cleanup_pending_item(&b->alloc, p);
+                    break;
+                }
+                if (p->reliable_size > ue->bytes_sent)
+                    p->reliable_size = ue->bytes_sent;
+                bridge_item_set_sid(p, ue->transport_id);
+                if (ue->awaiting_commit && ue->subgroup_header_len != 0) {
+                    ue->awaiting_commit = false;
+                    ue->fin_reset_pending = true;
+                } else {
+                    p->stream_ref = moq_stream_ref_from_u64(0);
+                    bridge_deactivate_stream(ue);
+                }
+            }
+            moq_transport_result_t r = p->uni_reset
+                ? bridge_reset_uni(b, p->stream_id, p->error_code,
+                                   p->reliable_size)
+                : sanitize_stream_result(
+                      b->ops->reset_stream(b->endpoint_ctx, p->stream_id,
+                                           p->error_code));
             if (r == MOQ_TRANSPORT_WOULD_BLOCK) goto stop;
             if (r == MOQ_TRANSPORT_ERROR) {
                 bridge_set_fatal(b, 0x1);
@@ -2144,7 +2783,8 @@ static moq_result_t bridge_retry_outbound_pending(moq_transport_bridge_t *b)
             /* Deferred bidi lifecycle: only now that the endpoint accepted the
              * reset do we close our send half and retire-or-keep the mapping,
              * so a peer terminal that arrived while the reset was blocked has
-             * not been dropped. A uni reset carries no ref and is unaffected. */
+             * not been dropped. A retained subgroup FIN also carries its ref
+             * until this accepted-reset boundary. */
             if (p->stream_ref._v) {
                 bridge_mark_local_close(b, p->stream_ref);
                 bridge_retire_or_tombstone(b, p->stream_ref);
@@ -2246,7 +2886,7 @@ static moq_result_t bridge_retry_outbound_pending(moq_transport_bridge_t *b)
 
         case PENDING_HEADER_PAYLOAD:
         case PENDING_PAYLOAD_ONLY: {
-            moq_result_t trc = bridge_try_send_data(b, p);
+            moq_result_t trc = bridge_try_send_data(b, p, NULL);
             if (trc < 0) {
                 rc = trc;
                 goto cleanup;
@@ -2450,6 +3090,23 @@ typedef struct {
     moq_result_t rc;         /* MOQ_OK, or MOQ_SESSION_SUSPENDED */
 } bridge_inbound_outcome_t;
 
+static moq_result_t bridge_stop_local_data(moq_transport_bridge_t *b,
+                                            bridge_stream_entry_t *e,
+                                            uint64_t code, uint64_t now_us)
+{
+    if (e->fin_reset_pending) return MOQ_OK;
+    if (e->awaiting_commit && e->subgroup_header_len != 0) {
+        moq_result_t rc = bridge_session_on_subgroup_stop(
+            b->session, e->ref, code, now_us, e->subgroup_header_len);
+        /* WOULD_BLOCK has no core reset effect, but the bridge retains the
+         * first STOP fact for retry. A later ACK must not erase that fact. */
+        if (rc == MOQ_OK || rc == MOQ_ERR_WOULD_BLOCK)
+            e->peer_stop_received = true;
+        return rc;
+    }
+    return moq_session_on_data_stop(b->session, e->ref, code, now_us);
+}
+
 static bridge_inbound_outcome_t bridge_retry_inbound_pending(
     moq_transport_bridge_t *b, uint64_t now_us)
 {
@@ -2494,7 +3151,7 @@ static bridge_inbound_outcome_t bridge_retry_inbound_pending(
          * obligation itself (held_input) ends only with that chunk's
          * acceptance, a peer RESET or teardown. */
         if (e->pending_admission) {
-            if (moq_session_can_admit_data_stream(b->session)) {
+            if (!b->holds && moq_session_can_admit_data_stream(b->session)) {
                 e->pending_admission = false;
                 progress = true;
             }
@@ -2582,8 +3239,7 @@ static bridge_inbound_outcome_t bridge_retry_inbound_pending(
             moq_result_t rc = (e->kind == BRIDGE_STREAM_BIDI)
                 ? moq_session_on_bidi_stream_stop(
                       b->session, e->ref, e->pending_stop_code, now_us)
-                : moq_session_on_data_stop(
-                      b->session, e->ref, e->pending_stop_code, now_us);
+                : bridge_stop_local_data(b, e, e->pending_stop_code, now_us);
             /* pending_stop and its code stay intact. */
             if (rc == MOQ_SESSION_SUSPENDED)
                 return (bridge_inbound_outcome_t){ progress, MOQ_SESSION_SUSPENDED };
@@ -2635,6 +3291,14 @@ static moq_result_t bridge_service_pass(
                 bridge_clear_all_state(b);
                 break;
             }
+        }
+
+        /* Held streams: expire, cancel and offer before any deadline is
+         * ticked, so a due hold age never reaches step 4 unchanged. */
+        if (!b->fatal && !b->closed && b->holds) {
+            bool moved = false;
+            moq_result_t hrc = bridge_hold_maintain(b, now_us, &moved);
+            if (hrc < 0) return hrc;
         }
 
         /* Step 1: retry outbound pending FIFO */
@@ -2841,11 +3505,11 @@ static moq_result_t bridge_feed_peer_data(
         if (fin) bridge_deactivate_stream(e);
         return MOQ_OK;
     }
-    if (bridge_admission_refused(b, e, ref, len))
-        return MOQ_ERR_INPUT_NOT_CONSUMED;
+    moq_result_t ar = bridge_admission_refused(b, e, ref, len, now_us);
+    if (ar < 0) return ar;
     moq_result_t rc = moq_session_on_data_bytes(b->session, ref, data, len,
                                                 fin, now_us);
-    bridge_admission_accepted(e);
+    bridge_admission_accepted(b, e);
     if (rc == MOQ_ERR_WOULD_BLOCK) {
         if (moq_session_has_transport_stream(b->session, ref)) {
             /* Session retained the bytes; the service tick drains them. */
@@ -2853,7 +3517,7 @@ static moq_result_t bridge_feed_peer_data(
             if (fin) e->fin_retained = true;
             return MOQ_ERR_WOULD_BLOCK;
         }
-        return bridge_hold_admission(e, len);
+        return bridge_hold_admission(b, e, len, now_us);
     }
     if (rc < 0) {
         bridge_set_fatal(b, 0x1);
@@ -2876,17 +3540,32 @@ static moq_result_t bridge_uni_pair_inbound(
     moq_transport_bridge_t *b, uint64_t stream_id,
     const uint8_t *data, size_t len, bool fin, uint64_t now_us)
 {
-    /* While the session is draining buffered control bytes, defer all further
-     * inbound (the adapter retries) so nothing is consumed out of order. The
-     * shared retry in moq_transport_bridge_service clears this. */
+    /* While the session is draining buffered control bytes, this bridge takes
+     * no further peer uni input until the shared retry in
+     * moq_transport_bridge_service clears it. The control stream's own input
+     * is the session's retained control input (WOULD_BLOCK; its FIN is
+     * recorded). Any other stream's chunk is refused whole and stays the
+     * adapter's (MOQ_ERR_INPUT_NOT_CONSUMED: zero bytes, no FIN taken, any
+     * classification prefix taken on an earlier call stays the bridge's);
+     * the stream reports pending until the control input drains
+     * (bridge_uni_deferred), and its redelivery is classified and validated
+     * as if it had just arrived. */
     if (b->pending_control) {
-        if (fin && stream_id == b->pending_control_stream_id)
-            b->pending_control_fin = true;
-        return MOQ_ERR_WOULD_BLOCK;
+        if (stream_id == b->pending_control_stream_id) {
+            if (fin) b->pending_control_fin = true;
+            return MOQ_ERR_WOULD_BLOCK;
+        }
+        if (len == 0 && !fin) return MOQ_OK;     /* nothing to take or keep */
+        return MOQ_ERR_INPUT_NOT_CONSUMED;
     }
 
     bridge_stream_entry_t *e = bridge_find_by_id(b, stream_id);
     if (!e && len == 0 && !fin) return MOQ_OK;
+
+    moq_result_t placed_rc;
+    if (!e && bridge_uni_pair_place_unmapped(b, stream_id, data, len, now_us,
+                                             &placed_rc))
+        return placed_rc;
 
     moq_stream_ref_t ref;
     if (!e) {
@@ -2932,7 +3611,20 @@ static moq_result_t bridge_uni_pair_inbound(
             return MOQ_ERR_PROTO;
         }
         /* On NEED_MORE the total is < a complete stream-type vi64 (< 9 bytes),
-         * so the whole chunk fits in the retained buffer. */
+         * so the whole chunk fits in the retained buffer.
+         *
+         * No age applies to an incomplete stream type: such a stream keeps
+         * its mapping until its type completes, a peer RESET, or teardown.
+         *
+         * Temporary known limitation, not a conformance result: an
+         * incomplete type takes any free mapping, an entry the control
+         * reserve keeps included, because it may be the control stream and
+         * has no other lossless destination yet. A peer that parks streams
+         * here consumes stream mappings, after which a new stream that
+         * cannot be held -- an incomplete type, or its control stream --
+         * meets a full map, which is fatal. Timeouts are left to the
+         * implementation (draft-22 section 15.6); the session's own timeouts
+         * are unchanged and nothing else bounds the wait. */
         if (len > 0) memcpy(e->classify_buf + e->classify_len, data, len);
         e->classify_len = (uint8_t)(e->classify_len + len);
         return MOQ_OK;
@@ -2946,8 +3638,10 @@ static moq_result_t bridge_uni_pair_inbound(
      * (nothing of it fed) and keep the classification prefix bridge-owned;
      * the redelivered chunk re-enters classification with that same prefix.
      * Control and padding streams are never gated here. */
-    if (cls == MOQ_UNI_CLASS_DATA && bridge_admission_refused(b, e, ref, len))
-        return MOQ_ERR_INPUT_NOT_CONSUMED;
+    if (cls == MOQ_UNI_CLASS_DATA) {
+        moq_result_t ar = bridge_admission_refused(b, e, ref, len, now_us);
+        if (ar < 0) return ar;
+    }
 
     /* Classified: flush any retained prefix, then this chunk. */
     uint8_t prefix[sizeof(e->classify_buf)];
@@ -2988,7 +3682,7 @@ static moq_result_t bridge_uni_pair_inbound(
             e->classify_len = (uint8_t)plen;
             e->uni_disp = BRIDGE_UNI_DISP_PENDING;
             e->held_payload = len > 0;
-            return bridge_hold_admission(e, len);
+            return bridge_hold_admission(b, e, len, now_us);
         }
         if (rc < 0 && rc != MOQ_ERR_WOULD_BLOCK) return rc;
         e = bridge_find_by_ref(b, ref);
@@ -3056,6 +3750,10 @@ moq_result_t moq_transport_bridge_on_peer_uni_bytes(
     /* Don't allocate a stream entry for empty non-FIN on unknown stream */
     if (!e && len == 0 && !fin) return MOQ_OK;
 
+    moq_result_t held_rc;
+    if (!e && bridge_hold_unmapped_uni(b, stream_id, len, now_us, &held_rc))
+        return held_rc;
+
     moq_stream_ref_t ref;
     if (!e) {
         ref = bridge_assign_inbound_ref(b, stream_id, BRIDGE_STREAM_UNI);
@@ -3065,12 +3763,12 @@ moq_result_t moq_transport_bridge_on_peer_uni_bytes(
         ref = e->ref;
     }
 
-    if (bridge_admission_refused(b, e, ref, len))
-        return MOQ_ERR_INPUT_NOT_CONSUMED;
+    moq_result_t ar = bridge_admission_refused(b, e, ref, len, now_us);
+    if (ar < 0) return ar;
 
     moq_result_t rc = moq_session_on_data_bytes(
         b->session, ref, data, len, fin, now_us);
-    bridge_admission_accepted(e);
+    bridge_admission_accepted(b, e);
 
     if (rc == MOQ_ERR_WOULD_BLOCK) {
         if (moq_session_has_transport_stream(b->session, ref)) {
@@ -3080,7 +3778,7 @@ moq_result_t moq_transport_bridge_on_peer_uni_bytes(
             if (fin) e->fin_retained = true;
             return MOQ_ERR_WOULD_BLOCK;
         }
-        return bridge_hold_admission(e, len);
+        return bridge_hold_admission(b, e, len, now_us);
     }
 
     if (rc < 0) {
@@ -3152,6 +3850,11 @@ moq_result_t moq_transport_bridge_on_peer_uni_rcbuf(
     size_t data_len = data ? moq_rcbuf_len(data) : 0;
     if (!e && data_len == 0 && !fin) return MOQ_OK;
 
+    moq_result_t held_rc;
+    if (!e && bridge_hold_unmapped_uni(b, stream_id, data_len, now_us,
+                                       &held_rc))
+        return held_rc;
+
     moq_stream_ref_t ref;
     if (!e) {
         ref = bridge_assign_inbound_ref(b, stream_id, BRIDGE_STREAM_UNI);
@@ -3161,12 +3864,12 @@ moq_result_t moq_transport_bridge_on_peer_uni_rcbuf(
         ref = e->ref;
     }
 
-    if (bridge_admission_refused(b, e, ref, data_len))
-        return MOQ_ERR_INPUT_NOT_CONSUMED;
+    moq_result_t ar = bridge_admission_refused(b, e, ref, data_len, now_us);
+    if (ar < 0) return ar;
 
     moq_result_t rc = moq_session_on_data_rcbuf(
         b->session, ref, data, fin, now_us);
-    bridge_admission_accepted(e);
+    bridge_admission_accepted(b, e);
 
     if (rc == MOQ_ERR_WOULD_BLOCK) {
         if (moq_session_has_transport_stream(b->session, ref)) {
@@ -3175,7 +3878,7 @@ moq_result_t moq_transport_bridge_on_peer_uni_rcbuf(
             if (fin) e->fin_retained = true;
             return MOQ_ERR_WOULD_BLOCK;
         }
-        return bridge_hold_admission(e, data_len);
+        return bridge_hold_admission(b, e, data_len, now_us);
     }
 
     if (rc < 0) {
@@ -3229,6 +3932,33 @@ moq_result_t moq_transport_bridge_on_peer_bidi_bytes(
 
     if (!e && len == 0 && !fin) return MOQ_OK;
 
+    /* A new peer request stream with held-stream records: it is mapped only
+     * when no older held request stream is waiting (or it is the one offered)
+     * and a mapping is free beyond the control reserve. Otherwise its exact
+     * chunk is held -- or, every record in use, refused for the adapter to
+     * cancel. */
+    const bool hold_bidi = b->holds && b->control_mode == BRIDGE_CONTROL_UNI_PAIR;
+    bridge_hold_t *held = (!e && hold_bidi) ? bridge_hold_find(b, stream_id) : NULL;
+    if (!e && hold_bidi) {
+        if (held && held->state == BRIDGE_HOLD_CANCELLING)
+            return MOQ_ERR_INPUT_NOT_CONSUMED;
+        bool queued = held ? !held->offered
+                           : bridge_hold_class_waiting(b, false);
+        /* The FIN cannot overtake the held bytes. */
+        if (held && held->held_payload && len == 0) queued = true;
+        if (queued || !bridge_can_map_peer_stream(b)) {
+            if (held) {
+                held->offered = false;
+                if (len > 0) held->held_payload = true;
+                return MOQ_ERR_INPUT_NOT_CONSUMED;
+            }
+            if (!bridge_hold_record(b, stream_id, BRIDGE_STREAM_BIDI, false,
+                                    len, now_us))
+                return MOQ_BRIDGE_INGRESS_REFUSE_CANCEL;
+            return MOQ_ERR_INPUT_NOT_CONSUMED;
+        }
+    }
+
     moq_stream_ref_t ref;
     if (!e) {
         ref = bridge_assign_inbound_ref(b, stream_id, BRIDGE_STREAM_BIDI);
@@ -3240,6 +3970,8 @@ moq_result_t moq_transport_bridge_on_peer_bidi_bytes(
 
     moq_result_t rc = moq_session_on_bidi_stream_bytes(
         b->session, ref, data, len, fin, now_us);
+    /* The session took the chunk (or failed below): the hold is over. */
+    if (held) bridge_hold_release(b, held);
 
     if (rc == MOQ_ERR_WOULD_BLOCK) {
         if (!moq_session_has_transport_stream(b->session, ref)) {
@@ -3273,6 +4005,28 @@ moq_result_t moq_transport_bridge_on_peer_stream_reset(
     if (bridge_is_tombstoned(b, stream_id)) {
         bridge_remove_tombstone(b, stream_id);
         return MOQ_OK;
+    }
+
+    /* A held stream: the peer's RESET settles only the receive half. A held
+     * uni stream has nothing more owed; a held request stream still has our
+     * own half, which is reset (cancellation in the record's own slot). The
+     * adapter drops the chunk it was holding either way. */
+    {
+        bridge_hold_t *h = bridge_hold_find(b, stream_id);
+        if (h) {
+            bridge_stream_entry_t *he = bridge_find_by_id(b, stream_id);
+            if (h->state == BRIDGE_HOLD_RECORDED &&
+                h->kind == BRIDGE_STREAM_BIDI) {
+                bridge_hold_cancel(b, h, true);
+                return MOQ_OK;
+            }
+            h->stop_owed = false;
+            if (!h->reset_owed) {
+                if (he) bridge_deactivate_stream(he);
+                bridge_hold_release(b, h);
+            }
+            return MOQ_OK;
+        }
     }
 
     bridge_stream_entry_t *e = bridge_find_by_id(b, stream_id);
@@ -3328,6 +4082,23 @@ moq_result_t moq_transport_bridge_on_peer_stream_terminal(
     /* Retire a stream we are discarding after a whole-stream abort. Any
      * other stream: harmless no-op (its own lifecycle already fired). */
     bridge_retire_aborting(b, stream_id);
+    return MOQ_OK;
+}
+
+moq_result_t moq_transport_bridge_on_local_stream_committed(
+    moq_transport_bridge_t *b, uint64_t stream_id, uint64_t now_us)
+{
+    if (!b || b->fatal || b->closed) return MOQ_ERR_CLOSED;
+    bridge_stream_entry_t *e = bridge_find_by_id(b, stream_id);
+    if (!e || !e->awaiting_commit || e->peer_stop_received) return MOQ_OK;
+    moq_stream_ref_t ref = e->ref;
+    moq_result_t rc = moq_session_on_data_committed(b->session, ref, now_us);
+    if (rc != MOQ_OK && rc != MOQ_ERR_CLOSED) return rc;
+    /* Resolve session ownership after its advancing input. An already-queued
+     * reset can outlive the subgroup slot and still needs this mapping until
+     * the endpoint accepts it; the clock alone does not establish ownership. */
+    if (!bridge_session_has_queued_data_reset(b->session, ref))
+        bridge_deactivate_stream(e);
     return MOQ_OK;
 }
 
@@ -3389,8 +4160,9 @@ moq_result_t moq_transport_bridge_on_peer_stop_sending(
         rc = moq_session_on_bidi_stream_stop(
             b->session, e->ref, error_code, now_us);
     } else if (e->origin == BRIDGE_ORIGIN_LOCAL) {
-        rc = moq_session_on_data_stop(
-            b->session, e->ref, error_code, now_us);
+        if (e->fin_reset_pending || e->peer_stop_received)
+            return e->pending_stop ? MOQ_ERR_WOULD_BLOCK : MOQ_OK;
+        rc = bridge_stop_local_data(b, e, error_code, now_us);
     } else {
         /* Peer-origin uni: we have no send half to stop. */
         return MOQ_OK;

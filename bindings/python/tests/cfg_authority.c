@@ -30,6 +30,7 @@ int main(void)
             cfg.callbacks.on_closed == NULL && cfg.callbacks.on_track_closed == NULL) ? 1 : 0);
     printf("content_protections_null %d\n",
            (cfg.content_protections == NULL && cfg.content_protection_count == 0) ? 1 : 0);
+    printf("companion_profile %lu\n", (unsigned long)cfg.companion_profile);
 
     /* The track configuration the send-track slice declares against. */
     moq_media_track_cfg_t t;

@@ -105,7 +105,7 @@ endif()
 
 # The installed component re-finds MsQuic through the same vendored
 # module the build used.
-install(FILES ${CMAKE_SOURCE_DIR}/cmake/FindMsQuic.cmake
+install(FILES ${PROJECT_SOURCE_DIR}/cmake/FindMsQuic.cmake
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libmoq)
 
 # Relocatable install-tree imported target files (MsQuic is re-found by
@@ -195,7 +195,7 @@ if(MOQ_BUILD_TESTS)
     target_include_directories(test_msquic_unit PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
-        ${CMAKE_SOURCE_DIR}/tests) # shared fake_endpoint for the rx pair
+        ${PROJECT_SOURCE_DIR}/tests) # shared fake_endpoint for the rx pair
     target_compile_definitions(test_msquic_unit PRIVATE
         MOQ_MSQUIC_TESTING MOQ_BUILDING)
     target_link_libraries(test_msquic_unit PRIVATE
@@ -208,6 +208,26 @@ if(MOQ_BUILD_TESTS)
             $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
     endif()
     add_test(NAME msquic_unit COMMAND test_msquic_unit)
+
+    add_executable(test_msquic_commit
+        tests/test_msquic_commit.c
+        tests/support/fake_msq_table.c
+        msquic_adapter.c)
+    target_include_directories(test_msquic_commit PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}/tests/unit)
+    target_compile_definitions(test_msquic_commit PRIVATE
+        MOQ_MSQUIC_TESTING MOQ_BUILDING)
+    target_link_libraries(test_msquic_commit PRIVATE moq::core msquic::msquic)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(test_msquic_commit PRIVATE
+            -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME msquic_commit COMMAND test_msquic_commit)
+    set_tests_properties(msquic_commit PROPERTIES LABELS "msquic;sansio" TIMEOUT 60)
 
     # The transport terminal always reaches the session, exactly once --
     # including when the bridge already latched a terminal of its own, whose
@@ -245,8 +265,8 @@ if(MOQ_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
         ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_SOURCE_DIR}/tests
-        ${CMAKE_SOURCE_DIR}/tests/unit)
+        ${PROJECT_SOURCE_DIR}/tests
+        ${PROJECT_SOURCE_DIR}/tests/unit)
     target_compile_definitions(test_msquic_hold_input PRIVATE
         MOQ_MSQUIC_TESTING MOQ_BUILDING)
     target_link_libraries(test_msquic_hold_input PRIVATE
@@ -309,7 +329,7 @@ if(MOQ_BUILD_TESTS)
             COMMAND ${CMAKE_COMMAND}
                 "-DCONSUMER_CONTEXT=${_msquic_consumer_context}"
                 "-DMSQUIC_RUNTIME_FILE=$<TARGET_FILE:msquic::msquic>"
-                -DSRC=${CMAKE_SOURCE_DIR}
+                -DSRC=${PROJECT_SOURCE_DIR}
                 -DWORK=${CMAKE_CURRENT_BINARY_DIR}/managed-shared-link-work
                 "-DMSQUIC_DIR_HINT=${msquic_DIR}"
                 "-DMSQUIC_ROOT_HINT=${MOQ_MSQUIC_ROOT}"
@@ -407,6 +427,47 @@ if(MOQ_BUILD_TESTS)
         set_tests_properties(msquic_loopback PROPERTIES
             LABELS "network;msquic"
             TIMEOUT 120)
+
+        add_executable(test_msquic_commit_loopback
+            tests/test_msquic_commit_loopback.c
+            msquic_adapter.c msquic_managed.c)
+        target_include_directories(test_msquic_commit_loopback PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        target_compile_definitions(test_msquic_commit_loopback PRIVATE
+            MOQ_MSQUIC_TESTING MOQ_BUILDING)
+        target_link_libraries(test_msquic_commit_loopback PRIVATE
+            moq::core msquic::msquic Threads::Threads)
+        if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(test_msquic_commit_loopback PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME msquic_commit_loopback
+            COMMAND test_msquic_commit_loopback
+                ${MOQ_MSQUIC_TEST_CERT} ${MOQ_MSQUIC_TEST_KEY})
+        set_tests_properties(msquic_commit_loopback PROPERTIES
+            LABELS "network;msquic" TIMEOUT 60)
+
+        # Reliable resets over real MsQuic: a data stream reset in the pump
+        # that opened it still delivers its header to the subscriber where
+        # both ends negotiated reliable reset.
+        add_executable(test_msquic_reliable_reset
+            tests/test_msquic_reliable_reset.c)
+        target_link_libraries(test_msquic_reliable_reset PRIVATE
+            moq::adapter-msquic-managed Threads::Threads)
+        if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(test_msquic_reliable_reset PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME msquic_reliable_reset
+            COMMAND test_msquic_reliable_reset
+                ${MOQ_MSQUIC_TEST_CERT} ${MOQ_MSQUIC_TEST_KEY})
+        set_tests_properties(msquic_reliable_reset PROPERTIES
+            LABELS "network;msquic"
+            TIMEOUT 120)
         add_test(NAME msquic_subgroup_pool
             COMMAND test_msquic_subgroup_pool
                 ${MOQ_MSQUIC_TEST_CERT} ${MOQ_MSQUIC_TEST_KEY})
@@ -445,7 +506,7 @@ if(MOQ_BUILD_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests
             ${CMAKE_CURRENT_SOURCE_DIR}/include
-            ${CMAKE_SOURCE_DIR}/tests) # shared fake_endpoint for the peer
+            ${PROJECT_SOURCE_DIR}/tests) # shared fake_endpoint for the peer
         target_compile_definitions(test_msquic_lanes PRIVATE
             MOQ_MSQUIC_TESTING MOQ_BUILDING)
         target_link_libraries(test_msquic_lanes PRIVATE
@@ -459,6 +520,61 @@ if(MOQ_BUILD_TESTS)
         set_tests_properties(msquic_lanes PROPERTIES
             LABELS "msquic;sansio"
             TIMEOUT 30)
+
+        # Current output ownership, FIN acknowledgement and non-advancing
+        # client-lane observation over the production executor/fake provider.
+        add_executable(test_msquic_flush
+            tests/test_msquic_flush.c
+            tests/support/fake_msq_table.c
+            tests/support/fake_msq_managed.c
+            msquic_adapter.c
+            msquic_managed.c)
+        target_include_directories(test_msquic_flush PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${PROJECT_SOURCE_DIR}/tests)
+        target_compile_definitions(test_msquic_flush PRIVATE
+            MOQ_MSQUIC_TESTING MOQ_BUILDING
+            # The fixture and fake provider embed QUIC_API_TABLE by value.
+            QUIC_API_ENABLE_PREVIEW_FEATURES=1)
+        target_link_libraries(test_msquic_flush PRIVATE
+            moq::core msquic::msquic Threads::Threads)
+
+        # Compile the actual endpoint TU with a typed query stub. Unused
+        # backend functions are discarded, not satisfied by test exports.
+        add_executable(test_msquic_flush_endpoint
+            tests/test_msquic_flush_endpoint.c)
+        target_include_directories(test_msquic_flush_endpoint PRIVATE
+            ${PROJECT_SOURCE_DIR}/service/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        target_compile_definitions(test_msquic_flush_endpoint PRIVATE
+            MOQ_STATIC MOQ_SERVICE_HAVE_MSQUIC_MANAGED=1)
+        target_link_libraries(test_msquic_flush_endpoint PRIVATE
+            moq::core msquic::msquic Threads::Threads)
+        set_target_properties(test_msquic_flush_endpoint PROPERTIES
+            C_VISIBILITY_PRESET hidden)
+        if(APPLE)
+            target_link_options(test_msquic_flush_endpoint PRIVATE -Wl,-dead_strip)
+        elseif(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(test_msquic_flush_endpoint PRIVATE
+                -ffunction-sections -fdata-sections)
+            target_link_options(test_msquic_flush_endpoint PRIVATE -Wl,--gc-sections)
+        endif()
+
+        add_executable(test_msquic_flush_observation
+            tests/test_msquic_flush_observation.c)
+        target_link_libraries(test_msquic_flush_observation PRIVATE moq::core)
+        foreach(_flush_test msquic_flush msquic_flush_endpoint msquic_flush_observation)
+            if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+                target_compile_options(test_${_flush_test} PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME ${_flush_test} COMMAND test_${_flush_test})
+            set_tests_properties(${_flush_test} PROPERTIES
+                LABELS "msquic;sansio" TIMEOUT 30)
+        endforeach()
 
         # Managed-lane seams: the API table is borrowed rather than opened,
         # no doorbell thread is created, one production doorbell decision is
@@ -475,7 +591,7 @@ if(MOQ_BUILD_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests
             ${CMAKE_CURRENT_SOURCE_DIR}/include
-            ${CMAKE_SOURCE_DIR}/tests)
+            ${PROJECT_SOURCE_DIR}/tests)
         target_compile_definitions(test_msq_seams PRIVATE
             MOQ_MSQUIC_TESTING MOQ_BUILDING)
         target_link_libraries(test_msq_seams PRIVATE
@@ -619,7 +735,7 @@ if(MOQ_BUILD_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests
             ${CMAKE_CURRENT_SOURCE_DIR}/include
-            ${CMAKE_SOURCE_DIR}/tests) # shared fake_endpoint for the peer
+            ${PROJECT_SOURCE_DIR}/tests) # shared fake_endpoint for the peer
         target_compile_definitions(test_msquic_no_spin PRIVATE
             MOQ_MSQUIC_TESTING MOQ_BUILDING)
         target_link_libraries(test_msquic_no_spin PRIVATE
@@ -648,7 +764,7 @@ if(MOQ_BUILD_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests
             ${CMAKE_CURRENT_SOURCE_DIR}/include
-            ${CMAKE_SOURCE_DIR}/tests) # shared fake_endpoint for the peer
+            ${PROJECT_SOURCE_DIR}/tests) # shared fake_endpoint for the peer
         target_compile_definitions(test_msquic_child_forwarding PRIVATE
             MOQ_MSQUIC_TESTING MOQ_BUILDING)
         target_link_libraries(test_msquic_child_forwarding PRIVATE
@@ -692,6 +808,35 @@ if(MOQ_BUILD_TESTS)
         set_tests_properties(msquic_lane_stats PROPERTIES
             LABELS "msquic;sansio"
             TIMEOUT 30)
+
+        # Application deadlines and lane wakes never stall a lane: a due
+        # deadline is pumped once, the per-lane deadline query is folded only
+        # by the lane it names (and only when struct_size covers it), a wake
+        # from a foreign thread returns while the lane is pumping, and
+        # back-to-back deadline passes release the lane lock between passes.
+        # Fake API table, injected clock, no listener or socket.
+        add_executable(test_msquic_lane_deadline
+            tests/test_msquic_lane_deadline.c
+            tests/support/fake_msq_table.c
+            msquic_adapter.c
+            msquic_managed.c)
+        target_include_directories(test_msquic_lane_deadline PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        target_compile_definitions(test_msquic_lane_deadline PRIVATE
+            MOQ_MSQUIC_TESTING MOQ_BUILDING)
+        target_link_libraries(test_msquic_lane_deadline PRIVATE
+            moq::core msquic::msquic Threads::Threads)
+        if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(test_msquic_lane_deadline PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME msquic_lane_deadline COMMAND test_msquic_lane_deadline)
+        set_tests_properties(msquic_lane_deadline PROPERTIES
+            LABELS "msquic;sansio"
+            TIMEOUT 60)
 
         # Managed settings policy: the listener's pinned path MTU. Compiles
         # the adapter + managed sources directly (test seams on) so it asserts
@@ -861,6 +1006,31 @@ if(MOQ_BUILD_TESTS)
         set_tests_properties(msquic_client_session_lifetime PROPERTIES
             LABELS "msquic;sansio" TIMEOUT 30)
 
+        # The port a server hands its listener: port 0 picked from the IPv4
+        # allocator with a bounded retry, an explicit port as given. Over
+        # the facade-level fake table; no transport.
+        add_executable(test_msquic_listen_port
+            tests/test_msquic_listen_port.c
+            tests/support/fake_msq_managed.c
+            tests/support/fake_msq_table.c
+            msquic_adapter.c msquic_managed.c)
+        target_include_directories(test_msquic_listen_port PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        target_compile_definitions(test_msquic_listen_port PRIVATE
+            MOQ_MSQUIC_TESTING MOQ_BUILDING)
+        target_link_libraries(test_msquic_listen_port PRIVATE
+            moq::core msquic::msquic Threads::Threads)
+        if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(test_msquic_listen_port PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME msquic_listen_port COMMAND test_msquic_listen_port)
+        set_tests_properties(msquic_listen_port PROPERTIES
+            LABELS "msquic;sansio" TIMEOUT 30)
+
         # Production-contract conformance over real MsQuic loopback:
         # every MoQ session call runs inside the managed on_lane_pump,
         # driven by per-side event-triggered scripts (see
@@ -906,6 +1076,44 @@ if(MOQ_BUILD_TESTS)
         set_tests_properties(msquic_stress PROPERTIES
             LABELS "network;msquic;soak"
             TIMEOUT 600)
+
+        # The same loopback run while IPv4-only sockets hold much of the
+        # ephemeral range (tests/support/port_shadow.c).
+        if(NOT WIN32)
+            add_test(NAME msquic_loopback_port_shadow
+                COMMAND $<TARGET_FILE:moq_port_shadow> --
+                    $<TARGET_FILE:test_msquic_loopback>
+                    ${MOQ_MSQUIC_TEST_CERT} ${MOQ_MSQUIC_TEST_KEY})
+            # Every port-shadow test holds thousands of IPv4 ports for its run; two at
+            # once can exhaust the ephemeral range, so they share one resource lock.
+            set_tests_properties(msquic_loopback_port_shadow PROPERTIES
+                LABELS "network;msquic"
+                TIMEOUT 180
+                RESOURCE_LOCK ipv4_port_shadow)
+
+            # A server created with port 0 is reachable over IPv4 loopback
+            # while IPv4-only sockets hold much of the ephemeral range: the
+            # facade, not the test, chooses the port.
+            add_executable(test_msquic_ephemeral_port
+                tests/test_msquic_ephemeral_port.c)
+            target_link_libraries(test_msquic_ephemeral_port PRIVATE
+                moq::adapter-msquic-managed Threads::Threads)
+            if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+                target_compile_options(test_msquic_ephemeral_port PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME msquic_ephemeral_port_shadow
+                COMMAND $<TARGET_FILE:moq_port_shadow> --
+                    $<TARGET_FILE:test_msquic_ephemeral_port>
+                    ${MOQ_MSQUIC_TEST_CERT} ${MOQ_MSQUIC_TEST_KEY})
+            # Every port-shadow test holds thousands of IPv4 ports for its run; two at
+            # once can exhaust the ephemeral range, so they share one resource lock.
+            set_tests_properties(msquic_ephemeral_port_shadow PROPERTIES
+                LABELS "network;msquic"
+                TIMEOUT 180
+                RESOURCE_LOCK ipv4_port_shadow)
+        endif()
 
         # A registration set that differs between the FIRST configure of a
         # fresh tree and an immediate second one is invisible from inside an
@@ -994,7 +1202,7 @@ if(MOQ_BUILD_TESTS)
             set(_moq_msquic_ident_inc "${MOQ_MSQUIC_INCLUDE_DIR}")
             set(_moq_msquic_ident_lib "${MOQ_MSQUIC_LIBRARY}")
         endif()
-        file(WRITE "${CMAKE_BINARY_DIR}/msquic-discovery.cmake"
+        file(WRITE "${PROJECT_BINARY_DIR}/msquic-discovery.cmake"
 "set(MOQ_MSQUIC_DISCOVERY_MODE [==[${MOQ_MSQUIC_DISCOVERY_MODE}]==])\n"
 "set(MOQ_MSQUIC_OWNS_PAIR [==[${_moq_msquic_owns_pair}]==])\n"
 "set(MOQ_MSQUIC_INCLUDE_DIR [==[${_moq_msquic_ident_inc}]==])\n"
@@ -1031,7 +1239,7 @@ if(MOQ_BUILD_TESTS)
             set(_reg_mode "${MOQ_MSQUIC_DISCOVERY_MODE}")
             add_test(NAME msquic_first_configure_registration
                 COMMAND ${CMAKE_COMMAND}
-                    -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
+                    -DSOURCE_DIR=${PROJECT_SOURCE_DIR}
                     -DBUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}/first-configure-child
                     -DCMAKE_CMD=${CMAKE_COMMAND}
                     -DCTEST_CMD=${CMAKE_CTEST_COMMAND}
@@ -1055,7 +1263,7 @@ if(MOQ_BUILD_TESTS)
         if(NOT MOQ_MSQUIC_REGISTRATION_CHILD AND _moq_msquic_owns_pair)
             add_test(NAME msquic_pinned_fail_closed
                 COMMAND ${CMAKE_COMMAND}
-                    -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
+                    -DSOURCE_DIR=${PROJECT_SOURCE_DIR}
                     -DBUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}/pinned-fail-closed-child
                     -DCMAKE_CMD=${CMAKE_COMMAND}
                     -DCTEST_CMD=${CMAKE_CTEST_COMMAND}
@@ -1088,7 +1296,7 @@ if(MOQ_BUILD_TESTS)
            AND MOQ_MSQUIC_INCLUDE_DIR AND MOQ_MSQUIC_LIBRARY)
             add_test(NAME msquic_preexisting_target
                 COMMAND ${CMAKE_COMMAND}
-                    -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
+                    -DSOURCE_DIR=${PROJECT_SOURCE_DIR}
                     -DBUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}/preexisting-child
                     -DCMAKE_CMD=${CMAKE_COMMAND}
                     -DCTEST_CMD=${CMAKE_CTEST_COMMAND}

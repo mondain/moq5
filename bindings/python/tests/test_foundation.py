@@ -1,6 +1,9 @@
 """Public Python contract, against the same bridge with a test-only C provider."""
 
+import contextlib
 import gc
+import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -78,7 +81,7 @@ class FoundationTests(unittest.TestCase):
     def test_sized_config_exact_fields_and_secure_default(self):
         with self.connect(versions=(18, 16), sni="peer.invalid", ca_file="/a path/ca.pem",
                           protocol=moq5.Protocol.WEBTRANSPORT, backend=moq5.Backend.PICOQUIC,
-                          wt_profile=moq5.WtProfile.CURRENT,
+                          wt_profile=moq5.WtProfile.CURRENT, uri_mode=moq5.UriMode.LEGACY,
                           wt_path="/live", handshake_timeout_us=2**40) as endpoint:
             observed = _native._test_config()
             self.assertEqual(observed["url"], b"moqt://fixture.invalid")
@@ -93,6 +96,8 @@ class FoundationTests(unittest.TestCase):
             self.assertEqual(observed["backend"], 1)
             self.assertEqual(observed["wt_profile"], 1)
             self.assertEqual(observed["version_policy"], 1)
+            self.assertEqual(observed["uri_mode"], 0)
+            self.assertEqual(observed["preferred_version"], 0)
             self.assertFalse(endpoint.closed)
         self.assertTrue(endpoint.closed)
         self.assertEqual(_native._test_counts(), (1, 1, 1))
@@ -103,6 +108,132 @@ class FoundationTests(unittest.TestCase):
                 self.assertEqual(_native._test_config()["version_policy"], policy)
                 self.assertEqual(_native._test_config()["versions"], versions)
         self.assertEqual(_native._test_counts(), (2, 2, 2))
+
+    def test_draft_22_is_a_named_version_that_round_trips(self):
+        self.assertEqual(moq5.Version.DRAFT_22, _native.constants["VERSION_DRAFT_22"])
+        self.assertEqual(int(moq5.Version.DRAFT_22), 22)
+        self.assertIs(moq5.Version(22), moq5.Version.DRAFT_22)
+        config = moq5.EndpointConfig(url="moqt://fixture.invalid",
+                                     versions=(moq5.Version.DRAFT_22, moq5.Version.DRAFT_18))
+        self.assertEqual(config.versions, (22, 18))
+        self.assertEqual([type(v) for v in config.versions], [int, int])
+        with moq5.Endpoint.connect(config) as endpoint:
+            observed = _native._test_config()
+            self.assertEqual((observed["versions"], observed["version_policy"]), ((22, 18), 1))
+            _native._test_snapshot(int(moq5.EndpointState.ESTABLISHED), 22)
+            negotiated = endpoint.negotiated_version
+            self.assertIs(type(negotiated), int)
+            self.assertIs(moq5.Version(negotiated), moq5.Version.DRAFT_22)
+        with self.connect(versions=(moq5.Version.DRAFT_22,)):
+            observed = _native._test_config()
+            self.assertEqual((observed["versions"], observed["version_policy"]), ((22,), 2))
+
+    def test_uri_mode_values_come_from_c(self):
+        self.assertEqual({m.name: m.value for m in moq5.UriMode}, {"STANDARD": 1, "LEGACY": 0})
+        self.assertEqual(moq5.UriMode.STANDARD, _native.constants["ENDPOINT_URI_STANDARD"])
+        self.assertEqual(moq5.UriMode.LEGACY, _native.constants["ENDPOINT_URI_LEGACY"])
+
+    def test_native_uri_modes_and_refusal_have_no_unexpected_effects(self):
+        args = (b"https://fixture.invalid", 0, 0, (), b"", b"", b"", 0, 0)
+        for mode in (moq5.UriMode.LEGACY, moq5.UriMode.STANDARD):
+            handle = _native.connect(*args, int(mode), 0)
+            try:
+                self.assertEqual(_native._test_config()["uri_mode"], int(mode))
+            finally:
+                _native.close(handle)
+        self.assertEqual(_native._test_counts(), (2, 2, 2))
+        for value, error in ((2, ValueError), (-1, ValueError), (2**32, ValueError),
+                             (True, TypeError), ("1", TypeError)):
+            with self.subTest(uri_mode=value):
+                with self.assertRaises(error):
+                    _native.connect(*args, value, 0)
+                self.assertEqual(_native._test_counts(), (2, 2, 2))
+
+    def test_default_config_is_legacy_with_the_library_preference(self):
+        config = moq5.EndpointConfig(url="moqt://fixture.invalid")
+        self.assertIs(config.uri_mode, moq5.UriMode.LEGACY)
+        self.assertIsNone(config.preferred_version)
+        with moq5.Endpoint.connect(config):
+            observed = _native._test_config()
+            self.assertTrue(observed["full_size"])
+            self.assertEqual((observed["uri_mode"], observed["preferred_version"]), (0, 0))
+            self.assertEqual((observed["versions"], observed["version_policy"]), ((), 0))
+            self.assertEqual(observed["wt_path"], b"")
+
+    def test_default_client_accepts_path_override_without_opt_in(self):
+        for url in ("https://fixture.invalid", "moq://fixture.invalid:4433/live"):
+            with self.subTest(url=url):
+                config = moq5.EndpointConfig(url=url, wt_path="/moq")
+                self.assertIs(config.uri_mode, moq5.UriMode.LEGACY)
+                with moq5.Endpoint.connect(config):
+                    observed = _native._test_config()
+                    self.assertEqual((observed["uri_mode"], observed["wt_path"]), (0, b"/moq"))
+        self.assertEqual(_native._test_counts(), (2, 2, 2))
+
+    def test_uri_mode_and_preferred_version_reach_the_sdk_config(self):
+        with self.connect(uri_mode=moq5.UriMode.LEGACY, preferred_version=moq5.Version.DRAFT_22):
+            observed = _native._test_config()
+            self.assertEqual((observed["uri_mode"], observed["preferred_version"]), (0, 22))
+            self.assertEqual((observed["versions"], observed["version_policy"]), ((), 0))
+        with self.connect(uri_mode=moq5.UriMode.STANDARD, preferred_version=16):
+            observed = _native._test_config()
+            self.assertEqual((observed["uri_mode"], observed["preferred_version"]), (1, 16))
+        config = moq5.EndpointConfig(url="moqt://fixture.invalid", uri_mode=0,
+                                     preferred_version=moq5.Version.DRAFT_18)
+        self.assertIs(config.uri_mode, moq5.UriMode.LEGACY)
+        self.assertIs(type(config.preferred_version), int)
+        self.assertEqual(config.preferred_version, 18)
+        self.assertEqual(_native._test_counts(), (2, 2, 2))
+
+    def test_wt_path_is_a_legacy_override_the_standard_url_carries(self):
+        for url in ("https://fixture.invalid/live", "moqt://fixture.invalid"):
+            for path in ("/live", "/moq"):
+                with self.subTest(url=url, wt_path=path):
+                    with self.assertRaisesRegex(ValueError, "wt_path.*UriMode.LEGACY"):
+                        moq5.EndpointConfig(url=url, wt_path=path, uri_mode=moq5.UriMode.STANDARD)
+        self.assertEqual(_native._test_counts(), (0, 0, 0))
+        for empty in (None, ""):
+            with self.subTest(wt_path=empty):
+                with self.connect(wt_path=empty, uri_mode=moq5.UriMode.STANDARD):
+                    observed = _native._test_config()
+                    self.assertEqual((observed["uri_mode"], observed["wt_path"]), (1, b""))
+        with moq5.Endpoint.connect(moq5.EndpointConfig(
+                url="https://fixture.invalid", uri_mode=moq5.UriMode.LEGACY, wt_path="/live")):
+            observed = _native._test_config()
+            self.assertEqual((observed["uri_mode"], observed["wt_path"]), (0, b"/live"))
+        self.assertEqual(_native._test_counts(), (3, 3, 3))
+
+    def test_preferred_version_orders_only_the_automatic_offer(self):
+        for versions in ((18,), (22, 18), [16]):
+            with self.subTest(versions=versions):
+                with self.assertRaisesRegex(ValueError, "preferred_version"):
+                    moq5.EndpointConfig(url="moqt://fixture.invalid", versions=versions,
+                                        preferred_version=22)
+        for value, error in ((True, TypeError), (22.0, TypeError), ("22", TypeError),
+                             (0, ValueError), (-1, ValueError), (2**32, ValueError)):
+            with self.subTest(preferred_version=value):
+                with self.assertRaises(error):
+                    moq5.EndpointConfig(url="moqt://fixture.invalid", preferred_version=value)
+        for value, error in ((2, ValueError), (True, TypeError), ("1", TypeError),
+                             (None, TypeError)):
+            with self.subTest(uri_mode=value):
+                with self.assertRaises(error):
+                    moq5.EndpointConfig(url="moqt://fixture.invalid", uri_mode=value)
+        self.assertEqual(_native._test_counts(), (0, 0, 0))
+
+    def test_private_boundary_leaves_the_mode_rule_to_the_service(self):
+        # The Python configuration refuses a STANDARD wt_path; the private
+        # bridge passes the pair through so the C service stays the authority.
+        handle = _native.connect(b"https://fixture.invalid", 0, 0, (18,), b"", b"", b"/live",
+                                 0, 0, 1, 22)
+        try:
+            observed = _native._test_config()
+            self.assertEqual((observed["uri_mode"], observed["wt_path"],
+                              observed["preferred_version"], observed["versions"]),
+                             (1, b"/live", 22, (18,)))
+        finally:
+            _native.close(handle)
+        self.assertEqual(_native._test_counts(), (1, 1, 1))
 
     def test_config_owns_an_immutable_offer_copy(self):
         offered = [18, 16]
@@ -290,15 +421,17 @@ class FoundationTests(unittest.TestCase):
                 with self.assertRaises((TypeError, ValueError)):
                     self.connect(handshake_timeout_us=value)
         for field in ("url", "ca_file", "sni", "wt_path"):
-            kwargs = {"url": "moqt://fixture.invalid", field: "before\0after"}
+            kwargs = {"url": "moqt://fixture.invalid", "uri_mode": moq5.UriMode.LEGACY,
+                      field: "before\0after"}
             with self.subTest(field=field):
                 with self.assertRaises((TypeError, ValueError)):
                     moq5.Endpoint.connect(moq5.EndpointConfig(**kwargs))
         self.assertEqual(_native._test_counts(), (0, 0, 0))
 
     def test_private_boundary_validates_before_effects_too(self):
-        args = [b"moqt://fixture.invalid", 0, 0, (18,), b"", b"", b"", 0, 0]
-        for index, value in ((0, b"a\0b"), (1, True), (3, (True,)), (8, 2**64)):
+        args = [b"moqt://fixture.invalid", 0, 0, (18,), b"", b"", b"", 0, 0, 0, 0]
+        for index, value in ((0, b"a\0b"), (1, True), (3, (True,)), (8, 2**64),
+                             (9, 2), (9, True), (10, 2**32), (10, True)):
             bad = args.copy()
             bad[index] = value
             with self.subTest(index=index):
@@ -821,6 +954,57 @@ class FoundationTests(unittest.TestCase):
             self.assertEqual(_native._test_counts(), (1, 0, 0))
         finally:
             endpoint.close()
+
+
+class ConnectExampleTests(unittest.TestCase):
+    """examples/connect.py, run in-process against the fixture provider."""
+
+    EXAMPLE = Path(__file__).resolve().parent.parent / "examples" / "connect.py"
+
+    def setUp(self):
+        gc.collect()
+        _native._test_reset()
+
+    def run_example(self, *argv):
+        spec = importlib.util.spec_from_file_location("connect_example", self.EXAMPLE)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", ["connect.py", *argv]), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = module.main()
+        return code, out.getvalue(), err.getvalue()
+
+    def test_example_standard_selection_takes_the_path_from_the_url(self):
+        code, _, err = self.run_example("https://fixture.invalid/live", "--uri-mode", "standard",
+                                       "--timeout-us", "0")
+        self.assertEqual(code, 1, err)
+        self.assertIn("connection observation timed out", err)
+        observed = _native._test_config()
+        self.assertEqual((observed["url"], observed["uri_mode"], observed["wt_path"]),
+                         (b"https://fixture.invalid/live", 1, b""))
+        self.assertEqual(_native._test_counts(), (1, 1, 1))
+
+    def test_wt_path_override_requires_the_legacy_mode(self):
+        code, _, err = self.run_example("https://fixture.invalid", "--uri-mode", "standard",
+                                       "--wt-path", "/live")
+        self.assertEqual(code, 2, err)
+        self.assertIn("invalid configuration: wt_path", err)
+        self.assertEqual(_native._test_counts(), (0, 0, 0))
+        code, _, err = self.run_example("https://fixture.invalid", "--uri-mode", "legacy",
+                                        "--wt-path", "/live", "--timeout-us", "0")
+        self.assertEqual(code, 1, err)
+        observed = _native._test_config()
+        self.assertEqual((observed["uri_mode"], observed["wt_path"]), (0, b"/live"))
+        self.assertEqual(_native._test_counts(), (1, 1, 1))
+
+    def test_established_draft_22_is_reported_by_name(self):
+        with mock.patch.object(_native, "state", lambda handle: int(moq5.EndpointState.ESTABLISHED)), \
+                mock.patch.object(_native, "negotiated_version", lambda handle: 22):
+            code, out, err = self.run_example("moqt://fixture.invalid:4433")
+        self.assertEqual(code, 0, err)
+        self.assertIn("negotiated_version=DRAFT_22 (22)", out.splitlines())
+        self.assertEqual(_native._test_counts(), (1, 1, 1))
 
 
 if __name__ == "__main__":

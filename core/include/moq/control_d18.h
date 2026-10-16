@@ -130,17 +130,43 @@ typedef struct moq_d18_auth_token {
     moq_bytes_t token_value;  /* REGISTER / USE_VALUE; borrowed */
 } moq_d18_auth_token_t;
 
-/* Decoded SETUP Options (§10.3.1). PATH/AUTHORITY surface as presence flags
- * (mirroring the draft-16 setup-parameter handling); token values borrow from
- * the payload. Unknown options are skipped per §10.3. */
+/* SETUP Options (§10.3.1), every option the draft defines with its value.
+ * PATH (§10.3.1.2) and AUTHORITY (§10.3.1.1) are each a presence flag and a
+ * value: the URI's path-abempty with "?" and the query appended when present,
+ * and the URI's authority component. Decoded values and token values borrow
+ * from the payload; unknown options are skipped per §10.3.
+ *
+ * A sized record: struct_size leads, set by moq_d18_setup_opts_init() (or
+ * init_sized), and both codec calls also take the caller's allocation size.
+ * The v0 layout is frozen through `authority`; fields appended later are
+ * read and written only when both sizes cover them. This sized form replaced
+ * an unsized record of the same name: binaries built against that earlier
+ * header are not compatible and must be rebuilt. */
 typedef struct moq_d18_setup_opts {
+    uint32_t struct_size;    /* bytes of this record the caller provides */
     bool     has_path;
     bool     has_authority;
     bool     has_max_auth_token_cache_size;
     uint64_t max_auth_token_cache_size;
     size_t               auth_token_count;
     moq_d18_auth_token_t auth_tokens[MOQ_D18_MAX_AUTH_TOKENS];
+    moq_bytes_t path;        /* valid when has_path */
+    moq_bytes_t authority;   /* valid when has_authority */
 } moq_d18_setup_opts_t;
+
+/* Frozen through the last named v0 field, never the future sizeof. */
+#define MOQ_D18_SETUP_OPTS_V0_SIZE \
+    (offsetof(moq_d18_setup_opts_t, authority) + sizeof(moq_bytes_t))
+
+/* Clear min(size, sizeof(moq_d18_setup_opts_t)) bytes and stamp struct_size
+ * with that count. A NULL record, or a size that cannot hold struct_size, is
+ * left untouched (nothing is written). A size below the v0 floor can be
+ * initialized but is refused by both codec calls. The plain form passes the
+ * caller's own sizeof, evaluated where it is compiled. */
+MOQ_API void moq_d18_setup_opts_init_sized(moq_d18_setup_opts_t *opts,
+                                           size_t size);
+#define moq_d18_setup_opts_init(opts) \
+    moq_d18_setup_opts_init_sized((opts), sizeof(*(opts)))
 
 /* Decode the SETUP payload (the bytes after the 16-bit Length) as a vi64 KVP
  * Setup Options walk: unknown options (and duplicates of unknown options) are
@@ -148,17 +174,34 @@ typedef struct moq_d18_setup_opts {
  * (> 2^16-1), or a Delta Type overflow is MOQ_ERR_PROTO; a malformed
  * AUTHORIZATION_TOKEN structure is MOQ_D18_ERR_KVP_FORMAT (close 0x6); more
  * than MOQ_D18_MAX_AUTH_TOKENS tokens -- a local capacity limit, not a peer
- * error -- is MOQ_ERR_BUFFER. */
+ * error -- is MOQ_ERR_BUFFER.
+ *
+ * out_size is the caller's allocation behind `out`. Below
+ * MOQ_D18_SETUP_OPTS_V0_SIZE (or a NULL out, or a NULL payload with a length)
+ * is MOQ_ERR_INVAL with nothing written. Otherwise exactly
+ * min(out_size, sizeof(moq_d18_setup_opts_t)) bytes are written and
+ * struct_size is stamped with that count -- the decoded options on success,
+ * a cleared record on any other failure (no partial result). */
 MOQ_API moq_result_t moq_d18_decode_setup_opts(const uint8_t *payload, size_t len,
-                                               moq_d18_setup_opts_t *out);
+                                               moq_d18_setup_opts_t *out,
+                                               size_t out_size);
 
-/* Encode a SETUP message carrying the given options (NULL opts == no options).
- * AUTHORIZATION_TOKEN (USE_VALUE or REGISTER structures, each borrowed for the
- * call) and MAX_AUTH_TOKEN_CACHE_SIZE are emitted; PATH/AUTHORITY are rejected
- * with MOQ_ERR_INVAL until a public surface supplies them, as are a DELETE or
- * USE_ALIAS token (nothing can be registered before SETUP). */
+/* Encode a SETUP message carrying the given options (NULL opts == no options;
+ * opts_size is then ignored), in ascending Option Type order with
+ * delta-encoded types: PATH (0x01), AUTHORIZATION_TOKEN (0x03, USE_VALUE or
+ * REGISTER structures, repeatable), MAX_AUTH_TOKEN_CACHE_SIZE (0x04),
+ * AUTHORITY (0x05). Values are borrowed for the call and written as given;
+ * URI syntax is the caller's to check.
+ *
+ * opts_size is the caller's allocation; opts->struct_size must cover
+ * MOQ_D18_SETUP_OPTS_V0_SIZE and must not exceed opts_size, and no byte past
+ * struct_size is read. A size violation, a DELETE or USE_ALIAS token (nothing
+ * can be registered before SETUP), a NULL value with a nonzero length, or a
+ * payload past the 16-bit Length is MOQ_ERR_INVAL; a writer too short is
+ * MOQ_ERR_BUFFER. The writer is left where it was on any failure. */
 MOQ_API moq_result_t moq_d18_encode_setup_opts(moq_buf_writer_t *w,
-                                               const moq_d18_setup_opts_t *opts);
+                                               const moq_d18_setup_opts_t *opts,
+                                               size_t opts_size);
 
 /*
  * Decoded Message Parameters. Only the representable subset is carried; an

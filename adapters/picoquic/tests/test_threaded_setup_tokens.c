@@ -8,8 +8,14 @@
  * negotiated draft-18 and draft-16. The facade's copy is wiped when it is
  * released (the core and service tests pin that); token values here hold no
  * zero byte, which a receiving session on this profile set refuses.
+ *
+ * The server also offers draft-22 when this picoquic reports exact stream
+ * terminal outcomes (PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1);
+ * without them a server offering it is refused at create with
+ * MOQ_ERR_UNSUPPORTED, and the server offers {18, 16}.
  */
 #include <moq/picoquic_threaded.h>
+#include <picoquic.h>
 #include <moq/types.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -89,7 +95,15 @@ static void run_client(int port, srv_ctx_t *sc, const moq_auth_token_t *tokens,
     cfg.on_lane_pump = client_pump;
     cfg.setup_auth_tokens = tokens;
     cfg.setup_auth_token_count = count;
-    if (alpn) { cfg.alpn_list = alpn; cfg.alpn_count = 1; }
+    static const uint8_t authority[] = "relay.example:443";
+    static const uint8_t path[] = "/live";
+    moq_connection_target_t target;
+    memset(&target, 0, sizeof(target));
+    target.struct_size = sizeof(target);
+    target.target_present = MOQ_BINDING_TARGET_COMPLETE;
+    target.authority = (moq_bytes_t){ authority, sizeof(authority) - 1 };
+    target.path_query = (moq_bytes_t){ path, sizeof(path) - 1 };
+    if (alpn) { cfg.alpn_list = alpn; cfg.alpn_count = 1; cfg.target = &target; }
     moq_pq_threaded_t *cli = NULL;
     CHECK(moq_pq_threaded_create(&cfg, &cli) == MOQ_OK);
     if (!cli) return;
@@ -124,9 +138,23 @@ int main(void)
     srv.port = port;
     srv.on_lane_pump = server_pump;
     srv.on_lane_pump_ctx = &sc;
+    static const char *const offer22[3] = { "moqt-22", "moqt-18", "moqt-16" };
     static const char *const offer[2] = { "moqt-18", "moqt-16" };
+#if defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) && \
+    PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1
+    srv.alpn_list = offer22;
+    srv.alpn_count = 3;
+#else
+    {
+        srv.alpn_list = offer22;
+        srv.alpn_count = 3;
+        moq_pq_threaded_t *refused = (moq_pq_threaded_t *)(uintptr_t)1;
+        CHECK(moq_pq_threaded_create(&srv, &refused) == MOQ_ERR_UNSUPPORTED);
+        CHECK(refused == NULL);
+    }
     srv.alpn_list = offer;
     srv.alpn_count = 2;
+#endif
     moq_pq_threaded_t *server = NULL;
     CHECK(moq_pq_threaded_create(&srv, &server) == MOQ_OK);
 
@@ -167,8 +195,9 @@ int main(void)
         CHECK(sc.type0 == 11 && sc.len0 == 3 && memcmp(sc.value0, value, 3) == 0);
         run_client(port, &sc, NULL, 0, NULL);
         CHECK(sc.token_count == 0);
-        /* Just inside the default arena: whole, on the legacy ALPN and on
-         * negotiated draft-18 and draft-16. */
+        /* Just inside the default arena, beside a short target: whole, on
+         * the legacy ALPN and on negotiated draft-18 and draft-16 (the core
+         * pair covers draft-22's SETUP at the same size). */
         moq_auth_token_t near = { 12, { big, 3800 } };
         const char *const *alpns[3] = { NULL, offer, offer + 1 };
         moq_auth_token_t small = { 12, { big, 16 } };

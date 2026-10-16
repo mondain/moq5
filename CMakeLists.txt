@@ -321,7 +321,7 @@ endif()
 if(MOQ_BUILD_ADAPTER_MSQUIC)
     # MsQuic resolves via an installed msquic CMake package (e.g.
     # Homebrew libmsquic) or a checkout at MOQ_MSQUIC_ROOT.
-    list(APPEND CMAKE_MODULE_PATH ${CMAKE_SOURCE_DIR}/cmake)
+    list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
     find_package(MsQuic)
     if(NOT MsQuic_FOUND)
         message(FATAL_ERROR
@@ -376,7 +376,7 @@ if(MOQ_BUILD_INTEROP_CLIENT)
         add_test(NAME interop_client_smoke
                  COMMAND ${CMAKE_COMMAND} -E env sh
                          ${CMAKE_CURRENT_SOURCE_DIR}/scripts/smoke_interop_client.sh
-                         ${CMAKE_BINARY_DIR})
+                         ${PROJECT_BINARY_DIR})
         set_tests_properties(interop_client_smoke PROPERTIES
             TIMEOUT 30
             LABELS "interop;smoke")
@@ -389,6 +389,7 @@ endif()
 if(MOQ_BUILD_RELAY_TOOL)
     add_subdirectory(tools/moq5-relay)
 endif()
+include(cmake/MoqServiceNativeTests.cmake)
 if(MOQ_BUILD_RELAY_CORE)
     if(MOQ_BUILD_TESTS)
         add_test(NAME relay_boundary
@@ -427,6 +428,7 @@ install(FILES
 if(MOQ_BUILD_ADAPTER_PICOQUIC OR MOQ_BUILD_ADAPTER_PICO_WT)
     install(FILES
         cmake/FindPicoquic.cmake
+        cmake/MoqPicoquicProjectPolicy.cmake
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libmoq)
 endif()
 
@@ -530,6 +532,16 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libmoq.pc
 # -- Tests ----------------------------------------------------------
 if(MOQ_BUILD_TESTS)
     add_subdirectory(tests)
+    # Recipes that prepare picoquic/picotls outside setup_picoquic_deps.sh
+    # (the interop-client Dockerfile) must apply its tracked patch lists and
+    # hand LibMoQ the picotls build-directory layout. Offline and provider-free.
+    if(UNIX)
+        add_test(NAME dependency_patch_consumers
+            COMMAND bash "${PROJECT_SOURCE_DIR}/scripts/setup_picoquic_deps.sh"
+                --check-patch-consumers)
+        set_tests_properties(dependency_patch_consumers PROPERTIES
+            TIMEOUT 30 LABELS "tooling")
+    endif()
 endif()
 
 # -- Examples -------------------------------------------------------

@@ -13,12 +13,14 @@
  */
 
 #include "../support/media_fuzz.h"
+#include "scenario_version.h"
 
 #include <stdint.h>
 #include <stdio.h>
 
 int main(int argc, char **argv)
 {
+    if (scenario_require_version("test_scenario_media_cmaf", NULL)) return 1;
     const char *argv0 = (argc > 0 && argv[0]) ? argv[0]
         : "./build/tests/test_scenario_media_cmaf";
 

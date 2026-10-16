@@ -20,7 +20,8 @@
 #include <moq/proxygen_wt.hpp>            /* attach moq::wt::Adapter */
 #include <moq/session.h>
 
-#include "../../common/moq_alpn.h"        /* moq_alpn_to_version / _for_version */
+#include "../../common/moq_alpn.h"
+#include "../../common/moq_adapter_binding.h"        /* moq_alpn_to_version / _for_version */
 
 #include <proxygen/lib/http/HTTPMessage.h>
 #include <proxygen/lib/http/HTTPMethod.h>
@@ -57,6 +58,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <stdexcept>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -221,6 +223,27 @@ struct moq_proxygen_wt_managed {
     uint64_t    goaway_timeout_us = 0;
     std::vector<std::string> alpn;          /* WT-Available-Protocols offer
                                              * (never empty after create) */
+    /* The connection target the session is bound with when its profile
+     * requires a binding (owned spelling). */
+    std::string target_authority;
+    std::string target_path_query;
+    uint32_t    target_present = 0;
+    /* The CONNECT's :authority (sent as the Host field, which proxygen's
+     * HTTP/3 codec carries as :authority) and :path, the same identity as
+     * the target: see moq_adapter_wt_client_target. Independent of the SNI. */
+    std::string connect_authority;
+
+    moq_connection_target_t target_view() const {
+        moq_connection_target_t t;
+        std::memset(&t, 0, sizeof(t));
+        t.struct_size = (uint32_t)sizeof(t);
+        t.target_present = target_present;
+        t.authority.data = (const uint8_t *)target_authority.data();
+        t.authority.len = target_authority.size();
+        t.path_query.data = (const uint8_t *)target_path_query.data();
+        t.path_query.len = target_path_query.size();
+        return t;
+    }
 
     moq_proxygen_wt_pump_fn     on_pump = nullptr;
     moq_proxygen_wt_activity_fn on_activity = nullptr;
@@ -459,8 +482,8 @@ folly::coro::Task<void> moq_proxygen_wt_managed::connect_coro()
 
         HTTPMessage req;
         req.setMethod(HTTPMethod::CONNECT);
-        req.setURL(path.empty() ? std::string("/moq") : path);
-        req.getHeaders().set(proxygen::HTTP_HEADER_HOST, server_name);
+        req.setURL(path);
+        req.getHeaders().set(proxygen::HTTP_HEADER_HOST, connect_authority);
         req.setUpgradeProtocol("webtransport");
         HTTPWebTransport::setWTAvailableProtocols(req, alpn);  /* never empty */
 
@@ -522,6 +545,19 @@ folly::coro::Task<void> moq_proxygen_wt_managed::connect_coro()
         if (moq_session_create(&scfg, now_us_steady(), &s) < 0) {
             set_fatal(0x1); signal_init(MOQ_ERR_INTERNAL); co_return;
         }
+        /* An established WebTransport-over-HTTP/3 session carries every fact
+         * a profile may require: the handshake is complete and QUIC DATAGRAM
+         * plus HTTP/3 datagrams were negotiated on both sides. Bind (when the
+         * profile requires it) before the first SETUP byte. */
+        {
+            moq_connection_target_t tv = target_view();
+            if (moq_adapter_bind_session(s, MOQ_BINDING_WEBTRANSPORT_H3,
+                                         MOQ_BINDING_FACTS_ALL,
+                                         MOQ_BINDING_FACTS_ALL, &tv) != MOQ_OK) {
+                moq_session_destroy(s);
+                set_fatal(0x1); signal_init(MOQ_ERR_UNSUPPORTED); co_return;
+            }
+        }
 
         moq::wt::Adapter::Config acfg{};
         acfg.session = s;
@@ -555,12 +591,28 @@ folly::coro::Task<void> moq_proxygen_wt_managed::connect_coro()
 
 extern "C" {
 
-void moq_proxygen_wt_managed_cfg_init(moq_proxygen_wt_managed_cfg_t *cfg)
+void moq_proxygen_wt_managed_cfg_init_sized(moq_proxygen_wt_managed_cfg_t *cfg,
+                                            size_t cfg_size)
 {
     if (!cfg) return;
-    std::memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(*cfg);
-    cfg->perspective = MOQ_PERSPECTIVE_CLIENT;
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    if (n < sizeof(cfg->struct_size)) return;   /* too small to even stamp */
+    std::memset(cfg, 0, n);
+    cfg->struct_size = static_cast<uint32_t>(n);
+    if (n >= offsetof(moq_proxygen_wt_managed_cfg_t, perspective) +
+                 sizeof(cfg->perspective))
+        cfg->perspective = MOQ_PERSPECTIVE_CLIENT;
+}
+
+/* Parenthesized: defines the symbol, not the header's sized macro. The
+ * layout through goaway_timeout_us is what a caller built before `target`
+ * was appended allocates. */
+void (moq_proxygen_wt_managed_cfg_init)(moq_proxygen_wt_managed_cfg_t *cfg)
+{
+    constexpr size_t end = offsetof(moq_proxygen_wt_managed_cfg_t, goaway_timeout_us) +
+                           sizeof(uint64_t);
+    constexpr size_t align = alignof(moq_proxygen_wt_managed_cfg_t);
+    moq_proxygen_wt_managed_cfg_init_sized(cfg, (end + align - 1) & ~(align - 1));
 }
 
 #define CFG_HAS(cfg, field) \
@@ -625,8 +677,9 @@ moq_result_t moq_proxygen_wt_managed_create(
         m->host = host;
         m->port = port;
         if (CFG_HAS(cfg, sni) && cfg->sni && cfg->sni[0]) m->sni = cfg->sni;
-        if (CFG_HAS(cfg, path) && cfg->path && cfg->path[0]) m->path = cfg->path;
-        else m->path = "/moq";
+        const char *cfg_path =
+            (CFG_HAS(cfg, path) && cfg->path && cfg->path[0]) ? cfg->path
+                                                               : nullptr;
         if (ca && ca[0]) m->ca_file = ca;
         m->insecure = insecure;
         if (CFG_HAS(cfg, send_request_capacity))
@@ -636,9 +689,39 @@ moq_result_t moq_proxygen_wt_managed_create(
         if (CFG_HAS(cfg, goaway_timeout_us))
             m->goaway_timeout_us = cfg->goaway_timeout_us;
         m->alpn = std::move(offer);
+        {
+            /* One CONNECT identity: the explicit target, else host:port and
+             * the configured path; the CONNECT sends exactly what the session
+             * binds (moq_adapter_wt_client_target). */
+            moq_connection_target_t t;
+            uint8_t *bytes = nullptr;
+            size_t bytes_len = 0;
+            const char *authority = nullptr;
+            const char *connect_path = nullptr;
+            moq_result_t trc = moq_adapter_wt_client_target(
+                alloc, CFG_HAS(cfg, target) ? cfg->target : nullptr,
+                m->host.c_str(), port, cfg_path, "/moq", &t, &bytes,
+                &bytes_len, &authority, &connect_path);
+            if (trc == MOQ_ERR_NOMEM) throw std::bad_alloc();
+            if (trc != MOQ_OK) throw std::invalid_argument("connection target");
+            auto release = folly::makeGuard(
+                [&] { alloc->free(bytes, bytes_len, alloc->ctx); });
+            m->target_present = t.target_present;
+            m->target_authority.assign((const char *)t.authority.data,
+                                       t.authority.len);
+            m->target_path_query.assign(
+                t.path_query.len ? (const char *)t.path_query.data : "",
+                t.path_query.len);
+            m->connect_authority = authority;
+            m->path = connect_path;
+        }
         m->on_pump = cfg->on_pump;
         m->on_activity = CFG_HAS(cfg, on_activity) ? cfg->on_activity : nullptr;
         m->user_ctx = CFG_HAS(cfg, user_ctx) ? cfg->user_ctx : nullptr;
+    } catch (const std::invalid_argument &) {
+        if (constructed) m->~moq_proxygen_wt_managed_t();
+        alloc->free(m, sizeof(*m), alloc->ctx);
+        return MOQ_ERR_INVAL;
     } catch (...) {
         if (constructed) m->~moq_proxygen_wt_managed_t();
         alloc->free(m, sizeof(*m), alloc->ctx);

@@ -22,8 +22,10 @@
 #include "mvfst_managed_testing.h"
 #endif
 #include "../../common/moq_alpn.h"  /* moq_alpn_to_version / _for_version */
+#include "../../common/moq_adapter_binding.h"
 
 #include <quic/api/QuicSocket.h>
+#include <quic/handshake/TransportParameters.h>
 #include <quic/QuicConstants.h>
 #include <quic/state/QuicStreamUtilities.h>
 
@@ -206,6 +208,7 @@ struct moq_mvfst_conn
     std::unique_ptr<moq::mvfst::adapter> adp;
     bool close_requested = false;
     bool fatal = false;
+    bool started = false;   /* bound (when required) and started */
 
     /* Schedule a server pump on parent (defined out-of-line; parent is
      * incomplete here). These connection callbacks run on server_evb, so the
@@ -286,6 +289,43 @@ private:
  * memory and per-tick CPU against idle peers. Overridable via cfg.max_connections. */
 static constexpr size_t MOQ_MVFST_DEFAULT_MAX_CONNECTIONS = 1024;
 
+/* The transport facts of a connection whose handshake has completed (the
+ * peer's transport parameters are known): QUIC DATAGRAM support is the local
+ * transport settings on the receive side and the peer's
+ * max_datagram_frame_size on the send side. */
+static uint32_t mvfst_binding_facts(const quic::QuicSocket &sock,
+                                    const std::vector<quic::TransportParameter> &peer)
+{
+    uint32_t supported = MOQ_BINDING_HANDSHAKE_COMPLETE;
+    if (sock.getTransportSettings().datagramConfig.enabled)
+        supported |= MOQ_BINDING_LOCAL_QUIC_DATAGRAM | MOQ_BINDING_DATAGRAM_RECEIVE;
+    auto size = quic::getIntegerParameter(
+        quic::TransportParameterId::max_datagram_frame_size, peer);
+    if (size.has_value() && size.value().has_value() && *size.value() > 0)
+        supported |= MOQ_BINDING_PEER_QUIC_DATAGRAM | MOQ_BINDING_DATAGRAM_SEND;
+    return supported;
+}
+
+static uint64_t managed_now_us();
+
+/* Bind (when the profile requires it) and start a session created before its
+ * handshake, once the transport knows the peer's parameters. Returns 1 when
+ * started, 0 while the handshake is still in progress, <0 on refusal. */
+static int mvfst_bind_and_start(moq_session_t *session, const quic::QuicSocket &sock,
+                                const moq_connection_target_t *target,
+                                uint64_t now_us)
+{
+    auto peer = sock.getPeerTransportParams();
+    if (!peer.has_value()) return 0;
+    moq_result_t rc = moq_adapter_bind_session(
+        session, MOQ_BINDING_RAW_QUIC, MOQ_BINDING_FACTS_ALL,
+        mvfst_binding_facts(sock, *peer), target);
+    if (rc != MOQ_OK) return -1;
+    rc = moq_session_start(session, now_us);
+    if (rc != MOQ_OK && rc != MOQ_ERR_WRONG_STATE) return -1;
+    return 1;
+}
+
 struct moq_mvfst_managed {
     moq_alloc_t alloc;
     moq_session_cfg_t session_cfg;
@@ -304,6 +344,31 @@ struct moq_mvfst_managed {
     std::string alpn = "moqt-16";
     moq_version_t cfg_version = MOQ_VERSION_DRAFT_16;
     std::atomic<int> negotiated{0};
+    /* True when cfg_version's profile must be bound to its transport before
+     * it starts; such a session starts on the first pump after the
+     * handshake completes rather than at create(). */
+    bool needs_binding = false;
+    bool client_started = false;
+    /* The connection target (owned spelling) or the server's URI policy. */
+    std::string target_authority;
+    std::string target_path_query;
+    uint32_t target_present = 0;
+    moq_uri_accept_fn accept_uri = nullptr;
+    void *accept_uri_ctx = nullptr;
+
+    moq_connection_target_t target_view() const {
+        moq_connection_target_t t;
+        std::memset(&t, 0, sizeof(t));
+        t.struct_size = (uint32_t)sizeof(t);
+        t.target_present = target_present;
+        t.authority.data = (const uint8_t *)target_authority.data();
+        t.authority.len = target_authority.size();
+        t.path_query.data = (const uint8_t *)target_path_query.data();
+        t.path_query.len = target_path_query.size();
+        t.accept_uri = accept_uri;
+        t.accept_uri_ctx = accept_uri_ctx;
+        return t;
+    }
     std::vector<quic::QuicVersion> client_supported_versions{
         quic::QuicVersion::QUIC_V1};
 
@@ -701,6 +766,17 @@ quic::QuicServerTransport::Ptr managed_server_factory::make(
             t->close(quic::QuicError(quic::ApplicationErrorCode(0)));
             return t;
         }
+        /* A profile that requires no facts is bound now, before any input,
+         * so the server's URI policy judges the target a client names. */
+        if (!owner_->needs_binding) {
+            moq_connection_target_t tv = owner_->target_view();
+            if (moq_adapter_bind_session(c->session, MOQ_BINDING_RAW_QUIC, 0, 0,
+                                         &tv) != MOQ_OK) {
+                c->fatal = true;
+                t->close(quic::QuicError(quic::ApplicationErrorCode(0)));
+                return t;
+            }
+        }
 
         auto acfg = moq::mvfst::adapter::config::server();
         try {
@@ -709,6 +785,17 @@ quic::QuicServerTransport::Ptr managed_server_factory::make(
             /* Inbound callbacks on this conn schedule the server pump so
              * on_lane_pump drains its events (SUBSCRIBE etc.) without a poll. */
             owner_->wire_conn_server_pump(c->adp.get());
+            if (owner_->needs_binding) {
+                moq_mvfst_managed *owner = owner_;
+                c->adp->on_transport_ready([owner, c]() {
+                    if (c->started || !c->session || !c->transport) return;
+                    moq_connection_target_t tv = owner->target_view();
+                    int brc = mvfst_bind_and_start(c->session, *c->transport, &tv,
+                                                   managed_now_us());
+                    if (brc < 0) c->fatal = true;
+                    else if (brc > 0) c->started = true;
+                });
+            }
         } catch (...) {
             c->fatal = true;
             t->close(quic::QuicError(quic::ApplicationErrorCode(0)));
@@ -868,6 +955,38 @@ moq_result_t moq_mvfst_managed_create(
         if (sni && sni[0]) m->sni = sni;
         m->cfg_version = version;
         m->alpn = alpn_tok;
+        m->needs_binding = moq_version_binding_requirements(version) != 0;
+        {
+            const moq_connection_target_t *target =
+                CFG_HAS(cfg, target) ? cfg->target : nullptr;
+            moq_connection_target_t derived;
+            char derived_buf[1024];
+            if (!target && persp == MOQ_PERSPECTIVE_CLIENT && host && host[0]) {
+                /* A dial identity that does not fit is refused, never an
+                 * unidentified client. */
+                if (!moq_adapter_target_from_dial(derived_buf,
+                                                  sizeof(derived_buf), host,
+                                                  port, nullptr, &derived))
+                    throw std::invalid_argument("connection target");
+                target = &derived;
+            }
+            if (target) {
+                if (target->struct_size < MOQ_CONNECTION_TARGET_V0_SIZE ||
+                    (target->target_present & ~MOQ_BINDING_TARGET_COMPLETE) ||
+                    (target->authority.len && !target->authority.data) ||
+                    (target->path_query.len && !target->path_query.data))
+                    throw std::invalid_argument("connection target");
+                m->target_present = target->target_present;
+                m->target_authority.assign(
+                    (const char *)target->authority.data, target->authority.len);
+                m->target_path_query.assign(
+                    (const char *)target->path_query.data, target->path_query.len);
+                m->accept_uri = target->accept_uri;
+                m->accept_uri_ctx = target->accept_uri_ctx;
+            }
+            if (persp == MOQ_PERSPECTIVE_SERVER && !m->accept_uri)
+                m->accept_uri = moq_adapter_accept_any_uri;
+        }
         if (CFG_HAS(cfg, max_num_ptos)) m->max_num_ptos = cfg->max_num_ptos;
         if (CFG_HAS(cfg, initial_rtt_us)) m->initial_rtt_us = cfg->initial_rtt_us;
         if (CFG_HAS(cfg, max_connections) && cfg->max_connections)
@@ -896,6 +1015,10 @@ moq_result_t moq_mvfst_managed_create(
         if (CFG_HAS(cfg, send_buffer_size) && cfg->send_buffer_size) m->session_cfg.send_buffer_size = cfg->send_buffer_size;
         if (CFG_HAS(cfg, recv_buffer_size) && cfg->recv_buffer_size) m->session_cfg.recv_buffer_size = cfg->recv_buffer_size;
         if (CFG_HAS(cfg, goaway_timeout_us) && cfg->goaway_timeout_us) m->session_cfg.goaway_timeout_us = cfg->goaway_timeout_us;
+    } catch (const std::invalid_argument &) {
+        if (constructed) m->~moq_mvfst_managed_t();
+        alloc->free(m, sizeof(*m), alloc->ctx);
+        return MOQ_ERR_INVAL;
     } catch (...) {
         if (constructed) m->~moq_mvfst_managed_t();
         alloc->free(m, sizeof(*m), alloc->ctx);
@@ -1014,6 +1137,25 @@ moq_result_t moq_mvfst_managed_create(
                 auto cc = std::make_shared<quic::ServerCongestionControllerFactory>();
                 m->server->setCongestionControllerFactory(cc);
                 m->server->setFizzContext(sctx);
+                /* The worker applies the server-wide settings to every
+                 * accepted transport after the factory runs, so QUIC
+                 * DATAGRAM (and the stream credit) must be advertised through
+                 * the server's override for the server to actually
+                 * negotiate them. */
+                {
+                    uint16_t ptos = m->max_num_ptos;
+                    uint32_t irtt = m->initial_rtt_us;
+                    m->server->setTransportSettingsOverrideFn(
+                        [ptos, irtt](quic::TransportSettings &sts) {
+                            sts.advertisedInitialMaxStreamsBidi = 100;
+                            sts.advertisedInitialMaxStreamsUni = 100;
+                            sts.datagramConfig.enabled = true;
+                            sts.datagramConfig.sendDropOldDataFirst = true;
+                            if (ptos) sts.maxNumPTOs = ptos;
+                            if (irtt)
+                                sts.initialRtt = std::chrono::microseconds(irtt);
+                        });
+                }
                 m->server->setQuicServerTransportFactory(
                     std::make_unique<managed_server_factory>(m, cc));
 
@@ -1052,11 +1194,22 @@ moq_result_t moq_mvfst_managed_create(
             }
             m->session.store(sess);
 
-            rc = moq_session_start(sess, managed_now_us());
-            if (rc < 0) {
-                signal_init(m, rc);
-                teardown(m);
-                return;
+            /* A profile that must be told how it is carried starts on the
+             * first pump after the handshake; the others start now, bound
+             * first (they require no facts) so the setup names the client's
+             * target. */
+            if (!m->needs_binding) {
+                moq_connection_target_t tv = m->target_view();
+                rc = moq_adapter_bind_session(sess, MOQ_BINDING_RAW_QUIC, 0, 0,
+                                              &tv);
+                if (rc == MOQ_OK)
+                    rc = moq_session_start(sess, managed_now_us());
+                if (rc < 0) {
+                    signal_init(m, rc);
+                    teardown(m);
+                    return;
+                }
+                m->client_started = true;
             }
 
             try {
@@ -1157,6 +1310,20 @@ moq_result_t moq_mvfst_managed_create(
                     m->adapter_ptr =
                         std::make_unique<moq::mvfst::adapter>(
                             acfg, sess, m->transport);
+                    /* Bind and start before any inbound byte can reach the
+                     * session: the peer may send its SETUP as soon as the
+                     * handshake completes. */
+                    if (m->needs_binding) {
+                        m->adapter_ptr->on_transport_ready([m]() {
+                            moq_session_t *cs = m->session.load();
+                            if (!cs || m->client_started || !m->transport) return;
+                            moq_connection_target_t tv = m->target_view();
+                            int brc = mvfst_bind_and_start(cs, *m->transport, &tv,
+                                                           managed_now_us());
+                            if (brc < 0) m->set_fatal(0x1);
+                            else if (brc > 0) m->client_started = true;
+                        });
+                    }
                     /* Managed mode: gate outbound stream-credit backpressure
                      * (no createStream spam; retry on the MAX_STREAMS
                      * callback). Attach mode never calls this. */
@@ -1183,6 +1350,27 @@ moq_result_t moq_mvfst_managed_create(
 
         auto pump_tick = [](moq_mvfst_managed_t *h) -> pump_result {
             auto now = managed_now_us();
+
+            /* Sessions whose profile requires a transport binding were
+             * created before their handshake: bind and start them once the
+             * transport knows the peer's parameters. A refused binding is a
+             * connection the facade cannot carry at this version. */
+            if (h->needs_binding) {
+                moq_connection_target_t tv = h->target_view();
+                moq_session_t *cs = h->session.load();
+                if (cs && !h->client_started && h->transport) {
+                    int brc = mvfst_bind_and_start(cs, *h->transport, &tv, now);
+                    if (brc < 0) { h->set_fatal(0x1); return {false, UINT64_MAX}; }
+                    if (brc > 0) h->client_started = true;
+                }
+                for (auto &c : h->conns) {
+                    if (c->started || c->should_remove() || !c->session || !c->transport)
+                        continue;
+                    int brc = mvfst_bind_and_start(c->session, *c->transport, &tv, now);
+                    if (brc < 0) c->fatal = true;
+                    else if (brc > 0) c->started = true;
+                }
+            }
 
             if (h->adapter_ptr) {
                 moq_result_t src = h->adapter_ptr->service(now);
@@ -1873,6 +2061,8 @@ struct __attribute__((visibility("hidden"))) adapter::impl
      * (null) in attach mode, where the caller drives its own pump. */
     std::function<void()> pump_wake;
     void wake_managed_pump() { if (pump_wake) pump_wake(); }
+    /* Caller's handshake-complete hook (see adapter::on_transport_ready). */
+    std::function<void()> transport_ready;
 
     static void on_local_bidi_opened(void *ctx, uint64_t stream_id) {
         auto *self = static_cast<impl *>(ctx);
@@ -2114,6 +2304,12 @@ struct __attribute__((visibility("hidden"))) adapter::impl
     /* -- ConnectionSetupCallback --------------------------------------- */
 
     void onTransportReady() noexcept override {
+        if (transport_ready) {
+            try { transport_ready(); } catch (...) {
+                moq_transport_bridge_on_transport_error(
+                    shared_bridge, 0x1, now_us_from_clock());
+            }
+        }
         try { service_all(now_us_from_clock()); wake_managed_pump(); } catch (...) {
             moq_transport_bridge_on_transport_error(
                 shared_bridge, 0x1, now_us_from_clock());
@@ -2504,6 +2700,10 @@ bool adapter::is_closed() const noexcept {
 
 uint64_t adapter::fatal_code() const noexcept {
     return impl_->fatal_code();
+}
+
+void adapter::on_transport_ready(std::function<void()> fn) {
+    impl_->transport_ready = std::move(fn);
 }
 
 bool adapter::has_pending() const noexcept {

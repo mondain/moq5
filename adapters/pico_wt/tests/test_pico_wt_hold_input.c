@@ -6,7 +6,7 @@
  * through moq_pico_wt_callback (post_data / post_fin / reset), outbound
  * bytes are pulled through the provide_data path. The publisher is a raw
  * session over the fake transport endpoint; this file relays between the
- * two. Every row runs on draft-16 and draft-18.
+ * two. Every row runs on draft-16, draft-18 and draft-22.
  *
  * The rows pin, for a response stream the session cannot admit yet: the
  * adapter keeps exactly the refused chunk (bytes and FIN) under the stream's
@@ -26,6 +26,7 @@
 #include <moq/rcbuf.h>
 #include <moq/transport_bridge.h>
 #include "held_bridge_driver.h"
+#include "../../../tests/unit/test_binding_support.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,21 +47,34 @@ static uint64_t g_next_uni = 2;     /* client-initiated uni: 2, 6, 10 .. */
 static uint64_t g_next_bidi = 4;    /* client-initiated bidi after the WT CONNECT stream 0 */
 static uint64_t g_reset_code = 0;
 static uint64_t g_rx_window = 65535;
+static uint64_t g_tp_streams_uni = 64;   /* initial_max_stream_id_unidir */
+static uint32_t g_client_max_events = 64;   /* the fetcher session's event queue */
 static picoquic_state_enum g_cnx_state = picoquic_state_ready;
 
 picoquic_quic_t *picoquic_get_quic_ctx(picoquic_cnx_t *c) { (void)c; return NULL; }
+#if defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) && PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1
+int picoquic_enable_stream_send_commit(picoquic_cnx_t *c, uint64_t sid)
+{ (void)c; (void)sid; return 0; }
+int picoquic_get_remote_stop_error(picoquic_cnx_t *c, uint64_t sid, uint64_t *out)
+{ (void)c; (void)sid; *out = 0; return 0; }
+void h3zero_delete_stream(picoquic_cnx_t *c, h3zero_callback_ctx_t *h3, h3zero_stream_ctx_t *sc)
+{ (void)c; (void)h3; sc->path_callback = NULL; sc->path_callback_ctx = NULL; }
+#endif
 uint64_t picoquic_get_quic_time(picoquic_quic_t *q) { (void)q; return g_time; }
 picoquic_state_enum picoquic_get_cnx_state(picoquic_cnx_t *c) { (void)c; return g_cnx_state; }
 uint64_t picoquic_get_remote_stream_error(picoquic_cnx_t *c, uint64_t sid) { (void)c; (void)sid; return g_reset_code; }
 int picoquic_is_client(picoquic_cnx_t *c) { (void)c; return 1; }
 int picoquic_set_stream_priority(picoquic_cnx_t *c, uint64_t sid, uint8_t p) { (void)c; (void)sid; (void)p; return 0; }
 size_t picoquic_frames_varint_encode_length(uint64_t n) { return n < 64 ? 1 : n < 16384 ? 2 : n < 1073741824ull ? 4 : 8; }
+static bool g_tp_null = false;   /* the provider cannot read the parameters */
 picoquic_tp_t const *picoquic_get_transport_parameters(picoquic_cnx_t *c, int get_local)
     { (void)c; (void)get_local; static picoquic_tp_t tp; memset(&tp, 0, sizeof(tp));
+      if (g_tp_null) return NULL;
       tp.max_datagram_frame_size = 1252;
       tp.initial_max_stream_data_uni = g_rx_window;
       tp.initial_max_stream_data_bidi_remote = g_rx_window;
       tp.initial_max_stream_data_bidi_local = g_rx_window;
+      tp.initial_max_stream_id_unidir = g_tp_streams_uni;
       return &tp; }
 
 /* h3zero stream contexts: a pool keyed by stream id */
@@ -145,8 +159,13 @@ int picoquic_reset_stream_at(picoquic_cnx_t *c, uint64_t sid, uint64_t ec, uint6
     { (void)c; (void)sid; (void)ec; (void)reliable_size; g_reset_n++; return 0; }
 int picowt_reset_stream(picoquic_cnx_t *cnx, h3zero_stream_ctx_t *stream_ctx, uint64_t local_stream_error)
     { (void)cnx; (void)stream_ctx; (void)local_stream_error; g_reset_n++; return 0; }
+/* g_stop_refused: picoquic refuses every STOP_SENDING, as it does for a
+ * stream it already released (INVALID_STREAM_ID). A refused call is still
+ * counted. */
+static bool g_stop_refused = false;
 int picoquic_stop_sending(picoquic_cnx_t *c, uint64_t sid, uint64_t ec)
-    { (void)c; if (g_stop_n < SIG_MAX) { g_stops[g_stop_n].sid = sid; g_stops[g_stop_n].code = ec; g_stop_n++; } return 0; }
+    { (void)c; if (g_stop_n < SIG_MAX) { g_stops[g_stop_n].sid = sid; g_stops[g_stop_n].code = ec; g_stop_n++; }
+      return g_stop_refused ? -1 : 0; }
 
 /* Flow-control instrumentation: app-flow-control takeover and grants per stream. */
 #define FC_MAX 64
@@ -266,7 +285,7 @@ typedef struct rig {
 
 /* receive-state snapshot, read from the adapter's own table */
 typedef struct rxs {
-    bool active, paused, held_input, buf_fin, fin_blocked, held_fin;
+    bool active, paused, held_input, buf_fin, fin_blocked, held_fin, rx_complete;
     uint64_t blocked, delivered, granted, budget;
     size_t held_len, buf_len;
     const uint8_t *buf;
@@ -280,6 +299,7 @@ static bool rx_state(rig_t *r, uint64_t sid, rxs_t *out)
         if (!st->active || st->stream_id != sid) continue;
         out->active = st->active; out->paused = st->paused; out->held_input = st->held_input;
         out->buf_fin = st->buf_fin; out->fin_blocked = st->fin_blocked; out->held_fin = st->held_fin;
+        out->rx_complete = st->rx_complete;
         out->blocked = st->blocked; out->delivered = st->delivered; out->granted = st->granted;
         out->budget = st->budget; out->held_len = st->held_len; out->buf_len = st->buf_len; out->buf = st->buf;
         return true;
@@ -325,7 +345,7 @@ static void relay_client_sends(rig_t *r)
                                    sc_get(sid), r->ad);
         if (g_provide_nb == 0 && !g_provide_fin) { act_set(sid, 0); continue; }
         bool fin = g_provide_fin != 0;
-        if (r->version == MOQ_VERSION_DRAFT_18) {
+        if (r->version != MOQ_VERSION_DRAFT_16) {
             if (sid & 2u)
                 (void)held_bridge_uni_bytes(r->sb, sid, g_provide_buf, g_provide_nb, fin, 0);
             else
@@ -399,6 +419,8 @@ static bool rig_up(rig_t *r, moq_version_t version)
     r->alloc = (moq_alloc_t){ NULL, ca, cr, cf };
     g_next_uni = 2; g_next_bidi = 4; g_active_n = 0; g_fc_n = 0; memset(g_fc, 0, sizeof(g_fc));
     g_stop_n = 0; g_stop_seen = 0; g_reset_n = 0; g_realloc_calls = 0; g_fail_realloc_after = -1;
+    g_stop_refused = false;
+    g_tp_streams_uni = 64;
     g_cnx_state = picoquic_state_ready; g_sc_n = 0;
     memset(&g_h3, 0, sizeof(g_h3)); memset(&g_prefix, 0, sizeof(g_prefix));
 
@@ -409,8 +431,9 @@ static bool rig_up(rig_t *r, moq_version_t version)
     cc.initial_request_capacity = 64;
     cc.max_data_streams = 2;
     cc.max_fetches = 32;
-    cc.max_events = 64;
+    cc.max_events = g_client_max_events;
     if (moq_session_create(&cc, 0, &r->c) < 0) return false;
+    if (test_bind_if_required(r->c) < 0) return false;
 
     h3zero_stream_ctx_t *ctrl = sc_get(0);           /* the WT CONNECT stream */
     moq_pico_wt_conn_cfg_t ac;
@@ -430,6 +453,7 @@ static bool rig_up(rig_t *r, moq_version_t version)
     sc.max_fetches = 32;
     sc.max_events = 64;
     if (moq_session_create(&sc, 0, &r->sv) < 0) return false;
+    if (test_bind_if_required(r->sv) < 0) return false;
     /* server op ids start at 1000: never one of the fetcher's own stream ids */
     held_endpoint_init(&r->sep, 1000, 1);
     moq_transport_bridge_cfg_t bcfg;
@@ -437,7 +461,7 @@ static bool rig_up(rig_t *r, moq_version_t version)
     if (held_bridge_create(&bcfg, r->sv, &r->sep.vtable, &r->sep, &r->sb) != MOQ_OK) return false;
 
     if (moq_session_start(r->c, 0) < 0) return false;
-    if (version == MOQ_VERSION_DRAFT_18 && moq_session_start(r->sv, 0) < 0) return false;
+    if (version != MOQ_VERSION_DRAFT_16 && moq_session_start(r->sv, 0) < 0) return false;
     pump(r, 8);
     moq_event_t ev;
     while (moq_session_poll_events(r->c, &ev, 1) > 0) moq_event_cleanup(&ev);
@@ -549,7 +573,7 @@ static uint64_t capture_response(rig_t *r, moq_fetch_t sfh, bool end)
 static int row_admission(moq_version_t v, bool split)
 {
     int before = failures;
-    const char *lbl = v == MOQ_VERSION_DRAFT_16 ? "v16" : "v18";
+    const char *lbl = v == MOQ_VERSION_DRAFT_16 ? "v16" : v == MOQ_VERSION_DRAFT_18 ? "v18" : "v22";
     rig_t r;
     if (!rig_up(&r, v)) {
         CHECK(false && "rig setup");
@@ -620,7 +644,7 @@ static int row_admission(moq_version_t v, bool split)
 static int row_repeat(moq_version_t v)
 {
     int before = failures;
-    const char *lbl = v == MOQ_VERSION_DRAFT_16 ? "v16" : "v18";
+    const char *lbl = v == MOQ_VERSION_DRAFT_16 ? "v16" : v == MOQ_VERSION_DRAFT_18 ? "v18" : "v22";
     rig_t r;
     if (!rig_up(&r, v)) {
         CHECK(false && "rig setup");
@@ -671,16 +695,17 @@ static int row_repeat(moq_version_t v)
     return failures - before;
 }
 
-/* Draft-18: the stream type arrives as the two-byte varint 0x80 0x05 split
+/* Drafts 18 and 22: the stream type arrives as the two-byte varint 0x80 0x05 split
  * across callbacks. The first byte is accepted into the bridge's retained
  * classification prefix (nothing paused); the chunk completing the type is
  * refused at admission and held exactly (the suffix only). The redelivery
  * must not replay the prefix: the response then decodes to its exact object. */
-static int row_prefix(void)
+static int row_prefix(moq_version_t v)
 {
+    const char *vl = v == MOQ_VERSION_DRAFT_18 ? "v18" : "v22";
     int before = failures;
     rig_t r;
-    if (!rig_up(&r, MOQ_VERSION_DRAFT_18)) {
+    if (!rig_up(&r, v)) {
         CHECK(false && "rig setup");
         rig_down(&r);
         return failures - before;
@@ -700,7 +725,7 @@ static int row_prefix(void)
     CHECK(rx_state(&r, sid, &st) && !st.paused && !st.held_input && st.delivered == 1);
     deliver(&r, sid, wide + 1, wtotal - 1, true);
     CHECK(rx_state(&r, sid, &st));
-    printf("prefix v18: total=%zu held_len=%zu held_first=0x%02x held_fin=%d paused=%d\n", wtotal, st.held_len,
+    printf("prefix %s: total=%zu held_len=%zu held_first=0x%02x held_fin=%d paused=%d\n", vl, wtotal, st.held_len,
            st.buf_len ? st.buf[0] : 0, (int)st.held_fin, (int)st.paused);
     CHECK(st.paused && st.held_input && st.held_len == wtotal - 1 && st.held_fin);
     CHECK(st.buf_len == wtotal - 1 && st.buf && memcmp(st.buf, wide + 1, wtotal - 1) == 0);   /* suffix only */
@@ -709,12 +734,12 @@ static int row_prefix(void)
     pump(&r, 3);
     memset(&co, 0, sizeof(co));
     drain(r.c, &co);
-    printf("prefix v18 recovery: objects=%d complete=%d dup=%d bad=%d fatal=%d\n", co.object, co.complete,
+    printf("prefix %s recovery: objects=%d complete=%d dup=%d bad=%d fatal=%d\n", vl, co.object, co.complete,
            co.duplicates, co.bad_payload, (int)moq_pico_wt_conn_is_fatal(r.ad));
     CHECK(co.complete == 2 && inventory_exact(&co, 1) && co.error == 0 && co.reset == 0);
     CHECK(!moq_pico_wt_conn_is_fatal(r.ad));
     rig_down(&r);
-    if (failures == before) printf("PASS: pw hold_input fragmented prefix v18\n");
+    if (failures == before) printf("PASS: pw hold_input fragmented prefix %s\n", vl);
     return failures - before;
 }
 
@@ -730,7 +755,7 @@ static int row_prefix(void)
 static int row_retained_and_deferred_fin(moq_version_t v, bool fin_while_held)
 {
     int before = failures;
-    const char *lbl = v == MOQ_VERSION_DRAFT_16 ? "v16" : "v18";
+    const char *lbl = v == MOQ_VERSION_DRAFT_16 ? "v16" : v == MOQ_VERSION_DRAFT_18 ? "v18" : "v22";
     g_end_object = 100;
     rig_t r;
     if (!rig_up(&r, v)) {
@@ -831,7 +856,7 @@ static int row_retained_and_deferred_fin(moq_version_t v, bool fin_while_held)
 static int row_terminals(moq_version_t v)
 {
     int before = failures;
-    const char *lbl = v == MOQ_VERSION_DRAFT_16 ? "v16" : "v18";
+    const char *lbl = v == MOQ_VERSION_DRAFT_16 ? "v16" : v == MOQ_VERSION_DRAFT_18 ? "v18" : "v22";
     g_end_object = 100;
     {   /* reset before redelivery */
         rig_t r;
@@ -942,7 +967,7 @@ static int row_terminals(moq_version_t v)
 static int row_alloc_and_budget(moq_version_t v)
 {
     int before = failures;
-    const char *lbl = v == MOQ_VERSION_DRAFT_16 ? "v16" : "v18";
+    const char *lbl = v == MOQ_VERSION_DRAFT_16 ? "v16" : v == MOQ_VERSION_DRAFT_18 ? "v18" : "v22";
     {   /* allocation failure on the retention buffer */
         rig_t r;
         if (!rig_up(&r, v)) {
@@ -1034,10 +1059,380 @@ static int row_required_hold(moq_version_t v)
     return failures - before;
 }
 
+/* -- held-stream cancellation at the hold age (HOLD_BIDI_INPUT) ------------ *
+ *
+ * The bridge cancels a held response that reaches the hold age through
+ * stop_sending. What the adapter does depends on its own record of the
+ * stream's receive half:
+ *   held FIN         -- the held chunk carried the FIN;
+ *   later FIN        -- a FIN arrived behind the held chunk while it was held;
+ *   peer RESET       -- the peer reset the stream while it was held;
+ *   replayed complete -- the stream was fed as already complete at the
+ *                       transport, bracketed with the completion marker the
+ *                       managed facade's replay uses, and no FIN reaches the
+ *                       adapter: the completion record is the only terminal
+ *                       fact (the facade's full replay, which also delivers
+ *                       the buffered FIN, is covered by the managed
+ *                       early-streams test);
+ *   live             -- none of these (bytes queued behind the held chunk).
+ * A stream terminal at the transport is discarded locally: no STOP_SENDING
+ * reaches picoquic (which here refuses every STOP, as for a stream it already
+ * released), the held bytes are dropped and never delivered, and nothing is
+ * fatal. A live stream gets exactly one STOP_SENDING with the profile's code
+ * in the WebTransport application-error space, after which the held bytes and
+ * everything queued behind them are dropped and never replayed; picoquic
+ * refusing that STOP is fatal. */
+typedef enum {
+    TC_HELD_FIN, TC_LATER_FIN, TC_PEER_RESET, TC_REPLAY_COMPLETE, TC_LIVE, TC_LIVE_REFUSED
+} tc_shape_t;
+
+static const char *tc_name(tc_shape_t t)
+{
+    switch (t) {
+    case TC_HELD_FIN:        return "held FIN";
+    case TC_LATER_FIN:       return "later FIN";
+    case TC_PEER_RESET:      return "peer RESET";
+    case TC_REPLAY_COMPLETE: return "replayed complete";
+    case TC_LIVE:            return "live";
+    case TC_LIVE_REFUSED:    return "live, STOP refused";
+    }
+    return "?";
+}
+
+static int row_terminal_cancel(moq_version_t v, tc_shape_t shape)
+{
+    int before = failures;
+    const char *lbl = v == MOQ_VERSION_DRAFT_16 ? "v16" : v == MOQ_VERSION_DRAFT_18 ? "v18" : "v22";
+    uint64_t wt_code = 0;
+    CHECK(pico_wt_moq_err_to_wt(v == MOQ_VERSION_DRAFT_16 ? MOQ_STREAM_ERROR_CANCELLED
+                                                           : MOQ_STREAM_ERROR_EXCESSIVE_LOAD,
+                                &wt_code));
+    rig_t r;
+    const uint64_t t0 = g_time;              /* restored: later rows start where they did */
+    moq_pico_wt_test_create_with_hold_bidi(true);
+    bool up = rig_up(&r, v);
+    moq_pico_wt_test_create_with_hold_bidi(false);
+    if (!up) {
+        CHECK(false && "rig setup");
+        rig_down(&r);
+        return failures - before;
+    }
+    moq_fetch_t fh[4], sfh[4];
+    CHECK(fetch_all(&r, 4, fh, sfh));
+    obs_t co;
+    fill_pool(&r, sfh, &co);
+    uint64_t sid = capture_response(&r, sfh[2], true);
+    if (sid == UINT64_MAX) { rig_down(&r); g_time = t0; return failures - before; }
+    uint8_t all[8192]; size_t total = r.cap_len; memcpy(all, r.cap, total);
+    r.capture_opid = UINT64_MAX;
+    r.hold_client = true;                    /* the publisher never sees the STOP */
+
+    /* The refused chunk, and what arrives behind it while it is held. */
+    const uint64_t held_at = g_time;
+    if (shape == TC_HELD_FIN) {
+        deliver(&r, sid, all, total, true);
+    } else if (shape == TC_REPLAY_COMPLETE) {
+        pico_wt_conn_rx_replay_complete_begin(r.ad, sid);
+        deliver(&r, sid, all, 2, false);     /* the 2-byte header write */
+        pico_wt_conn_rx_replay_complete_end(r.ad);
+    } else {
+        deliver(&r, sid, all, 2, false);
+        if (shape == TC_LATER_FIN)
+            deliver(&r, sid, all + 2, total - 2, true);
+        else if (shape == TC_LIVE || shape == TC_LIVE_REFUSED)
+            deliver(&r, sid, all + 2, total - 2, false);
+    }
+    rxs_t st;
+    CHECK(rx_state(&r, sid, &st) && st.held_input);
+    if (shape == TC_REPLAY_COMPLETE) {
+        /* The completion record alone shows the receive half terminal: no
+         * FIN has reached the adapter for this stream. */
+        CHECK(rx_state(&r, sid, &st) && st.held_input && st.rx_complete &&
+              !st.held_fin && !st.buf_fin);
+    }
+    if (shape == TC_PEER_RESET) {
+        g_reset_code = 0x2;
+        reset_cb(&r, sid);
+        CHECK(!rx_state(&r, sid, &st));
+    }
+    int stops_before = g_stop_n;
+    g_stop_refused = shape != TC_LIVE;
+    memset(&co, 0, sizeof(co));
+    drain(r.c, &co);
+
+    /* The hold age passes. */
+    g_time = held_at + 5000000;
+    (void)moq_pico_wt_service(r.ad, g_time);
+    g_time += 10;
+    (void)moq_pico_wt_service(r.ad, g_time);
+    obs_t after;
+    memset(&after, 0, sizeof(after));
+    drain(r.c, &after);
+    int stops = g_stop_n - stops_before;
+    bool tracked = rx_state(&r, sid, &st);
+    printf("terminal cancel %s %s: stops=%d tracked=%d held=%d fatal=%d objects=%d complete=%d\n", lbl,
+           tc_name(shape), stops, (int)tracked, tracked ? (int)st.held_input : -1,
+           (int)moq_pico_wt_conn_is_fatal(r.ad), after.object, after.complete);
+
+    if (shape == TC_LIVE_REFUSED) {
+        CHECK(stops == 1);
+        CHECK(moq_pico_wt_conn_is_fatal(r.ad));
+    } else {
+        CHECK(!moq_pico_wt_conn_is_fatal(r.ad));
+        CHECK(moq_session_state(r.c) == MOQ_SESS_ESTABLISHED);
+        if (shape == TC_LIVE) {
+            CHECK(stops == 1);
+            CHECK(stops == 1 && g_stops[stops_before].sid == sid &&
+                  g_stops[stops_before].code == wt_code);
+        } else {
+            CHECK(stops == 0);               /* no STOP_SENDING reaches picoquic */
+        }
+        CHECK(!tracked);                     /* held bytes and the queue behind dropped */
+        CHECK(co.object == 0 && after.object == 0 && after.complete == 0);   /* never delivered */
+        /* Later passes replay nothing and stop nothing more. */
+        g_time += 10;
+        pump(&r, 2);
+        memset(&after, 0, sizeof(after));
+        drain(r.c, &after);
+        CHECK(after.object == 0 && after.complete == 0 && after.error == 0);
+        CHECK(!rx_state(&r, sid, &st));
+        CHECK(g_stop_n - stops_before == stops);
+        CHECK(!moq_pico_wt_conn_is_fatal(r.ad));
+    }
+    g_stop_refused = false;
+    rig_down(&r);
+    g_time = t0;
+    if (failures == before) printf("PASS: pico_wt hold_input terminal cancel %s %s\n", lbl, tc_name(shape));
+    return failures - before;
+}
+
+/* The transport parameters are fixed at attach: the adapter samples the
+ * peer-unidirectional stream credit then, and a service pass that finds it
+ * changed (a later picoquic_set_transport_parameters) fails the connection
+ * closed. Unchanged parameters leave it running. */
+static int row_tp_fixed(moq_version_t v, bool change)
+{
+    int before = failures;
+    const char *lbl = v == MOQ_VERSION_DRAFT_16 ? "v16" : v == MOQ_VERSION_DRAFT_18 ? "v18" : "v22";
+    rig_t r;
+    if (!rig_up(&r, v)) {
+        CHECK(false && "rig setup");
+        rig_down(&r);
+        return failures - before;
+    }
+    CHECK(!moq_pico_wt_conn_is_fatal(r.ad));
+    if (change) g_tp_streams_uni = 65;
+    (void)moq_pico_wt_service(r.ad, g_time);
+    printf("tp fixed %s %s: fatal=%d\n", lbl, change ? "changed" : "unchanged", (int)moq_pico_wt_conn_is_fatal(r.ad));
+    CHECK(moq_pico_wt_conn_is_fatal(r.ad) == change);
+    g_tp_streams_uni = 64;
+    rig_down(&r);
+    if (failures == before)
+        printf("PASS: pico_wt hold_input transport parameters fixed at attach %s %s\n", lbl,
+               change ? "changed" : "unchanged");
+    return failures - before;
+}
+
+/* Unreadable local transport parameters refuse the attach before anything
+ * is allocated or any callback is rebound (the session prefix and the
+ * CONNECT stream keep their callbacks); the session is untouched and a later
+ * attach succeeds. Defensive: picoquic returns the parameters for every
+ * valid connection, so only the stub reaches this. */
+static int row_tp_unreadable(moq_version_t v)
+{
+    int before = failures;
+    const char *lbl = v == MOQ_VERSION_DRAFT_16 ? "v16" : v == MOQ_VERSION_DRAFT_18 ? "v18" : "v22";
+    moq_alloc_t al = (moq_alloc_t){ NULL, ca, cr, cf };
+    g_sc_n = 0;
+    memset(&g_h3, 0, sizeof(g_h3)); memset(&g_prefix, 0, sizeof(g_prefix));
+    moq_session_cfg_t cc;
+    moq_session_cfg_init_sized(&cc, sizeof(cc), moq_alloc_default(), MOQ_PERSPECTIVE_CLIENT);
+    cc.version = v;
+    moq_session_t *sess = NULL;
+    CHECK(moq_session_create(&cc, 0, &sess) == MOQ_OK);
+    if (!sess) return failures - before;
+    h3zero_stream_ctx_t *ctrl = sc_get(0);
+    long bal0 = g_bal;
+    moq_pico_wt_conn_cfg_t ac;
+    moq_pico_wt_conn_cfg_init_sized(&ac, sizeof(ac));
+    ac.session = sess;
+    ac.cnx = CNX;
+    ac.h3_ctx = &g_h3;
+    ac.ctrl_ctx = ctrl;
+    ac.alloc = &al;
+    moq_pico_wt_conn_t *ad = (moq_pico_wt_conn_t *)(uintptr_t)1;
+    g_tp_null = true;
+    int rc = moq_pico_wt_conn_create(&ac, &ad);
+    g_tp_null = false;
+    printf("tp unreadable %s: rc=%d out=%p balance=%ld\n", lbl, rc, (void *)ad, g_bal - bal0);
+    CHECK(rc == -1);
+    CHECK(ad == NULL);
+    CHECK(g_prefix.function_call == NULL && g_prefix.function_ctx == NULL);
+    CHECK(ctrl->path_callback == NULL && ctrl->path_callback_ctx == NULL);
+    CHECK(g_bal == bal0);
+    CHECK(moq_pico_wt_conn_create(&ac, &ad) == 0 && ad != NULL);
+    if (ad) moq_pico_wt_conn_destroy(ad);
+    moq_session_destroy(sess);
+    CHECK(g_bal == bal0);
+    if (failures == before) printf("PASS: pico_wt hold_input unreadable transport parameters %s\n", lbl);
+    return failures - before;
+}
+
+/* Drafts 18 and 22: the fetcher's one-slot event queue holds its unpolled
+ * FETCH_OK, so the publisher's GOAWAY on the control stream is retained by
+ * the session and the bridge waits for it to drain. A response arriving
+ * meanwhile on another stream is refused whole: the adapter keeps exactly
+ * that chunk (bytes and FIN) and redelivers it once the control input
+ * drains, and the fetch then completes with its exact object. */
+static int row_deferred_behind_control(moq_version_t v, bool with_fin)
+{
+    const char *vl = v == MOQ_VERSION_DRAFT_18 ? "v18" : "v22";
+    int before = failures;
+    const char *lbl = with_fin ? "with FIN" : "no FIN";
+    rig_t r;
+    g_client_max_events = 1;
+    bool up = rig_up(&r, v);
+    g_client_max_events = 64;
+    if (!up) {
+        CHECK(false && "rig setup");
+        rig_down(&r);
+        return failures - before;
+    }
+    moq_fetch_t fh[1], sfh[1];
+    bool fetched = fetch_all(&r, 1, fh, sfh);
+    CHECK(fetched);
+    if (!fetched) { rig_down(&r); return failures - before; }
+
+    /* The response data stream is opened by the accept itself (with its
+     * FETCH_HEADER), so the capture is armed on the next server uni id
+     * before the accept: the header, the object and (with_fin) the FIN on
+     * that stream are captured instead of delivered, while FETCH_OK flows
+     * and fills the fetcher's single event slot, unpolled. */
+    uint64_t opid = r.sep.next_uni_id;
+    r.capture_opid = opid; r.cap_len = 0; r.cap_fin = false;
+    moq_accept_fetch_cfg_t ac;
+    moq_accept_fetch_cfg_init(&ac);
+    ac.end_group = 0;
+    ac.end_object = g_end_object;
+    moq_result_t arc = moq_session_accept_fetch(r.sv, sfh[0], &ac, 0);
+    CHECK(arc == MOQ_OK);
+    if (arc != MOQ_OK) { rig_down(&r); return failures - before; }
+    pump(&r, 3);                              /* FETCH_OK fills the fetcher's queue */
+
+    CHECK(write_obj(r.sv, sfh[0], 0) == MOQ_OK);
+    if (with_fin) CHECK(moq_session_end_fetch(r.sv, sfh[0], 0) == MOQ_OK);
+    pump(&r, 2);
+    uint64_t sid = rig_sid(&r, opid);
+    uint8_t all[8192]; size_t total = r.cap_len; memcpy(all, r.cap, total);
+    bool fin = r.cap_fin;
+    r.capture_opid = UINT64_MAX;
+    CHECK(sid != UINT64_MAX);
+    CHECK(total > 1 && all[0] == 0x05);       /* FETCH_HEADER type */
+    CHECK(fin == with_fin);
+    if (sid == UINT64_MAX || total < 2 || all[0] != 0x05 || fin != with_fin) {
+        rig_down(&r);
+        return failures - before;
+    }
+
+    /* The GOAWAY reaches the fetcher while its queue is full. */
+    CHECK(moq_session_goaway(r.sv, NULL, 0, 0) == MOQ_OK);
+    pump(&r, 2);
+
+    deliver(&r, sid, all, total, fin);
+    rxs_t st;
+    bool tracked = rx_state(&r, sid, &st);
+    printf("deferred behind control pico_wt %s %s: tracked=%d held=%d held_len=%zu held_fin=%d blocked=%llu\n", vl, lbl,
+           (int)tracked, tracked ? (int)st.held_input : -1, tracked ? st.held_len : 0,
+           tracked ? (int)st.held_fin : -1, tracked ? (unsigned long long)st.blocked : 0ull);
+    CHECK(tracked && st.held_input && st.held_len == total && st.held_fin == fin);
+    CHECK(tracked && st.blocked == 0);       /* nothing claimed as bridge-owned */
+    CHECK(tracked && st.buf_len == total && st.buf && memcmp(st.buf, all, total) == 0);
+    CHECK(!moq_pico_wt_conn_is_fatal(r.ad));
+
+    /* The fetcher polls its events: the control input drains, then the
+     * held chunk is redelivered exactly. */
+    obs_t co, sum;
+    memset(&sum, 0, sizeof(sum));
+    for (int i = 0; i < 8; i++) {
+        memset(&co, 0, sizeof(co));
+        drain(r.c, &co);
+        obs_merge(&sum, &co);
+        pump(&r, 1);
+    }
+    printf("deferred behind control pico_wt %s %s replay: objects=%d complete=%d dup=%d bad=%d fatal=%d\n", vl, lbl,
+           sum.object, sum.complete, sum.duplicates, sum.bad_payload, (int)moq_pico_wt_conn_is_fatal(r.ad));
+    CHECK(inventory_exact(&sum, 1));
+    CHECK(sum.complete == (with_fin ? 1 : 0));
+    CHECK(sum.error == 0 && sum.reset == 0);
+    CHECK(!rx_state(&r, sid, &st) || !st.held_input);
+    CHECK(!moq_pico_wt_conn_is_fatal(r.ad));
+    rig_down(&r);
+    if (failures == before) printf("PASS: pico_wt hold_input deferred behind control %s %s\n", vl, lbl);
+    return failures - before;
+}
+
+/* Draft 22 needs this picoquic's exact stream terminal outcomes
+ * (PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1). Without them the attach
+ * refuses a draft-22 session before allocating or rebinding any callback,
+ * while a draft-18 session on the same configuration attaches. */
+#if defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) && \
+    PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1
+#define HOSTS_D22 1
+#else
+#define HOSTS_D22 0
+static int row_d22_attach_refused(void)
+{
+    int before = failures;
+    for (int i = 0; i < 2; i++) {
+        moq_version_t v = i ? MOQ_VERSION_DRAFT_18 : MOQ_VERSION_DRAFT_22;
+        moq_alloc_t al = (moq_alloc_t){ NULL, ca, cr, cf };
+        g_sc_n = 0;
+        memset(&g_h3, 0, sizeof(g_h3)); memset(&g_prefix, 0, sizeof(g_prefix));
+        moq_session_cfg_t cc;
+        moq_session_cfg_init_sized(&cc, sizeof(cc), moq_alloc_default(),
+                                   MOQ_PERSPECTIVE_CLIENT);
+        cc.version = v;
+        moq_session_t *sess = NULL;
+        CHECK(moq_session_create(&cc, 0, &sess) == MOQ_OK);
+        if (!sess) continue;
+        CHECK(test_bind_if_required(sess) >= 0);
+        h3zero_stream_ctx_t *ctrl = sc_get(0);
+        long bal0 = g_bal;
+        moq_pico_wt_conn_cfg_t ac;
+        moq_pico_wt_conn_cfg_init_sized(&ac, sizeof(ac));
+        ac.session = sess;
+        ac.cnx = CNX;
+        ac.h3_ctx = &g_h3;
+        ac.ctrl_ctx = ctrl;
+        ac.alloc = &al;
+        moq_pico_wt_conn_t *ad = (moq_pico_wt_conn_t *)(uintptr_t)1;
+        int rc = moq_pico_wt_conn_create(&ac, &ad);
+        if (v == MOQ_VERSION_DRAFT_22) {
+            CHECK(rc == -1 && ad == NULL);
+            CHECK(g_prefix.function_call == NULL && g_prefix.function_ctx == NULL);
+            CHECK(ctrl->path_callback == NULL && ctrl->path_callback_ctx == NULL);
+            CHECK(g_bal == bal0);
+        } else {
+            CHECK(rc == 0 && ad != NULL);
+            if (ad) moq_pico_wt_conn_destroy(ad);
+        }
+        moq_session_destroy(sess);
+        CHECK(g_bal == bal0);
+    }
+    if (failures == before) printf("PASS: pico_wt hold_input draft-22 attach refused without terminal contract\n");
+    return failures - before;
+}
+#endif
+
 int main(void)
 {
-    moq_version_t versions[2] = { MOQ_VERSION_DRAFT_16, MOQ_VERSION_DRAFT_18 };
-    for (int i = 0; i < 2; i++) {
+    moq_version_t versions[3] = { MOQ_VERSION_DRAFT_16, MOQ_VERSION_DRAFT_18,
+                                  MOQ_VERSION_DRAFT_22 };
+    const int nv = HOSTS_D22 ? 3 : 2;
+#if !HOSTS_D22
+    (void)row_d22_attach_refused();
+#endif
+    for (int i = 0; i < nv; i++) {
         (void)row_admission(versions[i], false);
         (void)row_admission(versions[i], true);
         (void)row_repeat(versions[i]);
@@ -1046,8 +1441,17 @@ int main(void)
         (void)row_terminals(versions[i]);
         (void)row_alloc_and_budget(versions[i]);
         (void)row_required_hold(versions[i]);
+        for (int t = TC_HELD_FIN; t <= TC_LIVE_REFUSED; t++)
+            (void)row_terminal_cancel(versions[i], (tc_shape_t)t);
+        (void)row_tp_fixed(versions[i], false);
+        (void)row_tp_fixed(versions[i], true);
+        (void)row_tp_unreadable(versions[i]);
     }
-    (void)row_prefix();
+    for (int i = 1; i < nv; i++) {
+        (void)row_prefix(versions[i]);
+        (void)row_deferred_behind_control(versions[i], false);
+        (void)row_deferred_behind_control(versions[i], true);
+    }
     if (failures == 0) printf("PASS: test_pico_wt_hold_input\n");
     else fprintf(stderr, "FAILED: test_pico_wt_hold_input (%d)\n", failures);
     return failures ? 1 : 0;

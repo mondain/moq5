@@ -188,6 +188,18 @@ public enum MediaObjectParser {
         object: FacadeReceivedObject,
         maxSamples: Int = 16
     ) throws -> MediaParsedObject {
+        try parse(track: track, object: object,
+                  wireVersion: WireVersion(track.transportVersion), maxSamples: maxSamples)
+    }
+
+    /// Parse with an explicit extended wire version. This argument is the
+    /// authority for the object's encoding, overriding the legacy track value.
+    /// This legacy result shape cannot carry LOC-04 metadata: the native parser
+    /// rejects draft-22, which requires a companion-aware metadata surface.
+    public static func parse(
+        track: MediaTrackInfo, object: FacadeReceivedObject,
+        wireVersion: WireVersion, maxSamples: Int = 16
+    ) throws -> MediaParsedObject {
         guard maxSamples >= 0 else {
             throw MediaParseError.invalidArgument
         }
@@ -198,7 +210,7 @@ public enum MediaObjectParser {
         // parser would then take the legacy draft-16 contract regardless of
         // what this track says.
         moq_media_track_info_init_sized(&ti, MemoryLayout.size(ofValue: ti))
-        ti.transport_version = cTransportVersion(track.transportVersion)
+        ti.transport_version = moq_version_t(rawValue: wireVersion.rawValue)
         ti.media_type = track.mediaType == .video
             ? MOQ_MEDIA_TYPE_VIDEO : MOQ_MEDIA_TYPE_AUDIO
 

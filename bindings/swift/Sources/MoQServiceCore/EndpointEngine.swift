@@ -97,6 +97,8 @@ package final class EndpointEngine: @unchecked Sendable {
     /// The negotiated version snapshotted at retirement, so the accessor
     /// keeps answering after the backend is gone.
     private var retiredNegotiatedVersion: MoQVersion?
+    private var retiredNegotiatedWireVersion: WireVersion?
+    private var retiredGoawayNewSessionURI: Data?
     private var hookSlots: [PumpHookKind: PumpHook] = [:]
 
     /// Defensive ceiling on one C wait; wakes make it irrelevant in practice
@@ -130,6 +132,20 @@ package final class EndpointEngine: @unchecked Sendable {
         defer { cond.unlock() }
         return backendRetired ? retiredNegotiatedVersion
                               : backend.negotiatedVersion
+    }
+
+    package var negotiatedWireVersion: WireVersion? {
+        cond.lock()
+        defer { cond.unlock() }
+        return backendRetired ? retiredNegotiatedWireVersion : backend.negotiatedWireVersion
+    }
+
+    /// The session-wide GOAWAY's New Session URI; the retirement snapshot
+    /// once the backend has been destroyed.
+    package var goawayNewSessionURI: Data? {
+        cond.lock()
+        defer { cond.unlock() }
+        return backendRetired ? retiredGoawayNewSessionURI : backend.goawayNewSessionURI
     }
 
     // MARK: Pump hooks (attachments)
@@ -513,6 +529,8 @@ package final class EndpointEngine: @unchecked Sendable {
                 cond.lock()
                 let failed = takeWaitersLocked()
                 retiredNegotiatedVersion = backend.negotiatedVersion
+                retiredNegotiatedWireVersion = backend.negotiatedWireVersion
+                retiredGoawayNewSessionURI = backend.goawayNewSessionURI
                 backendRetired = true
                 cond.unlock()
                 for cont in failed {

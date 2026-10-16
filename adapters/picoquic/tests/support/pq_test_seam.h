@@ -12,6 +12,12 @@
 /* Declare or withdraw MOQ_TRANSPORT_CAP_HOLD_INPUT on the attached endpoint. */
 void moq_pq_test_set_hold_input(moq_pq_conn_t *conn, bool on);
 
+/* Connections created while set also declare
+ * MOQ_TRANSPORT_CAP_HOLD_BIDI_INPUT, so their bridge keeps held-stream
+ * records (age, cancellation). Test builds only; no shipped adapter declares
+ * that capability. */
+void moq_pq_test_create_with_hold_bidi(bool on);
+
 /* Snapshot of one inbound stream's receive state (false if untracked). */
 typedef struct moq_pq_test_rx {
     bool           active;

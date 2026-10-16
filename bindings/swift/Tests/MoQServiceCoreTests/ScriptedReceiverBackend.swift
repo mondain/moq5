@@ -15,11 +15,19 @@ final class ScriptedReceiverBackend: ReceiverBackend, @unchecked Sendable {
         var handleID: UInt64
         var start: StartMode
         var priority: UInt8?
+        var options: MediaTrackSubscriptionOptions = .init()
+    }
+
+    struct CancelFillCall: Equatable, Sendable {
+        var handleID: UInt64
+        var initiatingRequestID: UInt64
     }
 
     /// @unchecked: an immutable value copy; the Thread is identity-only.
     struct Snapshot: @unchecked Sendable {
         var pollCalls = 0
+        /// Completed event removals, excluding empty and terminal polls.
+        var eventPollsReturned = 0
         var objectPollCalls = 0
         var detachCalls = 0
         /// Track events still queued in the backend (never polled). The
@@ -37,6 +45,8 @@ final class ScriptedReceiverBackend: ReceiverBackend, @unchecked Sendable {
         var queuedObjectsRemaining = 0
         var subscribeCalls: [SubscribeCall] = []
         var unsubscribeCalls: [UInt64] = []
+        var cancelFillCalls: [CancelFillCall] = []
+        var trackStateCalls: [UInt64] = []
         var violations: [String] = []
         var serviceThread: Thread?
         var objectPollBlocked = false
@@ -46,6 +56,10 @@ final class ScriptedReceiverBackend: ReceiverBackend, @unchecked Sendable {
     private var queue: [ReceiverPolledEvent] = []
     private var objectQueue: [ReceiverPolledObject] = []
     private var subscribeResults: [ReceiverCommandResult] = []
+    private var cancelFillResults: [ReceiverCommandResult] = []
+    private let cancelFillGate: TestGate?
+    private let trackStateGate: TestGate?
+    private var trackStates: [UInt64: Result<ExtendedTrackSubscriptionState, MoQServiceError>] = [:]
     private var terminal = false
     private var scriptedFatal = false
     private var scriptedFatalCode: UInt64 = 0
@@ -59,8 +73,11 @@ final class ScriptedReceiverBackend: ReceiverBackend, @unchecked Sendable {
     /// cross-backend teardown-ordering assertions.
     var onDetach: (@Sendable () -> Void)?
 
-    init(latch: @escaping @Sendable () -> Bool = { false }) {
+    init(cancelFillGate: TestGate? = nil, trackStateGate: TestGate? = nil,
+         latch: @escaping @Sendable () -> Bool = { false }) {
         self.latch = latch
+        self.cancelFillGate = cancelFillGate
+        self.trackStateGate = trackStateGate
     }
 
     // MARK: ReceiverBackend
@@ -76,12 +93,15 @@ final class ScriptedReceiverBackend: ReceiverBackend, @unchecked Sendable {
 
     func pollTrackEvent() -> ReceiverPollResult {
         cond.lock()
-        defer { cond.unlock() }
+        defer { cond.broadcast(); cond.unlock() }
         tripwireLocked("pollTrackEvent")
         noteServiceThreadLocked("pollTrackEvent")
         r.pollCalls += 1
-        cond.broadcast()
-        if !queue.isEmpty { return .event(queue.removeFirst()) }
+        if !queue.isEmpty {
+            let event = queue.removeFirst()
+            r.eventPollsReturned += 1
+            return .event(event)
+        }
         if terminal { r.terminalPollsReturned += 1; return .closed }
         return .none
     }
@@ -117,13 +137,13 @@ final class ScriptedReceiverBackend: ReceiverBackend, @unchecked Sendable {
     }
 
     func subscribe(handleID: UInt64, start: StartMode,
-                   priority: UInt8?) -> ReceiverCommandResult {
+                   priority: UInt8?, options: MediaTrackSubscriptionOptions) -> ReceiverCommandResult {
         cond.lock()
         defer { cond.unlock() }
         tripwireLocked("subscribe")
         noteServiceThreadLocked("subscribe")
         r.subscribeCalls.append(SubscribeCall(
-            handleID: handleID, start: start, priority: priority))
+            handleID: handleID, start: start, priority: priority, options: options))
         cond.broadcast()
         return subscribeResults.isEmpty ? .ok : subscribeResults.removeFirst()
     }
@@ -136,6 +156,18 @@ final class ScriptedReceiverBackend: ReceiverBackend, @unchecked Sendable {
         r.unsubscribeCalls.append(handleID)
         cond.broadcast()
         return subscribeResults.isEmpty ? .ok : subscribeResults.removeFirst()
+    }
+
+    func cancelFill(handleID: UInt64, initiatingRequestID: UInt64) -> ReceiverCommandResult {
+        cond.lock()
+        tripwireLocked("cancelFill")
+        noteServiceThreadLocked("cancelFill")
+        r.cancelFillCalls.append(.init(handleID: handleID, initiatingRequestID: initiatingRequestID))
+        let result = cancelFillResults.isEmpty ? .ok : cancelFillResults.removeFirst()
+        cond.broadcast()
+        cond.unlock()
+        cancelFillGate?.pass()
+        return result
     }
 
     func detach() {
@@ -155,7 +187,26 @@ final class ScriptedReceiverBackend: ReceiverBackend, @unchecked Sendable {
         hook?()
     }
 
+    func trackState(handleID: UInt64) -> Result<ExtendedTrackSubscriptionState, MoQServiceError> {
+        cond.lock()
+        tripwireLocked("trackState")
+        noteServiceThreadLocked("trackState")
+        r.trackStateCalls.append(handleID)
+        let result = trackStates[handleID] ?? .success(.legacy(.discovered))
+        cond.broadcast()
+        cond.unlock()
+        trackStateGate?.pass()
+        return result
+    }
+
     // MARK: Test control
+
+    func scriptTrackState(_ handleID: UInt64,
+                          _ result: Result<ExtendedTrackSubscriptionState, MoQServiceError>) {
+        cond.lock()
+        trackStates[handleID] = result
+        cond.unlock()
+    }
 
     func scriptEvents(_ events: [ReceiverPolledEvent]) {
         cond.lock()
@@ -174,6 +225,12 @@ final class ScriptedReceiverBackend: ReceiverBackend, @unchecked Sendable {
     func scriptSubscribeResults(_ results: [ReceiverCommandResult]) {
         cond.lock()
         subscribeResults = results
+        cond.unlock()
+    }
+
+    func scriptCancelFillResults(_ results: [ReceiverCommandResult]) {
+        cond.lock()
+        cancelFillResults = results
         cond.unlock()
     }
 
@@ -253,6 +310,17 @@ final class ScriptedReceiverBackend: ReceiverBackend, @unchecked Sendable {
 
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
 extension ReceiverPolledEvent {
+    static func localFailure(_ id: UInt64, result: Int32?) -> ReceiverPolledEvent {
+        ReceiverPolledEvent(kind: .localFailure(localResult: result), handleID: id, trackDescription: nil)
+    }
+    static func fill(_ id: UInt64, requestID: UInt64,
+                     reason: MediaFillReason = .complete,
+                     domain: MediaFillErrorDomain = .none,
+                     code: UInt64 = 0) -> ReceiverPolledEvent {
+        ReceiverPolledEvent(kind: .fillTerminal(.init(
+            initiatingRequestID: requestID, reason: reason, errorDomain: domain, errorCode: code)),
+            handleID: id, trackDescription: nil)
+    }
     static func added(_ id: UInt64, name: String,
                       mediaType: MediaType = .video) -> ReceiverPolledEvent {
         ReceiverPolledEvent(

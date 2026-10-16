@@ -2,6 +2,7 @@ add_library(moq-sim
     src/simpair.c
     src/simpair_fault.c
     src/simpair_delay.c
+    src/simpair_hold.c
     src/simpair_pump.c
 )
 

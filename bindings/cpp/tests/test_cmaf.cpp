@@ -1,7 +1,6 @@
 #include <moq/cmaf.hpp>
 #include "test_support.hpp"
 
-#include <cassert>
 #include <cstring>
 
 /* -- Synthetic box helpers (same logic as C tests) ------------------- */
@@ -141,10 +140,9 @@ static size_t build_fragment(uint8_t *buf, size_t cap, uint64_t base_time,
     size_t traf_sz = 8 + tfhd_sz + tfdt_sz + trun_sz;
     size_t moof_sz = 8 + traf_sz;
 
-    /* Fail loudly if the caller's buffer cannot hold the moof + mdat box rather
-     * than silently writing past it (caught by ASan, not by a plain run). */
-    assert(moof_sz + 8 + mdat_len <= cap &&
-           "build_fragment: destination buffer too small");
+    if (moof_sz > cap || cap - moof_sz < 8 ||
+        mdat_len > cap - moof_sz - 8)
+        return 0;
 
     size_t p = 0;
     p += box_hdr(buf + p, (uint32_t)moof_sz, "moof");
@@ -176,6 +174,30 @@ static size_t build_fragment(uint8_t *buf, size_t cap, uint64_t base_time,
 int main()
 {
     int failures = 0;
+
+    // Fixture capacity refusal must remain active in release builds.
+    {
+        const moq::cmaf::sample samples[] = {{1000, 2, 0, 0}};
+        const uint8_t payload[] = {0xCA, 0xFE};
+        uint8_t expected[256] = {};
+        constexpr size_t required = 86;
+        MOQ_CHECK(build_fragment(expected, sizeof(expected), 90000, 0x300,
+            samples, 1, payload, sizeof(payload)) == required);
+        uint8_t buf[256], untouched[256];
+        std::memset(untouched, 0xA5, sizeof(untouched));
+        for (size_t cap = 0; cap < required; ++cap) {
+            std::memcpy(buf, untouched, sizeof(buf));
+            MOQ_CHECK(build_fragment(buf, cap, 90000, 0x300, samples, 1,
+                payload, sizeof(payload)) == 0);
+            MOQ_CHECK(std::memcmp(buf, untouched, sizeof(buf)) == 0);
+        }
+        std::memcpy(buf, untouched, sizeof(buf));
+        MOQ_CHECK(build_fragment(buf, required, 90000, 0x300, samples, 1,
+            payload, sizeof(payload)) == required);
+        MOQ_CHECK(std::memcmp(buf, expected, required) == 0);
+        MOQ_CHECK(std::memcmp(buf + required, untouched + required,
+            sizeof(buf) - required) == 0);
+    }
 
     // Parse AVC init
     {

@@ -391,6 +391,42 @@ cap_core_poisoned_prefix(void)
     return failures;
 }
 
+/* The track-discovery offer matrix is the product of two limits (track
+ * subscriptions x tracks). A configuration whose matrix is not representable
+ * in size_t -- on a 32-bit target 65536 tracks and 4097 track subscriptions
+ * already are; here both at their 32-bit maxima -- is refused before
+ * anything is allocated, never allocated at a wrapped size, and the
+ * capacity description refuses it alike. A representable one is created. */
+static int
+cap_core_offer_matrix_representable(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_relay_cfg_t cfg;
+    tiny_cfg(&cfg, &a);
+    if (sizeof(size_t) == 4) {
+        cfg.max_tracks = 65536;
+        cfg.max_ns_subs = 4097;
+    } else {
+        cfg.max_tracks = UINT32_MAX;
+        cfg.max_ns_subs = UINT32_MAX;
+    }
+    moqr_core_t *core = NULL;
+    moqr_core_capacity_t cap;
+    MOQ_TEST_CHECK_EQ_INT((int)moqr_core_capacity_describe(&cfg, &cap), (int)MOQR_ERR_INVAL);
+    MOQ_TEST_CHECK_EQ_INT((int)moqr_core_create(&cfg, &core), (int)MOQR_ERR_INVAL);
+    MOQ_TEST_CHECK(core == NULL);
+    MOQ_TEST_CHECK_EQ_INT((int)a.allocs, 0);
+
+    tiny_cfg(&cfg, &a);
+    MOQ_TEST_CHECK(moqr_core_create(&cfg, &core) == MOQR_OK);
+    moqr_core_destroy(core);
+    MOQ_TEST_CHECK(a.live == 0);
+    if (failures == 0) MOQ_TEST_PASS("cap_core_offer_matrix_representable");
+    return failures;
+}
+
 static int
 cap_core_log_max_chunk_nodes_knob(void)
 {
@@ -546,6 +582,7 @@ main(void)
     failures += cap_overflow_refused();
     failures += cap_core_poisoned_prefix();
     failures += cap_core_log_max_chunk_nodes_knob();
+    failures += cap_core_offer_matrix_representable();
     if (failures == 0) {
         printf("ALL PASS\n");
     }

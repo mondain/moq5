@@ -70,10 +70,11 @@
  * Client mode: create() opens the environment and starts the connect
  * holding the lane guard, so the returned session handle is published
  * before any callback runs. Server mode: create() starts the listener
- * (port 0 = ephemeral; _port() reports the bound port). Each accepted
- * connection is admitted (facade child reserved on a lane, enforcing
- * cfg.max_connections) BEFORE any wtquic session exists; its MoQ session
- * is created lazily on establishment.
+ * (port 0 = ephemeral, a port no IPv4 socket holds so that IPv4 and IPv6
+ * clients both reach the dual-stack listener; _port() reports the bound
+ * port). Each accepted connection is admitted (facade child reserved on a
+ * lane, enforcing cfg.max_connections) BEFORE any wtquic session exists; its
+ * MoQ session is created lazily on establishment.
  *
  * Teardown: a teardown COORDINATOR is created at create(), so initiating
  * teardown never fails and never blocks. stop_begin() only latches the
@@ -90,6 +91,7 @@
 #include <stddef.h>
 
 #include <moq/wtquic.h>
+#include <moq/connection_target.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -163,7 +165,8 @@ typedef struct moq_wtquic_msquic_managed_cfg {
                                       server: bind address
                                       (default 0.0.0.0) */
     uint16_t port;                 /* client: remote (required);
-                                      server: listen, 0 = ephemeral */
+                                      server: listen, 0 = ephemeral
+                                      (see Server mode above) */
     const char *cert_path;         /* server: required */
     const char *key_path;          /* server: required */
     bool insecure_skip_verify;     /* client: skip cert validation */
@@ -242,8 +245,18 @@ typedef struct moq_wtquic_msquic_managed_cfg {
      * application state changes the value this query would return, the owner
      * MUST issue a facade/lane wake (moq_wtquic_msquic_managed_wake /
      * moq_wtquic_msquic_lane_wake) so the next pump recomputes the deadline; an
-     * idle lane will not observe the new deadline on its own. Set via
-     * moq_wtquic_msquic_managed_cfg_init_sized. */
+     * idle lane will not observe the new deadline on its own.
+     *
+     * Every lane folds this one value, whichever lane's state it describes.
+     * An application whose deadlines belong to particular lanes should use
+     * app_lane_deadline_us below instead, so a lane waits only for its own.
+     *
+     * A lane pumps for an application deadline once: an instant at or before
+     * the pump that recomputes the deadline has been served by that pump and
+     * is not published again. Returning a later instant (or waking the lane)
+     * asks for another pump; a query that keeps answering an instant already
+     * served leaves the lane waiting rather than pumping without pause. Set
+     * via moq_wtquic_msquic_managed_cfg_init_sized. */
     uint64_t (*app_deadline_us)(void *ctx);
     void *app_deadline_ctx;
 
@@ -296,6 +309,51 @@ typedef struct moq_wtquic_msquic_managed_cfg {
      * policy. */
     const char *const *allowed_origins;
     size_t allowed_origin_count;
+
+    /* appended -- connection target (struct_size append-only ABI).
+     *
+     * target: the URI identity this facade binds the session with when the
+     * negotiated wire profile requires a transport binding (see
+     * <moq/connection_target.h>; draft-22 does, draft-16/18 do not). The
+     * facade supplies the transport facts itself -- the session is created
+     * once the WebTransport session is up, this side's QUIC DATAGRAM support
+     * is its own provider tuning and the peer's is what the transport
+     * reports -- and copies the target's fields and bytes during create()
+     * (accept_uri_ctx is borrowed until destroy(); a policy is never consulted
+     * over WebTransport). CLIENT: the authority and path/query the CONNECT
+     * dereferences and the session binds -- complete, with no policy; NULL
+     * derives them from `host`, `port` and `wt_path`. The CONNECT's
+     * :authority is this authority as spelled, or "host:port" when derived
+     * (`host` stays the TLS server name); its :path is the target path/query
+     * as spelled, with "/" in front of an empty or query-only one (RFC 9114
+     * Section 4.3.1). A `wt_path` set alongside a target must equal that
+     * projection; a conflict, an identity above the binding's bound
+     * (authority plus path/query over 65535 bytes) or one embedding a NUL is
+     * MOQ_ERR_INVAL at create(), before any transport effect.
+     * SERVER: ignored -- each accepted session is bound with the :authority
+     * and :path the client's CONNECT named. A malformed target is
+     * MOQ_ERR_INVAL at create(). Honored only when struct_size covers the
+     * field; set via moq_wtquic_msquic_managed_cfg_init_sized. */
+    const moq_connection_target_t *target;
+
+    /* appended: per-lane application service-deadline query -- ONE ABI block,
+     * read only when struct_size covers THROUGH app_lane_deadline_ctx (the
+     * callback and its context are honored together or not at all). Like the
+     * Origin block, it starts at the aggregate's own alignment, so it never
+     * lies in the trailing padding of the layout before it. The same contract
+     * as app_deadline_us above, asked for one lane: `lane_index`
+     * (0..lane_count-1) names the lane whose pump is recomputing its
+     * deadline, and the answer is that lane's earliest pending time-based
+     * deadline (CLOCK_MONOTONIC us), or UINT64_MAX for none. A lane folds
+     * only the answer for its own index, so one lane's due deadline never
+     * wakes another. The served-once rule above applies per lane. Called at
+     * the end of that lane's pump, concurrently with other lanes' pumps: MUST
+     * be pure/non-blocking and MUST NOT re-enter the facade. When both
+     * queries are set, each lane folds both. NULL = none. Set via
+     * moq_wtquic_msquic_managed_cfg_init_sized. */
+    MOQ_WTQUIC_MSQUIC_CFG_TAIL_ALIGNAS
+    uint64_t (*app_lane_deadline_us)(void *ctx, uint32_t lane_index);
+    void *app_lane_deadline_ctx;
 } moq_wtquic_msquic_managed_cfg_t;
 
 /* How a server path authorizes the client's serialized Origin. Facade-owned:
@@ -613,6 +671,35 @@ MOQ_API moq_result_t moq_wtquic_msquic_managed_wake(
     moq_wtquic_msquic_managed_t *m);
 MOQ_API moq_result_t moq_wtquic_msquic_managed_wait(
     moq_wtquic_msquic_managed_t *m, uint64_t timeout_us);
+
+/* CLIENT ONLY: nonblocking observation of currently required reliable output.
+ * Safe on application threads; destroy must be externally serialized. Under
+ * one successful try-entry to the actual managed lane, holds client/session
+ * lifetime and observes core, bridge, attach and WT output obligations. Does
+ * not allocate, pump, dispatch callbacks, advance the provider or wait behind
+ * a hook. Datagrams, receive-only work and future application answers are not
+ * reliable-output obligations.
+ *
+ * MOQ_OK means all covered byte/FIN obligations and retained ownership satisfy
+ * WT's completion contract. Its conservative acknowledgment mode can wait
+ * longer than local departure; success does not prove peer consumption.
+ * Explicitly accepted send cancellation or lawful peer STOP may supersede an
+ * ordinary WT stream's remaining output, but borrows, deferred submissions and
+ * abort-completion ownership must settle first. An in-flight cancellation
+ * decision stays pending; refused/partially failed cancellation cannot grant
+ * success. Receive-only abort cannot settle sends. This is not delivery of
+ * canceled bytes, FIN or RESET and does not earn a stream commit. Unexpected,
+ * earlier, other-stream or critical CONNECT/H3/QPACK output loss remains sticky
+ * MOQ_ERR_INTERNAL; intentional cancellation cannot clear it.
+ *
+ * Refusal precedence: MOQ_ERR_INVAL for NULL; MOQ_ERR_UNSUPPORTED for server
+ * mode; MOQ_ERR_WRONG_STATE from this instance's managed hooks. Otherwise
+ * actual stop/terminal wins as MOQ_ERR_CLOSED. MOQ_DONE means pending output,
+ * an unestablished client or lane contention; unavailable provider capability
+ * returns MOQ_ERR_UNSUPPORTED. MOQ_ERR_INTERNAL is an unsuccessful flush, not
+ * a fabricated terminal state. */
+MOQ_API moq_result_t moq_wtquic_msquic_managed_poll_flush(
+    const moq_wtquic_msquic_managed_t *managed);
 
 /* Terminal observation — CLIENT convenience (the single connection). On a
  * SERVER these are NOT a per-connection correctness API (poll SESSION_CLOSED

@@ -23,6 +23,7 @@
 #include "test_support.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int failures = 0;
@@ -193,11 +194,57 @@ static void t_standalone(void)
         printf("PASS: standalone\n");
 }
 
+/* An omitted version is always the session default, including in an actual
+ * old-sized allocation. CTest also runs this under conflicting environment
+ * selections; explicit scenario choices must go through cfg.version. */
+static void t_default(bool old_prefix)
+{
+    int before = failures;
+    const char *name = old_prefix ? "old-prefix-default" : "full-default";
+    moq_simpair_cfg_t cfg = MOQ_SIMPAIR_CFG_INIT;
+    cfg.alloc = moq_alloc_default();
+    cfg.seed = 0x5e5510u;
+    void *old = NULL;
+    const moq_simpair_cfg_t *input = &cfg;
+    if (old_prefix) {
+        cfg.struct_size = (uint32_t)offsetof(moq_simpair_cfg_t, version);
+        cfg.version = (moq_version_t)99;
+        old = malloc(cfg.struct_size);
+        MOQ_TEST_CHECK(old != NULL);
+        if (!old) return;
+        memcpy(old, &cfg, cfg.struct_size);
+        input = (const moq_simpair_cfg_t *)old;
+    }
+    moq_simpair_t *sp = NULL;
+    moq_result_t rc = moq_simpair_create(input, &sp);
+    free(old);
+    if (rc != MOQ_OK)
+        fprintf(stderr, "FAIL[%s]: create=%d\n", name, (int)rc);
+    MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
+    MOQ_TEST_CHECK(sp != NULL);
+    if (!sp) return;
+    check_pair(sp, MOQ_VERSION_DRAFT_16, name);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_simpair_start(sp), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(
+        (int)moq_simpair_run_until_quiescent(sp, 64, NULL), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(moq_simpair_client(sp)),
+                          (int)MOQ_SESS_ESTABLISHED);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(moq_simpair_server(sp)),
+                          (int)MOQ_SESS_ESTABLISHED);
+    check_pair(sp, MOQ_VERSION_DRAFT_16, name);
+    moq_simpair_destroy(sp);
+    if (failures == before)
+        printf("PASS: %s\n", name);
+}
+
 int main(void)
 {
     t_lifetime(MOQ_VERSION_DRAFT_16, "d16");
     t_lifetime(MOQ_VERSION_DRAFT_18, "d18");
+    t_lifetime(MOQ_VERSION_DRAFT_22, "d22");
     t_standalone();
+    t_default(false);
+    t_default(true);
 
     if (failures == 0)
         MOQ_TEST_PASS("session_version");

@@ -52,6 +52,7 @@ set(BASE_SYMBOLS
     moq_transport_bridge_on_peer_stream_reset
     moq_transport_bridge_on_peer_stop_sending
     moq_transport_bridge_on_peer_stream_terminal
+    moq_transport_bridge_on_local_stream_committed
     moq_transport_bridge_on_peer_datagram
     moq_transport_bridge_on_transport_close
     moq_transport_bridge_on_transport_error

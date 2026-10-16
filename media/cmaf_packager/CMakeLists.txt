@@ -85,7 +85,7 @@ if(MOQ_BUILD_TESTS)
     set(packager_context "${CMAKE_CURRENT_BINARY_DIR}/consumer-context.cmake")
     moq_write_consumer_context("${packager_context}")
     add_test(NAME cmaf_packager_consumer COMMAND ${CMAKE_COMMAND}
-        -DBUILD_DIR=${CMAKE_BINARY_DIR} -DCONTEXT=${packager_context}
+        -DBUILD_DIR=${PROJECT_BINARY_DIR} -DCONTEXT=${packager_context}
         -DCHECK_DIR=${CMAKE_CURRENT_BINARY_DIR}/cold-consumer
         -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/tests
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_consumer.cmake)

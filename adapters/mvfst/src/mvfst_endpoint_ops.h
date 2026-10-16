@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <unordered_map>
 
 namespace moq::mvfst {
 
@@ -59,6 +60,15 @@ struct mvfst_endpoint_ctx_t {
     std::atomic<uint64_t> bidi_block_count{0};
     std::atomic<uint64_t> uni_credit_grants{0};
     std::atomic<uint64_t> bidi_credit_grants{0};
+
+    /* Reliable resets. mvfst resets reliably up to a checkpoint marked with
+     * updateReliableDeliveryCheckpoint() when the bytes before it were
+     * written, so the first write on each local unidirectional stream (its
+     * stream header) is checkpointed; this maps the stream to that size until
+     * the stream ends. Network-thread confined. reliable_resets counts the
+     * RESET_STREAM_AT resets issued (test witness, read across threads). */
+    std::unordered_map<uint64_t, uint64_t> reliable_checkpoint;
+    std::atomic<uint64_t> reliable_resets{0};
 };
 
 void mvfst_endpoint_ops_init(moq_transport_endpoint_ops_t *ops,

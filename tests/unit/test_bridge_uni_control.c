@@ -46,6 +46,52 @@ static int uc_init(uc_fixture_t *f)
     return 0;
 }
 
+/* Same fixture on a profile whose control channel is a unidirectional stream
+ * per side, for either perspective. */
+static int uc_init_uni(uc_fixture_t *f, moq_perspective_t perspective)
+{
+    memset(f, 0, sizeof(*f));
+    moq_session_cfg_t cfg;
+    moq_session_cfg_init_sized(&cfg, sizeof(cfg), moq_alloc_default(), perspective);
+    cfg.version = MOQ_VERSION_DRAFT_18;
+    if (moq_session_create(&cfg, 0, &f->session) < 0) return -1;
+    held_endpoint_init(&f->ep, 1000, 2000);
+    moq_transport_bridge_cfg_t bcfg;
+    moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
+    if (held_bridge_create(&bcfg, f->session, &f->ep.vtable,
+                                     &f->ep, &f->bridge) < 0) {
+        moq_session_destroy(f->session);
+        return -1;
+    }
+    return 0;
+}
+
+static void push_open_uni_control(moq_session_t *s, moq_stream_ref_t ref,
+                                  const uint8_t *data, size_t len)
+{
+    moq_action_t a;
+    memset(&a, 0, sizeof(a));
+    a.kind = MOQ_ACTION_OPEN_UNI_CONTROL;
+    a.detail_size = (uint32_t)sizeof(moq_open_uni_control_action_t);
+    a.borrow_epoch = s->borrow_epoch;
+    a.u.open_uni_control.stream_ref = ref;
+    a.u.open_uni_control.data = data;
+    a.u.open_uni_control.len  = len;
+    (void)push_action(s, &a);
+}
+
+static void push_send_control(moq_session_t *s, const uint8_t *data, size_t len)
+{
+    moq_action_t a;
+    memset(&a, 0, sizeof(a));
+    a.kind = MOQ_ACTION_SEND_CONTROL;
+    a.detail_size = (uint32_t)sizeof(moq_send_control_action_t);
+    a.borrow_epoch = s->borrow_epoch;
+    a.u.send_control.data = data;
+    a.u.send_control.len  = len;
+    (void)push_action(s, &a);
+}
+
 static void uc_destroy(uc_fixture_t *f)
 {
     held_bridge_destroy(f->bridge);
@@ -959,6 +1005,89 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT((int)de->origin, (int)BRIDGE_ORIGIN_LOCAL);
         MOQ_TEST_CHECK(de->uni_disp != BRIDGE_UNI_DISP_CONTROL);
 
+        uc_destroy(&f);
+    }
+
+    /* == Post-setup control bytes ride the local uni control channel ===
+     *  The session emits every control message after the opening one as
+     *  SEND_CONTROL regardless of topology. On a uni-pair profile the bridge
+     *  must write those bytes on the local uni control stream: never open a
+     *  bidi stream for them, and never wait for a peer bidi that will not
+     *  come. Covers both perspectives and an open that is still pending. */
+    {
+        uc_fixture_t f;
+        HELD_REQUIRE_EQ_INT(uc_init_uni(&f, MOQ_PERSPECTIVE_CLIENT), 0);
+        MOQ_TEST_CHECK_EQ_INT((int)f.bridge->control_mode,
+                              (int)BRIDGE_CONTROL_UNI_PAIR);
+        moq_stream_ref_t ref = moq_stream_ref_from_u64(0x9101);
+        push_open_uni_control(f.session, ref, setup_bytes, sizeof(setup_bytes));
+        push_send_control(f.session, more_bytes, sizeof(more_bytes));
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
+        MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(f.bridge));
+        MOQ_TEST_CHECK_EQ_SIZE(
+            fake_endpoint_count_kind(&f.ep, FAKE_OP_OPEN_BIDI), 0);
+        MOQ_TEST_CHECK_EQ_SIZE(
+            fake_endpoint_count_kind(&f.ep, FAKE_OP_OPEN_UNI), 1);
+        MOQ_TEST_CHECK_EQ_SIZE(
+            fake_endpoint_count_kind(&f.ep, FAKE_OP_WRITE), 2);
+        MOQ_TEST_CHECK(f.ep.count >= 3);
+        uint64_t uni_id = f.ep.ops[0].stream_id;
+        MOQ_TEST_CHECK_EQ_INT((int)f.ep.ops[2].kind, (int)FAKE_OP_WRITE);
+        MOQ_TEST_CHECK_EQ_U64(f.ep.ops[2].stream_id, uni_id);
+        MOQ_TEST_CHECK_EQ_SIZE(f.ep.ops[2].data_len, sizeof(more_bytes));
+        MOQ_TEST_CHECK(memcmp(f.ep.ops[2].data, more_bytes,
+                              sizeof(more_bytes)) == 0);
+        MOQ_TEST_CHECK_EQ_U64(f.bridge->pending_count, 0);
+        MOQ_TEST_CHECK(!f.bridge->control_open);
+        uc_destroy(&f);
+    }
+    {
+        /* Server perspective, no peer control stream known yet: the bytes
+         * still go out on the local channel. */
+        uc_fixture_t f;
+        HELD_REQUIRE_EQ_INT(uc_init_uni(&f, MOQ_PERSPECTIVE_SERVER), 0);
+        moq_stream_ref_t ref = moq_stream_ref_from_u64(0x9102);
+        push_open_uni_control(f.session, ref, setup_bytes, sizeof(setup_bytes));
+        push_send_control(f.session, more_bytes, sizeof(more_bytes));
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_SIZE(
+            fake_endpoint_count_kind(&f.ep, FAKE_OP_WRITE), 2);
+        MOQ_TEST_CHECK_EQ_U64(f.ep.ops[2].stream_id, f.ep.ops[0].stream_id);
+        MOQ_TEST_CHECK_EQ_U64(f.bridge->pending_count, 0);
+        uc_destroy(&f);
+    }
+    {
+        /* The local channel's open is refused at first: the control bytes
+         * wait behind it and both go out, in order, once the open succeeds. */
+        uc_fixture_t f;
+        HELD_REQUIRE_EQ_INT(uc_init_uni(&f, MOQ_PERSPECTIVE_CLIENT), 0);
+        f.ep.block_open_uni = true;
+        moq_stream_ref_t ref = moq_stream_ref_from_u64(0x9103);
+        push_open_uni_control(f.session, ref, setup_bytes, sizeof(setup_bytes));
+        push_send_control(f.session, more_bytes, sizeof(more_bytes));
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_SIZE(fake_endpoint_count_kind(&f.ep, FAKE_OP_WRITE), 0);
+        MOQ_TEST_CHECK_EQ_SIZE(fake_endpoint_count_kind(&f.ep, FAKE_OP_OPEN_BIDI), 0);
+        MOQ_TEST_CHECK_EQ_U64(f.bridge->pending_count, 2);
+        f.ep.block_open_uni = false;
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
+        MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(f.bridge));
+        MOQ_TEST_CHECK_EQ_SIZE(fake_endpoint_count_kind(&f.ep, FAKE_OP_OPEN_UNI), 1);
+        MOQ_TEST_CHECK_EQ_SIZE(fake_endpoint_count_kind(&f.ep, FAKE_OP_WRITE), 2);
+        MOQ_TEST_CHECK_EQ_SIZE(fake_endpoint_count_kind(&f.ep, FAKE_OP_OPEN_BIDI), 0);
+        const fake_op_t *ou = fake_endpoint_find(&f.ep, FAKE_OP_OPEN_UNI);
+        MOQ_TEST_CHECK(ou != NULL);
+        size_t writes_on_uni = 0;
+        for (size_t i = 0; i < f.ep.count; i++)
+            if (f.ep.ops[i].kind == FAKE_OP_WRITE && ou &&
+                f.ep.ops[i].stream_id == ou->stream_id)
+                writes_on_uni++;
+        MOQ_TEST_CHECK_EQ_SIZE(writes_on_uni, 2);
+        MOQ_TEST_CHECK_EQ_U64(f.bridge->pending_count, 0);
         uc_destroy(&f);
     }
 

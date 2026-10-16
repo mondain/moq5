@@ -32,6 +32,10 @@ static void drain_events(moq_session_t *s)
         moq_event_cleanup(&ev);
 }
 
+/* The rows below run against the shipping library only; the private-endpoint
+ * build compiles just the rows that need the adapter's private sources. */
+#if !defined(MOQ_PICO_WT_LOOPBACK_PRIVATE)
+
 /* -- Full protocol flow: handshake → subscribe → object ------------- */
 
 static void test_pico_wt_loopback(void)
@@ -688,6 +692,8 @@ cleanup:
     pico_wt_harness_cleanup(&h);
 }
 
+#endif /* !MOQ_PICO_WT_LOOPBACK_PRIVATE */
+
 /* ================================================================== */
 /* Datagrams behind a wrapped connection callback context             */
 /* ================================================================== */
@@ -817,8 +823,11 @@ static void test_datagram_wrapped_cnx_context(moq_version_t version)
         CHECK(pico_wt_harness_pump(&h, 200) == 0);
         CHECK(ep->pending_dg_len == 0);
 
+#if defined(MOQ_PICO_WT_LOOPBACK_PRIVATE)
         /* An endpoint whose control stream has no registered prefix cannot
-         * become datagram-ready: refused, and nothing is left buffered. */
+         * become datagram-ready: refused, and nothing is left buffered. The
+         * endpoint constructor is private to the adapter, so this row runs
+         * only in the build that compiles the adapter sources in. */
         pico_wt_endpoint_ctx_t lone;
         moq_transport_endpoint_ops_t lone_ops;
         h3zero_stream_ctx_t lone_ctrl;
@@ -830,6 +839,7 @@ static void test_datagram_wrapped_cnx_context(moq_version_t version)
               MOQ_TRANSPORT_DROPPED);
         CHECK(lone.pending_dg_len == 0);
         pico_wt_endpoint_cleanup(&lone);
+#endif
     }
     CHECK(!moq_pico_wt_conn_is_fatal(h.client_conn));
     CHECK(!moq_pico_wt_conn_is_fatal(h.server_conn));
@@ -839,6 +849,8 @@ cleanup:
      * reach the h3zero context through the connection either. */
     pico_wt_harness_cleanup(&h);
 }
+
+#if !defined(MOQ_PICO_WT_LOOPBACK_PRIVATE)
 
 /* Control: the same datagram path with h3zero's own connection context (the
  * attach and server shape) delivers too, and a detached endpoint refuses
@@ -1288,8 +1300,22 @@ static void test_control_arbitration(moq_version_t v, bool recv_server)
     }
 }
 
+#endif /* !MOQ_PICO_WT_LOOPBACK_PRIVATE */
+
 int main(void)
 {
+#if defined(MOQ_PICO_WT_LOOPBACK_PRIVATE)
+    /* The private-endpoint build runs the rows that need the adapter's
+     * private sources; every other row runs against the shipping library. */
+    test_datagram_wrapped_cnx_context(MOQ_VERSION_DRAFT_16);
+    test_datagram_wrapped_cnx_context(MOQ_VERSION_DRAFT_18);
+    if (failures == 0)
+        printf("test_pico_wt_loopback_private: PASS (%d tests)\n", 2);
+    else
+        fprintf(stderr, "test_pico_wt_loopback_private: %d failure(s)\n",
+                failures);
+    return failures ? 1 : 0;
+#else
     test_pico_wt_loopback();
     test_datagram_too_large();
     test_stop_sending_round_trip();
@@ -1318,4 +1344,5 @@ int main(void)
         fprintf(stderr, "test_pico_wt_loopback: %d failure(s)\n",
                 failures);
     return failures ? 1 : 0;
+#endif
 }

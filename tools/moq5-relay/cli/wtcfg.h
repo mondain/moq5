@@ -33,9 +33,11 @@ extern "C" {
  * allowlist, and the transport takes its own copies during create.
  *
  * `lane_count` and `max_connections` are this listener's share of the process
- * plan, never the combined totals. `on_lane_pump` / `on_lane_pump_user` and
+ * plan, never the combined totals. `on_lane_pump` / `on_lane_pump_user`,
  * `app_deadline_us` / `app_deadline_ctx` (the lanes' relay-core deadlines;
- * NULL = none) are passed through unchanged.
+ * NULL = none) and `app_lane_deadline_us` / `app_lane_deadline_ctx` (the
+ * facade's per-lane fill-deadline query; NULL = none) are passed through
+ * unchanged.
  *
  * Returns the transport's own result. Nothing is mapped, softened or retried.
  */
@@ -47,6 +49,8 @@ moq_result_t moqr_cli_wt_listener_create(
     void *on_lane_pump_user,
     uint64_t (*app_deadline_us)(void *ctx),
     void *app_deadline_ctx,
+    uint64_t (*app_lane_deadline_us)(void *ctx, uint32_t lane_index),
+    void *app_lane_deadline_ctx,
     moq_wtquic_msquic_managed_t **out);
 
 #ifdef __cplusplus

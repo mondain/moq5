@@ -43,6 +43,7 @@ typedef enum {
     FAKE_OP_DATAGRAM,
     FAKE_OP_CLOSE,
     FAKE_OP_ABORT,
+    FAKE_OP_RESET_AT,   /* reliable reset: error_code + reliable_size */
 } fake_op_kind_t;
 
 typedef struct {
@@ -52,6 +53,7 @@ typedef struct {
     size_t         data_len;
     bool           fin;
     uint64_t       error_code;
+    uint64_t       reliable_size;   /* FAKE_OP_RESET_AT */
 } fake_op_t;
 
 typedef struct {
@@ -81,6 +83,13 @@ typedef struct {
     bool      block_stop;         /* stop_sending -> WOULD_BLOCK        */
     bool      fail_stop;          /* stop_sending -> ERROR (partial)    */
     bool      fail_write;         /* write -> ERROR                     */
+    /* reset_stream_at (wired by fake_endpoint_enable_reset_at): the
+     * connection did not negotiate it -> DROPPED (nothing recorded), or it
+     * cannot take the frame yet -> WOULD_BLOCK. reset_at_calls counts every
+     * call, answered or not. */
+    bool      reset_at_unavailable;
+    bool      block_reset_at;
+    uint64_t  reset_at_calls;
     bool      drop_datagram;
     int       block_count;
     /* Monotonic accepted-operation totals. The ops[] recorder is bounded at
@@ -299,6 +308,34 @@ static inline void fake_endpoint_enable_abort(fake_endpoint_t *ep)
 {
     ep->use_abort_op = true;
     ep->vtable.abort_stream = fake_abort;
+}
+
+static moq_transport_result_t fake_reset_at(void *ctx, uint64_t stream_id,
+                                             uint64_t error_code,
+                                             uint64_t reliable_size)
+{
+    fake_endpoint_t *ep = (fake_endpoint_t *)ctx;
+    ep->reset_at_calls++;
+    if (ep->reset_at_unavailable) return MOQ_TRANSPORT_DROPPED;
+    if (ep->block_reset_at) { ep->block_count++; return MOQ_TRANSPORT_WOULD_BLOCK; }
+    if (ep->count >= FAKE_EP_MAX_OPS) {
+        ep->overflowed = true;
+    } else {
+        fake_op_t *o = &ep->ops[ep->count++];
+        memset(o, 0, sizeof(*o));
+        o->kind = FAKE_OP_RESET_AT;
+        o->stream_id = stream_id;
+        o->error_code = error_code;
+        o->reliable_size = reliable_size;
+    }
+    return MOQ_TRANSPORT_OK;
+}
+
+/* Call AFTER init to declare and wire the optional reliable reset op. */
+static inline void fake_endpoint_enable_reset_at(fake_endpoint_t *ep)
+{
+    ep->vtable.capabilities |= MOQ_TRANSPORT_CAP_RELIABLE_RESET;
+    ep->vtable.reset_stream_at = fake_reset_at;
 }
 
 /* Clears the recorded operations only. The sticky loss flags deliberately

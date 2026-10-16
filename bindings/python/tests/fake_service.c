@@ -102,6 +102,11 @@ typedef struct {
     uint64_t expires_ms;
     int parse_drop_class;
     uint64_t parse_drops_total, parse_drops_delta;
+    int32_t local_result;
+    uint64_t initiating_request_id, fill_error_code;
+    uint32_t fill_reason, fill_error_domain;
+    uint32_t delivery_origin;
+    uint64_t delivery_initiating_request_id;
     bool orphan_desc;    /* no handle, but a non-NULL descriptor pointer (malformed shape) */
 } fixture_event_t;
 
@@ -121,6 +126,9 @@ typedef struct {
     int start;
     bool has_priority;
     int priority;
+    bool has_location, has_fill, has_fill_location;
+    moq_location_filter_cfg_t location, fill_location;
+    moq_fill_cfg_t fill;
 } subscription_t;
 
 static moq_media_receiver_t *current_receiver;
@@ -147,7 +155,7 @@ typedef struct {
     moq_cmaf_sample_t borrowed_samples[FIXTURE_SAMPLES]; /* for a NULL samples_owned case */
 } fixture_object_t;
 static fixture_object_t objects[FIXTURE_OBJECTS];
-static moq_rcbuf_t *kept[FIXTURE_OBJECTS * 2];
+static moq_rcbuf_t *kept[FIXTURE_OBJECTS * 3];
 static int kept_count;
 static int object_head, object_count;
 static int objects_pushed, objects_dequeued, cleanup_calls, cleanup_effective;
@@ -196,6 +204,8 @@ static moq_media_receiver_stats_t scripted_stats;
 static uint32_t stats_size = sizeof(moq_media_receiver_stats_t);
 static subscription_t subscriptions[FIXTURE_MAX_SUBSCRIPTIONS];
 static int subscription_count;
+static struct { int track; uint64_t id; moq_result_t result; } cancellations[FIXTURE_MAX_SUBSCRIPTIONS];
+static int cancellation_count;
 /* The last attach configuration, copied byte-exact (parts may contain NUL). */
 static uint8_t rcfg_parts[FIXTURE_MAX_PARTS][256];
 static size_t rcfg_part_len[FIXTURE_MAX_PARTS];
@@ -205,6 +215,7 @@ static size_t rcfg_catalog_len;
 static bool rcfg_auto_subscribe, rcfg_full_size, rcfg_endpoint_null;
 static int rcfg_time_mode, rcfg_policy;
 static uint32_t rcfg_max_objects, rcfg_max_track_events;
+static uint32_t rcfg_companion;
 static uint64_t rcfg_max_bytes;
 
 /* -- sender fixture ------------------------------------------------------- *
@@ -275,6 +286,7 @@ static size_t scfg_declared_count, scfg_captured_count;
 static uint8_t scfg_catalog[FIXTURE_SCFG_CATALOG_CAP];
 static size_t scfg_catalog_captured, scfg_catalog_declared;
 static int scfg_backpressure;
+static moq_media_companion_profile_t scfg_companion;
 static uint64_t scfg_block_timeout_us, scfg_catalog_refresh_interval_us;
 static uint32_t scfg_queue_max_objects, scfg_queue_max_bytes;
 static uint32_t scfg_pre_ready_max_objects, scfg_pre_ready_max_bytes;
@@ -312,6 +324,8 @@ static size_t version_count;
 static uint64_t handshake_timeout;
 static bool full_size, insecure;
 static int protocol, backend, profile, version_policy;
+static uint32_t uri_mode;
+static moq_version_t preferred_version;
 
 static struct timespec watchdog(void)
 {
@@ -393,6 +407,8 @@ moq_result_t moq_endpoint_connect(const moq_endpoint_cfg_t *cfg, moq_endpoint_t 
     version_policy = cfg->versions.policy;
     insecure = cfg->insecure_skip_verify;
     handshake_timeout = cfg->handshake_timeout_us;
+    uri_mode = cfg->uri_mode;
+    preferred_version = cfg->preferred_version;
     copy_text(url, cfg->url);
     copy_text(sni, cfg->sni);
     copy_text(ca_file, cfg->ca_file);
@@ -593,6 +609,7 @@ PyObject *test_reset(PyObject *module, PyObject *args)
     memset(&scripted_stats, 0, sizeof(scripted_stats));
     stats_size = sizeof(moq_media_receiver_stats_t);
     subscription_count = 0;
+    cancellation_count = 0;
     rcfg_part_count = 0;
     rcfg_catalog_len = 0;
     created = stopped = destroyed = 0;
@@ -640,13 +657,15 @@ PyObject *test_config(PyObject *module, PyObject *args)
             return NULL;
         }
     }
-    PyObject *result = Py_BuildValue("{s:y,s:y,s:y,s:y,s:O,s:K,s:O,s:O,s:i,s:i,s:i,s:i}",
+    PyObject *result = Py_BuildValue("{s:y,s:y,s:y,s:y,s:O,s:K,s:O,s:O,s:i,s:i,s:i,s:i,s:k,s:k}",
         "url", url, "sni", sni, "ca_file", ca_file, "wt_path", wt_path,
         "versions", offers, "handshake_timeout_us", (unsigned long long)handshake_timeout,
         "insecure_skip_verify", insecure ? Py_True : Py_False,
         "full_size", full_size ? Py_True : Py_False,
         "protocol", protocol, "backend", backend, "wt_profile", profile,
-        "version_policy", version_policy);
+        "version_policy", version_policy,
+        "uri_mode", (unsigned long)uri_mode,
+        "preferred_version", (unsigned long)preferred_version);
     Py_DECREF(offers);
     return result;
 }
@@ -812,17 +831,31 @@ PyObject *test_unblock(PyObject *module, PyObject *args)
 
 void moq_media_receiver_cfg_init(moq_media_receiver_cfg_t *cfg)
 {
-    if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(*cfg);
+    moq_media_receiver_cfg_init_sized(cfg, offsetof(moq_media_receiver_cfg_t, companion_profile));
+}
+
+void moq_media_receiver_cfg_init_sized(moq_media_receiver_cfg_t *cfg, size_t size)
+{
+    if (!cfg || size < sizeof(cfg->struct_size)) return;
+    size_t n = size < sizeof(*cfg) ? size : sizeof(*cfg);
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
+    if (n >= offsetof(moq_media_receiver_cfg_t, companion_profile) + sizeof(cfg->companion_profile))
+        cfg->companion_profile = MOQ_MEDIA_COMPANION_AUTO;
 }
 
 void moq_media_receiver_track_subscribe_cfg_init(moq_media_receiver_track_subscribe_cfg_t *cfg)
 {
-    if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(*cfg);
-    cfg->start = MOQ_MEDIA_START_CURRENT;
+    moq_media_receiver_track_subscribe_cfg_init_sized(cfg,
+        offsetof(moq_media_receiver_track_subscribe_cfg_t, location));
+}
+
+void moq_media_receiver_track_subscribe_cfg_init_sized(moq_media_receiver_track_subscribe_cfg_t *cfg, size_t size)
+{
+    if (!cfg || size < sizeof(cfg->struct_size)) return;
+    size_t n = size < sizeof(*cfg) ? size : sizeof(*cfg);
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
 }
 
 moq_result_t moq_media_receiver_attach(moq_endpoint_t *ep, const moq_media_receiver_cfg_t *cfg,
@@ -868,6 +901,8 @@ moq_result_t moq_media_receiver_attach(moq_endpoint_t *ep, const moq_media_recei
     rcfg_max_objects = cfg->overflow.max_objects;
     rcfg_max_bytes = cfg->overflow.max_bytes;
     rcfg_max_track_events = cfg->max_track_events;
+    rcfg_companion = cfg->struct_size >= offsetof(moq_media_receiver_cfg_t, companion_profile) + sizeof(cfg->companion_profile)
+                       ? cfg->companion_profile : MOQ_MEDIA_COMPANION_AUTO;
     receivers_attached++;
     *out = current_receiver;
     pthread_mutex_unlock(&mutex);
@@ -944,6 +979,10 @@ static void release_refs_locked(moq_media_object_t *o)
 {
     if (o->payload_ref) { moq_rcbuf_decref(o->payload_ref); o->payload_ref = NULL; refs_released++; }
     if (o->properties_ref) { moq_rcbuf_decref(o->properties_ref); o->properties_ref = NULL; refs_released++; }
+    if (o->struct_size >= offsetof(moq_media_object_t, track_properties_ref) + sizeof(o->track_properties_ref) &&
+        o->track_properties_ref) {
+        moq_rcbuf_decref(o->track_properties_ref); o->track_properties_ref = NULL; refs_released++;
+    }
     if (o->samples_owned) {
         sample_block_free(o->samples_owned, o->sample_count * sizeof(moq_cmaf_sample_t));
         o->samples_owned = NULL;
@@ -1045,11 +1084,25 @@ static moq_result_t record_subscription(int subscribe, const moq_media_track_t *
 {
     if (subscription_count >= FIXTURE_MAX_SUBSCRIPTIONS) return MOQ_ERR_NOMEM;
     subscription_t *s = &subscriptions[subscription_count++];
+    memset(s, 0, sizeof(*s));
     s->subscribe = subscribe;
     s->track = track->index;
     s->start = cfg ? (int)cfg->start : -1;
     s->has_priority = cfg ? cfg->has_priority : false;
     s->priority = cfg ? cfg->priority : -1;
+    if (cfg && cfg->location) {
+        s->has_location = true;
+        s->location = *cfg->location;
+    }
+    if (cfg && cfg->fill) {
+        s->has_fill = true;
+        s->fill = *cfg->fill;
+        s->fill.location = NULL;
+        if (cfg->fill->location) {
+            s->has_fill_location = true;
+            s->fill_location = *cfg->fill->location;
+        }
+    }
     return MOQ_OK;
 }
 
@@ -1080,6 +1133,24 @@ moq_result_t moq_media_receiver_unsubscribe_track(moq_media_receiver_t *r, moq_m
     else if (!owns(r, track)) rc = MOQ_ERR_INVAL;
     else if (track->removed) rc = MOQ_ERR_WRONG_STATE;   /* an ended track may still be disabled */
     else rc = record_subscription(0, track, NULL);
+    pthread_mutex_unlock(&mutex);
+    return rc;
+}
+
+moq_result_t moq_media_receiver_cancel_fill(moq_media_receiver_t *r, moq_media_track_t *track, uint64_t id)
+{
+    if (!r || !track) return MOQ_ERR_INVAL;
+    pthread_mutex_lock(&mutex);
+    moq_result_t rc = subscribe_result;
+    if (!owns(r, track)) rc = MOQ_ERR_INVAL;
+    else if (receiver_terminal(r)) rc = MOQ_ERR_CLOSED;
+    if (cancellation_count >= FIXTURE_MAX_SUBSCRIPTIONS) {
+        pthread_mutex_unlock(&mutex);
+        return MOQ_ERR_NOMEM;
+    }
+    cancellations[cancellation_count].track = track->index;
+    cancellations[cancellation_count].id = id;
+    cancellations[cancellation_count++].result = rc;
     pthread_mutex_unlock(&mutex);
     return rc;
 }
@@ -1126,14 +1197,15 @@ PyObject *test_receiver_config(PyObject *module, PyObject *args)
             return NULL;
         }
     }
-    PyObject *result = Py_BuildValue("{s:O,s:y#,s:O,s:i,s:i,s:I,s:K,s:I,s:O,s:O}",
+    PyObject *result = Py_BuildValue("{s:O,s:y#,s:O,s:i,s:i,s:I,s:K,s:I,s:O,s:O,s:I}",
         "namespace", parts, "catalog_track", (const char *)rcfg_catalog, (Py_ssize_t)rcfg_catalog_len,
         "auto_subscribe", rcfg_auto_subscribe ? Py_True : Py_False,
         "time_mode", rcfg_time_mode, "overflow", rcfg_policy,
         "max_objects", (unsigned int)rcfg_max_objects, "max_bytes", (unsigned long long)rcfg_max_bytes,
         "max_track_events", (unsigned int)rcfg_max_track_events,
         "full_size", rcfg_full_size ? Py_True : Py_False,
-        "endpoint_null", rcfg_endpoint_null ? Py_True : Py_False);
+        "endpoint_null", rcfg_endpoint_null ? Py_True : Py_False,
+        "companion_profile", (unsigned)rcfg_companion);
     Py_DECREF(parts);
     return result;
 }
@@ -1179,10 +1251,10 @@ PyObject *test_receiver_queue(PyObject *module, PyObject *args)
 PyObject *test_stats(PyObject *module, PyObject *args)
 {
     (void)module;
-    unsigned long long v[9], catalog_drops;
+    unsigned long long v[9], catalog_drops, malformed = 0;
     int paused, complete;
-    if (!PyArg_ParseTuple(args, "KKKKKKKKKpKp", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8],
-                          &paused, &catalog_drops, &complete)) return NULL;
+    if (!PyArg_ParseTuple(args, "KKKKKKKKKpKp|K", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8],
+                          &paused, &catalog_drops, &complete, &malformed)) return NULL;
     pthread_mutex_lock(&mutex);
     scripted_stats.objects_received = v[0];
     scripted_stats.objects_queued = v[1];
@@ -1196,6 +1268,7 @@ PyObject *test_stats(PyObject *module, PyObject *args)
     scripted_stats.paused = paused;
     scripted_stats.catalog_drops = catalog_drops;
     scripted_stats.catalog_complete = complete;
+    scripted_stats.tracks_malformed = malformed;
     pthread_mutex_unlock(&mutex);
     Py_RETURN_NONE;
 }
@@ -1283,6 +1356,49 @@ PyObject *test_subscriptions(PyObject *module, PyObject *args)
     return list;
 }
 
+static PyObject *fixture_location(const moq_location_filter_cfg_t *l, bool present)
+{
+    if (!present) Py_RETURN_NONE;
+    return Py_BuildValue("(IKKKKK)", (unsigned)l->kind, (unsigned long long)l->relative_group_offset,
+                         (unsigned long long)l->start_group, (unsigned long long)l->start_object,
+                         (unsigned long long)l->end_group, (unsigned long long)l->end_object);
+}
+
+PyObject *test_receiver_options(PyObject *module, PyObject *args)
+{
+    (void)module; (void)args;
+    if (!subscription_count) Py_RETURN_NONE;
+    const subscription_t *s = &subscriptions[subscription_count - 1];
+    PyObject *location = fixture_location(&s->location, s->has_location);
+    PyObject *fill_location = fixture_location(&s->fill_location, s->has_fill_location);
+    PyObject *fill = NULL, *result = NULL;
+    if (!location || !fill_location) goto out;
+    fill = s->has_fill ? Py_BuildValue("(OiOiOKO)",
+        s->fill.has_subscriber_priority ? Py_True : Py_False, (int)s->fill.subscriber_priority,
+        s->fill.has_group_order ? Py_True : Py_False, (int)s->fill.group_order,
+        s->fill.has_fill_timeout ? Py_True : Py_False, (unsigned long long)s->fill.fill_timeout_ms,
+        fill_location) : Py_NewRef(Py_None);
+    if (fill) result = Py_BuildValue("(OO)", location, fill);
+out:
+    Py_XDECREF(location);
+    Py_XDECREF(fill_location);
+    Py_XDECREF(fill);
+    return result;
+}
+
+PyObject *test_receiver_cancellations(PyObject *module, PyObject *args)
+{
+    (void)module; (void)args;
+    PyObject *list = PyList_New(cancellation_count);
+    if (!list) return NULL;
+    for (int i = 0; i < cancellation_count; ++i) {
+        PyObject *v = Py_BuildValue("(iKi)", cancellations[i].track,
+            (unsigned long long)cancellations[i].id, (int)cancellations[i].result);
+        if (!v || PyList_SetItem(list, i, v) < 0) { Py_DECREF(list); return NULL; }
+    }
+    return list;
+}
+
 PyObject *test_stats_result(PyObject *module, PyObject *value)
 {
     (void)module;
@@ -1351,6 +1467,13 @@ moq_result_t moq_media_receiver_poll_track(moq_media_receiver_t *r, moq_media_tr
     full.parse_drop_class = (moq_media_parse_drop_class_t)e.parse_drop_class;
     full.parse_drops_total = e.parse_drops_total;
     full.parse_drops_delta = e.parse_drops_delta;
+    full.local_result = e.local_result;
+    full.initiating_request_id = e.initiating_request_id;
+    full.fill_reason = e.fill_reason;
+    full.fill_error_domain = e.fill_error_domain;
+    full.fill_error_code = e.fill_error_code;
+    full.delivery_origin = e.delivery_origin;
+    full.delivery_initiating_request_id = e.delivery_initiating_request_id;
     /* Write exactly the stamped prefix (clamped to sizeof), like a sized
      * native poll; the caller's bytes beyond it stay whatever they were. */
     size_t n = e.stamp < sizeof(full) ? e.stamp : sizeof(full);
@@ -1645,12 +1768,36 @@ PyObject *test_push_event(PyObject *module, PyObject *args)
 {
     (void)module;
     int kind;
-    PyObject *capsule, *stamp, *largest, *expires, *drop;
-    if (!PyArg_ParseTuple(args, "iOOOOO", &kind, &capsule, &stamp, &largest, &expires, &drop)) return NULL;
+    PyObject *capsule, *stamp, *largest, *expires, *drop, *local = Py_None, *fill = Py_None;
+    PyObject *delivery = Py_None;
+    if (!PyArg_ParseTuple(args, "iOOOOO|OOO", &kind, &capsule, &stamp, &largest, &expires,
+                         &drop, &local, &fill, &delivery)) return NULL;
     fixture_event_t e;
     memset(&e, 0, sizeof(e));
     e.kind = kind;
     e.stamp = sizeof(moq_media_track_event_t);
+    if (local != Py_None) {
+        long n = PyLong_AsLong(local);
+        if (PyErr_Occurred()) return NULL;
+        if (n < INT32_MIN || n > INT32_MAX) { PyErr_SetString(PyExc_ValueError, "local_result outside int32"); return NULL; }
+        e.local_result = (int32_t)n;
+    }
+    if (fill != Py_None) {
+        unsigned long long id, code;
+        unsigned reason, domain;
+        if (!PyArg_ParseTuple(fill, "KIIK", &id, &reason, &domain, &code)) return NULL;
+        e.initiating_request_id = id;
+        e.fill_reason = reason;
+        e.fill_error_domain = domain;
+        e.fill_error_code = code;
+    }
+    if (delivery != Py_None) {
+        unsigned origin;
+        unsigned long long id;
+        if (!PyArg_ParseTuple(delivery, "IK", &origin, &id)) return NULL;
+        e.delivery_origin = origin;
+        e.delivery_initiating_request_id = id;
+    }
     if (capsule != Py_None) {
         e.track = moq5_test_track(capsule);
         if (!e.track) return NULL;
@@ -1740,7 +1887,7 @@ PyObject *test_scramble_track(PyObject *module, PyObject *capsule)
 PyObject *test_layout(PyObject *module, PyObject *args)
 {
     (void)module; (void)args;
-    return Py_BuildValue("{s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n}",
+    PyObject *d = Py_BuildValue("{s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n}",
         "event_v0", (Py_ssize_t)(offsetof(moq_media_track_event_t, config_generation) + sizeof(uint32_t)),
         "event_has_largest_end", (Py_ssize_t)END(moq_media_track_event_t, has_largest),
         "event_largest_object_end", (Py_ssize_t)END(moq_media_track_event_t, largest_object),
@@ -1776,6 +1923,29 @@ PyObject *test_layout(PyObject *module, PyObject *args)
         "status_normal", (Py_ssize_t)MOQ_OBJECT_NORMAL,
         "status_end_of_group", (Py_ssize_t)MOQ_OBJECT_END_OF_GROUP,
         "status_end_of_track", (Py_ssize_t)MOQ_OBJECT_END_OF_TRACK);
+    if (!d) return NULL;
+#define LAYOUT(name, value) do { \
+    PyObject *v = PyLong_FromSize_t(value); \
+    if (!v || PyDict_SetItemString(d, name, v) < 0) { Py_XDECREF(v); Py_DECREF(d); return NULL; } \
+    Py_DECREF(v); \
+} while (0)
+    LAYOUT("event_local_result_end", END(moq_media_track_event_t, local_result));
+    LAYOUT("event_initiating_request_id_end", END(moq_media_track_event_t, initiating_request_id));
+    LAYOUT("event_fill_reason_end", END(moq_media_track_event_t, fill_reason));
+    LAYOUT("event_fill_error_domain_end", END(moq_media_track_event_t, fill_error_domain));
+    LAYOUT("event_fill_error_code_end", END(moq_media_track_event_t, fill_error_code));
+    LAYOUT("event_delivery_origin_end", END(moq_media_track_event_t, delivery_origin));
+    LAYOUT("event_delivery_initiating_request_id_end", END(moq_media_track_event_t, delivery_initiating_request_id));
+    LAYOUT("object_identity_end", END(moq_media_object_t, has_subgroup));
+    LAYOUT("object_metadata_end", END(moq_media_object_t, metadata));
+    LAYOUT("object_track_properties_end", END(moq_media_object_t, track_properties_ref));
+    LAYOUT("object_origin_end", END(moq_media_object_t, initiating_request_id));
+    LAYOUT("metadata_v0", MOQ_MEDIA_METADATA_V0_SIZE);
+    LAYOUT("metadata_sizeof", sizeof(moq_media_metadata_t));
+    LAYOUT("loc_v0", MOQ_LOC_METADATA_V0_SIZE);
+    LAYOUT("loc_sizeof", sizeof(moq_loc_metadata_t));
+#undef LAYOUT
+    return d;
 }
 
 /* _test_push_orphan_desc(kind): queue an event of `kind` with NO handle and a
@@ -1844,6 +2014,7 @@ moq_result_t moq_media_receiver_poll_object(moq_media_receiver_t *r, moq_media_o
     moq_media_object_t full = f->obj;
     full.struct_size = f->stamp;
     size_t copy = n < sizeof(full) ? n : sizeof(full);
+    if (copy > f->stamp) copy = f->stamp;
     memcpy(obj, &full, copy);
     memset(&f->obj, 0, sizeof(f->obj));
     objects_dequeued++;
@@ -1858,7 +2029,8 @@ void moq_media_object_cleanup(moq_media_object_t *obj)
     if (!obj) return;
     pthread_mutex_lock(&mutex);
     cleanup_calls++;
-    bool effective = obj->payload_ref || obj->properties_ref || obj->samples_owned;
+    bool effective = obj->payload_ref || obj->properties_ref || obj->samples_owned ||
+        (obj->struct_size >= END(moq_media_object_t, track_properties_ref) && obj->track_properties_ref);
     if (effective) {
         if (have_poll_thread && pthread_equal(pthread_self(), last_poll_thread)) cleanups_on_polling_thread++;
         else cleanups_off_polling_thread++;
@@ -1911,6 +2083,72 @@ static int make_ref(PyObject *dict, const char *key, moq_rcbuf_t **ref, moq_byte
     return 0;
 }
 
+/* A config span selects an actual object/track-properties buffer, not Python
+ * backing. The fixture's post-cleanup scrambling then tests real ownership. */
+static int fixture_config_span(PyObject *dict, const char *key, moq_media_object_t *o,
+                               moq_bytes_t *span, uint32_t bit)
+{
+    PyObject *v = field(dict, key);
+    if (!v) return 0;
+    int source;
+    Py_ssize_t offset, len;
+    if (!PyArg_ParseTuple(v, "inn", &source, &offset, &len)) return -1;
+    moq_rcbuf_t *ref = source == 0 ? o->properties_ref : o->track_properties_ref;
+    size_t size = ref ? moq_rcbuf_len(ref) : 0;
+    if ((source != 0 && source != 1) || offset < 0 || len < 0 ||
+        (size_t)offset > size || (size_t)len > size - (size_t)offset) {
+        PyErr_SetString(PyExc_ValueError, "fixture config span exceeds selected backing");
+        return -1;
+    }
+    span->data = ref ? moq_rcbuf_data(ref) + offset : NULL;
+    span->len = (size_t)len;
+    o->metadata.loc.present |= bit;
+    return 0;
+}
+
+static int fixture_metadata(PyObject *dict, moq_media_object_t *o)
+{
+    PyObject *d = field(dict, "metadata");
+    if (!d) return 0;
+    if (!PyDict_Check(d)) { PyErr_SetString(PyExc_TypeError, "metadata must be dict"); return -1; }
+    moq_media_metadata_t *m = &o->metadata;
+    moq_loc_metadata_t *l = &m->loc;
+    bool has;
+    uint64_t n;
+    m->struct_size = sizeof(*m);
+    l->struct_size = sizeof(*l);
+#define SCALAR(key, dest) do { if (take_u64(d, key, &has, &n) < 0) return -1; if (has) dest = n; } while (0)
+    SCALAR("stamp", m->struct_size);
+    SCALAR("loc_stamp", l->struct_size);
+    SCALAR("time_domain", m->time_domain);
+    SCALAR("time_us", m->time_us);
+    m->has_time_us = has;
+    SCALAR("present", l->present);
+    SCALAR("timestamp", l->timestamp);
+    if (has) l->present |= MOQ_LOC_METADATA_HAS_TIMESTAMP;
+    SCALAR("timescale", l->timescale);
+    if (has) l->present |= MOQ_LOC_METADATA_HAS_TIMESCALE;
+    SCALAR("audio_level", l->audio_level);
+    if (has) l->present |= MOQ_LOC_METADATA_HAS_AUDIO_LEVEL;
+#undef SCALAR
+    PyObject *independent = field(d, "independent");
+    m->independence_known = independent != NULL;
+    m->independent = take_bool(d, "independent");
+    PyObject *marking = field(d, "marking");
+    if (marking) {
+        char *bytes;
+        Py_ssize_t len;
+        if (PyBytes_AsStringAndSize(marking, &bytes, &len) < 0) return -1;
+        if (len < 1 || len > 4) { PyErr_SetString(PyExc_ValueError, "fixture marking must have 1..4 bytes"); return -1; }
+        memcpy(l->marking, bytes, (size_t)len);
+        l->marking_len = (uint8_t)len;
+        l->present |= MOQ_LOC_METADATA_HAS_MARKING;
+    }
+    if (fixture_config_span(d, "video_config", o, &l->video_config, MOQ_LOC_METADATA_HAS_VIDEO_CONFIG) < 0 ||
+        fixture_config_span(d, "audio_config", o, &l->audio_config, MOQ_LOC_METADATA_HAS_AUDIO_CONFIG) < 0) return -1;
+    return 0;
+}
+
 /* _test_push_object(track_capsule|None, dict): queue one object with genuine
  * buffers. Keys: packaging, status, end_of_group, datagram, keyframe,
  * capture_time_us (None -> absent), decode_time_us, composition_offset_us
@@ -1932,7 +2170,7 @@ PyObject *test_push_object(PyObject *module, PyObject *args)
         if (!track) return NULL;
     }
     pthread_mutex_lock(&mutex);
-    if (object_count >= FIXTURE_OBJECTS || kept_count + 2 > (int)(sizeof(kept) / sizeof(kept[0]))) {
+    if (object_count >= FIXTURE_OBJECTS || kept_count + 3 > (int)(sizeof(kept) / sizeof(kept[0]))) {
         pthread_mutex_unlock(&mutex);
         PyErr_SetString(PyExc_RuntimeError, "fixture object queue is full");
         return NULL;
@@ -1969,6 +2207,17 @@ PyObject *test_push_object(PyObject *module, PyObject *args)
         goto fail;
     }
     if (make_ref(dict, "properties", &o->properties_ref, &(moq_bytes_t){ NULL, 0 }) < 0) goto fail;
+    if (make_ref(dict, "track_properties", &o->track_properties_ref, &(moq_bytes_t){ NULL, 0 }) < 0) goto fail;
+    if (take_u64(dict, "group_id", &has, &o->group_id) < 0 ||
+        take_u64(dict, "object_id", &has, &o->object_id) < 0 ||
+        take_u64(dict, "subgroup_id", &o->has_subgroup, &o->subgroup_id) < 0 ||
+        take_u64(dict, "publisher_priority", &has, &u) < 0) goto fail;
+    o->publisher_priority = (uint8_t)u;
+    o->delivery_origin = MOQ_MEDIA_DELIVERY_LIVE;
+    if (take_u64(dict, "delivery_origin", &has, &u) < 0) goto fail;
+    if (has) o->delivery_origin = (uint32_t)u;
+    if (take_u64(dict, "initiating_request_id", &has, &o->initiating_request_id) < 0) goto fail;
+    if (fixture_metadata(dict, o) < 0) goto fail;
     if (take_u64(dict, "mdat_offset", &has, &u) < 0) goto fail;
     o->mdat_offset = (size_t)u;
     if (take_u64(dict, "mdat_len", &has, &u) < 0) goto fail;
@@ -2010,6 +2259,10 @@ PyObject *test_push_object(PyObject *module, PyObject *args)
         }
         f->stamp = (uint32_t)u;
     }
+    if (o->track_properties_ref && f->stamp < END(moq_media_object_t, track_properties_ref)) {
+        PyErr_SetString(PyExc_ValueError, "fixture stamp would strand track-properties ownership");
+        goto fail;
+    }
     PyObject *malformed = field(dict, "malformed");
     if (malformed) {
         const char *which = PyUnicode_AsUTF8AndSize(malformed, NULL);
@@ -2034,12 +2287,25 @@ PyObject *test_push_object(PyObject *module, PyObject *args)
         else if (strcmp(which, "mdat_len_over") == 0) o->mdat_len = o->fragment.len - o->mdat_offset + 1;
         else if (strcmp(which, "status_with_payload") == 0) { /* status object with a payload ref: refs genuine */ o->status = MOQ_OBJECT_END_OF_TRACK; }
         else if (strcmp(which, "normal_without_payload") == 0) { release_refs_locked(o); o->payload = (moq_bytes_t){ NULL, 0 }; o->status = MOQ_OBJECT_NORMAL; }
+        else if (strcmp(which, "video_config_null_len") == 0) {
+            o->metadata.loc.present |= MOQ_LOC_METADATA_HAS_VIDEO_CONFIG;
+            o->metadata.loc.video_config = (moq_bytes_t){NULL, 1};
+        }
+        else if (strcmp(which, "audio_config_len_over") == 0) {
+            o->metadata.loc.present |= MOQ_LOC_METADATA_HAS_AUDIO_CONFIG;
+            o->metadata.loc.audio_config.len = (size_t)PY_SSIZE_T_MAX + 1u;
+        }
+        else if (strcmp(which, "marking_len_over") == 0) {
+            o->metadata.loc.present |= MOQ_LOC_METADATA_HAS_MARKING;
+            o->metadata.loc.marking_len = 5;
+        }
         else { PyErr_SetString(PyExc_ValueError, "unknown malformed"); goto fail; }
     }
     /* keep one extra reference to every buffer so the bytes can be scrambled
      * after the binding's cleanup */
     if (o->payload_ref) kept[kept_count++] = moq_rcbuf_incref(o->payload_ref);
     if (o->properties_ref) kept[kept_count++] = moq_rcbuf_incref(o->properties_ref);
+    if (o->track_properties_ref) kept[kept_count++] = moq_rcbuf_incref(o->track_properties_ref);
     object_count++;
     objects_pushed++;
     pthread_mutex_unlock(&mutex);
@@ -2283,6 +2549,7 @@ static sender_shape_t sender_record_cfg(const moq_media_sender_cfg_t *cfg)
     memset(scfg_catalog, 0, sizeof(scfg_catalog));
     scfg_catalog_captured = scfg_catalog_declared = 0;
     scfg_backpressure = 0;
+    scfg_companion = MOQ_MEDIA_COMPANION_AUTO;
     scfg_block_timeout_us = scfg_catalog_refresh_interval_us = 0;
     scfg_queue_max_objects = scfg_queue_max_bytes = 0;
     scfg_pre_ready_max_objects = scfg_pre_ready_max_bytes = 0;
@@ -2305,6 +2572,7 @@ static sender_shape_t sender_record_cfg(const moq_media_sender_cfg_t *cfg)
     bool refused_here = false;
     scfg_endpoint_null = (cfg->endpoint == NULL);
     scfg_backpressure = (int)cfg->backpressure;
+    scfg_companion = cfg->companion_profile;
     scfg_block_timeout_us = cfg->block_timeout_us;
     scfg_queue_max_objects = cfg->queue_max_objects;
     scfg_queue_max_bytes = cfg->queue_max_bytes;
@@ -2416,6 +2684,8 @@ void moq_media_sender_cfg_init_sized(moq_media_sender_cfg_t *cfg, size_t cfg_siz
     }
     if (n >= offsetof(moq_media_sender_cfg_t, validate_cmaf) + sizeof(cfg->validate_cmaf))
         cfg->validate_cmaf = true;
+    if (n >= offsetof(moq_media_sender_cfg_t, companion_profile) + sizeof(cfg->companion_profile))
+        cfg->companion_profile = MOQ_MEDIA_COMPANION_AUTO;
 }
 
 /* The SDK's closed set (sender_validate_cfg): UNSET and anything else fail. */
@@ -2565,7 +2835,10 @@ static bool tk_pool_exhausted;
 
 /* The captured image of the LAST add_track configuration. */
 static text_t tcfg_name, tcfg_codec, tcfg_init_data, tcfg_role, tcfg_lang,
-              tcfg_channel_config;
+              tcfg_channel_config, tcfg_track_properties;
+static bool tcfg_dynamic_groups;
+/* A scripted pending new-group request per pool index (-1 = none). */
+static int64_t tk_new_group[FIXTURE_SEND_TRACKS];
 static uint32_t tcfg_struct_size;
 static bool tcfg_full_size;
 static int tcfg_media_type, tcfg_packaging;
@@ -2607,6 +2880,8 @@ static void tcfg_clear(void)
     memset(&tcfg_role, 0, sizeof(tcfg_role));
     memset(&tcfg_lang, 0, sizeof(tcfg_lang));
     memset(&tcfg_channel_config, 0, sizeof(tcfg_channel_config));
+    memset(&tcfg_track_properties, 0, sizeof(tcfg_track_properties));
+    tcfg_dynamic_groups = false;
     tcfg_struct_size = 0; tcfg_full_size = false;
     tcfg_media_type = tcfg_packaging = 0;
     tcfg_timescale = tcfg_width = tcfg_height = tcfg_samplerate = 0;
@@ -2660,6 +2935,9 @@ static bool tcfg_record(const moq_media_track_cfg_t *cfg)
     tcfg_take(&tcfg_lang, cfg->lang, "lang exceeds fixture capacity");
     tcfg_take(&tcfg_channel_config, cfg->channel_config,
               "channel_config exceeds fixture capacity");
+    tcfg_take(&tcfg_track_properties, cfg->track_properties,
+              "track_properties exceeds fixture capacity");
+    tcfg_dynamic_groups = cfg->dynamic_groups;
     tcfg_media_type = (int)cfg->media_type;
     tcfg_packaging = (int)cfg->packaging;
     tcfg_timescale = cfg->timescale;
@@ -2717,6 +2995,7 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
         send_track_name_store[i].len = cfg->name.len;
     }
     send_track_owner[i] = s;
+    tk_new_group[i] = -1;
     send_track_removed_flag[i] = false;
     send_track_owner_destroyed[i] = false;
     tk_added++;
@@ -2774,6 +3053,9 @@ static uint64_t wr_decode_time_us, wr_presentation_time_us, wr_capture_time_us;
 static text_t wr_payload, wr_properties;
 static size_t wr_payload_len, wr_properties_len;   /* DECLARED lengths */
 static uint32_t wr_payload_refs, wr_properties_refs;   /* at entry */
+static bool wr_metadata_null, wr_video_config_null, wr_audio_config_null;
+static moq_media_metadata_t wr_metadata;
+static text_t wr_video_config, wr_audio_config;
 static bool wr_oracle_limit;
 static const char *wr_oracle_limit_reason;
 /* References this recorder accepted on MOQ_OK and still owns. */
@@ -2964,6 +3246,86 @@ static void wr_take(text_t *dst, size_t *declared, const moq_rcbuf_t *buf,
     dst->len = n;
 }
 
+static void wr_take_metadata(const moq_media_metadata_t *m)
+{
+    memset(&wr_metadata, 0, sizeof(wr_metadata));
+    memset(&wr_video_config, 0, sizeof(wr_video_config));
+    memset(&wr_audio_config, 0, sizeof(wr_audio_config));
+    wr_metadata_null = (m == NULL);
+    wr_video_config_null = wr_audio_config_null = true;
+    if (!m) return;
+    wr_metadata.struct_size = m->struct_size;
+    if (m->struct_size != sizeof(*m)) {
+        wr_oracle_limit = true;
+        wr_oracle_limit_reason = "fixture records full current metadata only";
+        return;
+    }
+    wr_metadata.loc.struct_size = m->loc.struct_size;
+    if (m->loc.struct_size != sizeof(m->loc)) {
+        wr_oracle_limit = true;
+        wr_oracle_limit_reason = "fixture records full current LOC metadata only";
+        return;
+    }
+    wr_metadata.time_domain = m->time_domain;
+    wr_metadata.time_us = m->time_us;
+    wr_metadata.has_time_us = m->has_time_us;
+    wr_metadata.independence_known = m->independence_known;
+    wr_metadata.independent = m->independent;
+    memcpy(wr_metadata.reserved, m->reserved, sizeof(m->reserved));
+    wr_metadata.loc.present = m->loc.present;
+    wr_metadata.loc.timestamp = m->loc.timestamp;
+    wr_metadata.loc.timescale = m->loc.timescale;
+    wr_metadata.loc.marking_len = m->loc.marking_len;
+    memcpy(wr_metadata.loc.marking, m->loc.marking, sizeof(m->loc.marking));
+    wr_metadata.loc.audio_level = m->loc.audio_level;
+    memcpy(wr_metadata.loc.reserved, m->loc.reserved, sizeof(m->loc.reserved));
+    wr_video_config_null = (m->loc.video_config.data == NULL);
+    wr_audio_config_null = (m->loc.audio_config.data == NULL);
+    if (m->loc.marking_len > sizeof(m->loc.marking) ||
+        !span_coherent(m->loc.video_config) || !span_coherent(m->loc.audio_config) ||
+        m->loc.video_config.len > sizeof(wr_video_config.data) ||
+        m->loc.audio_config.len > sizeof(wr_audio_config.data)) {
+        wr_oracle_limit = true;
+        wr_oracle_limit_reason = "metadata spans exceed fixture capacity or are incoherent";
+        return;
+    }
+    if (m->loc.video_config.len)
+        memcpy(wr_video_config.data, m->loc.video_config.data, m->loc.video_config.len);
+    wr_video_config.len = m->loc.video_config.len;
+    if (m->loc.audio_config.len)
+        memcpy(wr_audio_config.data, m->loc.audio_config.data, m->loc.audio_config.len);
+    wr_audio_config.len = m->loc.audio_config.len;
+}
+
+static PyObject *wr_metadata_image(void)
+{
+    if (wr_metadata_null) return Py_NewRef(Py_None);
+    const moq_loc_metadata_t *loc = &wr_metadata.loc;
+    bool derived_absent = wr_metadata.time_domain == MOQ_MEDIA_TIME_DOMAIN_NONE &&
+        !wr_metadata.time_us && !wr_metadata.has_time_us &&
+        !wr_metadata.independence_known && !wr_metadata.independent;
+    for (size_t i = 0; i < sizeof(wr_metadata.reserved); ++i)
+        derived_absent = derived_absent && !wr_metadata.reserved[i];
+    return Py_BuildValue(
+        "{s:I,s:I,s:O,s:O,s:I,s:K,s:K,s:y#,s:I,s:y#,s:O,s:y#,s:O,s:O,s:O}",
+        "struct_size", (unsigned int)wr_metadata.struct_size,
+        "loc_struct_size", (unsigned int)loc->struct_size,
+        "full_size", wr_metadata.struct_size == sizeof(wr_metadata) ? Py_True : Py_False,
+        "loc_full_size", loc->struct_size == sizeof(*loc) ? Py_True : Py_False,
+        "present", (unsigned int)loc->present,
+        "timestamp", (unsigned long long)loc->timestamp,
+        "timescale", (unsigned long long)loc->timescale,
+        "marking", (const char *)loc->marking,
+        (Py_ssize_t)(loc->marking_len <= sizeof(loc->marking) ? loc->marking_len : 0),
+        "audio_level", (unsigned int)loc->audio_level,
+        "video_config", (const char *)wr_video_config.data, (Py_ssize_t)wr_video_config.len,
+        "video_config_null", wr_video_config_null ? Py_True : Py_False,
+        "audio_config", (const char *)wr_audio_config.data, (Py_ssize_t)wr_audio_config.len,
+        "audio_config_null", wr_audio_config_null ? Py_True : Py_False,
+        "derived_absent", derived_absent ? Py_True : Py_False,
+        "loc_reserved_zero", !loc->reserved[0] && !loc->reserved[1] ? Py_True : Py_False);
+}
+
 /* References deliberately NOT released by a fault driver, kept here so the
  * test that arranged the omission can observe the intended outstanding state
  * and then release them. Dropping them on the floor would be a real leak. */
@@ -3028,6 +3390,7 @@ moq_result_t moq_media_sender_write(moq_media_sender_t *s,
     wr_entries++;
     sender_log_add("write");
     wr_seen = true;
+    wr_take_metadata(NULL);
     wr_track_null = (track == NULL);
     wr_track_index = -1;
     for (size_t i = 0; i < send_track_count; i++)
@@ -3062,6 +3425,8 @@ moq_result_t moq_media_sender_write(moq_media_sender_t *s,
     wr_sap_type = (int)obj->sap_type;
 
     if (wr_block_armed) wr_park();
+    /* Read borrowed metadata AFTER the barrier, while the call still owns it. */
+    wr_take_metadata(obj->metadata);
 
     if (wr_result != MOQ_OK) {
         moq_result_t scripted = wr_result;
@@ -3106,6 +3471,7 @@ PyObject *test_write_reset(PyObject *self, PyObject *args)
     memset(&wr_properties, 0, sizeof(wr_properties));
     wr_payload_len = wr_properties_len = 0;
     wr_payload_refs = wr_properties_refs = 0;
+    wr_take_metadata(NULL);
     wr_oracle_limit = false; wr_oracle_limit_reason = NULL;
     wr_block_armed = wr_in_call = wr_gate_timed_out = wr_gate_fault = false;
     wr_released = true;
@@ -3144,9 +3510,11 @@ PyObject *test_write_object(PyObject *self, PyObject *args)
     (void)self; (void)args;
     pthread_mutex_lock(&mutex);
     if (!wr_seen) { pthread_mutex_unlock(&mutex); Py_RETURN_NONE; }
+    PyObject *metadata = wr_metadata_image();
+    if (!metadata) { pthread_mutex_unlock(&mutex); return NULL; }
     PyObject *r = Py_BuildValue(
         "{s:y#,s:n,s:y#,s:n,s:O,s:O,s:O,s:n,s:n,s:O,s:O,s:O,s:K,s:K,s:O,s:K,"
-        "s:O,s:i,s:I,s:I,s:I,s:O,s:O,s:z}",
+        "s:O,s:i,s:I,s:I,s:I,s:O,s:O,s:z,s:O}",
         "payload", (const char *)wr_payload.data, (Py_ssize_t)wr_payload.len,
         "payload_declared_length", (Py_ssize_t)wr_payload_len,
         "properties", (const char *)wr_properties.data,
@@ -3171,7 +3539,9 @@ PyObject *test_write_object(PyObject *self, PyObject *args)
         "properties_refs_at_entry", (unsigned int)wr_properties_refs,
         "full_size", wr_full_size ? Py_True : Py_False,
         "oracle_limit", wr_oracle_limit ? Py_True : Py_False,
-        "oracle_limit_reason", wr_oracle_limit_reason);
+        "oracle_limit_reason", wr_oracle_limit_reason,
+        "metadata", metadata);
+    Py_DECREF(metadata);
     pthread_mutex_unlock(&mutex);
     return r;
 }
@@ -4722,8 +5092,62 @@ PyObject *test_send_track_config(PyObject *self, PyObject *args)
         "content_protection_ref_ids_null", tcfg_cp_ptr_null ? Py_True : Py_False,
         "oracle_limit", tcfg_oracle_limit ? Py_True : Py_False,
         "oracle_limit_reason", tcfg_oracle_limit_reason);
+    if (r) {
+        PyObject *props = PyBytes_FromStringAndSize(
+            (const char *)tcfg_track_properties.data,
+            (Py_ssize_t)tcfg_track_properties.len);
+        if (!props ||
+            PyDict_SetItemString(r, "track_properties", props) < 0 ||
+            PyDict_SetItemString(r, "dynamic_groups",
+                                 tcfg_dynamic_groups ? Py_True : Py_False) < 0) {
+            Py_XDECREF(props);
+            Py_DECREF(r);
+            pthread_mutex_unlock(&mutex);
+            return NULL;
+        }
+        Py_DECREF(props);
+    }
     pthread_mutex_unlock(&mutex);
     return r;
+}
+
+/* The fixture's new-group request: one scripted value per track, taken once. */
+moq_result_t moq_media_sender_take_new_group_request(moq_media_sender_t *s,
+                                                     moq_media_track_t *track,
+                                                     uint64_t *requested_group)
+{
+    pthread_mutex_lock(&mutex);
+    moq_result_t rc = MOQ_ERR_INVAL;
+    for (size_t i = 0; s && track && i < send_track_count; i++) {
+        if (&send_track_pool[i] != track || send_track_owner[i] != s) continue;
+        rc = MOQ_DONE;
+        if (tk_new_group[i] >= 0) {
+            if (requested_group) *requested_group = (uint64_t)tk_new_group[i];
+            tk_new_group[i] = -1;
+            rc = MOQ_OK;
+        }
+        break;
+    }
+    pthread_mutex_unlock(&mutex);
+    return rc;
+}
+
+/* Script a pending new-group request on the track at a pool index. */
+PyObject *test_send_track_new_group(PyObject *self, PyObject *args)
+{
+    (void)self;
+    Py_ssize_t index = 0;
+    long long value = 0;
+    if (!PyArg_ParseTuple(args, "nL", &index, &value)) return NULL;
+    pthread_mutex_lock(&mutex);
+    if (index < 0 || (size_t)index >= send_track_count || value < 0) {
+        pthread_mutex_unlock(&mutex);
+        PyErr_SetString(PyExc_ValueError, "no such fixture track");
+        return NULL;
+    }
+    tk_new_group[index] = value;
+    pthread_mutex_unlock(&mutex);
+    Py_RETURN_NONE;
 }
 
 /* Script the next add/remove outcome. The call and its configuration are still
@@ -4772,7 +5196,7 @@ PyObject *test_sender_cfg_shape(PyObject *self, PyObject *args)
         cfg.callbacks.on_subscriber_left == NULL && cfg.callbacks.on_ready == NULL &&
         cfg.callbacks.on_closed == NULL && cfg.callbacks.on_track_closed == NULL;
     return Py_BuildValue(
-        "{s:n,s:n,s:n,s:I,s:I,s:O,s:i,s:O,s:O}",
+        "{s:n,s:n,s:n,s:I,s:I,s:O,s:i,s:O,s:O,s:I}",
         "cfg_size", (Py_ssize_t)sizeof(cfg),
         "callbacks_size", (Py_ssize_t)sizeof(cfg.callbacks),
         "callbacks_offset", (Py_ssize_t)offsetof(moq_media_sender_cfg_t, callbacks),
@@ -4783,7 +5207,8 @@ PyObject *test_sender_cfg_shape(PyObject *self, PyObject *args)
         "callbacks_pointers_null", pointers_null ? Py_True : Py_False,
         "content_protections_null",
         (cfg.content_protections == NULL && cfg.content_protection_count == 0)
-            ? Py_True : Py_False);
+            ? Py_True : Py_False,
+        "companion_profile", (unsigned int)cfg.companion_profile);
 }
 
 
@@ -4808,6 +5233,7 @@ PyObject *test_sender_reset(PyObject *module, PyObject *args)
     memset(scfg_catalog, 0, sizeof(scfg_catalog));
     scfg_catalog_captured = scfg_catalog_declared = 0;
     scfg_backpressure = 0;
+    scfg_companion = MOQ_MEDIA_COMPANION_AUTO;
     scfg_block_timeout_us = scfg_catalog_refresh_interval_us = 0;
     scfg_queue_max_objects = scfg_queue_max_bytes = 0;
     scfg_pre_ready_max_objects = scfg_pre_ready_max_bytes = 0;
@@ -4922,13 +5348,14 @@ PyObject *test_sender_config(PyObject *module, PyObject *args)
         }
     }
     PyObject *result = Py_BuildValue(
-        "{s:O,s:O,s:n,s:y#,s:n,s:i,s:K,s:I,s:I,s:I,s:I,s:O,s:O,s:O,s:K,s:O,s:O,s:O,s:I,s:O,s:O,s:z,s:O,s:z,s:O,s:z}",
+        "{s:O,s:O,s:n,s:y#,s:n,s:i,s:I,s:K,s:I,s:I,s:I,s:I,s:O,s:O,s:O,s:K,s:O,s:O,s:O,s:I,s:O,s:O,s:z,s:O,s:z,s:O,s:z}",
         "namespace", parts,
         "namespace_declared_lengths", declared,
         "namespace_declared_count", (Py_ssize_t)scfg_declared_count,
         "catalog_track", (const char *)scfg_catalog, (Py_ssize_t)scfg_catalog_captured,
         "catalog_declared_length", (Py_ssize_t)scfg_catalog_declared,
         "backpressure", scfg_backpressure,
+        "companion_profile", (unsigned int)scfg_companion,
         "block_timeout_us", (unsigned long long)scfg_block_timeout_us,
         "queue_max_objects", (unsigned int)scfg_queue_max_objects,
         "queue_max_bytes", (unsigned int)scfg_queue_max_bytes,

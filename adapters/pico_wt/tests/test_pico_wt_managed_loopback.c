@@ -54,6 +54,7 @@
 
 #include <moq/moq.h>
 #include <moq/pico_wt_managed.h>
+#include <picoquic.h>
 
 #include <stdatomic.h>
 #include <stdint.h>
@@ -1186,6 +1187,101 @@ static run_status_t run_nego(const char *cert, const char *key,
     return got ? RUN_OK : RUN_HARD;
 }
 
+/* Draft 22 needs this picoquic's exact stream terminal outcomes
+ * (PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1). Without them the draft-22
+ * rows check the refusal instead: a facade whose WT-Protocol offer names
+ * moqt-22 is refused at create with MOQ_ERR_UNSUPPORTED and nothing starts,
+ * while a server supporting only {18, 16} is created as usual. */
+#if defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) && \
+    PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1
+/* Negotiated loopback with explicit offers: the client offers `client_offer`,
+ * the server supports `server_list`; the session establishes at `want` and
+ * media flows (used for draft-22 and its fallback to 18 and 16). */
+static run_status_t run_nego_ex(const char *cert, const char *key,
+                                int port, int timeout_sec,
+                                const char *client_offer,
+                                const char *server_list,
+                                moq_version_t want)
+{
+    server_app_t sapp; memset(&sapp, 0, sizeof(sapp));
+    moq_pico_wt_managed_t *srv =
+        make_server_ex(cert, key, port, &sapp, server_list);
+    if (!srv) return RUN_RETRY;
+    for (int i = 0; i < 3; i++) moq_pico_wt_managed_wait(srv, 100000);
+
+    client_app_t capp; memset(&capp, 0, sizeof(capp));
+    atomic_init(&capp.got_object, 0);
+    moq_pico_wt_managed_t *cli = make_client_ex2(
+        moq_pico_wt_managed_local_port(srv), &capp, 0, client_offer);
+    if (!cli) {
+        moq_pico_wt_managed_stop(srv);
+        moq_pico_wt_managed_destroy(srv);
+        return RUN_RETRY;
+    }
+
+    wait_for_object(cli, &capp, timeout_sec);
+    int got = atomic_load(&capp.got_object);
+    int fatal = moq_pico_wt_managed_is_fatal(cli) ||
+                moq_pico_wt_managed_is_fatal(srv);
+    moq_pico_wt_managed_stop(cli);
+    int reached_setup = capp.subscribed;
+    if (!got && !reached_setup && !fatal) {
+        moq_pico_wt_managed_destroy(cli);
+        moq_pico_wt_managed_stop(srv);
+        moq_pico_wt_managed_destroy(srv);
+        fprintf(stderr, "[nego_ex] port %d: no setup reached (retryable)\n", port);
+        return RUN_RETRY;
+    }
+    CHECK(got);
+    CHECK(!fatal);
+    CHECK(moq_pico_wt_managed_negotiated_version(cli) == want);
+    CHECK(moq_pico_wt_managed_negotiated_version(srv) == want);
+    moq_pico_wt_managed_destroy(cli);
+    moq_pico_wt_managed_stop(srv);
+    moq_pico_wt_managed_destroy(srv);
+    return got ? RUN_OK : RUN_HARD;
+}
+
+#else
+static run_status_t run_nego_ex_refused(const char *cert, const char *key,
+                                        int port, const char *client_offer,
+                                        const char *server_list)
+{
+    int before = failures;
+    moq_pico_wt_managed_cfg_t cfg;
+    moq_pico_wt_managed_cfg_init(&cfg);
+    cfg.alloc = moq_alloc_default();
+    cfg.perspective = MOQ_PERSPECTIVE_SERVER;
+    cfg.cert_path = cert;
+    cfg.key_path = key;
+    cfg.port = port;
+    cfg.on_pump = server_pump;
+    cfg.wt_protocols = server_list;
+    moq_pico_wt_managed_t *srv = (moq_pico_wt_managed_t *)(uintptr_t)1;
+    moq_result_t rc = moq_pico_wt_managed_create(&cfg, &srv);
+    if (strstr(server_list, "moqt-22")) {
+        CHECK(rc == MOQ_ERR_UNSUPPORTED && srv == NULL);
+    } else {
+        if (rc != MOQ_OK) return RUN_RETRY;   /* port in use */
+        CHECK(srv != NULL);
+        moq_pico_wt_managed_stop(srv);
+        moq_pico_wt_managed_destroy(srv);
+    }
+    moq_pico_wt_managed_cfg_init(&cfg);
+    cfg.alloc = moq_alloc_default();
+    cfg.perspective = MOQ_PERSPECTIVE_CLIENT;
+    cfg.host = "127.0.0.1";
+    cfg.port = port;
+    cfg.insecure_skip_verify = true;
+    cfg.on_pump = client_pump;
+    cfg.wt_protocols = client_offer;
+    moq_pico_wt_managed_t *cli = (moq_pico_wt_managed_t *)(uintptr_t)1;
+    CHECK(moq_pico_wt_managed_create(&cfg, &cli) == MOQ_ERR_UNSUPPORTED);
+    CHECK(cli == NULL);
+    return failures == before ? RUN_OK : RUN_HARD;
+}
+#endif
+
 /* No-overlap negotiation: the client offers only moqt-18 against a
  * moqt-16-only server; the server refuses the CONNECT (explicit non-2xx) and
  * the client observes a deterministic terminal fatal -- never a silent
@@ -1708,18 +1804,23 @@ int main(int argc, char **argv)
     int alpn_close_18 = !strcmp(mode, "alpn_close_18");
     int datagram = !strcmp(mode, "datagram");
     int datagram_18 = !strcmp(mode, "datagram_18");
+    int loopback_22 = !strcmp(mode, "loopback_22");
+    int nego_22_18 = !strcmp(mode, "nego_22_18");
+    int nego_22_16 = !strcmp(mode, "nego_22_16");
     if (!refuse && !close_mode && !stop_close && !pump_exit_close && !nego &&
         !nego_refuse && !nego_legacy && !nego_legacy_18 && !no_rsa &&
         !bigobj && !bigobj_smallwin && !bigobj_drain && !announce &&
         !announce_18 && !announce_done_18 && !announce_done_no_rsa &&
         !loopback_18 && !alpn_close_18 && !datagram && !datagram_18 &&
+        !loopback_22 && !nego_22_18 && !nego_22_16 &&
         strcmp(mode, "loopback") != 0) {
         fprintf(stderr, "unknown --mode '%s' (expected loopback|refuse|close|"
                 "stop_close|pump_exit_close|nego|nego_refuse|nego_legacy|"
                 "nego_legacy_18|"
                 "no_reset_stream_at|bigobj|bigobj_smallwin|bigobj_drain|"
                 "announce|announce_18|announce_done_18|announce_done_no_rsa|"
-                "loopback_18|alpn_close_18|datagram|datagram_18)\n", mode);
+                "loopback_18|alpn_close_18|datagram|datagram_18|loopback_22|"
+                "nego_22_18|nego_22_16)\n", mode);
         return 2;
     }
 
@@ -1759,6 +1860,30 @@ int main(int argc, char **argv)
            : alpn_close_18  ? run_alpn_close_18(cert, key, ports[i], 6)
            : datagram       ? run_datagram(cert, key, ports[i], 6, NULL)
            : datagram_18    ? run_datagram(cert, key, ports[i], 6, "moqt-18")
+#if defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) && \
+    PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1
+           : loopback_22    ? run_nego_ex(cert, key, ports[i], 6,
+                                          "moqt-22, moqt-18, moqt-16",
+                                          "moqt-22, moqt-18, moqt-16",
+                                          MOQ_VERSION_DRAFT_22)
+           : nego_22_18     ? run_nego_ex(cert, key, ports[i], 6,
+                                          "moqt-22, moqt-18, moqt-16",
+                                          "moqt-18, moqt-16",
+                                          MOQ_VERSION_DRAFT_18)
+           : nego_22_16     ? run_nego_ex(cert, key, ports[i], 6,
+                                          "moqt-22, moqt-18, moqt-16",
+                                          "moqt-16", MOQ_VERSION_DRAFT_16)
+#else
+           : loopback_22    ? run_nego_ex_refused(cert, key, ports[i],
+                                          "moqt-22, moqt-18, moqt-16",
+                                          "moqt-22, moqt-18, moqt-16")
+           : nego_22_18     ? run_nego_ex_refused(cert, key, ports[i],
+                                          "moqt-22, moqt-18, moqt-16",
+                                          "moqt-18, moqt-16")
+           : nego_22_16     ? run_nego_ex_refused(cert, key, ports[i],
+                                          "moqt-22, moqt-18, moqt-16",
+                                          "moqt-16")
+#endif
            : pump_exit_close ? run_loopback_proto(cert, key, ports[i], 6,
                                                   NULL, 1)
                             : run_loopback_proto(cert, key, ports[i], 6,

@@ -16,6 +16,40 @@
  * (clean terminal exchanges still retire their slot promptly). */
 #define MOQ_SIM_MAX_BIDI_STREAMS 64
 
+struct sim_delay_entry;
+
+/* What a receiving session's WOULD_BLOCK left owed on one ordered input
+ * (a data stream, one half of a request bidi, or the control channel). */
+typedef enum sim_hold {
+    SIM_HOLD_NONE = 0,
+    /* The session retained the refused bytes (and FIN, hold_fin): a stream
+     * resumes with an empty re-feed, the control channel with
+     * moq_session_process_pending, once the session's queue has room. */
+    SIM_HOLD_RETAINED,
+    /* The session did not admit the data stream and retained nothing: the
+     * refused chunk heads the held queue and is delivered again as it was. */
+    SIM_HOLD_REDELIVER,
+    /* The session recorded the RESET and owes its closure: the same reset is
+     * delivered again with hold_code. */
+    SIM_HOLD_RESET,
+} sim_hold_t;
+
+/* Receive-side backpressure for one ordered input. While a refusal is owed
+ * (hold), every later chunk waits in head..tail in order, as a transport
+ * pauses a stream's reads: nothing written is dropped, and the step loop
+ * resumes the input once the session accepts again. A STOP_SENDING the
+ * session refused is owed separately (stop_owed); it is not ordered with
+ * the bytes. */
+typedef struct sim_inbound {
+    sim_hold_t              hold;
+    bool                    hold_fin;
+    bool                    stop_owed;
+    uint64_t                hold_code;
+    uint64_t                stop_code;
+    struct sim_delay_entry *head;
+    struct sim_delay_entry *tail;
+} sim_inbound_t;
+
 typedef struct moq_sim_stream_map {
     uint64_t            sender_ref;
     uint64_t            receiver_ref;
@@ -24,6 +58,9 @@ typedef struct moq_sim_stream_map {
     bool                terminal_pending;
     uint64_t            generation;
     uint64_t            last_due_us;
+    /* The receiver's backpressure on this stream; stop_owed is a STOP
+     * refused by the sender's session. */
+    sim_inbound_t       in;
 } moq_sim_stream_map_t;
 
 typedef struct moq_sim_bidi_map {
@@ -40,6 +77,8 @@ typedef struct moq_sim_bidi_map {
     bool                responder_fin;
     uint64_t            generation;
     uint64_t            last_due_us;
+    /* Backpressure per receiving session, indexed by sim_side(). */
+    sim_inbound_t       in[2];
 } moq_sim_bidi_map_t;
 
 typedef enum sim_delay_kind {
@@ -80,6 +119,8 @@ struct moq_simpair {
     uint64_t         step;
     moq_sim_trace_fn trace_fn;
     void            *trace_ctx;
+    bool             trace_hash_enabled;
+    uint64_t         trace_hash;
     moq_sim_stream_map_t stream_map[MOQ_SIM_MAX_DATA_STREAMS];
     moq_sim_bidi_map_t   bidi_map[MOQ_SIM_MAX_BIDI_STREAMS];
     uint64_t         next_rx_ref;
@@ -95,6 +136,12 @@ struct moq_simpair {
      * so each chunk needs a unique deterministic decision index. */
     uint64_t          delay_decision_seq;
     uint64_t          last_control_due_us[2];
+    /* Control-channel backpressure per receiving session (sim_side()), and
+     * whether that session's peer drives control over a unidirectional
+     * stream pair -- where, as in the transport bridge, a blocked control
+     * channel also pauses the session's other unidirectional inputs. */
+    sim_inbound_t     ctrl_in[2];
+    bool              ctrl_uni_pair[2];
     moq_version_t     version;   /* both sessions; 0 = session default */
 };
 
@@ -285,6 +332,80 @@ moq_result_t deliver_or_delay_data_stop(
 moq_result_t sim_delay_deliver_matured(moq_simpair_t *sp,
                                        size_t *delivered,
                                        size_t *to_server);
+
+/* -- simpair_hold.c ------------------------------------------------- *
+ * Receive-side backpressure: every session input that returns
+ * MOQ_ERR_WOULD_BLOCK is held, never dropped, and resumed by
+ * sim_resume_held at the start of each step. Each *_input function feeds
+ * the session now or queues behind an owed refusal; a WOULD_BLOCK is
+ * recorded and MOQ_OK returned. Any other negative result is returned. */
+
+static inline int sim_side(moq_perspective_t p)
+{
+    return p == MOQ_PERSPECTIVE_CLIENT ? 0 : 1;
+}
+
+moq_result_t sim_control_input(
+    moq_simpair_t *sp, moq_session_t *to, const uint8_t *data, size_t len,
+    moq_perspective_t from, moq_perspective_t to_persp);
+
+moq_result_t sim_data_input(
+    moq_simpair_t *sp, moq_session_t *to, moq_stream_ref_t ref,
+    const uint8_t *data, size_t len, bool fin,
+    int dslot, moq_perspective_t from, moq_perspective_t to_persp);
+
+moq_result_t sim_data_reset_input(
+    moq_simpair_t *sp, moq_session_t *to, moq_stream_ref_t ref,
+    uint64_t error_code, int dslot,
+    moq_perspective_t from, moq_perspective_t to_persp);
+
+moq_result_t sim_data_stop_input(
+    moq_simpair_t *sp, moq_session_t *sender_session,
+    moq_stream_ref_t sender_ref, uint64_t error_code,
+    int dslot, moq_perspective_t from, moq_perspective_t sender_persp);
+
+moq_result_t sim_bidi_input(
+    moq_simpair_t *sp, moq_session_t *to, moq_stream_ref_t ref,
+    const uint8_t *data, size_t len, bool fin,
+    int bslot, moq_perspective_t from, moq_perspective_t to_persp);
+
+moq_result_t sim_bidi_reset_input(
+    moq_simpair_t *sp, moq_session_t *to, moq_stream_ref_t ref,
+    uint64_t error_code, int bslot,
+    moq_perspective_t from, moq_perspective_t to_persp);
+
+moq_result_t sim_bidi_stop_input(
+    moq_simpair_t *sp, moq_session_t *to, moq_stream_ref_t ref,
+    uint64_t error_code, int bslot,
+    moq_perspective_t from, moq_perspective_t to_persp);
+
+/* A datagram the session refuses is dropped, as the bridge drops it. */
+moq_result_t sim_datagram_input(
+    moq_simpair_t *sp, moq_session_t *to, const uint8_t *data, size_t len,
+    moq_perspective_t from, moq_perspective_t to_persp);
+
+/* Resume every held input: the control channels first, then each stream
+ * (owed refusal, then held chunks in order, then an owed STOP). Counts each
+ * input that progressed toward its receiving direction. */
+moq_result_t sim_resume_held(moq_simpair_t *sp,
+                             size_t *to_server, size_t *to_client);
+
+/* Record a FIN on the sender's half of a bidi; retire once both are closed. */
+void sim_bidi_mark_fin(moq_simpair_t *sp, int bslot, moq_perspective_t from);
+
+/* Retire a data-stream slot: releases its held inputs and owed refusals and
+ * bumps its generation, so delayed inputs for it become stale. */
+void sim_stream_slot_retire(moq_simpair_t *sp, int slot);
+
+/* Mark a slot inactive and release its held inputs, keeping its generation
+ * (delayed inputs for it stay deliverable). */
+void sim_stream_slot_deactivate(moq_simpair_t *sp, int slot);
+
+/* Retire a bidi slot, releasing both halves' held inputs. */
+void sim_bidi_slot_retire(moq_simpair_t *sp, int bslot);
+
+/* Release every held input (pair teardown). */
+void sim_held_clear(moq_simpair_t *sp);
 
 /* -- simpair_pump.c -------------------------------------------------- */
 

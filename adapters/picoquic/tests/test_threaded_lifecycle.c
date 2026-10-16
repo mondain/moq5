@@ -60,6 +60,7 @@ typedef struct {
 static int window_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
                     uint64_t now, void *vctx)
 {
+    (void)t;
     (void)lane;
     (void)now;
     window_ctx_t *w = (window_ctx_t *)vctx;

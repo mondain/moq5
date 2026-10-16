@@ -13,6 +13,7 @@
 #include <time.h>
 
 #include "wtquic_contract_pair.h"
+#include "wtq_loopback_port.h"
 
 #include <moq/rcbuf.h>
 
@@ -362,15 +363,24 @@ int wtqc_pair_setup(wtqc_pair_t *p, const wtqc_pair_cfg_t *cfg)
 
     wtq_msquic_listener_cfg_t lcfg = WTQ_MSQUIC_LISTENER_CFG_INIT;
     lcfg.bind_address = "127.0.0.1";
-    lcfg.port = 0;
     lcfg.cert_file = cfg->cert;
     lcfg.key_file = cfg->key;
     lcfg.paths = &sv;
     lcfg.path_count = 1;
     lcfg.events = wtq_test_attach_events();
     lcfg.user = &p->server.attach;
-    if (wtq_msquic_listener_start(p->env, &lcfg, &p->listener) != WTQ_OK)
+    /* MsQuic listens on the dual-stack wildcard and the client dials
+     * 127.0.0.1, so the port comes from the IPv4 allocator
+     * (wtq_loopback_port.h) unless the caller names one */
+    if (cfg->listen_port != 0) {
+        lcfg.port = cfg->listen_port;
+        if (wtq_msquic_listener_start(p->env, &lcfg, &p->listener) != WTQ_OK) {
+            p->listener = NULL;
+            return -1;
+        }
+    } else if (wtqt_listener_start(p->env, &lcfg, &p->listener) != WTQ_OK) {
         return -1;
+    }
 
     wtq_connect_config_t wcfg = WTQ_CONNECT_CONFIG_INIT;
     wcfg.authority = "localhost";

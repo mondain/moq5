@@ -74,12 +74,51 @@
  * which then stays at the caller's limit, and the conflict is not detectable
  * through picoquic's public API.
  *
+ * Transport parameters are fixed at attach. Attach (moq_pq_conn_create) only
+ * once the connection's local transport parameters are final -- for a client,
+ * after any picoquic_set_transport_parameters; for a server, as picoquic
+ * created the connection from the context defaults -- and never call
+ * picoquic_set_transport_parameters on an attached connection: it replaces
+ * the local parameters wholesale and restarts picoquic's per-connection
+ * stream limits while the streams it already counted stay counted, under
+ * this adapter's receive accounting. Create refuses a connection whose
+ * local transport parameters cannot be read, before taking anything. The
+ * adapter samples initial_max_stream_id_unidir at attach and fails the
+ * connection closed (the transport-error path) when a service pass finds it
+ * changed or unreadable. That check sees only a change of that one value;
+ * it does not see other parameters or the stream-credit history before
+ * attach, so attaching to a connection that has already carried peer streams
+ * is not supported.
+ *
  * One moq_pq_conn_t per MoQ session/QUIC connection. The adapter does
  * not own the picoquic context or connection — those are created and
  * driven by the application's event loop.
  *
  * Thread safety: none. All calls must be serialized on the same thread
  * that drives picoquic (the callback thread).
+ *
+ * Reliable resets: when both endpoints advertise the reset_stream_at
+ * transport parameter (picoquic_set_default_tp_value(quic,
+ * picoquic_tp_reset_stream_at, 1) before the connection is created; the
+ * threaded facade sets it), a data stream reset keeps its stream header
+ * with RESET_STREAM_AT; otherwise it is a plain RESET_STREAM. A reset whose
+ * header picoquic has not sent yet is completed by a later moq_pq_service()
+ * or picoquic callback, once picoquic has taken the header.
+ *
+ * Transport binding: a session whose wire profile requires one
+ * (moq_session_binding_requirements() != 0, e.g. draft-22) must be bound by
+ * the attaching caller with moq_session_bind_transport() before
+ * moq_session_start(): kind MOQ_BINDING_RAW_QUIC, the handshake-complete
+ * fact once the connection is ready, QUIC DATAGRAM support from the local
+ * and remote transport parameters (picoquic_get_transport_parameters(cnx,
+ * 1 / 0)->max_datagram_frame_size: receive follows the local one, send the
+ * peer's), and the connection target -- the client's authority and
+ * path/query, the server's accept_uri policy. A profile without
+ * requirements (draft-16, draft-18) accepts the same binding optionally,
+ * with no facts needed: a client connecting to a moqt URI binds its target
+ * before moq_session_start() so its setup names it. The adapter never binds
+ * or starts the session; the threaded facade in <moq/picoquic_threaded.h>
+ * does.
  */
 
 #include <moq/session.h>

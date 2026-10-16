@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import TYPE_CHECKING, TypeVar, TypedDict
 
@@ -46,11 +46,26 @@ class WtProfile(IntEnum):
     D13_14_COMPAT = _constants["WT_PROFILE_D13_14_COMPAT"]
 
 
+class UriMode(IntEnum):
+    """How the endpoint reads the URL.
+
+    STANDARD is opt-in and reads it as the MOQT URI scheme defines it (port 443 when
+    omitted; the URL's own path, or "/", is the WebTransport path) and takes
+    no wt_path override. LEGACY is the default and original reading: lowercase moqt, moq
+    and https schemes, port 4433 for moqt and moq, the wt_path override and
+    the "/moq" WebTransport default.
+    """
+
+    STANDARD = _constants["ENDPOINT_URI_STANDARD"]
+    LEGACY = _constants["ENDPOINT_URI_LEGACY"]
+
+
 class Version(IntEnum):
     """Named wire versions; availability is checked by the native service."""
 
     DRAFT_16 = _constants["VERSION_DRAFT_16"]
     DRAFT_18 = _constants["VERSION_DRAFT_18"]
+    DRAFT_22 = _constants["VERSION_DRAFT_22"]
 
 
 class EndpointState(IntEnum):
@@ -129,6 +144,11 @@ class EndpointConfig:
     Text is UTF-8. None or an empty optional string selects the native default.
     A version tuple or list is copied in preference order; empty means AUTO.
     handshake_timeout_us bounds only the transport handshake, not MoQ SETUP.
+    uri_mode defaults to LEGACY, preserving the wt_path override and native
+    port/path defaults. Explicit STANDARD uses the URL's WebTransport path
+    and refuses a non-empty wt_path here before any native effect.
+    preferred_version (None for the library default) names the version an
+    AUTO offer places first, so it is refused beside an explicit versions list.
     """
 
     url: str
@@ -140,6 +160,8 @@ class EndpointConfig:
     wt_path: str | None = None
     wt_profile: WtProfile = WtProfile.BACKEND_DEFAULT
     handshake_timeout_us: int = 0
+    uri_mode: UriMode = UriMode.LEGACY
+    preferred_version: int | None = None
 
     def __post_init__(self) -> None:
         _text(self.url, "url")
@@ -170,6 +192,24 @@ class EndpointConfig:
                 self.handshake_timeout_us, "handshake_timeout_us", _INT64_MAX
             ),
         )
+        object.__setattr__(
+            self, "uri_mode", UriMode(_integer(self.uri_mode, "uri_mode"))
+        )
+        if self.uri_mode is UriMode.STANDARD and self.wt_path:
+            raise ValueError(
+                "wt_path is a UriMode.LEGACY override; under UriMode.STANDARD "
+                "the url carries the WebTransport path"
+            )
+        if self.preferred_version is not None:
+            preferred = _bounded_integer(
+                self.preferred_version, "preferred_version", _UINT32_MAX, minimum=1
+            )
+            if versions:
+                raise ValueError(
+                    "preferred_version orders only the automatic offer; an "
+                    "explicit versions list already states its order"
+                )
+            object.__setattr__(self, "preferred_version", preferred)
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,6 +264,76 @@ class StartMode(IntEnum):
     NEXT_GROUP = _constants["MEDIA_START_NEXT_GROUP"]
 
 
+class CompanionProfile(IntEnum):
+    """Media dialect. AUTO (the default) follows the negotiated draft: the
+    legacy dialect on draft 16/18, the draft-22 dialect on draft 22. An
+    explicit dialect refuses the other drafts."""
+
+    LEGACY_MSF01_LOC01 = _constants["MEDIA_COMPANION_LEGACY_MSF01_LOC01"]
+    D22_MSF01_LOC04_PUBLIC = _constants["MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC"]
+    AUTO = _constants["MEDIA_COMPANION_AUTO"]
+
+
+class LocationFilterKind(IntEnum):
+    NONE = _constants["LOCATION_FILTER_NONE"]
+    RELATIVE_GROUP = _constants["LOCATION_FILTER_RELATIVE_GROUP"]
+    ABSOLUTE_START = _constants["LOCATION_FILTER_ABSOLUTE_START"]
+    GROUP_END = _constants["LOCATION_FILTER_GROUP_END"]
+    OBJECT_END = _constants["LOCATION_FILTER_OBJECT_END"]
+    NEXT_OBJECT = _constants["LOCATION_FILTER_NEXT_OBJECT"]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class LocationFilter:
+    """Semantic locations: absolute ends, inclusive end_object, full uint64.
+
+    NONE explicitly removes a constraint; None at the call site omits it.
+    RELATIVE_GROUP offset 0 selects next, 1 current, 2 preceding group.
+    Inactive fields are ignored by native validation/resolution.
+    """
+
+    kind: LocationFilterKind = LocationFilterKind.NONE
+    relative_group_offset: int = 0
+    start_group: int = 0
+    start_object: int = 0
+    end_group: int = 0
+    end_object: int = 0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "kind", LocationFilterKind(_integer(self.kind, "kind")))
+        for name in ("relative_group_offset", "start_group", "start_object", "end_group", "end_object"):
+            object.__setattr__(self, name, _bounded_integer(getattr(self, name), name, _UINT64_MAX))
+
+
+class FillGroupOrder(IntEnum):
+    ASCENDING = _constants["GROUP_ORDER_ASCENDING"]
+    DESCENDING = _constants["GROUP_ORDER_DESCENDING"]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class FillConfig:
+    """One initial fill request; an empty value still requests a child.
+
+    None overrides inherit; timeout_ms=0 permits only immediately available
+    objects, not a child-lifetime timer. Native service checks eligibility.
+    """
+
+    priority: int | None = None
+    group_order: FillGroupOrder | None = None
+    timeout_ms: int | None = None
+    location: LocationFilter | None = None
+
+    def __post_init__(self) -> None:
+        if self.priority is not None:
+            object.__setattr__(self, "priority", _bounded_integer(self.priority, "priority", 255))
+        if self.group_order is not None:
+            object.__setattr__(self, "group_order", FillGroupOrder(_integer(self.group_order, "group_order")))
+        if self.timeout_ms is not None:
+            object.__setattr__(self, "timeout_ms", _bounded_integer(self.timeout_ms, "timeout_ms", _UINT64_MAX))
+        if self.location is not None and not isinstance(self.location, LocationFilter):
+            raise TypeError("location must be LocationFilter or None")
+
+
 class PollOutcome(IntEnum):
     """The non-item results of a poll, as exact native codes. CLOSED means the
     polled queue is empty AND the receiver is terminal, never aggregate EOF."""
@@ -254,6 +364,59 @@ class TrackState(IntEnum):
     PAUSED_APP = _constants["MEDIA_TRACK_STATE_PAUSED_APP"]
     PAUSED_FLOW = _constants["MEDIA_TRACK_STATE_PAUSED_FLOW"]
     ENDED = _constants["MEDIA_TRACK_STATE_ENDED"]
+
+
+class ExtendedTrackEventKind(IntEnum):
+    """Additive names without changing TrackEventKind's original members."""
+
+    ADDED = TrackEventKind.ADDED
+    UPDATED = TrackEventKind.UPDATED
+    REMOVED = TrackEventKind.REMOVED
+    ENDED = TrackEventKind.ENDED
+    CATALOG_READY = TrackEventKind.CATALOG_READY
+    UPDATE_OK = TrackEventKind.UPDATE_OK
+    PARSE_DROP = TrackEventKind.PARSE_DROP
+    LOCAL_FAILURE = _constants["MEDIA_TRACK_LOCAL_FAILURE"]
+    FILL_TERMINAL = _constants["MEDIA_TRACK_FILL_TERMINAL"]
+    DELIVERY_LOCAL_FAILURE = _constants["MEDIA_TRACK_DELIVERY_LOCAL_FAILURE"]
+
+
+class ExtendedTrackState(IntEnum):
+    DISCOVERED = TrackState.DISCOVERED
+    PENDING = TrackState.PENDING
+    ACTIVE = TrackState.ACTIVE
+    PAUSED_APP = TrackState.PAUSED_APP
+    PAUSED_FLOW = TrackState.PAUSED_FLOW
+    ENDED = TrackState.ENDED
+    FAILED = _constants["MEDIA_TRACK_STATE_FAILED"]
+
+
+class FillReason(IntEnum):
+    COMPLETE = _constants["FILL_COMPLETE"]
+    NO_STREAM = _constants["FILL_NO_STREAM"]
+    LOCAL_CANCELLED = _constants["FILL_LOCAL_CANCELLED"]
+    PEER_CANCELLED_OR_RESET = _constants["FILL_PEER_CANCELLED_OR_RESET"]
+    LOCAL_ABORTED = _constants["FILL_LOCAL_ABORTED"]
+    PARENT_REJECTED = _constants["FILL_PARENT_REJECTED"]
+    PARENT_TERMINATED = _constants["FILL_PARENT_TERMINATED"]
+
+
+class FillErrorDomain(IntEnum):
+    NONE = _constants["FILL_ERROR_NONE"]
+    STREAM = _constants["FILL_ERROR_STREAM"]
+    PARENT_REQUEST = _constants["FILL_ERROR_PARENT_REQUEST"]
+    PARENT_DONE = _constants["FILL_ERROR_PARENT_DONE"]
+
+
+@dataclass(frozen=True, slots=True)
+class FillTerminal:
+    """One child's terminal, not parent END_OF_TRACK. Partial fields are None;
+    a zero error_code with STREAM domain is a real failure code, not success."""
+
+    initiating_request_id: int | None
+    reason: FillReason | int | None
+    error_domain: FillErrorDomain | int | None
+    error_code: int | None
 
 
 class ReceiverFatal(IntEnum):
@@ -308,6 +471,7 @@ class ReceiverConfig:
     max_objects: int = 0
     max_bytes: int = 0
     max_track_events: int = 0
+    companion_profile: CompanionProfile = CompanionProfile.AUTO
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "namespace", _namespace(self.namespace))
@@ -320,6 +484,9 @@ class ReceiverConfig:
             raise TypeError("auto_subscribe must be bool")
         object.__setattr__(
             self, "time_mode", TimeMode(_integer(self.time_mode, "time_mode"))
+        )
+        object.__setattr__(
+            self, "companion_profile", CompanionProfile(_integer(self.companion_profile, "companion_profile"))
         )
         object.__setattr__(
             self, "max_objects", _bounded_integer(self.max_objects, "max_objects", _MAX_OBJECTS)
@@ -362,6 +529,7 @@ class ReceiverStats:
     paused: bool
     catalog_drops: int | None
     catalog_complete: bool | None
+    tracks_malformed: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -582,6 +750,42 @@ class CmafSample:
     composition_offset: int
 
 
+class MediaTimeDomain(IntEnum):
+    NONE = _constants["MEDIA_TIME_DOMAIN_NONE"]
+    UNIX_US = _constants["MEDIA_TIME_DOMAIN_UNIX_US"]
+    APPLICATION_MEDIA = _constants["MEDIA_TIME_DOMAIN_APPLICATION_MEDIA"]
+
+
+class DeliveryOrigin(IntEnum):
+    LIVE = _constants["MEDIA_DELIVERY_LIVE"]
+    FILL = _constants["MEDIA_DELIVERY_FILL"]
+
+
+@dataclass(frozen=True, slots=True)
+class LocMetadata:
+    """Copied effective LOC fields. None is absent; b'' is present-empty.
+    Raw ticks/scale/marking and the presence mask are never reinterpreted."""
+
+    present: int
+    timestamp: int | None
+    timescale: int | None
+    marking: bytes | None
+    audio_level: int | None
+    video_config: bytes | None
+    audio_config: bytes | None
+
+
+@dataclass(frozen=True, slots=True)
+class MediaMetadata:
+    """Native time-domain classification; time_us is not necessarily UNIX.
+    None means no conversion/independence observation, never zero/false."""
+
+    time_domain: MediaTimeDomain | int
+    time_us: int | None
+    independent: bool | None
+    loc: LocMetadata | None
+
+
 @dataclass(frozen=True, slots=True)
 class MediaObject:
     """One dequeued media object, fully owned: every byte and sample is a
@@ -592,7 +796,9 @@ class MediaObject:
     object carried none. RAW media is `payload` (fragment empty); CMAF media
     is the whole `fragment` with the mdat slice at `mdat_offset`/`mdat_len`
     and its `samples` (payload empty). Unknown `status`/`packaging` values
-    are kept as integers and their bytes are not interpreted."""
+    are kept as integers and their bytes are not interpreted. Additive
+    observations are keyword-only and do not change legacy equality/hash;
+    compare their values explicitly when they matter."""
 
     track: Track
     config_generation: int
@@ -610,6 +816,16 @@ class MediaObject:
     mdat_offset: int
     mdat_len: int
     samples: tuple[CmafSample, ...]
+    group_id: int | None = field(default=None, compare=False, kw_only=True)
+    subgroup_id: int | None = field(default=None, compare=False, kw_only=True)
+    object_id: int | None = field(default=None, compare=False, kw_only=True)
+    publisher_priority: int | None = field(default=None, compare=False, kw_only=True)
+    has_subgroup: bool | None = field(default=None, compare=False, kw_only=True)
+    metadata: MediaMetadata | None = field(default=None, compare=False, kw_only=True)
+    object_properties: bytes | None = field(default=None, compare=False, kw_only=True)
+    track_properties: bytes | None = field(default=None, compare=False, kw_only=True)
+    delivery_origin: DeliveryOrigin | int | None = field(default=None, compare=False, kw_only=True)
+    initiating_request_id: int | None = field(default=None, compare=False, kw_only=True)
 
     @property
     def is_status_only(self) -> bool:
@@ -623,7 +839,10 @@ class TrackEvent:
     """One dequeued track event. `track`/`description` are None for
     CATALOG_READY; `largest`/`expires_ms` are UPDATE_OK observations present
     only when the native stamped prefix covers them; `parse_drop` is present
-    for PARSE_DROP only."""
+    for PARSE_DROP only. DELIVERY_LOCAL_FAILURE carries local_result and
+    delivery_origin; only FILL has a delivery_initiating_request_id (zero is
+    valid). Absent complete fields remain None. The keyword-only views
+    preserve legacy equality/hash and positional construction/patterns."""
 
     kind: TrackEventKind | int
     track: Track | None
@@ -631,6 +850,15 @@ class TrackEvent:
     largest: tuple[int, int] | None
     expires_ms: int | None
     parse_drop: ParseDrop | None
+    local_result: int | None = field(default=None, compare=False, kw_only=True)
+    fill_terminal: FillTerminal | None = field(default=None, compare=False, kw_only=True)
+    delivery_origin: DeliveryOrigin | int | None = field(default=None, compare=False, kw_only=True)
+    delivery_initiating_request_id: int | None = field(default=None, compare=False, kw_only=True)
+
+    @property
+    def kind_extended(self) -> ExtendedTrackEventKind | int:
+        """Named new observations; kind retains its legacy enum/int behavior."""
+        return _known_or_int(ExtendedTrackEventKind, self.kind)
 
 
 # -- sender -------------------------------------------------------------------
@@ -725,6 +953,44 @@ class WriteOutcome(IntEnum):
     CLOSED = _constants["ERR_CLOSED"]
 
 
+_SEND_LOC_FIELDS = (
+    ("timestamp", _constants["LOC_METADATA_HAS_TIMESTAMP"], _UINT64_MAX),
+    ("timescale", _constants["LOC_METADATA_HAS_TIMESCALE"], _UINT64_MAX),
+    ("marking", _constants["LOC_METADATA_HAS_MARKING"], None),
+    ("audio_level", _constants["LOC_METADATA_HAS_AUDIO_LEVEL"], 0xff),
+    ("video_config", _constants["LOC_METADATA_HAS_VIDEO_CONFIG"], None),
+    ("audio_config", _constants["LOC_METADATA_HAS_AUDIO_CONFIG"], None),
+)
+_SEND_LOC_MASK = sum(flag for _, flag, _ in _SEND_LOC_FIELDS)
+
+
+def _loc_metadata_arguments(value: LocMetadata | None) -> tuple | None:
+    """Validate outbound use only and retain immutable native-call inputs."""
+    if value is None:
+        return None
+    if not isinstance(value, LocMetadata):
+        raise TypeError("loc_metadata must be LocMetadata or None")
+    present = _bounded_integer(value.present, "loc_metadata.present", _UINT32_MAX)
+    if present & ~_SEND_LOC_MASK:
+        raise ValueError("loc_metadata.present has unknown bits")
+    arguments = [present]
+    for field, flag, maximum in _SEND_LOC_FIELDS:
+        item = getattr(value, field)
+        name = f"loc_metadata.{field}"
+        if bool(present & flag) != (item is not None):
+            raise ValueError(f"{name} must agree with loc_metadata.present")
+        if item is not None:
+            if maximum is not None:
+                item = _bounded_integer(item, name, maximum)
+            else:
+                if type(item) is not bytes:
+                    raise TypeError(f"{name} must be immutable bytes")
+                if field == "marking" and not 1 <= len(item) <= 4:
+                    raise ValueError(f"{name} must contain 1 to 4 bytes")
+        arguments.append(item)
+    return tuple(arguments)
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class SendObject:
     """One media object to submit, checked before any native call.
@@ -738,10 +1004,18 @@ class SendObject:
 
     `capture_time_us` and `sap_type` are optional: None is absence, and an
     explicit 0 is a declared value (SapType.NONE is "not a SAP", which is not
-    the same as declaring nothing). `capture_time_us` is the LOC Capture
-    Timestamp (LOC-01 2.3.1.1), wall-clock microseconds since the Unix epoch,
-    emitted verbatim. Its encodable range follows the NEGOTIATED codec and is
-    enforced by the service, not clamped here.
+    the same as declaring nothing). `capture_time_us` is wall-clock
+    microseconds since the Unix epoch, emitted verbatim as the legacy LOC-01
+    Capture Timestamp on drafts 16 and 18. Its encodable range follows the
+    negotiated codec and is enforced by the service, not clamped here.
+    These legacy timing fields do not supply D22 RAW metadata.
+
+    `loc_metadata` supplies explicit raw LOC inputs, not derived time or
+    independence observations. Its present bits must agree with non-None
+    values; zero and present-empty configs are preserved. Timestamp and scale
+    remain uint64 values without clock conversion. D22 RAW timestamp/scale
+    semantics and companion compatibility are checked by the native service;
+    legacy RAW and CMAF ignore this metadata input.
 
     `decode_time_us` is advisory in v0: per track, write order IS decode order.
     """
@@ -755,6 +1029,7 @@ class SendObject:
     presentation_time_us: int = 0
     capture_time_us: int | None = None
     sap_type: SapType | None = None
+    loc_metadata: LocMetadata | None = None
 
     def __post_init__(self) -> None:
         if type(self.payload) is not bytes:
@@ -777,6 +1052,7 @@ class SendObject:
             object.__setattr__(
                 self, "sap_type",
                 SapType(_integer(self.sap_type, "sap_type")))
+        _loc_metadata_arguments(self.loc_metadata)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -787,7 +1063,8 @@ class SenderConfig:
     `catalog_refresh_interval_us` keeps the native meanings: 0 is the library
     default, CATALOG_REFRESH_DISABLED turns refresh off, anything else is that
     interval. Namespace parts and the catalog name are binary and copied
-    byte-exact.
+    byte-exact. `companion_profile` selects the media dialect; its AUTO
+    default follows the draft the endpoint negotiates.
     """
 
     namespace: tuple[bytes, ...]
@@ -802,12 +1079,16 @@ class SenderConfig:
     publish_tracks: bool = False
     drop_without_demand: bool = False
     catalog_refresh_interval_us: int = 0
+    companion_profile: CompanionProfile = CompanionProfile.AUTO
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "namespace", _namespace(self.namespace))
         object.__setattr__(
             self, "backpressure",
             Backpressure(_integer(self.backpressure, "backpressure")))
+        object.__setattr__(
+            self, "companion_profile",
+            CompanionProfile(_integer(self.companion_profile, "companion_profile")))
         if type(self.catalog_track) is not bytes:
             raise TypeError("catalog_track must be bytes")
         for name in ("validate_cmaf", "publish_tracks", "drop_without_demand"):
@@ -867,14 +1148,25 @@ class SendTrackConfig:
     samplerate: int = 0
     channel_config: bytes = b""
     track_duration_ms: int | None = None
+    # The track's Track Properties (draft-22 section 10), stated on every
+    # answer the sender gives for the track: opaque and in the negotiated
+    # draft's encoding. A property whose type and value are both below 64
+    # encodes identically on drafts 16, 18 and 22. A set the session refuses
+    # makes the sender fatal.
+    track_properties: bytes = b""
+    # Advertise DYNAMIC_GROUPS = 1: subscribers may then ask for a new group,
+    # which Sender.take_new_group_request reports.
+    dynamic_groups: bool = False
 
     def __post_init__(self) -> None:
         for field in ("name", "codec", "init_data", "role", "lang",
-                      "channel_config"):
+                      "channel_config", "track_properties"):
             if type(getattr(self, field)) is not bytes:
                 raise TypeError(f"{field} must be bytes")
         if type(self.is_live) is not bool:
             raise TypeError("is_live must be bool")
+        if type(self.dynamic_groups) is not bool:
+            raise TypeError("dynamic_groups must be bool")
         object.__setattr__(
             self, "media_type", MediaType(_integer(self.media_type, "media_type")))
         object.__setattr__(

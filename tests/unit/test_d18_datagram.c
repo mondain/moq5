@@ -43,13 +43,23 @@ static moq_result_t roundtrip(const moq_d18_object_datagram_t *dg,
 
 /* --- SimPair: establish a subscription, return both subscription handles ---- */
 
-static moq_simpair_t *make_pair(void)
+static moq_simpair_t *make_pair_version(moq_version_t version)
 {
     moq_simpair_cfg_t cfg = MOQ_SIMPAIR_CFG_INIT;
     cfg.alloc = moq_alloc_default();
-    cfg.version = MOQ_VERSION_DRAFT_18;
+    cfg.version = version;
     moq_simpair_t *sp = NULL;
     if (moq_simpair_create(&cfg, &sp) < 0) return NULL;
+    return sp;
+}
+
+static moq_simpair_t *make_pair(void)
+{
+    moq_simpair_t *sp = make_pair_version(MOQ_VERSION_DRAFT_18);
+    if (sp) {
+        MOQ_TEST_CHECK(moq_session_version(moq_simpair_client(sp)) == MOQ_VERSION_DRAFT_18);
+        MOQ_TEST_CHECK(moq_session_version(moq_simpair_server(sp)) == MOQ_VERSION_DRAFT_18);
+    }
     return sp;
 }
 
@@ -82,6 +92,85 @@ static bool setup_sub(moq_simpair_t *sp, moq_subscription_t *out_server)
     while (moq_session_poll_events(client, &ev, 1) > 0) moq_event_cleanup(&ev);
     *out_server = sh;
     return true;
+}
+
+static void check_one_normal(moq_session_t *client, uint64_t group, uint64_t object,
+                             const uint8_t *payload, size_t payload_len)
+{
+    size_t objects = 0, other = 0;
+    moq_event_t ev;
+    while (moq_session_poll_events(client, &ev, 1) > 0) {
+        if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED) {
+            const moq_object_received_event_t *o = &ev.u.object_received;
+            objects++;
+            MOQ_TEST_CHECK(o->datagram && o->status == MOQ_OBJECT_NORMAL && !o->end_of_group);
+            MOQ_TEST_CHECK(o->group_id == group && o->object_id == object);
+            MOQ_TEST_CHECK_EQ_SIZE(moq_rcbuf_len(o->payload), payload_len);
+            if (payload_len) {
+                MOQ_TEST_CHECK(o->payload != NULL);
+                if (o->payload && moq_rcbuf_len(o->payload) == payload_len)
+                    MOQ_TEST_CHECK(memcmp(moq_rcbuf_data(o->payload), payload, payload_len) == 0);
+            }
+        } else {
+            other++;
+        }
+        moq_event_cleanup(&ev);
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(objects, 1);
+    MOQ_TEST_CHECK_EQ_SIZE(other, 0);
+    MOQ_TEST_CHECK(moq_session_state(client) == MOQ_SESS_ESTABLISHED);
+}
+
+static void test_public_receive_policy(moq_version_t version)
+{
+    const int before = failures;
+    moq_simpair_t *sp = make_pair_version(version);
+    MOQ_TEST_CHECK(sp != NULL);
+    if (!sp) return;
+    moq_session_t *client = moq_simpair_client(sp);
+    moq_session_t *server = moq_simpair_server(sp);
+    MOQ_TEST_CHECK(moq_session_version(client) == version);
+    MOQ_TEST_CHECK(moq_session_version(server) == version);
+    moq_subscription_t ssub;
+    bool ready = setup_sub(sp, &ssub);
+    MOQ_TEST_CHECK(ready);
+    if (!ready) { moq_simpair_destroy(sp); return; }
+
+    const uint8_t pad_none[] = {0xf0, 0x13, 0x2b, 0x3e, 0x29};
+    const uint8_t pad_zero[] = {0xf0, 0x13, 0x2b, 0x3e, 0x29, 0, 0, 0};
+    const uint8_t pad_nonzero[] = {0xf0, 0x13, 0x2b, 0x3e, 0x29, 0xff, 0x80, 1};
+    const moq_bytes_t padding[] = {{pad_none, sizeof(pad_none)},
+        {pad_zero, sizeof(pad_zero)}, {pad_nonzero, sizeof(pad_nonzero)}};
+    for (size_t i = 0; i < sizeof(padding) / sizeof(padding[0]); ++i) {
+        MOQ_TEST_CHECK_EQ_INT(moq_session_on_datagram(client, padding[i].data,
+            padding[i].len, moq_simpair_now_us(sp)), MOQ_OK);
+        moq_event_t ev;
+        size_t events = 0;
+        while (moq_session_poll_events(client, &ev, 1) > 0) {
+            events++;
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK_EQ_SIZE(events, 0);
+        MOQ_TEST_CHECK(moq_session_state(client) == MOQ_SESS_ESTABLISHED);
+    }
+
+    /* Independent received wires, followed by a real public empty-object send. */
+    const uint8_t empty[] = {0x00, 7, 20, 1, 128};
+    MOQ_TEST_CHECK_EQ_INT(moq_session_on_datagram(client, empty, sizeof(empty),
+        moq_simpair_now_us(sp)), MOQ_OK);
+    check_one_normal(client, 20, 1, NULL, 0);
+    const uint8_t ordinary[] = {0x00, 7, 21, 2, 128, 0x52, 0x53};
+    MOQ_TEST_CHECK_EQ_INT(moq_session_on_datagram(client, ordinary, sizeof(ordinary),
+        moq_simpair_now_us(sp)), MOQ_OK);
+    check_one_normal(client, 21, 2, ordinary + 5, 2);
+    MOQ_TEST_CHECK_EQ_INT(moq_session_send_object_datagram(server, ssub, 22, 3,
+        128, false, NULL, NULL, 0, moq_simpair_now_us(sp)), MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(moq_simpair_run_until_quiescent(sp, 16, NULL), MOQ_OK);
+    check_one_normal(client, 22, 3, NULL, 0);
+    MOQ_TEST_CHECK(moq_session_state(server) == MOQ_SESS_ESTABLISHED);
+    if (failures == before)
+        printf("PASS: datagram_policy.public_session_version_%u\n", (unsigned)version);
+    moq_simpair_destroy(sp);
 }
 
 int main(void)
@@ -182,13 +271,14 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT(
             (int)moq_d18_decode_object_datagram(b6, moq_buf_writer_offset(&w), &out),
             (int)MOQ_ERR_PROTO);
-        /* non-status object with empty payload (mirror D16: malformed) */
+        /* D18 permits empty normal payloads; D16's distinct codec is unchanged. */
         uint8_t b7[] = { 0x00, 0x01, 0x02, 0x03, 0x80 };
         MOQ_TEST_CHECK_EQ_INT((int)moq_d18_decode_object_datagram(b7, sizeof(b7), &out),
-                              (int)MOQ_ERR_PROTO);
+                              (int)MOQ_OK);
+        MOQ_TEST_CHECK(!out.is_status && out.payload_len == 0);
     }
 
-    /* == Padding datagram (§11.5.2): all-zero ⇒ discard, non-zero ⇒ proto = */
+    /* == Padding datagram (§11.5.2): receiver discards every padding byte = */
     {
         moq_d18_object_datagram_t out;
         uint8_t pad[16]; moq_buf_writer_t w; moq_buf_writer_init(&w, pad, sizeof(pad));
@@ -197,13 +287,13 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT(
             (int)moq_d18_decode_object_datagram(pad, moq_buf_writer_offset(&w), &out),
             (int)MOQ_DONE);
-        /* a non-zero padding byte is malformed (MUST be all zero) */
+        /* Senders MUST use zero, but receivers MUST discard all padding data. */
         moq_buf_writer_t w2; moq_buf_writer_init(&w2, pad, sizeof(pad));
         moq_buf_write_vi64(&w2, MOQ_D18_PADDING_DATAGRAM);
         uint8_t nz[3] = {0,1,0}; moq_buf_write_raw(&w2, nz, 3);
         MOQ_TEST_CHECK_EQ_INT(
             (int)moq_d18_decode_object_datagram(pad, moq_buf_writer_offset(&w2), &out),
-            (int)MOQ_ERR_PROTO);
+            (int)MOQ_DONE);
     }
 
     /* == Encode is strict: a mandatory track property as an object property is *
@@ -319,6 +409,8 @@ int main(void)
         moq_simpair_destroy(sp);
     }
 
+    test_public_receive_policy(MOQ_VERSION_DRAFT_18);
+    test_public_receive_policy(MOQ_VERSION_DRAFT_22);
     MOQ_TEST_PASS("d18_datagram");
     return failures != 0;
 }

@@ -564,10 +564,12 @@ int main(void)
         moq_simpair_destroy(sp);
     }
 
-    /* == I. Mandatory Track Property as an object property -> close ==== *
-     * Type 0x4000-0x7FFF MUST be Track-scoped (§2.5.1); carried as an object
-     * property the object is malformed -> PROTOCOL_VIOLATION on the subscriber.
-     * (The local encoder refuses to emit this, so craft the wire on the client.) */
+    /* == I. Mandatory Track Property as an object property -> track ==== *
+     * Type 0x4000-0x7FFF MUST be Track-scoped (§2.5.1); "An Object received
+     * with a Mandatory Track Property as an Object Property is malformed"
+     * (§2.5.1, §2.4.2): the subscriber cancels the subscription, the session
+     * stays up, and the object is not delivered. (The local encoder refuses
+     * to emit this, so craft the wire on the client.) */
     {
         moq_simpair_t *sp = make_pair(MOQ_VERSION_DRAFT_18, false, 0, 0);
         MOQ_TEST_CHECK(sp != NULL);
@@ -599,7 +601,17 @@ int main(void)
         moq_buf_write_raw(&w, (const uint8_t *)"x", 1);
         (void)moq_session_on_data_bytes(client, moq_stream_ref_from_u64(0xD18E),
             wire, moq_buf_writer_offset(&w), false, moq_simpair_now_us(sp));
-        MOQ_TEST_CHECK_EQ_INT((int)client->state, (int)MOQ_SESS_CLOSED);
+        MOQ_TEST_CHECK_EQ_INT((int)client->state, (int)MOQ_SESS_ESTABLISHED);
+        bool cancelled = false, delivered = false;
+        moq_event_t mev;
+        while (moq_session_poll_events(client, &mev, 1) == 1) {
+            if (mev.kind == MOQ_EVENT_UNSUBSCRIBED &&
+                mev.u.unsubscribed.cause == MOQ_REQUEST_TERMINAL_MALFORMED_TRACK)
+                cancelled = true;
+            if (mev.kind == MOQ_EVENT_OBJECT_RECEIVED) delivered = true;
+            moq_event_cleanup(&mev);
+        }
+        MOQ_TEST_CHECK(cancelled && !delivered);
         moq_simpair_destroy(sp);
     }
 
@@ -747,7 +759,7 @@ int main(void)
         fa.properties_len = 10;
         fa.header_only = true;
         MOQ_TEST_CHECK(
-            srv->profile->encode_fetch_object(srv, &w, &fa, NULL) < 0);
+            srv->profile->encode_fetch_object(srv, &w, MOQ_GROUP_ORDER_ASCENDING, &fa, NULL) < 0);
         MOQ_TEST_CHECK_EQ_SIZE(moq_buf_writer_offset(&w), 0);
 
         moq_simpair_destroy(sp);
@@ -1135,14 +1147,14 @@ int main(void)
         /* draft-16: no such bit -> MOQ_ERR_INVAL, nothing written. */
         moq_buf_writer_init(&w, buf, sizeof(buf));
         MOQ_TEST_CHECK_EQ_INT(
-            (int)s16->profile->encode_fetch_object(s16, &w, &fa, NULL),
+            (int)s16->profile->encode_fetch_object(s16, &w, MOQ_GROUP_ORDER_ASCENDING, &fa, NULL),
             (int)MOQ_ERR_INVAL);
         MOQ_TEST_CHECK_EQ_SIZE(moq_buf_writer_offset(&w), 0);
 
         /* draft-18: accepted, and the encoded flags carry the 0x40 Datagram bit. */
         moq_buf_writer_init(&w, buf, sizeof(buf));
         MOQ_TEST_CHECK_EQ_INT(
-            (int)s18->profile->encode_fetch_object(s18, &w, &fa, NULL), (int)MOQ_OK);
+            (int)s18->profile->encode_fetch_object(s18, &w, MOQ_GROUP_ORDER_ASCENDING, &fa, NULL), (int)MOQ_OK);
         moq_buf_reader_t r;
         moq_buf_reader_init(&r, buf, moq_buf_writer_offset(&w));
         uint64_t flags = 0;

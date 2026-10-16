@@ -48,6 +48,9 @@ typedef int moq_result_t;
  * exact chunk and redelivers it once the stream's pending state clears. Never
  * returned for retained input (that stays MOQ_ERR_WOULD_BLOCK). */
 #define MOQ_ERR_INPUT_NOT_CONSUMED (-15)
+/* A non-replenishable implementation limit was reached. Retrying unchanged
+ * cannot succeed; unlike WOULD_BLOCK this is not temporary backpressure. */
+#define MOQ_ERR_LIMIT             (-16)
 #define MOQ_ERR_INTERNAL        (-99)
 
 MOQ_API const char *moq_strerror(moq_result_t rc);
@@ -98,7 +101,9 @@ typedef struct moq_namespace {
 /* -- Authorization token ------------------------------------------- */
 
 /* Caller-owned authorization token for outbound requests.
- * token_value is borrowed for the duration of the API call. */
+ * token_value is borrowed for the duration of the API call. token_type is
+ * refused (MOQ_ERR_INVAL, before any effect) above what the session's version
+ * encodes: 2^62-1 on draft-16; draft-18 and draft-22 carry any uint64. */
 typedef struct moq_auth_token {
     uint64_t    token_type;
     moq_bytes_t token_value;
@@ -147,6 +152,7 @@ MOQ_API const moq_alloc_t *moq_alloc_default(void);
 typedef struct moq_subscription  { uint64_t _opaque; } moq_subscription_t;
 typedef struct moq_publication   { uint64_t _opaque; } moq_publication_t;
 typedef struct moq_fetch         { uint64_t _opaque; } moq_fetch_t;
+typedef struct moq_fill          { uint64_t _opaque; } moq_fill_t;
 typedef struct moq_announcement  { uint64_t _opaque; } moq_announcement_t;
 typedef struct moq_ns_sub_handle { uint64_t _opaque; } moq_ns_sub_handle_t;
 typedef struct moq_track_status_handle { uint64_t _opaque; } moq_track_status_handle_t;
@@ -157,6 +163,7 @@ typedef struct moq_track_sub_handle { uint64_t _opaque; } moq_track_sub_handle_t
 #define MOQ_SUBSCRIPTION_INVALID (moq_subscription_t{0})
 #define MOQ_PUBLICATION_INVALID  (moq_publication_t{0})
 #define MOQ_FETCH_INVALID        (moq_fetch_t{0})
+#define MOQ_FILL_INVALID         (moq_fill_t{0})
 #define MOQ_ANNOUNCEMENT_INVALID (moq_announcement_t{0})
 #define MOQ_NS_SUB_HANDLE_INVALID (moq_ns_sub_handle_t{0})
 #define MOQ_TRACK_STATUS_HANDLE_INVALID (moq_track_status_handle_t{0})
@@ -165,6 +172,7 @@ typedef struct moq_track_sub_handle { uint64_t _opaque; } moq_track_sub_handle_t
 #define MOQ_SUBSCRIPTION_INVALID ((moq_subscription_t){ 0 })
 #define MOQ_PUBLICATION_INVALID  ((moq_publication_t){ 0 })
 #define MOQ_FETCH_INVALID        ((moq_fetch_t){ 0 })
+#define MOQ_FILL_INVALID         ((moq_fill_t){ 0 })
 #define MOQ_ANNOUNCEMENT_INVALID ((moq_announcement_t){ 0 })
 #define MOQ_NS_SUB_HANDLE_INVALID ((moq_ns_sub_handle_t){ 0 })
 #define MOQ_TRACK_STATUS_HANDLE_INVALID ((moq_track_status_handle_t){ 0 })
@@ -185,6 +193,12 @@ MOQ_API bool     moq_fetch_is_valid(moq_fetch_t h);
 MOQ_API bool     moq_fetch_eq(moq_fetch_t a, moq_fetch_t b);
 MOQ_API uint64_t moq_fetch_hash(moq_fetch_t h);
 MOQ_API uint64_t moq_fetch_id_for_trace(moq_fetch_t h);
+
+/* Structural helpers only; validity does not imply a live session owner. */
+MOQ_API bool     moq_fill_is_valid(moq_fill_t h);
+MOQ_API bool     moq_fill_eq(moq_fill_t a, moq_fill_t b);
+MOQ_API uint64_t moq_fill_hash(moq_fill_t h);
+MOQ_API uint64_t moq_fill_id_for_trace(moq_fill_t h);
 
 MOQ_API bool     moq_announcement_is_valid(moq_announcement_t h);
 MOQ_API bool     moq_announcement_eq(moq_announcement_t a, moq_announcement_t b);
@@ -217,6 +231,7 @@ MOQ_API uint64_t moq_track_sub_handle_id_for_trace(moq_track_sub_handle_t h);
 #define MOQ_HANDLE_POOL_TRACK_STATUS  7u
 #define MOQ_HANDLE_POOL_PLAYBACK_TRACK 8u
 #define MOQ_HANDLE_POOL_SUBSCRIBE_TRACKS 9u
+#define MOQ_HANDLE_POOL_FILL          10u
 
 /*
  * Pack handle fields into a 64-bit opaque value.

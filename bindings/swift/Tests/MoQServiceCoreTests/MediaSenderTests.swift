@@ -16,13 +16,15 @@ private struct SenderRig {
 
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
 private func makeSenderRig(
-    configuration: MediaSender.Configuration = .live(namespace: "live/cam1")
+    configuration: MediaSender.Configuration = .live(namespace: "live/cam1"),
+    writeGate: TestGate? = nil
 ) throws -> SenderRig {
     let endpointBackend = ScriptedEndpointBackend()
     let endpoint = MoQEndpoint(
         configuration: .init(url: URL(string: "moqt://relay.test:4443")!),
         engine: EndpointEngine(backend: endpointBackend))
     let senderBackend = ScriptedSenderBackend(
+        writeGate: writeGate,
         latch: { endpointBackend.isLatched })
     let sender = try MediaSender.attach(
         to: endpoint, configuration: configuration, backend: senderBackend)
@@ -430,6 +432,145 @@ struct SenderEndTrackTests {
     }
 }
 
+@Suite("Sender metadata operations")
+struct SenderMetadataTests {
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    private var object: OutgoingObject {
+        .init(payload: Data([1, 0, 255]), properties: Data([2, 0]),
+              locMetadata: .init(rawPresence: 0x31, timestamp: .max,
+                                 videoConfig: Data([0, 255]), audioConfig: Data()))
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("UNSUPPORTED is unchanged public error, never a retry, for every policy and endTrack")
+    func unsupportedMapping() async throws {
+        let policies: [MediaSender.Configuration.SendPolicy] = [
+            .failFast, .lossless(timeout: .milliseconds(100)), .dropToKeyframe, .dropGroup,
+        ]
+        for policy in policies {
+            let rig = try makeSenderRig(configuration: .init(namespace: "live/cam1", sendPolicy: policy))
+            let track = try await addVideoTrack(rig)
+            rig.senderBackend.scriptWrites([.unsupported, .ok])
+            await #expect(throws: MoQServiceError.unsupported) {
+                try await rig.sender.write(object, to: track)
+            }
+            let refused = rig.senderBackend.snapshot()
+            #expect(refused.writeCalls.count == 1 && refused.waitCalls.isEmpty)
+            #expect(refused.acceptedPayloads.isEmpty && refused.acceptedMetadata.isEmpty)
+            try await rig.sender.write(object, to: track)
+            rig.senderBackend.scriptEndTracks([.unsupported])
+            await #expect(throws: MoQServiceError.unsupported) {
+                try await rig.sender.endTrack(track)
+            }
+            #expect(rig.senderBackend.snapshot().acceptedMetadata == [object.locMetadata])
+            #expect(rig.senderBackend.snapshot().waitCalls.isEmpty)
+            #expect(rig.sender.isReady)
+            await rig.endpoint.close()
+            #expect(rig.senderBackend.snapshot().violations.isEmpty)
+        }
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("Lossless attempts retain exact metadata; only successful attempt accepts it")
+    func losslessMetadata() async throws {
+        let rig = try makeSenderRig(configuration: .lossless(namespace: "live/cam1"))
+        let track = try await addVideoTrack(rig)
+        rig.senderBackend.scriptWrites([.wouldBlock, .wouldBlock, .ok])
+        try await rig.sender.write(object, to: track)
+        let snapshot = rig.senderBackend.snapshot()
+        #expect(snapshot.writtenObjects.map(\.locMetadata) == Array(repeating: object.locMetadata, count: 3))
+        #expect(snapshot.writtenObjects.map(\.properties) == Array(repeating: object.properties, count: 3))
+        #expect(snapshot.acceptedMetadata == [object.locMetadata])
+        #expect(snapshot.acceptedPayloads == [object.payload])
+        #expect(snapshot.waitCalls == [50_000, 50_000])
+        await rig.endpoint.close()
+        #expect(rig.senderBackend.snapshot().violations.isEmpty)
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("Cancellation before start never reaches metadata write")
+    func metadataPrestartCancellation() async throws {
+        let rig = try makeSenderRig()
+        let track = try await addVideoTrack(rig)
+        let gate = TestGate()
+        rig.endpoint.engine.post { gate.pass() }
+        #expect(await gate.awaitBlocked(count: 1))
+        let wakesBefore = rig.endpointBackend.snapshot().wakeCount
+        let writer = Task { try await rig.sender.write(object, to: track) }
+        #expect(await rig.endpointBackend.awaitCondition { $0.wakeCount > wakesBefore })
+        writer.cancel()
+        gate.openGate()
+        await #expect(throws: CancellationError.self) { try await writer.value }
+        await rig.endpoint.close()
+        #expect(rig.senderBackend.snapshot().writtenObjects.isEmpty)
+        #expect(rig.senderBackend.snapshot().violations.isEmpty)
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("Started metadata writes report actual success/refusal despite cancellation")
+    func metadataStartedCancellation() async throws {
+        for result in [SenderOperationResult.ok, .unsupported, .wouldBlock] {
+            let gate = TestGate()
+            let rig = try makeSenderRig(configuration: .init(namespace: "live/cam1", sendPolicy: .failFast),
+                                        writeGate: gate)
+            let track = try await addVideoTrack(rig)
+            rig.senderBackend.scriptWrites([result])
+            let writer = Task { try await rig.sender.write(object, to: track) }
+            #expect(await gate.awaitBlocked(count: 1))
+            writer.cancel()
+            gate.openGate()
+            switch result {
+            case .ok: try await writer.value
+            case .unsupported:
+                await #expect(throws: MoQServiceError.unsupported) { try await writer.value }
+            default:
+                await #expect(throws: MoQServiceError.wouldBlock) { try await writer.value }
+            }
+            #expect(rig.senderBackend.snapshot().writtenObjects.map(\.locMetadata) == [object.locMetadata])
+            if case .ok = result {
+                #expect(rig.senderBackend.snapshot().acceptedMetadata == [object.locMetadata])
+            } else {
+                #expect(rig.senderBackend.snapshot().acceptedMetadata.isEmpty)
+            }
+            await rig.endpoint.close()
+            #expect(rig.senderBackend.snapshot().violations.isEmpty)
+        }
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("Cancellation between lossless attempts leaves no accepted metadata")
+    func metadataRetryCancellation() async throws {
+        let rig = try makeSenderRig(configuration: .lossless(namespace: "live/cam1"))
+        let track = try await addVideoTrack(rig)
+        rig.senderBackend.scriptWrites([.wouldBlock, .ok])
+        rig.senderBackend.setWaitGate(true)
+        let writer = Task { try await rig.sender.write(object, to: track) }
+        #expect(await rig.senderBackend.awaitWaitBlocked())
+        writer.cancel()
+        rig.senderBackend.setWaitGate(false)
+        await #expect(throws: CancellationError.self) { try await writer.value }
+        #expect(rig.senderBackend.snapshot().writtenObjects.map(\.locMetadata) == [object.locMetadata])
+        #expect(rig.senderBackend.snapshot().acceptedMetadata.isEmpty)
+        await rig.endpoint.close()
+        #expect(rig.senderBackend.snapshot().violations.isEmpty)
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("Closed sender and foreign-track guards make no metadata attempt")
+    func metadataOwnershipGuards() async throws {
+        let rig = try makeSenderRig()
+        let track = try await addVideoTrack(rig)
+        let foreign = MediaTrack(description: TrackDescription(name: "foreign", mediaType: .video, packaging: .raw))
+        await #expect(throws: MoQServiceError.self) { try await rig.sender.write(object, to: foreign) }
+        await rig.sender.close()
+        await #expect(throws: MoQServiceError.closed) { try await rig.sender.write(object, to: track) }
+        await rig.endpoint.close()
+        #expect(rig.senderBackend.snapshot().writtenObjects.isEmpty)
+        #expect(rig.senderBackend.snapshot().detachCalls == 1)
+        #expect(rig.senderBackend.snapshot().violations.isEmpty)
+    }
+}
+
 @Suite("Sender readiness")
 struct SenderReadinessTests {
 
@@ -604,5 +745,35 @@ struct SenderTeardownTests {
         #expect(snap.addTrackNames == ["video"])    /* only the pre-close add */
         #expect(snap.violations.isEmpty)            /* nothing after detach */
         await rig.endpoint.close()
+    }
+}
+
+@Suite("Sender new-group requests")
+struct SenderNewGroupRequestTests {
+
+    /// takeNewGroupRequest reports the backend's pending request for the
+    /// track once, then nil; a foreign track is an invalid argument.
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("A pending request is taken once")
+    func takeOnce() async throws {
+        let rig = try makeSenderRig()
+        var cfg = TrackConfiguration.video(
+            name: "video", codec: "avc1.64001f", bitrate: 3_000_000,
+            width: 1280, height: 720)
+        cfg.dynamicGroups = true
+        cfg.trackProperties = Data([0x3C, 0x01])
+        let track = try await rig.sender.addTrack(cfg)
+        #expect(try await rig.sender.takeNewGroupRequest(for: track) == nil)
+        let handle = try #require(rig.sender.attachment.handleID(for: track))
+        rig.senderBackend.scriptNewGroupRequest(handleID: handle, value: 7)
+        #expect(try await rig.sender.takeNewGroupRequest(for: track) == 7)
+        #expect(try await rig.sender.takeNewGroupRequest(for: track) == nil)
+        let other = try makeSenderRig()
+        let foreign = try await addVideoTrack(other)
+        await #expect(throws: MoQServiceError.self) {
+            _ = try await rig.sender.takeNewGroupRequest(for: foreign)
+        }
+        await rig.sender.close()
+        await other.sender.close()
     }
 }

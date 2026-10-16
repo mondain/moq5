@@ -1,3 +1,7 @@
+#if defined(__linux__) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 /*
  * Concurrent per-shard stepping over the cross-shard channels: threads each
  * own one shard and free-run churn through the per-shard step seam

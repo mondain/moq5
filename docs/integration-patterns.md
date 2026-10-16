@@ -159,7 +159,10 @@ The track info must carry the transport draft the SESSION negotiated:
 LOC object properties are Key-Value-Pairs, and draft-16 and draft-18
 encode a KVP's integers differently (draft-16 §1.4 `(i)`, draft-18
 §1.4.1 `(vi64)`). The two agree only below 64, so a wrong draft is
-invisible on small values and wrong on everything else. A catalog
+invisible on small values and wrong on everything else. The draft also
+selects the LOC property registry: drafts 16 and 18 carry
+draft-ietf-moq-loc-01 ids, draft-22 carries draft-ietf-moq-loc-04 ids
+(`<moq/loc.h>`). A catalog
 describes the track, never the session carrying it, so the version
 comes from `moq_session_version(session)` — never from endpoint
 configuration or an offered preference.

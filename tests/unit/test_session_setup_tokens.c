@@ -346,7 +346,15 @@ static int row_refusals(moq_version_t v)
     MOQ_TEST_CHECK_EQ_INT((int)moq_session_create(&cfg, 0, &s), MOQ_ERR_INVAL);
     tokens[0].token_value = (moq_bytes_t){ NULL, 0 };
     tokens[0].token_type = UINT64_C(1) << 62;              /* type past 2^62-1 */
-    MOQ_TEST_CHECK_EQ_INT((int)moq_session_create(&cfg, 0, &s), MOQ_ERR_INVAL);
+    if (v == MOQ_VERSION_DRAFT_16) {
+        /* Draft-16 Token Type is a QUIC varint. */
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_create(&cfg, 0, &s), MOQ_ERR_INVAL);
+    } else {
+        /* Draft-18 Token Type is vi64: the full width is a type. */
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_create(&cfg, 0, &s), MOQ_OK);
+        moq_session_destroy(s);
+        s = NULL;
+    }
     static uint8_t huge[65536];
     tokens[0].token_type = 1;
     tokens[0].token_value = (moq_bytes_t){ huge, sizeof(huge) };   /* > 65535 */
@@ -757,7 +765,7 @@ static int row_d18_codec(void)
     moq_d18_setup_opts_t o, d;
     static const uint8_t v1[] = { 1, 2, 3 };
 
-    memset(&o, 0, sizeof(o));
+    moq_d18_setup_opts_init(&o);
     o.auth_token_count = 2;
     o.auth_tokens[0].alias_type = MOQ_AUTH_TOKEN_USE_VALUE;
     o.auth_tokens[0].token_type = 7;
@@ -769,13 +777,13 @@ static int row_d18_codec(void)
     o.has_max_auth_token_cache_size = true;
     o.max_auth_token_cache_size = 100;
     moq_buf_writer_init(&w, buf, sizeof(buf));
-    MOQ_TEST_CHECK_EQ_INT((int)moq_d18_encode_setup_opts(&w, &o), MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d18_encode_setup_opts(&w, &o, sizeof(o)), MOQ_OK);
     size_t n = moq_buf_writer_offset(&w);
     /* SETUP type 0x2F00 (two vi64 bytes) and the 16-bit length precede the
      * options. */
     MOQ_TEST_CHECK(n > 4);
-    memset(&d, 0, sizeof(d));
-    MOQ_TEST_CHECK_EQ_INT((int)moq_d18_decode_setup_opts(buf + 4, n - 4, &d), MOQ_OK);
+    moq_d18_setup_opts_init(&d);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d18_decode_setup_opts(buf + 4, n - 4, &d, sizeof(d)), MOQ_OK);
     MOQ_TEST_CHECK_EQ_SIZE(d.auth_token_count, 2);
     MOQ_TEST_CHECK_EQ_U64(d.auth_tokens[0].token_type, 7);
     MOQ_TEST_CHECK(d.auth_tokens[0].alias_type == MOQ_AUTH_TOKEN_USE_VALUE);
@@ -789,13 +797,13 @@ static int row_d18_codec(void)
      * cannot be sent there, nor more than the decoder's 16 tokens. */
     o.auth_tokens[1].alias_type = MOQ_AUTH_TOKEN_USE_ALIAS;
     moq_buf_writer_init(&w, buf, sizeof(buf));
-    MOQ_TEST_CHECK_EQ_INT((int)moq_d18_encode_setup_opts(&w, &o), MOQ_ERR_INVAL);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d18_encode_setup_opts(&w, &o, sizeof(o)), MOQ_ERR_INVAL);
     MOQ_TEST_CHECK_EQ_SIZE(moq_buf_writer_offset(&w), 0);
     o.auth_tokens[1].alias_type = MOQ_AUTH_TOKEN_DELETE;
-    MOQ_TEST_CHECK_EQ_INT((int)moq_d18_encode_setup_opts(&w, &o), MOQ_ERR_INVAL);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d18_encode_setup_opts(&w, &o, sizeof(o)), MOQ_ERR_INVAL);
     o.auth_tokens[1].alias_type = MOQ_AUTH_TOKEN_USE_VALUE;
     o.auth_token_count = MOQ_D18_MAX_AUTH_TOKENS + 1;
-    MOQ_TEST_CHECK_EQ_INT((int)moq_d18_encode_setup_opts(&w, &o), MOQ_ERR_INVAL);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d18_encode_setup_opts(&w, &o, sizeof(o)), MOQ_ERR_INVAL);
     MOQ_TEST_CHECK_EQ_SIZE(moq_buf_writer_offset(&w), 0);
     MOQ_TEST_PASS("draft-18 setup option codec carries tokens");
     return failures;

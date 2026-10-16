@@ -6,22 +6,28 @@
 /* =====================================================================
  * The declared topology.
  *
- * Transport rows: both built drafts are AVAILABLE, with their ALPN literals
- * (the canonical table in adapters/common/moq_alpn.h is the authority the
- * drift gate compares against), the integer codec each draft specifies, and the endpoint-offer
- * facts. AUTO ranks are 1-based and D18 is offered FIRST.
+ * Transport rows: all three built drafts are AVAILABLE, with their ALPN
+ * literals (the canonical table in adapters/common/moq_alpn.h is the authority
+ * the drift gate compares against), the integer codec each draft specifies,
+ * and the endpoint-offer facts. AUTO ranks are 1-based: the endpoint's library
+ * default offers every available draft, newest first -- D22, D18, then D16.
  *
- * Media rows: LOC-01 is implemented; LOC-02 is RESERVED with a reason. The
- * property IDs are recorded because they collide across the two profiles -- LOC-01 Capture Timestamp is ID 2
+ * Media rows: LOC-01 and explicit D22 LOC-04 are implemented; LOC-02 is
+ * RESERVED with a reason. The property IDs are recorded because they collide
+ * across the profiles -- LOC-01 Capture Timestamp is ID 2
  * (draft-ietf-moq-loc-01 §2.3.1.1) while LOC-02 Timestamp is ID 0x06
  * (draft-ietf-moq-loc-02 §2.3.1.1), which is LOC-01's AUDIO LEVEL id.
+ * LOC-04 uses Timestamp 0x10 (draft-ietf-moq-loc-04 section 2.3.1.1).
+ * The transport offer never selects the D22 media companion for a service.
  * ===================================================================== */
 
 static const np_transport_row_t kTransports[] = {
     /* draft, state, ALPN, len, codec, max, offered, rank, unusable reason */
     { 16, NP_T_AVAILABLE, "moqt-16", 7, NP_ENC_QUIC_VARINT,
-      NP_QUIC_VARINT_MAX, true, 2, NULL },
+      NP_QUIC_VARINT_MAX, true, 3, NULL },
     { 18, NP_T_AVAILABLE, "moqt-18", 7, NP_ENC_VI64,
+      NP_VI64_MAX,        true, 2, NULL },
+    { 22, NP_T_AVAILABLE, "moqt-22", 7, NP_ENC_VI64,
       NP_VI64_MAX,        true, 1, NULL },
 };
 
@@ -32,20 +38,20 @@ static const np_media_row_t kMedias[] = {
       "Audio Level id; adopting it is a separate wire-visible decision and no "
       "product code implements it yet",
       6 },
+    { "loc04", NP_M_IMPLEMENTED, NULL, 0x10 },
 };
 
 /*
- * Closure cells. LOC-01 is SUPPORTED on both drafts but carries a closure
- * waiver with both callbacks NULL: the tables declare the topology only, and
- * a cell's waiver is replaced by the shared send/receive functions once the
- * service closures exist.
+ * Service closures run as standalone CTests, not callbacks from this pure
+ * declaration object. The waivers name those required tests, not exemptions
+ * from running them. The legacy corpus is not evidence for LOC-04.
  */
 static const np_cell_row_t kCells[] = {
     { 16, "loc01", NP_C_SUPPORTED, NULL,
-      "topology only: no service closure callbacks are declared",
+      "standalone CTests: np_closure_sender and np_closure_receiver",
       NULL, NULL },
     { 18, "loc01", NP_C_SUPPORTED, NULL,
-      "topology only: no service closure callbacks are declared",
+      "standalone CTests: np_closure_sender and np_closure_receiver",
       NULL, NULL },
     { 16, "loc02", NP_C_UNSUPPORTED,
       "LOC-02 is RESERVED: no product encoder or decoder exists for its "
@@ -55,12 +61,31 @@ static const np_cell_row_t kCells[] = {
       "LOC-02 is RESERVED: no product encoder or decoder exists for its "
       "renumbered property ids on any draft",
       NULL, NULL, NULL },
+    { 22, "loc01", NP_C_UNSUPPORTED,
+      "the legacy MSF-01/LOC-01 service companion is limited to D16/D18; "
+      "D22 requires explicit MSF-01/LOC-04 selection",
+      NULL, NULL, NULL },
+    { 22, "loc02", NP_C_UNSUPPORTED,
+      "LOC-02 is RESERVED: no product encoder or decoder exists for its "
+      "renumbered property ids on any draft",
+      NULL, NULL, NULL },
+    { 16, "loc04", NP_C_UNSUPPORTED,
+      "the explicit MSF-01/LOC-04 service companion requires D22",
+      NULL, NULL, NULL },
+    { 18, "loc04", NP_C_UNSUPPORTED,
+      "the explicit MSF-01/LOC-04 service companion requires D22",
+      NULL, NULL, NULL },
+    { 22, "loc04", NP_C_SUPPORTED, NULL,
+      "standalone CTests: sender_companion and media_receiver_companion; "
+      "explicit service companion selection required",
+      NULL, NULL },
 };
 
 /*
  * The canonical unordered pair table: one row per unordered pair of drafts
  * that are SUPPORTED for a given media profile. LOC-01 has both drafts, so
- * exactly one pair; LOC-02 has none supported, so none.
+ * exactly one pair. LOC-02 has none supported and LOC-04 has only D22, so
+ * neither contributes a cross-transport pair.
  */
 static const np_pair_row_t kPairs[] = {
     { "loc01", 16, 18, NP_R_ENCODING_DIVERGES },
@@ -133,7 +158,8 @@ int np_topology_validate(const np_topology_t *t, bool quiet)
     for (size_t i = 0; i < t->n_transports; i++) {
         const np_transport_row_t *r = &t->transports[i];
         VC("transport.state", r->state == NP_T_AVAILABLE ||
-                              r->state == NP_T_ABSENT);
+                              r->state == NP_T_ABSENT ||
+                              r->state == NP_T_PENDING);
         VC("transport.alpn", nonempty(r->alpn));
         VC("transport.alpn_len",
            r->alpn && strlen(r->alpn) == (size_t)r->alpn_len);
@@ -208,6 +234,10 @@ int np_topology_validate(const np_topology_t *t, bool quiet)
         bool reason = nonempty(r->unusable_reason);
         if (r->state == NP_T_ABSENT) {
             VC("transport.absent_reason", reason);
+            continue;
+        }
+        if (r->state == NP_T_PENDING) {
+            VC("transport.pending_reason", reason);
             continue;
         }
         size_t carries = 0;

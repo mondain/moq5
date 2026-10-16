@@ -1,5 +1,6 @@
 #include <moq/msf_media.h>
 #include "msf_internal.h"
+#include <moq/loc.h>
 #include <stddef.h>
 #include <string.h>
 
@@ -166,9 +167,10 @@ static moq_result_t msf_track_to_media_info_impl(
          * this entry point exists to remove. */
         if (out_info_size < MSF_TRACK_INFO_VERSION_SIZE)
             return MOQ_ERR_INVAL;
-        /* Zero and unsupported versions are refused rather than downgraded. */
-        if (transport_version != MOQ_VERSION_DRAFT_16 &&
-            transport_version != MOQ_VERSION_DRAFT_18)
+        /* Zero and unsupported versions are refused rather than downgraded;
+         * the LOC table names the drafts whose property codec and revision
+         * are registered. */
+        if (moq_loc_profile_for_version(transport_version) == 0)
             return MOQ_ERR_INVAL;
 
         moq_media_track_info_init_sized(out_info, out_info_size);

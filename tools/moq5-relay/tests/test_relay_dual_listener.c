@@ -55,6 +55,13 @@ t_legacy_raw_only_unchanged(void)
     /* a config that never mentions WebTransport must not acquire a WT
      * listener by default: raw-only stays raw-only */
     MOQ_TEST_CHECK(!moqr_cli_config_has_webtransport(&cfg));
+    /* Without a versions list the listener offers every supported draft,
+     * newest first. */
+    MOQ_TEST_CHECK_EQ_U64(cfg.version_count, 3);
+    MOQ_TEST_CHECK_EQ_U64(cfg.versions[0], MOQ_VERSION_DRAFT_22);
+    MOQ_TEST_CHECK_EQ_U64(cfg.versions[1], MOQ_VERSION_DRAFT_18);
+    MOQ_TEST_CHECK_EQ_U64(cfg.versions[2], MOQ_VERSION_DRAFT_16);
+    MOQ_TEST_CHECK(strcmp(cfg.alpn_set, "moqt-22+moqt-18+moqt-16") == 0);
     return failures;
 }
 

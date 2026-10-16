@@ -138,9 +138,60 @@
  *   - A peer RESET of a pending stream retires it; the adapter drops the
  *     held chunk. Bridge close/fatal/destroy retires every pending stream;
  *     held chunks are then dropped by the adapter.
- * MOQ_ERR_INPUT_NOT_CONSUMED is never returned for control or bidi input,
- * and never reinterprets
- * MOQ_ERR_WOULD_BLOCK (retained input).
+ *   - On a profile whose control channel is a unidirectional pair (drafts 18
+ *     and 22), while the session is still processing control input it could
+ *     not take at once, a chunk of any OTHER peer uni stream -- data,
+ *     padding, or a stream whose type is not yet known -- is refused the
+ *     same way, with the same obligations; the stream reports pending until
+ *     that control input is processed, and its redelivery is then handled as
+ *     if it had just arrived.
+ * MOQ_ERR_INPUT_NOT_CONSUMED is never returned for an identified control
+ * stream or for bidi input, and never reinterprets
+ * MOQ_ERR_WOULD_BLOCK (retained input), except as follows.
+ *
+ * -- Held peer streams (MOQ_TRANSPORT_CAP_HOLD_BIDI_INPUT) --
+ *
+ * With this capability, admission holding is bounded:
+ *   - On a profile whose control channel is a unidirectional pair (drafts
+ *     18 and 22), the streams below never take the last free mappings while
+ *     a control stream still needs one: one for each control stream not yet
+ *     mapped (ours until it is first opened, the peer's until its stream type
+ *     identifies it). A NEW peer bidirectional (request)
+ *     stream that finds no mapping free beyond that reserve is held too:
+ *     MOQ_ERR_INPUT_NOT_CONSUMED, with the same zero-consumption and
+ *     exact-redelivery obligations as above.
+ *   - On the same profiles, a NEW peer uni stream whose first chunk carries
+ *     a complete data stream type (a subgroup or fetch header) and finds no
+ *     mapping free beyond the reserve is held the same way; a NEW peer uni
+ *     stream whose first chunk carries a complete padding stream type is
+ *     then refused with MOQ_BRIDGE_INGRESS_REFUSE_CANCEL and never held. A
+ *     stream whose first chunk is the control type, an incomplete type or
+ *     an unknown type is never held or refused this way: it takes a free
+ *     mapping as without this capability, and a full stream map is fatal
+ *     for it.
+ *   - On a profile whose control channel is one bidirectional stream (draft
+ *     16, where every peer unidirectional stream is data), a NEW peer uni
+ *     stream that finds no free stream mapping is held the same way. The
+ *     draft-16 control stream is never held.
+ *   - Every held stream (uni or bidi) takes one hold record; there are
+ *     max_pending of them. Held streams are offered for redelivery oldest
+ *     first, and a new arrival waits behind them.
+ *   - A stream that cannot be held because every record is in use is refused
+ *     with MOQ_BRIDGE_INGRESS_REFUSE_CANCEL (above): the adapter cancels it.
+ *   - A stream held for the bridge's local hold age (five seconds from its first
+ *     refusal, checked against now_us on every service pass) is cancelled
+ *     by the bridge through stop_sending (and
+ *     abort_stream, or reset_stream, for a bidi). The adapter drops the held
+ *     chunk when it sees that cancellation for a held id and delivers
+ *     nothing more on it. An unexpected endpoint ERROR is fatal.
+ *   - A peer FIN never discharges a held chunk; a peer RESET settles only the
+ *     receive half, and our own half of a bidi is still reset.
+ * Every cancellation carries EXCESSIVE_LOAD (0x9) on drafts 18 and 22, and
+ * CANCELLED (0x1) on draft 16, which defines no EXCESSIVE_LOAD stream code;
+ * an adapter selects it by moq_session_version.
+ * The earliest hold age is reported through moq_session_next_deadline_us;
+ * moq_session_tick does not consume it, so an adapter with this capability
+ * drives time only through moq_transport_bridge_service.
  */
 
 #include "export.h"
@@ -157,7 +208,7 @@ extern "C" {
 typedef enum moq_transport_result {
     MOQ_TRANSPORT_OK          = 0,
     MOQ_TRANSPORT_WOULD_BLOCK = 1,
-    MOQ_TRANSPORT_DROPPED     = 2,  /* datagram only */
+    MOQ_TRANSPORT_DROPPED     = 2,  /* datagram; reset_stream_at: unavailable */
     MOQ_TRANSPORT_TOO_LARGE   = 3,  /* datagram only */
     MOQ_TRANSPORT_ERROR       = 4,  /* fatal */
 } moq_transport_result_t;
@@ -170,7 +221,39 @@ typedef enum moq_transport_cap {
     /* The adapter can HOLD an inbound peer uni data chunk the bridge did not
      * consume (see "Inbound admission contract" below) and redeliver it. */
     MOQ_TRANSPORT_CAP_HOLD_INPUT    = 1u << 2,
+    /* The adapter reports when a local data stream reaches "all data
+     * committed" (every byte through its FIN acknowledged by the peer) via
+     * moq_transport_bridge_on_local_stream_committed(). With this set the
+     * bridge keeps a FIN'd local unidirectional data stream mapped until that
+     * report or a RESET of the stream, so a session that times the subgroup
+     * from its FIN can still reset it; without it the stream is retired as
+     * soon as its FIN is written and the report is never expected. */
+    MOQ_TRANSPORT_CAP_COMMIT_REPORT = 1u << 3,
+    /* The adapter provides reset_stream_at(): it can reset a stream while
+     * still delivering a prefix of it (RESET_STREAM_AT), where the connection
+     * negotiated that extension. Without it every reset is a plain
+     * RESET_STREAM. */
+    MOQ_TRANSPORT_CAP_RELIABLE_RESET = 1u << 4,
+    /* Bounded admission holding with cancellation at the limit (see "Held
+     * peer streams" below). Set by an adapter only once it intercepts
+     * MOQ_BRIDGE_INGRESS_REFUSE_CANCEL at every ingress site and performs the
+     * cancellations it implies. */
+    MOQ_TRANSPORT_CAP_HOLD_BIDI_INPUT = 1u << 5,
 } moq_transport_cap_t;
+
+/* Private ingress outcome of on_peer_uni_bytes / on_peer_uni_rcbuf /
+ * on_peer_bidi_bytes, returned only to endpoints that advertise
+ * MOQ_TRANSPORT_CAP_HOLD_BIDI_INPUT: the bridge took zero bytes and no FIN
+ * (a borrowed rcbuf stays the caller's), holds no record of the stream, and
+ * the adapter must cancel it itself before returning to its transport --
+ * STOP_SENDING, plus RESET_STREAM of its own half on a bidirectional stream,
+ * both with the profile's cancellation code (MOQ_STREAM_ERROR_EXCESSIVE_LOAD
+ * on drafts 18 and 22, MOQ_STREAM_ERROR_CANCELLED on draft 16) -- and drop
+ * the chunk. An
+ * unexpected failure of the transport to take that cancellation is a fatal
+ * transport error. Disjoint from every moq_result_t and from internal
+ * sentinels; never an application-visible result. */
+#define MOQ_BRIDGE_INGRESS_REFUSE_CANCEL (-1100)
 
 /* -- Endpoint ops vtable -------------------------------------------- */
 /*
@@ -180,7 +263,7 @@ typedef enum moq_transport_cap {
  *   close_transport.
  * Optional ops (gated by capabilities or struct_size):
  *   write_payload (CAP_WRITE_PAYLOAD), send_datagram (CAP_DATAGRAM),
- *   max_datagram_size (CAP_DATAGRAM).
+ *   max_datagram_size (CAP_DATAGRAM), reset_stream_at (CAP_RELIABLE_RESET).
  *
  * -- Write contract --
  *
@@ -261,6 +344,26 @@ typedef struct moq_transport_endpoint_ops {
      * fatal. Must not consume bytes. Older/other adapters may omit it. */
     moq_transport_result_t (*set_stream_priority)(void *ctx, uint64_t stream_id,
                                                 uint32_t key);
+    /*
+     * OPTIONAL reliable reset (MOQ_TRANSPORT_CAP_RELIABLE_RESET): reset our
+     * send half of a unidirectional data stream with RESET_STREAM_AT, keeping
+     * its first `reliable_size` bytes. The bridge calls it only with
+     * 0 < reliable_size <= the bytes it handed this stream through
+     * write/write_payload, after every one of those writes was accepted. The
+     * endpoint must see those bytes delivered before the stream ends; it may
+     * hold the frame until its transport has taken them. Results:
+     *   OK           the reliable reset is committed;
+     *   WOULD_BLOCK  nothing done; the bridge retains and retries;
+     *   DROPPED      this connection cannot reset reliably (the extension
+     *                was not negotiated, or the stack cannot express this
+     *                size) and nothing was done: the bridge sends a plain
+     *                reset_stream instead, the fallback the protocol expects;
+     *   ERROR        fatal.
+     * Appended after set_stream_priority: old callers stay ABI-safe.
+     */
+    moq_transport_result_t (*reset_stream_at)(void *ctx, uint64_t stream_id,
+                                              uint64_t error_code,
+                                              uint64_t reliable_size);
 } moq_transport_endpoint_ops_t;
 
 #ifdef __cplusplus
@@ -280,10 +383,21 @@ typedef struct moq_transport_endpoint_ops {
  * drift between bridge and session assumptions.
  */
 
+/*
+ * max_streams is the stream-map capacity (0 selects the default, 128). On a
+ * profile whose control channel is a unidirectional pair (drafts 18 and 22:
+ * each peer opens one control stream, draft-22 section 6.3, draft-18 section
+ * 3.3, and neither may be closed during the session), both control streams
+ * hold a map entry for the whole session, so create refuses an effective
+ * capacity below 2 with MOQ_ERR_INVAL before allocating anything. This is a
+ * constraint of this implementation's map, not a protocol minimum, and 2
+ * leaves no room for request or data streams. Draft-16 (one bidirectional
+ * control stream) accepts 1.
+ */
 typedef struct moq_transport_bridge_cfg {
     uint32_t           struct_size;
     const moq_alloc_t *alloc;          /* required; copied into bridge */
-    uint32_t           max_streams;    /* 0 = default 128 */
+    uint32_t           max_streams;    /* 0 = default 128; see above */
     uint32_t           max_pending;    /* 0 = default 64 */
     uint32_t           max_tombstones; /* 0 = default 64 */
 } moq_transport_bridge_cfg_t;
@@ -319,6 +433,12 @@ typedef struct moq_transport_bridge moq_transport_bridge_t;
  *
  * Allocates: bridge state via cfg->alloc.
  * Ownership: caller owns *out until moq_transport_bridge_destroy().
+ *
+ * One bridge per session: while a bridge created on `session` exists --
+ * including one that has gone fatal or closed -- another create on the same
+ * session returns MOQ_ERR_WRONG_STATE, freeing what it allocated and
+ * changing nothing else.
+ * Destroying the bridge releases the session for a new one.
  */
 MOQ_API moq_result_t moq_transport_bridge_create(
     const moq_transport_bridge_cfg_t   *cfg,
@@ -329,7 +449,9 @@ MOQ_API moq_result_t moq_transport_bridge_create(
 
 /*
  * Destroy a bridge and free all internal state.
- * Cleans up pending items (decrefs owned rcbufs, frees copied data).
+ * Cleans up pending items (decrefs owned rcbufs, frees copied data) and
+ * releases the session for another bridge, so the session must still be
+ * alive: destroy the bridge before its session.
  * destroy(NULL) is a no-op.
  */
 MOQ_API void moq_transport_bridge_destroy(moq_transport_bridge_t *brg);
@@ -406,6 +528,18 @@ MOQ_API moq_result_t moq_transport_bridge_on_peer_stream_reset(
  * on any other stream it is a harmless no-op.
  */
 MOQ_API moq_result_t moq_transport_bridge_on_peer_stream_terminal(
+    moq_transport_bridge_t *b, uint64_t stream_id, uint64_t now_us);
+
+/*
+ * A local unidirectional data stream has reached "all data committed": the
+ * peer has acknowledged every byte through its FIN. Adapters declaring
+ * MOQ_TRANSPORT_CAP_COMMIT_REPORT call this once per such stream; the bridge
+ * retires the mapping it kept for the stream and tells the session
+ * (moq_session_on_data_committed), which stops the subgroup's FIN-started
+ * delivery timer. A stream the bridge is not holding for this report is a
+ * harmless no-op.
+ */
+MOQ_API moq_result_t moq_transport_bridge_on_local_stream_committed(
     moq_transport_bridge_t *b, uint64_t stream_id, uint64_t now_us);
 
 /*
@@ -529,10 +663,22 @@ MOQ_API bool     moq_transport_bridge_uses_uni_control(
 /*
  * Per-stream pending query. Returns true if the bridge has deferred
  * inbound state for this stream_id (pending_retry, pending_reset,
- * pending_stop, or pending_fin). Adapters use this to decide when
- * to resume transport-level reads for a specific stream after an
- * inbound handler returned MOQ_ERR_WOULD_BLOCK.
- * Returns false if stream_id is unknown or has no pending state.
+ * pending_stop, or pending_fin), or, for a stream whose chunk the bridge
+ * refused (MOQ_ERR_INPUT_NOT_CONSUMED), while that chunk may not be
+ * redelivered yet (see the admission contract). Adapters use this to
+ * decide when to resume transport-level reads for a specific stream after
+ * an inbound handler returned MOQ_ERR_WOULD_BLOCK, and when to redeliver a
+ * refused chunk.
+ *
+ * It is a readiness answer for streams whose receive records the adapter
+ * polls, not an identity or ownership answer: on a profile whose control
+ * channel is a unidirectional pair, while the session is still processing
+ * control input it could not take at once, it returns true for every
+ * stream_id other than the control stream that the bridge cannot exclude --
+ * a mapped peer uni stream, or an id it has no mapping for -- since any of
+ * those may be a peer uni stream whose chunk was refused. Locally opened
+ * streams and mapped request streams are excluded. Otherwise it returns false if
+ * stream_id is unknown or has no pending state.
  */
 MOQ_API bool     moq_transport_bridge_stream_has_pending(
     const moq_transport_bridge_t *brg, uint64_t stream_id);

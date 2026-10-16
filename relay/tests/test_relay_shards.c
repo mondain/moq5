@@ -1270,6 +1270,208 @@ test_shards_prefix_safe(void)
     return failures;
 }
 
+/* -- a caller built against the layout through pump_subgroup_slots ---------- */
+
+/* The bind template ending at fetch_forward_bytes and the shards config
+ * ending at pump_subgroup_slots, declared here so the caller below writes its
+ * fields where a binary built against that layout does, whatever the current
+ * header says. */
+typedef struct {
+    uint32_t                   struct_size;
+    const moq_alloc_t         *alloc;
+    moqr_core_t               *core;
+    uint32_t                   max_conns;
+    uint32_t                   max_downstream_subs;
+    uint32_t                   max_open_subgroups;
+    uint32_t                   max_upstream_subs;
+    uint32_t                   max_publishes;
+    uint32_t                   max_announces;
+    uint32_t                   request_grant_window;
+    uint64_t                   router_cookie_base;
+    moqr_bind_intent_router_fn router;
+    void                      *router_ctx;
+    uint64_t                   fetch_forward_bytes;
+} old_bind_cfg_t;
+
+typedef struct {
+    uint32_t              struct_size;
+    const moq_alloc_t    *alloc;
+    uint16_t              shards;
+    uint32_t              trace_ring_records;
+    moqr_place_fn         placement;
+    uint64_t              permute_seed;
+    moqr_core_relay_cfg_t core_cfg;
+    old_bind_cfg_t       bind_cfg;
+    uint32_t              mailbox_entries;
+    uint32_t              journal_entries;
+    uint32_t              pending_demand_entries;
+    bool                  live_visibility;
+    uint32_t              demand_channel_entries;
+    bool                  admit_remote_demand;
+    uint64_t              demand_channel_bytes;
+    uint32_t              pump_turn_messages;
+    uint64_t              pump_turn_bytes;
+    uint32_t              pump_subgroup_slots;
+} old_shards_cfg_t;
+
+/* The current layout keeps every one of those fields where it was. */
+#define OLD_AT(f)                                                          \
+    _Static_assert(offsetof(moqr_shards_cfg_t, f) ==                        \
+                       offsetof(old_shards_cfg_t, f),                      \
+                   "moqr_shards_cfg_t." #f " moved from its offset")
+OLD_AT(struct_size); OLD_AT(alloc); OLD_AT(shards);
+OLD_AT(trace_ring_records); OLD_AT(placement); OLD_AT(permute_seed);
+OLD_AT(core_cfg); OLD_AT(bind_cfg); OLD_AT(mailbox_entries);
+OLD_AT(journal_entries); OLD_AT(pending_demand_entries);
+OLD_AT(live_visibility); OLD_AT(demand_channel_entries);
+OLD_AT(admit_remote_demand); OLD_AT(demand_channel_bytes);
+OLD_AT(pump_turn_messages); OLD_AT(pump_turn_bytes);
+OLD_AT(pump_subgroup_slots);
+#undef OLD_AT
+_Static_assert(sizeof(moqr_bind_cfg_t) == sizeof(old_bind_cfg_t),
+               "the embedded bind template keeps its size");
+
+/* A caller built against that layout: its config ends at
+ * pump_subgroup_slots, it lets the library init exactly that many bytes, sets
+ * every field the layout has (at its offsets) and passes that sizeof as
+ * struct_size. Every value it set is the
+ * value the runtime resolves, the bind template it initialised is used, and
+ * the fields appended since -- poisoned past its struct with a fill-wait pair
+ * create would refuse -- are never read, in place and in an exact heap block
+ * that ends where the caller's struct does. */
+static int
+test_shards_cfg_old_caller(void)
+{
+    int failures = 0;
+    const size_t old = sizeof(old_shards_cfg_t);
+
+    MOQ_TEST_CHECK(old <= sizeof(moqr_shards_cfg_t));
+    for (int exact = 0; exact < 2; exact++) {
+        ca_t a;
+        ca_init(&a);
+        /* poisoned storage of the current size; the caller owns only `old` */
+        unsigned char *buf = malloc(sizeof(moqr_shards_cfg_t));
+        MOQ_TEST_CHECK(buf != NULL);
+        if (buf == NULL) {
+            return failures;
+        }
+        memset(buf, 0xA5, sizeof(moqr_shards_cfg_t));
+        moqr_shards_cfg_init_sized((moqr_shards_cfg_t *)(void *)buf, old,
+                                   &a.vt);
+        /* the library initialised the caller's bytes and nothing past them */
+        bool tail_untouched = true;
+        for (size_t i = old; i < sizeof(moqr_shards_cfg_t); i++) {
+            if (buf[i] != 0xA5u) {
+                tail_untouched = false;
+            }
+        }
+        MOQ_TEST_CHECK(tail_untouched);
+
+        old_shards_cfg_t mc;
+        memcpy(&mc, buf, old);
+        MOQ_TEST_CHECK_EQ_U64(mc.struct_size, old);
+        MOQ_TEST_CHECK(mc.alloc == &a.vt);
+        /* the nested templates the library initialised are whole, so the
+         * runtime takes them rather than its own defaults */
+        MOQ_TEST_CHECK_EQ_U64(mc.bind_cfg.struct_size, sizeof(old_bind_cfg_t));
+        MOQ_TEST_CHECK(mc.bind_cfg.alloc == &a.vt);
+        mc.shards = 2;
+        mc.admit_remote_demand = true;
+        mc.bind_cfg.max_conns = 9;
+        mc.mailbox_entries = 3;
+        mc.journal_entries = 5;
+        mc.pending_demand_entries = 7;
+        mc.demand_channel_entries = 11;
+        mc.pump_turn_messages = 13;
+        mc.pump_turn_bytes = 4096;
+        mc.pump_subgroup_slots = 17;
+        memcpy(buf, &mc, old);
+
+        const moqr_shards_cfg_t *cfg = (const moqr_shards_cfg_t *)(void *)buf;
+        unsigned char *blk = NULL;
+        if (exact) {
+            blk = malloc(old);
+            MOQ_TEST_CHECK(blk != NULL);
+            if (blk == NULL) {
+                free(buf);
+                return failures;
+            }
+            memcpy(blk, buf, old);
+            cfg = (const moqr_shards_cfg_t *)(void *)blk;
+        }
+
+        moqr_shards_limits_t lim;
+        MOQ_TEST_CHECK(moqr_shards_cfg_resolve(cfg, &lim) == MOQR_OK);
+        MOQ_TEST_CHECK_EQ_U64(lim.shards, 2);
+        MOQ_TEST_CHECK(lim.admit);
+        MOQ_TEST_CHECK_EQ_U64(lim.mbox_cap, 3);
+        MOQ_TEST_CHECK_EQ_U64(lim.jrn_cap, 5);
+        MOQ_TEST_CHECK_EQ_U64(lim.pend_cap, 7);
+        MOQ_TEST_CHECK_EQ_U64(lim.dch_cap, 11);
+        MOQ_TEST_CHECK_EQ_U64(lim.pump_turn_msgs, 13);
+        MOQ_TEST_CHECK_EQ_U64(lim.pump_turn_bytes, 4096);
+        MOQ_TEST_CHECK_EQ_U64(lim.sg_slots, 17);
+        /* the bind template's max_conns, under the core's external cap */
+        MOQ_TEST_CHECK_EQ_U64(lim.usable_bindings, 9);
+
+        /* the poisoned fill-wait pair would be refused if it were read */
+        moqr_shards_t *s = NULL;
+        MOQ_TEST_CHECK(moqr_shards_create(cfg, &s) == MOQR_OK);
+        MOQ_TEST_CHECK(s != NULL);
+        moqr_shards_destroy(s);
+        MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+        free(blk);
+        free(buf);
+    }
+    MOQ_TEST_PASS("shards_cfg_old_caller");
+    return failures;
+}
+
+/* The fill-wait pair appended to the shards config reaches every shard's
+ * binding through moqr_bind_set_fill_timeouts, so a pair that setter refuses
+ * fails create, with nothing left allocated; a valid pair, or none, is
+ * accepted. (The waits themselves are pinned end to end by
+ * relay_shard_fill.) */
+static int
+test_shards_cfg_fill_timeouts(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_shards_cfg_t cfg;
+    moqr_shards_cfg_init_sized(&cfg, sizeof(cfg), &a.vt);
+    cfg.shards = 2;
+    MOQ_TEST_CHECK_EQ_U64(cfg.fill_timeout_default_ms, 0);
+    MOQ_TEST_CHECK_EQ_U64(cfg.fill_timeout_max_ms, 0);
+    moqr_shards_t *s = NULL;
+
+    cfg.fill_timeout_default_ms = 20;
+    cfg.fill_timeout_max_ms = 10;
+    MOQ_TEST_CHECK(moqr_shards_create(&cfg, &s) == MOQR_ERR_INVAL);
+    MOQ_TEST_CHECK(s == NULL);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    /* the named default (1000 ms) above an explicit maximum */
+    cfg.fill_timeout_default_ms = 0;
+    cfg.fill_timeout_max_ms = 500;
+    MOQ_TEST_CHECK(moqr_shards_create(&cfg, &s) == MOQR_ERR_INVAL);
+    MOQ_TEST_CHECK(s == NULL);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    /* valid, and then a struct_size that stops before the pair: not read */
+    cfg.fill_timeout_default_ms = 400;
+    MOQ_TEST_CHECK(moqr_shards_create(&cfg, &s) == MOQR_OK);
+    moqr_shards_destroy(s);
+    s = NULL;
+    cfg.fill_timeout_default_ms = 20;
+    cfg.fill_timeout_max_ms = 10;
+    cfg.struct_size = (uint32_t)offsetof(moqr_shards_cfg_t,
+                                         fill_timeout_default_ms);
+    MOQ_TEST_CHECK(moqr_shards_create(&cfg, &s) == MOQR_OK);
+    moqr_shards_destroy(s);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("shards_cfg_fill_timeouts");
+    return failures;
+}
+
 /* -- remote-owner subscribe demand refusal --------------------------------- */
 
 /* A subscribe for a namespace this shard OWNS locally targets the local publisher
@@ -1713,6 +1915,9 @@ resolved(moqr_shards_t *s, uint16_t i, uint64_t *code, bool *pre)
     return moqr_shards_debug_remote_demand_resolved(s, i, code, pre);
 }
 
+/* The FIRST_OBJECT mark the next pub_obj / pub_open_rec ingests with. */
+static bool g_pub_first_object = false;
+
 /* Ingest one object (optionally with properties, a status shape, or the
  * datagram preference) into an owned track on shard i. Payload bytes are a
  * fill pattern so identity survives the boundary crossing verifiably. */
@@ -1730,6 +1935,7 @@ pub_obj(moqr_shards_t *s, ca_t *a, uint16_t i, moqr_track_t th, uint64_t g,
     d.status = (moqr_obj_status_t)status;
     d.datagram_pref = datagram;
     d.end_of_group = eog;
+    d.first_object = g_pub_first_object;
     d.now_us = 1;
     if (len != 0) {
         uint8_t buf[256];
@@ -1777,6 +1983,7 @@ typedef struct dl_probe {
     uint8_t  status;
     bool     datagram;
     bool     eog;
+    bool     first_object;   /* the record opens its subgroup */
     size_t   len, prop_len;
     uint8_t  first, prop_first;
     uint8_t  notice;
@@ -1801,6 +2008,7 @@ pull_one(moqr_shards_t *s, uint16_t i, moqr_binding_t b, dl_probe_t *out)
     out->status = (uint8_t)d.rec.status;
     out->datagram = d.rec.datagram_pref;
     out->eog = d.rec.end_of_group;
+    out->first_object = d.rec.first_object;
     out->notice = d.notice;
     out->sg_end = d.subgroup_end;
     out->reset = d.rec.reset;
@@ -3378,6 +3586,7 @@ pub_open_rec(moqr_shards_t *s, ca_t *a, uint16_t i, moqr_track_t th,
     d.object_id = o;
     d.publisher_priority = 77;
     d.end_of_group = eog;
+    d.first_object = g_pub_first_object;
     d.obj_state = MOQR_OBJ_OPEN;
     d.declared_len = declared;
     d.now_us = 1;
@@ -3791,18 +4000,24 @@ test_shards_cap_admission_delta(void)
     moqr_shards_capacity_t con, coff;
     MOQ_TEST_CHECK(moqr_shards_capacity_describe(&on, &con) == MOQR_OK);
     MOQ_TEST_CHECK(moqr_shards_capacity_describe(&off, &coff) == MOQR_OK);
-    /* The delta lives ONLY in the structure term (channels/canon/staging
-     * are admission-independent), and it scales exactly with K — pinning
-     * it as K x (progress tables + row bitmap), with no other term able to
-     * absorb it. */
+    /* The delta lives in the structure term and, for the full-track key a
+     * requester retrieval slot holds while it routes a standalone FETCH to
+     * the owning shard, in the canon term: exactly K x max_fetches x 4232.
+     * Channels and staging are admission-independent. The structure delta
+     * scales exactly with K — pinning it as K x (progress tables + row
+     * bitmap + retrieval tables), with no other term able to absorb it. */
+    moqr_core_limits_t cl;
+    MOQ_TEST_CHECK(moqr_core_limits_resolve(&on.core_cfg, &cl) == MOQR_OK);
+    const uint64_t keys = 2ull * cl.max_fetches * 4232ull;
+    MOQ_TEST_CHECK(keys > 0);
     MOQ_TEST_CHECK_EQ_U64(con.channel_byte_ceiling, coff.channel_byte_ceiling);
-    MOQ_TEST_CHECK_EQ_U64(con.canon_byte_ceiling, coff.canon_byte_ceiling);
+    MOQ_TEST_CHECK_EQ_U64(con.canon_byte_ceiling - coff.canon_byte_ceiling, keys);
     MOQ_TEST_CHECK_EQ_U64(con.staging_byte_ceiling,
                           coff.staging_byte_ceiling);
     uint64_t d2 = con.shards_structure_bytes - coff.shards_structure_bytes;
     MOQ_TEST_CHECK(d2 > 0);
     MOQ_TEST_CHECK_EQ_U64(con.relay_alloc_ceiling - coff.relay_alloc_ceiling,
-                          d2);
+                          d2 + keys);
     moqr_shards_cfg_t on3, off3;
     shards_cfg(&on3, &a, 3, 0);
     on3.admit_remote_demand = true;
@@ -4101,8 +4316,9 @@ test_shards_cap_term_deltas(void)
         MOQ_TEST_CHECK(s1 > 0);
         MOQ_TEST_CHECK_EQ_U64(s1, s2);
     }
-    /* demand_channel_entries: the channel ceiling moves by exactly
-     * K^2 x (4232 + 2 x HDR) per slot; canon does not move. */
+    /* demand_channel_entries: each slot reserves a control-exempt canon
+     * key and 64 KiB metadata set, plus two clone headers. Canon pools and
+     * the one-message-per-shard staging allowance do not move. */
     {
         moqr_shards_cfg_t c1 = base;
         c1.demand_channel_entries = lb.dch_cap + 1;
@@ -4110,11 +4326,14 @@ test_shards_cap_term_deltas(void)
         MOQ_TEST_CHECK(moqr_shards_capacity_describe(&c1, &d1) == MOQR_OK);
         MOQ_TEST_CHECK_EQ_U64(
             d1.channel_byte_ceiling - cb.channel_byte_ceiling,
-            4ull * (4232ull + 2ull * (uint64_t)hdr));
+            4ull * (4232ull + 65536ull + 2ull * (uint64_t)hdr));
         MOQ_TEST_CHECK_EQ_U64(d1.canon_byte_ceiling, cb.canon_byte_ceiling);
+        MOQ_TEST_CHECK_EQ_U64(d1.staging_byte_ceiling,
+                              cb.staging_byte_ceiling);
     }
     /* demand_channel_bytes: +X moves the channel ceiling by exactly K^2 x X
-     * and the staging term follows the RECORD budget, not the cap. */
+     * and staged fill objects/reasons by K x X. They can exceed a cached
+     * log record, but must fit the channel before either clone is allocated. */
     {
         moqr_shards_cfg_t c1 = base;
         c1.demand_channel_bytes = lb.dch_byte_cap + 4096;
@@ -4123,8 +4342,13 @@ test_shards_cap_term_deltas(void)
         MOQ_TEST_CHECK_EQ_U64(
             d1.channel_byte_ceiling - cb.channel_byte_ceiling,
             4ull * 4096ull);
-        MOQ_TEST_CHECK_EQ_U64(d1.staging_byte_ceiling,
-                              cb.staging_byte_ceiling);
+        MOQ_TEST_CHECK_EQ_U64(
+            d1.staging_byte_ceiling - cb.staging_byte_ceiling,
+            2ull * 4096ull);
+        MOQ_TEST_CHECK_EQ_U64(d1.canon_byte_ceiling, cb.canon_byte_ceiling);
+        MOQ_TEST_CHECK_EQ_U64(
+            d1.relay_alloc_ceiling - cb.relay_alloc_ceiling,
+            (4ull + 2ull) * 4096ull);
     }
     /* subgroup slots: structure-only, linear (admission tables). */
     {
@@ -4481,6 +4705,58 @@ test_shards_chunk_eog_header(void)
     return failures;
 }
 
+/* The FIRST_OBJECT mark (the record is the first object ever published in
+ * its subgroup, draft-18 and draft-22 §2.2) crosses the shard boundary with
+ * the record on both the whole-object and the chunk-through path, so the
+ * requester shard can open its downstream stream with the bit; a later
+ * record of the same subgroup crosses without it. */
+static int
+test_shards_first_object_cross(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_shards_t *s = mk_shards_admit(&a, 2, 0);
+    MOQ_TEST_CHECK(s != NULL);
+    moqr_binding_t p0 = pub_open(s, 0);
+    MOQ_TEST_CHECK(ann(s, 0, p0, "ckF") == MOQR_OK);
+    moqr_track_t ot;
+    MOQ_TEST_CHECK(pub_track_h(s, 0, p0, "ckF", &ot) == MOQR_OK);
+    step_n(s, 8);
+    moqr_binding_t d1 = sub_open(s, 1, 2);
+    moqr_sub_t sub;
+    MOQ_TEST_CHECK(do_subscribe(s, 1, d1, "ckF", 7, &sub) == MOQR_OK);
+    step_n(s, 4);
+    dl_probe_t pr;
+    /* Whole objects: (0,0,0) opens the subgroup, (0,0,1) follows. */
+    for (uint64_t o = 0; o < 2; o++) {
+        g_pub_first_object = o == 0;
+        MOQ_TEST_CHECK(pub_obj(s, &a, 0, ot, 0, 0, o, (uint8_t)(0x30 + o), 8,
+                               0, 0, 0, false, false) == MOQR_OK);
+        g_pub_first_object = false;
+        step_n(s, 6);
+        MOQ_TEST_CHECK(pull_one(s, 1, d1, &pr) == MOQR_OK);
+        MOQ_TEST_CHECK_EQ_U64(pr.object, o);
+        MOQ_TEST_CHECK(pr.first_object == (o == 0));
+    }
+    /* Chunk-through: (1,0,0) opens its subgroup. */
+    g_pub_first_object = true;
+    MOQ_TEST_CHECK(pub_open_rec(s, &a, 0, ot, 1, 0, 0, 16, false, 0, 0) ==
+                   MOQR_OK);
+    g_pub_first_object = false;
+    MOQ_TEST_CHECK(pub_chunk(s, &a, 0, ot, 1, 0, 0, 0x46, 16) == MOQR_OK);
+    MOQ_TEST_CHECK(pub_complete(s, 0, ot, 1, 0, 0) == MOQR_OK);
+    step_n(s, 6);
+    MOQ_TEST_CHECK(pull_one(s, 1, d1, &pr) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(pr.group, 1);
+    MOQ_TEST_CHECK(pr.first_object);
+    MOQ_TEST_CHECK_EQ_U64(dch_total(s, 2), 0);
+    moqr_shards_destroy(s);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("shards_first_object_cross");
+    return failures;
+}
+
 /* One subgroup slot: sequential objects in the same subgroup reuse it, and a
  * second live subgroup exhausts the owner table into the staged terminal —
  * STREAM_ERROR release, captured-track cancel, post-ACK DONE(INTERNAL), and
@@ -4769,6 +5045,13 @@ test_shards_chunk_done_abandons_open(void)
     MOQ_TEST_CHECK(moqr_core_source_done(moqr_shards_core(s, 0), ot, 1, pd_wire(0),
                                          1000) == MOQR_OK);
     step_n(s, 8);
+    /* A forwarded DONE lets d1 drain first. The abandoned object never began
+     * downstream, so nothing is left to send: d1's next pull finishes it
+     * without delivering a record. */
+    {
+        dl_probe_t pr;
+        MOQ_TEST_CHECK(pull_one(s, 1, d1, &pr) != MOQR_OK);
+    }
     moqr_core_stats_t st;
     moqr_core_get_stats(moqr_shards_core(s, 1), &st);
     MOQ_TEST_CHECK_EQ_U64(st.subs_active, 0);
@@ -6927,6 +7210,8 @@ main(void)
     int failures = 0;
     failures += test_shards_lifecycle_k1();
     failures += test_shards_prefix_safe();
+    failures += test_shards_cfg_old_caller();
+    failures += test_shards_cfg_fill_timeouts();
     failures += test_shards_k3_isolation();
     failures += test_shards_determinism();
     failures += test_shards_placement();
@@ -6999,6 +7284,7 @@ main(void)
     failures += test_shards_chunk_cap1();
     failures += test_shards_chunk_turn_budget();
     failures += test_shards_chunk_eog_header();
+    failures += test_shards_first_object_cross();
     failures += test_shards_chunk_slot_exhaust();
     failures += test_shards_chunk_requester_abandon();
     failures += test_shards_chunk_terminal_staged_wb();

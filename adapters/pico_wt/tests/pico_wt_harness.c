@@ -68,6 +68,7 @@ static int harness_create_session(moq_perspective_t persp,
                                    uint64_t goaway_timeout_us,
                                    uint32_t max_events,
                                    moq_version_t version,
+                                   uint32_t max_fills,
                                    moq_session_t **out)
 {
     moq_session_cfg_t cfg;
@@ -77,7 +78,39 @@ static int harness_create_session(moq_perspective_t persp,
     cfg.goaway_timeout_us = goaway_timeout_us;
     if (max_events) cfg.max_events = max_events;
     cfg.version = version;
+    if (max_fills) cfg.max_fills = max_fills;
     return moq_session_create(&cfg, 0, out);
+}
+
+/* An attaching caller binds a session whose profile requires it (draft-22)
+ * before starting it: inside a WebTransport session, handshake complete,
+ * QUIC DATAGRAM from both sides' transport parameters with sending also
+ * needing the peer's HTTP/3 datagram setting, and the authority/path the
+ * CONNECT named. Profiles without requirements are left alone. */
+static int harness_bind_session(moq_session_t *session, picoquic_cnx_t *cnx,
+                                const h3zero_callback_ctx_t *h3)
+{
+    if (moq_session_binding_requirements(session) == 0) return 0;
+    picoquic_tp_t const *local = picoquic_get_transport_parameters(cnx, 1);
+    picoquic_tp_t const *remote = picoquic_get_transport_parameters(cnx, 0);
+    uint32_t supported = MOQ_BINDING_HANDSHAKE_COMPLETE;
+    bool local_dg = local && local->max_datagram_frame_size > 0;
+    bool peer_dg = remote && remote->max_datagram_frame_size > 0;
+    bool peer_h3_dg = h3 && h3->settings.settings_received && h3->settings.h3_datagram;
+    if (local_dg) supported |= MOQ_BINDING_LOCAL_QUIC_DATAGRAM | MOQ_BINDING_DATAGRAM_RECEIVE;
+    if (peer_dg) supported |= MOQ_BINDING_PEER_QUIC_DATAGRAM;
+    if (peer_dg && peer_h3_dg) supported |= MOQ_BINDING_DATAGRAM_SEND;
+    static const uint8_t authority[] = "test.example:443";
+    static const uint8_t path[] = "/moq";
+    moq_transport_binding_t b;
+    moq_transport_binding_init(&b);
+    b.kind = MOQ_BINDING_WEBTRANSPORT_H3;
+    b.facts_known = MOQ_BINDING_FACTS_ALL;
+    b.facts_supported = supported;
+    b.target_present = MOQ_BINDING_TARGET_COMPLETE;
+    b.authority.data = authority; b.authority.len = sizeof(authority) - 1;
+    b.path_query.data = path; b.path_query.len = sizeof(path) - 1;
+    return moq_session_bind_transport(session, &b, sizeof(b)) == MOQ_OK ? 0 : -1;
 }
 
 static int harness_attach_adapter(moq_session_t *session,
@@ -166,12 +199,13 @@ int pico_wt_harness_setup(pico_wt_harness_t *h,
 
     h->version = cfg->version;
     if (harness_create_session(MOQ_PERSPECTIVE_CLIENT, cap, 0,
-                               cfg->max_events, cfg->version,
+                               cfg->max_events, cfg->version, 0,
                                &h->client_session) != 0)
         return -1;
     if (harness_create_session(MOQ_PERSPECTIVE_SERVER, cap,
                                cfg->server_goaway_timeout_us,
                                cfg->max_events, cfg->version,
+                               cfg->server_max_fills,
                                &h->server_session) != 0)
         return -1;
 
@@ -236,11 +270,17 @@ int pico_wt_harness_pump_until_closed(pico_wt_harness_t *h, uint64_t ms,
 
 int pico_wt_harness_handshake(pico_wt_harness_t *h)
 {
+    /* Profiles that must be told how they are carried are bound first. */
+    if (harness_bind_session(h->client_session, h->test_ctx->cnx_client,
+                             h->client_wt.h3_ctx) != 0 ||
+        harness_bind_session(h->server_session, h->test_ctx->cnx_server,
+                             h->server_wt.h3_ctx) != 0)
+        return -1;
     moq_session_start(h->client_session, h->now);
-    /* Draft-18 is a symmetric handshake over a unidirectional
-     * control-channel pair: both endpoints start and send SETUP.
-     * Draft-16 starts the client alone; the server is reactive. */
-    if (h->version == MOQ_VERSION_DRAFT_18)
+    /* Uni-control profiles (draft-18, draft-22) are a symmetric handshake
+     * over a unidirectional control-channel pair: both endpoints start and
+     * send SETUP. Draft-16 starts the client alone; the server is reactive. */
+    if (h->version == MOQ_VERSION_DRAFT_18 || h->version == MOQ_VERSION_DRAFT_22)
         moq_session_start(h->server_session, h->now);
     moq_pico_wt_service(h->client_conn, h->now);
 

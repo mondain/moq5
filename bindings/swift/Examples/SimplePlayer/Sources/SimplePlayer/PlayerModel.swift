@@ -88,7 +88,8 @@ final class PlayerModel: ObservableObject {
         }
     }
     enum VersionChoice: String, CaseIterable, Identifiable {
-        case automatic = "Auto"          // offer all supported versions
+        case automatic = "Auto"          // legacy offer: draft 18, then draft 16
+        case draft22 = "Draft 22"
         case draft18 = "Draft 18"
         case draft16 = "Draft 16"
         var id: String { rawValue }
@@ -180,14 +181,7 @@ final class PlayerModel: ObservableObject {
             state = .failed("Invalid URL")
             return
         }
-        let configuration = LiveMediaSession.Configuration(
-            endpoint: makeConfiguration(url: url),
-            namespace: MediaNamespace(namespaceText),
-            selector: Self.videoRequiredSelector,
-            // Bound establishment so an unreachable relay (or an experimental
-            // backend that wedges before it establishes) surfaces a clear
-            // failure instead of an indefinite "Connecting…".
-            establishmentTimeout: .seconds(15))
+        let configuration = makeWatchConfiguration(url: url)
 
         isRunning = true
         activeBackend = backend        // latch: describe() uses this, not the live picker
@@ -312,8 +306,8 @@ final class PlayerModel: ObservableObject {
     /// drop that state, but the endpoint keeps answering.
     private func refreshVersion() {
         if negotiatedVersion == nil,
-           let version = session.endpoint?.negotiatedVersion {
-            negotiatedVersion = String(describing: version)
+           let version = session.endpoint?.negotiatedWireVersion {
+            negotiatedVersion = "draft\(version.draftNumber)"
         }
     }
 
@@ -418,6 +412,19 @@ final class PlayerModel: ObservableObject {
 
     // -- Configuration mapping --------------------------------------------
 
+    func makeWatchConfiguration(url: URL) -> LiveMediaSession.Configuration {
+        LiveMediaSession.Configuration(
+            endpoint: makeConfiguration(url: url),
+            namespace: MediaNamespace(namespaceText),
+            selector: Self.videoRequiredSelector,
+            // Bound establishment so an unreachable relay (or an experimental
+            // backend that wedges before it establishes) surfaces a clear
+            // failure instead of an indefinite "Connecting...".
+            establishmentTimeout: .seconds(15),
+            companionProfile: version == .draft22
+                ? .draft22MSF01LOC04Public : .legacyMSF01LOC01)
+    }
+
     /// The Advanced panel maps 1:1 onto `MoQEndpoint.Configuration`; nothing
     /// here is invented. `.automatic` transport derives from the URL scheme
     /// (moqt:// -> raw QUIC, https:// -> WebTransport, taking the WT path
@@ -437,6 +444,7 @@ final class PlayerModel: ObservableObject {
         }
         switch version {
         case .automatic: break
+        case .draft22:   configuration.wireVersions = .list([.draft22])
         case .draft18:   configuration.versions = .list([.draft18])
         case .draft16:   configuration.versions = .list([.draft16])
         }

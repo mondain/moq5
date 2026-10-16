@@ -91,7 +91,7 @@ failed:
 static int usage(FILE *out)
 {
     fputs("Usage: moq_simple_relay CERT.pem KEY.pem [PORT]\n"
-          "Loopback-only raw QUIC relay; drafts 18 and 16; default port 4433.\n"
+          "Loopback-only raw QUIC relay; drafts 22, 18 and 16; default port 4433.\n"
           "PORT 0 selects an ephemeral port. Ctrl-C or SIGTERM stops it.\n", out);
     return out == stdout ? 0 : 2;
 }
@@ -144,7 +144,8 @@ int main(int argc, char **argv)
         fputs("relay create failed\n", stderr);
         return 1;
     }
-    const moq_version_t versions[] = {MOQ_VERSION_DRAFT_18, MOQ_VERSION_DRAFT_16};
+    const moq_version_t versions[] = {MOQ_VERSION_DRAFT_22, MOQ_VERSION_DRAFT_18,
+                                     MOQ_VERSION_DRAFT_16};
     moq_msquic_managed_cfg_t cfg;
     moq_msquic_managed_cfg_init_sized(&cfg, sizeof(cfg));
     cfg.alloc = moq_alloc_default();

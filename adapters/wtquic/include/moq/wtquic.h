@@ -19,6 +19,9 @@
  *      with the adapter as their user argument. Keep the bootstrap context
  *      alive until provider quiescence. Handle pre-establishment failure
  *      without an adapter; qualification failure must close the WT session.
+ *      Forward the complete sized event table, including
+ *      on_stream_send_committed; forwarding only buffer-return callbacks
+ *      cannot satisfy peer-ACK reporting.
  *   3. Everything else happens inside wtquic's callbacks: the adapter
  *      feeds the bridge, services it, and then invokes the hook — the
  *      application's slot to poll moq session events and drive the
@@ -33,6 +36,9 @@
  *   transport queue, and any sent while the session carries no datagrams
  *   are dropped, never fatal). No idle deadline tick: sessions relying on
  *   timer-driven closes (GOAWAY drain) need external service() calls.
+ *   Peer-ACK commitment is enabled only for a WT session advertising the
+ *   local-UNI ACK-through-FIN/resettable contract. Other backends keep their
+ *   existing behavior. This does not imply reliable-prefix reset support.
  *
  * LIFETIME
  *   The moq session must outlive the conn. Destroy the conn only after

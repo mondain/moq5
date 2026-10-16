@@ -242,3 +242,15 @@ External provider packages must carry the equivalent implementation and
 advertise `PICOQUIC_CLOSE_REASON_COPIED=1` in their matching public header.
 The adapter rejects headers without this contract. Rebuild private-header
 consumers and provider binaries together after applying the patch.
+
+## Provider terminal observation
+
+`scripts/setup_picoquic_deps.sh` also applies patch 0007, which advertises
+`PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION` 1: the exact STOP_SENDING error
+(`picoquic_get_remote_stop_error`) and an opt-in callback once every byte and
+the FIN of a local unidirectional stream are acknowledged
+(`picoquic_enable_stream_send_commit`). With it the raw and WebTransport
+adapters report commitment to the bridge (`MOQ_TRANSPORT_CAP_COMMIT_REPORT`).
+A reset accepted on the stream wins over any later ACK. A provider header
+without the macro builds the adapters without commit reports. The patches
+apply in file order: 0002, 0006, 0007.

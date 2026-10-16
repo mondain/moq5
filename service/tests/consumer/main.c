@@ -1,10 +1,10 @@
 /*
  * pkg-config consumer for the libmoq service tier.
  *
- * Consumes the service exactly as a Meson/autotools/VLC-style downstream would:
- * built with ONLY `pkg-config --cflags --libs libmoq-service` from an installed
- * prefix -- no CMake, no source-tree includes. Includes only public service
- * headers and calls init-only APIs (no network, no certs, no connect).
+ * The install gate builds this with ONLY `pkg-config --cflags --libs
+ * libmoq-service`, as a Meson/autotools/VLC-style downstream would. The same
+ * source also runs against the in-tree shipping target. Public headers and
+ * init-only APIs only (no network, no certs, no connect).
  */
 #include <moq/endpoint.h>
 #include <moq/media_receiver.h>
@@ -13,6 +13,27 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
+
+/* Complete receiver config before the MPEG2TS and companion tails were
+ * appended. */
+typedef struct receiver_cfg_v0 {
+    uint32_t struct_size;
+    const moq_endpoint_cfg_t *endpoint;
+    moq_namespace_t namespace_;
+    moq_bytes_t catalog_track;
+    bool auto_subscribe;
+    moq_media_time_mode_t time_mode;
+    moq_media_overflow_cfg_t overflow;
+    uint32_t max_track_events;
+} receiver_cfg_v0_t;
+
+typedef struct track_cfg_v0 {
+    uint32_t struct_size;
+    moq_media_start_mode_t start;
+    bool has_priority;
+    uint8_t priority;
+} track_cfg_v0_t;
 
 static moq_tls_certificate_verdict_t consumer_verify_certificate(
     void *ctx, moq_bytes_t server_name,
@@ -66,14 +87,31 @@ int main(void)
     if (ecs.handshake_timeout_us != 5000000ull)
         return 1;
 
-    /* Receiver cfg (live preset): forces an overflow policy. The pointer-only
-     * form stamps the frozen v0 prefix, the sized form the full struct. */
+    /* Receiver cfg (live preset): the pointer-only form stamps exactly the
+     * frozen v0 allocation and leaves the appended tails alone; the sized
+     * forms stamp the full struct. */
     moq_media_receiver_cfg_t rcfg;
+    memset(&rcfg, 0xa5, sizeof(rcfg));
     moq_media_receiver_cfg_init_live(&rcfg);
-    if (rcfg.struct_size != MOQ_MEDIA_RECEIVER_CFG_V0_SIZE)
+    if (rcfg.struct_size != MOQ_MEDIA_RECEIVER_CFG_V0_SIZE ||
+        rcfg.struct_size != sizeof(receiver_cfg_v0_t) ||
+        rcfg.overflow.policy != MOQ_MEDIA_OVERFLOW_DROP_TO_KEYFRAME)
+        return 2;
+    for (size_t i = sizeof(receiver_cfg_v0_t); i < sizeof(rcfg); ++i)
+        if (((const unsigned char *)&rcfg)[i] != 0xa5)
+            return 2;
+    moq_media_receiver_cfg_init_sized(&rcfg, sizeof(rcfg));
+    if (rcfg.struct_size != sizeof(rcfg) || rcfg.overflow.policy != MOQ_MEDIA_OVERFLOW_UNSET ||
+        rcfg.companion_profile != MOQ_MEDIA_COMPANION_AUTO)
+        return 2;
+    moq_media_receiver_cfg_init_flow_control_sized(&rcfg, sizeof(rcfg));
+    if (rcfg.struct_size != sizeof(rcfg) || rcfg.overflow.policy != MOQ_MEDIA_OVERFLOW_FLOW_CONTROL)
         return 2;
     moq_media_receiver_cfg_init_live_sized(&rcfg, sizeof(rcfg));
-    if (rcfg.struct_size != sizeof(moq_media_receiver_cfg_t))
+    if (rcfg.struct_size != sizeof(rcfg) || rcfg.overflow.policy != MOQ_MEDIA_OVERFLOW_DROP_TO_KEYFRAME)
+        return 2;
+    rcfg.companion_profile = MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC;
+    if (rcfg.companion_profile != MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC)
         return 2;
 
     /* Sender cfg (live preset). The pointer-only initializer stamps the
@@ -87,7 +125,8 @@ int main(void)
     /* Sized presets stamp the caller's full struct and enable the appended
      * fields (the documented push-sender flow). */
     moq_media_sender_cfg_init_live_sized(&scfg, sizeof(scfg));
-    if (scfg.struct_size != sizeof(moq_media_sender_cfg_t))
+    if (scfg.struct_size != sizeof(moq_media_sender_cfg_t) ||
+        scfg.companion_profile != MOQ_MEDIA_COMPANION_AUTO)
         return 31;
     scfg.publish_tracks = true;
     scfg.drop_without_demand = true;
@@ -122,13 +161,14 @@ int main(void)
     /* Per-track subscribe cfg: the manual-subscription surface. */
     moq_media_receiver_track_subscribe_cfg_t tcfg;
     moq_media_receiver_track_subscribe_cfg_init(&tcfg);
-    if (tcfg.struct_size != MOQ_MEDIA_RECEIVER_TRACK_SUBSCRIBE_CFG_V0_SIZE)
+    if (tcfg.struct_size != MOQ_MEDIA_RECEIVER_TRACK_SUBSCRIBE_CFG_V0_SIZE ||
+        tcfg.struct_size != sizeof(track_cfg_v0_t))
         return 4;
     if (tcfg.start != MOQ_MEDIA_START_CURRENT)
         return 5;
     moq_media_receiver_track_subscribe_cfg_init_sized(&tcfg, sizeof(tcfg));
-    if (tcfg.struct_size != sizeof(moq_media_receiver_track_subscribe_cfg_t))
-        return 4;
+    if (tcfg.struct_size != sizeof(tcfg) || tcfg.location != NULL || tcfg.fill != NULL)
+        return 5;
 
     /* Wake/wait contract surface: NULL-safe forms only (no network), so the
      * installed prefix proves both new public symbols link and behave. */

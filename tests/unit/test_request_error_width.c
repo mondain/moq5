@@ -477,7 +477,7 @@ static int check_sub_armed(const moq_session_t *s,
     MOQ_TEST_CHECK(s->subs[id->slot].generation == id->generation);
     MOQ_TEST_CHECK(s->subs[id->slot].handle._opaque == id->handle._opaque);
     MOQ_TEST_CHECK(s->subs[id->slot].request_id == id->request_id);
-    MOQ_TEST_CHECK(s->subs[id->slot].request_stream_ref._v == id->ref._v);
+    MOQ_TEST_CHECK(s->subs[id->slot].rs.ref._v == id->ref._v);
 
     og_capture(s, &g);
     failures += og_check_integrity(&g, what);
@@ -1010,7 +1010,7 @@ static int run_inbound_d18(uint64_t wire_code, struct inbound_obs *o)
         MOQ_TEST_CHECK(c->subs[id.slot].state == MOQ_SUB_TERMINATED);
         MOQ_TEST_CHECK(c->subs[id.slot].generation == id.generation);
         MOQ_TEST_CHECK(c->subs[id.slot].handle._opaque == id.handle._opaque);
-        MOQ_TEST_CHECK(c->subs[id.slot].request_stream_ref._v == id.ref._v);
+        MOQ_TEST_CHECK(c->subs[id.slot].rs.ref._v == id.ref._v);
     }
     {
         const og_edge_spec_t want[] = {
@@ -1262,7 +1262,7 @@ static int check_inbound_sub_armed(const moq_session_t *s,
     MOQ_TEST_CHECK(s->subs[id->slot].generation == id->generation);
     MOQ_TEST_CHECK(s->subs[id->slot].handle._opaque == id->handle._opaque);
     MOQ_TEST_CHECK(s->subs[id->slot].request_id == id->request_id);
-    MOQ_TEST_CHECK(s->subs[id->slot].request_stream_ref._v == id->ref._v);
+    MOQ_TEST_CHECK(s->subs[id->slot].rs.ref._v == id->ref._v);
 
     og_capture(s, &g);
     failures += og_check_integrity(&g, what);

@@ -27,7 +27,7 @@
  */
 
 #include <moq/sim.h>
-#include <moq/codec.h>
+#include "scenario_pair_version.h"
 #include "../../tests/unit/test_support.h"
 #include <stdlib.h>
 #include <string.h>
@@ -53,6 +53,7 @@ typedef struct {
     size_t   goaway_blocked;
     size_t   objects_after_goaway;
     size_t   duplicate_goaway_close;
+    size_t   duplicate_failures;
     size_t   goaway_timeout_closes;
     size_t   ticks_before_deadline;
     size_t   rnd_time_advances;
@@ -99,6 +100,120 @@ static void sa_free(void *p, size_t sz, void *ctx) {
     scen_alloc_t *s = (scen_alloc_t *)ctx;
     (void)sz; if (p) s->balance--;
     free(p);
+}
+
+static moq_result_t inject_goaway(moq_session_t *client, uint64_t now_us)
+{
+    /* Independent control-stream literals: D16 section9.4 has only URI;
+     * D18 section10.4 adds Timeout and Request ID; D22 section9.2 retains
+     * Timeout but removes Request ID. All fields are zero here, including
+     * the D18 client-even Request ID. Length is a big-endian uint16. */
+    static const uint8_t d16[] = { 0x10, 0x00, 0x01, 0x00 };
+    static const uint8_t d18[] = { 0x10, 0x00, 0x03, 0x00, 0x00, 0x00 };
+    static const uint8_t d22[] = { 0x10, 0x00, 0x02, 0x00, 0x00 };
+    const uint8_t *bytes;
+    size_t len;
+    switch (moq_session_version(client)) {
+    case MOQ_VERSION_DRAFT_16: bytes = d16; len = sizeof(d16); break;
+    case MOQ_VERSION_DRAFT_18: bytes = d18; len = sizeof(d18); break;
+    case MOQ_VERSION_DRAFT_22: bytes = d22; len = sizeof(d22); break;
+    default: return MOQ_ERR_UNSUPPORTED;
+    }
+    return moq_session_on_control_bytes(client, bytes, len, now_us);
+}
+
+static bool poll_duplicate_close(moq_session_t *client)
+{
+    static const char reason[] = "duplicate GOAWAY";
+    size_t closed = 0;
+    bool exact = true;
+    moq_event_t event;
+    while (moq_session_poll_events(client, &event, 1) == 1) {
+        if (event.kind == MOQ_EVENT_SESSION_CLOSED) {
+            ++closed;
+            exact = exact && event.u.closed.code == 0x3 &&
+                event.u.closed.reason.len == sizeof(reason) - 1 &&
+                event.u.closed.reason.data != NULL &&
+                memcmp(event.u.closed.reason.data, reason, sizeof(reason) - 1) == 0;
+        }
+        moq_event_cleanup(&event);
+    }
+    return closed == 1 && exact &&
+           moq_session_state(client) == MOQ_SESS_CLOSED;
+}
+
+/* The injected packet must first work as a lawful, non-duplicate GOAWAY.
+ * Otherwise a malformed-packet close could impersonate duplicate handling. */
+static int run_duplicate_wire_control(const moq_alloc_t *alloc, bool malformed)
+{
+    int failures = 0;
+    moq_simpair_cfg_t cfg = MOQ_SIMPAIR_CFG_INIT;
+    cfg.version = scenario_selected_version(MOQ_VERSION_DRAFT_16);
+    cfg.alloc = alloc;
+    moq_simpair_t *sp = NULL;
+    if (moq_simpair_create(&cfg, &sp) != MOQ_OK) return 1;
+    if (moq_simpair_start(sp) != MOQ_OK ||
+        moq_simpair_run_until_quiescent(sp, 8, NULL) != MOQ_OK) {
+        fprintf(stderr, "FAIL: goaway-wire setup\n");
+        failures++;
+        goto done;
+    }
+    moq_session_t *client = moq_simpair_client(sp);
+    moq_session_t *server = moq_simpair_server(sp);
+    moq_event_t event;
+    while (moq_session_poll_events(client, &event, 1) == 1)
+        moq_event_cleanup(&event);
+    while (moq_session_poll_events(server, &event, 1) == 1)
+        moq_event_cleanup(&event);
+    if (moq_session_version(client) != cfg.version ||
+        moq_session_version(server) != cfg.version ||
+        moq_session_state(client) != MOQ_SESS_ESTABLISHED ||
+        moq_session_state(server) != MOQ_SESS_ESTABLISHED) {
+        fprintf(stderr, "FAIL: goaway-wire actual profile/setup\n");
+        failures++;
+        goto done;
+    }
+    if (malformed) {
+        static const uint8_t missing_body[] = { 0x10, 0x00, 0x00 };
+        if (moq_session_on_control_bytes(client, missing_body,
+                sizeof(missing_body), moq_simpair_now_us(sp)) != MOQ_OK ||
+            moq_session_state(client) != MOQ_SESS_CLOSED) {
+            fprintf(stderr, "FAIL: goaway-wire malformed control prerequisite\n");
+            failures++;
+        } else if (poll_duplicate_close(client)) {
+            fprintf(stderr, "FAIL: goaway-wire malformed close counted as duplicate\n");
+            failures++;
+        }
+        goto done;
+    }
+    size_t goaway = 0, closed = 0;
+    moq_result_t rc = inject_goaway(client, moq_simpair_now_us(sp));
+    while (moq_session_poll_events(client, &event, 1) == 1) {
+        if (event.kind == MOQ_EVENT_GOAWAY) ++goaway;
+        if (event.kind == MOQ_EVENT_SESSION_CLOSED) ++closed;
+        moq_event_cleanup(&event);
+    }
+    if (rc != MOQ_OK || goaway != 1 || closed != 0 ||
+        moq_session_state(client) != MOQ_SESS_DRAINING) {
+        fprintf(stderr, "FAIL: goaway-wire first-valid d%u rc=%d goaway=%zu closed=%zu\n",
+                (unsigned)cfg.version, (int)rc, goaway, closed);
+        failures++;
+        goto done;
+    }
+    if (inject_goaway(client, moq_simpair_now_us(sp)) != MOQ_OK ||
+        !poll_duplicate_close(client)) {
+        fprintf(stderr, "FAIL: goaway-wire exact duplicate close d%u\n",
+                (unsigned)cfg.version);
+        failures++;
+    }
+    if (moq_session_poll_events(client, &event, 1) != 0) {
+        moq_event_cleanup(&event);
+        fprintf(stderr, "FAIL: goaway-wire repeated terminal\n");
+        failures++;
+    }
+done:
+    moq_simpair_destroy(sp);
+    return failures;
 }
 
 /* -- Shadow model --------------------------------------------------- */
@@ -520,15 +635,13 @@ static void execute_step(moq_simpair_t *sp, shadow_t *sh,
 
     case OP_DUPLICATE_GOAWAY:
         if (sh->server_goaway_sent && !sh->closed) {
-            uint8_t buf[16];
-            moq_buf_writer_t w;
-            moq_buf_writer_init(&w, buf, sizeof(buf));
-            moq_d16_encode_goaway(&w, NULL, 0);
-            moq_session_on_control_bytes(c, buf,
-                moq_buf_writer_offset(&w), moq_simpair_now_us(sp));
-            if (moq_session_state(c) == MOQ_SESS_CLOSED) {
+            if (inject_goaway(c, moq_simpair_now_us(sp)) == MOQ_OK &&
+                poll_duplicate_close(c)) {
                 ts->duplicate_goaway_close++;
                 sh->closed = true;
+            } else {
+                fprintf(stderr, "FAIL: random GOAWAY did not yield exact duplicate close\n");
+                ts->duplicate_failures++;
             }
         }
         break;
@@ -554,6 +667,7 @@ static int run_scenario(uint64_t seed, const moq_alloc_t *alloc,
     summary->hash = 0xCBF29CE484222325ULL;
 
     moq_simpair_cfg_t cfg = MOQ_SIMPAIR_CFG_INIT;
+    cfg.version = scenario_selected_version(MOQ_VERSION_DRAFT_16);
     cfg.alloc = alloc;
     cfg.seed = seed;
     cfg.initial_now_us = 1000;
@@ -613,7 +727,7 @@ static int run_scenario(uint64_t seed, const moq_alloc_t *alloc,
     }
 
     moq_simpair_destroy(sp);
-    return failures;
+    return failures + (int)summary->duplicate_failures;
 }
 
 /* -- Run one timeout scenario --------------------------------------- */
@@ -625,6 +739,7 @@ static int run_timeout_scenario(uint64_t seed, const moq_alloc_t *alloc,
     summary->hash = 0xCBF29CE484222325ULL;
 
     moq_simpair_cfg_t cfg = MOQ_SIMPAIR_CFG_INIT;
+    cfg.version = scenario_selected_version(MOQ_VERSION_DRAFT_16);
     cfg.alloc = alloc;
     cfg.seed = seed;
     cfg.initial_now_us = 1000;
@@ -682,7 +797,18 @@ static int run_timeout_scenario(uint64_t seed, const moq_alloc_t *alloc,
 
 int main(void)
 {
+    if (scenario_selected_version(MOQ_VERSION_DRAFT_16) == 0) return 1;
     int failures = 0;
+    for (unsigned malformed = 0; malformed < 2; ++malformed) {
+        scen_alloc_t as = {0};
+        moq_alloc_t alloc = { &as, sa_alloc, sa_realloc, sa_free };
+        failures += run_duplicate_wire_control(&alloc, malformed != 0);
+        if (as.balance != 0) {
+            fprintf(stderr, "FAIL: goaway-wire allocator balance=%lld\n",
+                    (long long)as.balance);
+            failures++;
+        }
+    }
     const char *env_seeds = getenv("MOQ_SCENARIO_SEEDS");
     const char *env_start = getenv("MOQ_SCENARIO_SEED_START");
     const char *env_steps = getenv("MOQ_SCENARIO_STEPS");
@@ -737,6 +863,7 @@ int main(void)
                 sums[0].goaway_blocked != sums[1].goaway_blocked ||
                 sums[0].objects_after_goaway != sums[1].objects_after_goaway ||
                 sums[0].duplicate_goaway_close != sums[1].duplicate_goaway_close ||
+                sums[0].duplicate_failures != sums[1].duplicate_failures ||
                 sums[0].goaway_timeout_closes != sums[1].goaway_timeout_closes ||
                 sums[0].ticks_before_deadline != sums[1].ticks_before_deadline ||
                 sums[0].rnd_time_advances != sums[1].rnd_time_advances) {
@@ -836,5 +963,5 @@ int main(void)
                 "(%d failures in %llu seeds)\n",
                 failures, (unsigned long long)num_seeds);
 
-    return failures;
+    return failures ? 1 : 0;
 }

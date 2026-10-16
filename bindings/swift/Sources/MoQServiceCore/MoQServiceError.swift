@@ -2,8 +2,7 @@
 ///
 /// The cases mirror the C service tier's `moq_result_t` vocabulary, but only
 /// the states an app can meaningfully react to are distinct cases; internal
-/// C codes that "cannot happen" through this API surface land in
-/// ``internalError(_:)``.
+/// C codes without a distinct public case land in ``internalError(_:)``.
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
 public enum MoQServiceError: Error, Sendable, Hashable {
     /// A configuration or argument was rejected before any I/O happened.
@@ -42,8 +41,9 @@ public enum MoQServiceError: Error, Sendable, Hashable {
 
     case outOfMemory
 
-    /// An unexpected C result code leaked through; the raw value is kept
-    /// for diagnostics.
+    /// A C result without a dedicated case, preserving its signed raw value.
+    /// This includes expected native refusals such as a stale fill ID or
+    /// an ABI-size mismatch; it does not necessarily indicate an internal bug.
     case internalError(Int32)
 }
 

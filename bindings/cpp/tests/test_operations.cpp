@@ -379,7 +379,13 @@ int main()
         c.poll_event();
 
         auto sg = s.open_subgroup(srv_sub, {}, 0).value();
-        s.poll_action(); // drain open
+        size_t header_len = 0;
+        if (auto open = s.poll_action()) { // the subgroup header
+            open->visit(
+                [&](const moq::action::send_data &sd) { header_len = sd.header.size(); },
+                [](const auto &) {});
+        }
+        MOQ_CHECK(header_len > 0);
 
         auto rr = s.reset_subgroup(sg, 0x42, 0);
         MOQ_CHECK(rr.ok());
@@ -390,6 +396,8 @@ int main()
                 [&](const moq::action::reset_data &rd) {
                     found_reset = true;
                     MOQ_CHECK(rd.error_code == 0x42);
+                    // the reset keeps the header it follows
+                    MOQ_CHECK(a->reliable_size() == header_len);
                 },
                 [](const auto &) {});
         }

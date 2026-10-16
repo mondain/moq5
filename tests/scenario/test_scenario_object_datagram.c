@@ -2,6 +2,7 @@
  * Two-tier oracle: prelude (exact delivery) + random (received <= fed).
  * Each seed runs twice; trace hash + all oracle counters must match. */
 #include <moq/sim.h>
+#include "scenario_pair_version.h"
 #include "../../tests/unit/test_support.h"
 #include <stdlib.h>
 #include <string.h>
@@ -96,6 +97,7 @@ static int run_one(uint64_t seed, int max_steps, run_counters_t *out)
         traces[run].rnd_prop_rcv_hash = INIT_HASH;
 
         moq_simpair_cfg_t cfg = MOQ_SIMPAIR_CFG_INIT;
+        cfg.version = scenario_selected_version(MOQ_VERSION_DRAFT_16);
         cfg.alloc = &alloc;
         cfg.seed = seed;
         cfg.client_send_request_capacity = true;
@@ -231,8 +233,18 @@ static int run_one(uint64_t seed, int max_steps, run_counters_t *out)
         }
 
         /* -- Random phase ---------------------------------------------- */
+        /* The random traffic keeps the Track well-formed so the subscription
+         * survives the whole phase: once a group's final Object is known
+         * (END_OF_GROUP status or an end-of-group datagram), no later Object
+         * in that group exceeds it, and a final never lands below an Object
+         * already sent. Properties are well-formed even-type KVPs. Malformed
+         * Track handling has its own targeted tests. Group 0's final is
+         * Object 2 from the prelude. */
         rng_t rng = { seed ^ 0xDA7A60A3ULL };
         bool closed = false;
+        enum { RND_GROUPS = 4 };
+        uint64_t g_final[RND_GROUPS] = { 2, UINT64_MAX, UINT64_MAX, UINT64_MAX };
+        uint64_t g_max[RND_GROUPS] = { 2, 0, 0, 0 };
 
         for (int step = 0; step < max_steps && !closed; step++) {
             op_t op = (op_t)(rng_next(&rng) % OP_COUNT);
@@ -250,16 +262,28 @@ static int run_one(uint64_t seed, int max_steps, run_counters_t *out)
                     pd[j] = (uint8_t)(rng_next(&rng) & 0xFF);
                 moq_rcbuf_t *p = NULL;
                 if (moq_rcbuf_create(&alloc, pd, pl, &p) < 0) break;
-                uint64_t gid = rng_next(&rng) % 4;
+                uint64_t gid = rng_next(&rng) % RND_GROUPS;
                 uint64_t oid = 1 + rng_next(&rng) % 15;
                 bool eog = (rng_next(&rng) % 8) == 0;
                 bool use_props = (rng_next(&rng) % 4) == 0;
+                if (g_final[gid] != UINT64_MAX) {
+                    /* Stay strictly below the known final Object. */
+                    if (g_final[gid] <= 1) { moq_rcbuf_decref(p); break; }
+                    if (oid >= g_final[gid]) oid = 1 + oid % (g_final[gid] - 1);
+                    eog = false;
+                } else if (eog && oid <= g_max[gid]) {
+                    eog = false;
+                }
+                /* One to three (even type, single-byte value) pairs: type 2
+                 * repeated under absolute types, types 2/4/6 under deltas. */
                 uint8_t prop_buf[8];
                 size_t prop_len = 0;
                 if (use_props) {
-                    prop_len = 1 + rng_next(&rng) % 7;
-                    for (size_t j = 0; j < prop_len; j++)
-                        prop_buf[j] = (uint8_t)(rng_next(&rng) & 0xFF);
+                    size_t pairs = 1 + rng_next(&rng) % 3;
+                    for (size_t j = 0; j < pairs; j++) {
+                        prop_buf[prop_len++] = 0x02;
+                        prop_buf[prop_len++] = (uint8_t)(rng_next(&rng) & 0x3F);
+                    }
                 }
                 moq_result_t rc = moq_session_send_object_datagram(
                     sv, srv_sub, gid, oid, 128, eog, p,
@@ -267,6 +291,8 @@ static int run_one(uint64_t seed, int max_steps, run_counters_t *out)
                     moq_simpair_now_us(sp));
                 moq_rcbuf_decref(p);
                 if (rc == MOQ_OK) {
+                    if (oid > g_max[gid]) g_max[gid] = oid;
+                    if (eog) g_final[gid] = oid;
                     hash_pl(&ts->rnd_fed_hash, pl, pd);
                     ts->rnd_fed_count++;
                     if (use_props) {
@@ -278,11 +304,17 @@ static int run_one(uint64_t seed, int max_steps, run_counters_t *out)
                 break;
             }
             case OP_SEND_STATUS_DG: {
-                uint64_t gid = rng_next(&rng) % 4;
+                uint64_t gid = rng_next(&rng) % RND_GROUPS;
                 uint64_t oid = rng_next(&rng) % 16;
+                if (g_final[gid] != UINT64_MAX) break;   /* group already ended */
+                if (oid <= g_max[gid]) oid = g_max[gid] + 1;
                 moq_result_t rc = moq_session_send_status_datagram(
                     sv, srv_sub, gid, oid, 128, MOQ_OBJECT_END_OF_GROUP,
                     moq_simpair_now_us(sp));
+                if (rc == MOQ_OK) {
+                    g_max[gid] = oid;
+                    g_final[gid] = oid;
+                }
                 HMIX(ts, rc);
                 break;
             }
@@ -399,6 +431,7 @@ static int run_one(uint64_t seed, int max_steps, run_counters_t *out)
 
 int main(void)
 {
+    if (scenario_selected_version(MOQ_VERSION_DRAFT_16) == 0) return 1;
     int failures = 0;
 
     uint64_t seed_start = 0;

@@ -22,6 +22,7 @@ typedef struct {
 static const alpn_expect_t EXPECT[] = {
     { MOQ_VERSION_DRAFT_16, "moqt-16", 7 },
     { MOQ_VERSION_DRAFT_18, "moqt-18", 7 },
+    { MOQ_VERSION_DRAFT_22, "moqt-22", 7 },
 };
 
 #define EXPECT_N (sizeof(EXPECT) / sizeof(EXPECT[0]))
@@ -91,7 +92,7 @@ static int table_problems(void)
     int failures = 0;
 
     /* 1. exact cardinality */
-    MOQ_TEST_CHECK(TABLE_N == 2);
+    MOQ_TEST_CHECK(TABLE_N == 3);
     MOQ_TEST_CHECK(TABLE_N == EXPECT_N);
 
     /* 5. every table row is well formed -- non-NULL, nonzero length, and a
@@ -229,6 +230,18 @@ int main(void)
 
     /* NULL out pointer is rejected. */
     MOQ_TEST_CHECK(moq_alpn_to_version("moqt-16", 7, NULL) == false);
+
+    /* Every ALPN row names a version this build offers: a token the table
+     * can select must map to a wire-ready profile, and "moqt-22" is one. */
+    for (size_t i = 0; i < TABLE_N; i++)
+        MOQ_TEST_CHECK(moq_version_supported(moq_alpn_table[i].version));
+    {
+        moq_version_t v = (moq_version_t)0;
+        MOQ_TEST_CHECK(moq_alpn_to_version("moqt-22", 7, &v) == true);
+        MOQ_TEST_CHECK(v == MOQ_VERSION_DRAFT_22);
+        const char *s22 = moq_alpn_for_version(MOQ_VERSION_DRAFT_22);
+        MOQ_TEST_CHECK(s22 != NULL && strcmp(s22, "moqt-22") == 0);
+    }
 
     /* Reverse mapping. */
     {

@@ -1270,6 +1270,8 @@ static void run_input_row(bool delay_all, const char *lane,
         w.want_ref = m.far_ref; w.other_ref = m.near_ref;
         w.want_from = MOQ_PERSPECTIVE_CLIENT; w.want_to = MOQ_PERSPECTIVE_SERVER;
         w.want_error_code = IN_CODE_BIDI_STOP;
+        /* the signal cancels the subscription, so the publisher resets the
+         * flow's open data stream, which SimPair delivers back: declared. */
         w.side_kind = MOQ_SIM_INPUT_DATA_RESET; w.side_count = 1;
         break;
     default:
@@ -1282,6 +1284,8 @@ static void run_input_row(bool delay_all, const char *lane,
         w.want_ref = m.far_ref; w.other_ref = m.near_ref;
         w.want_from = MOQ_PERSPECTIVE_CLIENT; w.want_to = MOQ_PERSPECTIVE_SERVER;
         w.want_error_code = IN_CODE_BIDI_RESET;
+        /* the signal cancels the subscription, so the publisher resets the
+         * flow's open data stream, which SimPair delivers back: declared. */
         w.side_kind = MOQ_SIM_INPUT_DATA_RESET; w.side_count = 1;
         break;
     }
@@ -2009,16 +2013,14 @@ static void t_zero_detail_faults(void)
             CHECKN("zfe.rig", false); return;
         }
         /*
-         * ONE pump step, deliberately: the injection fires once per direction
-         * per step, so a single step gives an EXACT, declarable image -- one
-         * FAULT_INJECT record and one CONTROL INPUT per direction, and the
-         * rows below pin the client-to-server pair as exactly one each.
-         * Running the whole flow instead produced 124 injections and 123
-         * injected CONTROL inputs, a count that is an artifact of how many
-         * times the pump happened to run and cannot honestly be pinned.
+         * One step injects client-to-server, then propagates the protocol
+         * close. The now-closed peers must not receive a second injection.
+         * Pin both records from that one input, not just injection intent.
          */
         size_t mark = r.log.n;   /* post-handshake: only injected control here */
         CHECKN("zfe.step", moq_simpair_step(r.sp, NULL) == MOQ_OK);
+        CHECKN("zfe.client_closed", moq_session_state(moq_simpair_client(r.sp)) == MOQ_SESS_CLOSED);
+        CHECKN("zfe.server_closed", moq_session_state(moq_simpair_server(r.sp)) == MOQ_SESS_CLOSED);
         /*
          * The injected close is TWO producers at one site: the inline
          * FAULT_INJECT record, and the separate trace_input() call that
@@ -2027,9 +2029,9 @@ static void t_zero_detail_faults(void)
          * only the FAULT_INJECT record leaves it unconstrained.
          *
          * The envelope is declared here, independently of the producer:
-         * QUIC varint 255 (unknown message type) + a zero uint16 length.
+         * D18 vi64 255 (unknown message type) + a zero uint16 length.
          */
-        static const uint8_t BAD_MSG[4] = { 0x40, 0xFF, 0x00, 0x00 };
+        static const uint8_t BAD_MSG[4] = { 0x80, 0xFF, 0x00, 0x00 };
         static const zero_row_t ROWS[] = {
             /* the two producers at this site, as a declared ONE-TO-ONE image */
             { .cls = "zfe.inject_close", .kind = MOQ_SIM_TRACE_FAULT_INJECT,
@@ -2037,6 +2039,7 @@ static void t_zero_detail_faults(void)
               .pin_code = true, .code = 0x3,
               .pin_from = true, .from = MOQ_PERSPECTIVE_CLIENT,
               .pin_to = true, .to = MOQ_PERSPECTIVE_SERVER,
+              .want_bytes = BAD_MSG, .want_bytes_len = sizeof(BAD_MSG),
               .exact = true, .want_count = 1 },
             { .cls = "zfe.inject_close.input", .kind = MOQ_SIM_TRACE_INPUT,
               .pin_input_kind = true, .input_kind = MOQ_SIM_INPUT_CONTROL_BYTES,

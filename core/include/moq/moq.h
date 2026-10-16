@@ -13,7 +13,11 @@
 #include "export.h"
 #include "version.h"
 #include "types.h"
+#include "location.h"
+#include "fill.h"
 #include "rcbuf.h"
 #include "session.h"
+#include "transport_binding.h"
+#include "connection_target.h"
 
 #endif /* MOQ_H */

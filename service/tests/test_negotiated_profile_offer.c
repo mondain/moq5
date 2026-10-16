@@ -11,6 +11,7 @@
  * Pure resolution: no network, no endpoint is connected.
  */
 #include "endpoint_internal.h"
+#include "endpoint_offer_expect.h"
 #include "np_tables.h"
 #include "test_support.h"
 
@@ -73,19 +74,25 @@ int main(void)
                 MOQ_TEST_CHECK(rows[i].endpoint_offered);
             }
 
-        MOQ_TEST_CHECK_EQ_SIZE(r.version_count, ranked);
+        /* The endpoint offers the declared list as projected onto what the
+         * selected backend carries: rank order kept, a draft that backend
+         * cannot carry left out. The declaration itself is unchanged. */
+        uint64_t want[MOQ_ENDPOINT_MAX_VERSIONS];
+        size_t nw = 0;
         for (uint8_t rank = 1; rank <= (uint8_t)ranked; rank++) {
-            const np_transport_row_t *want = NULL;
+            const np_transport_row_t *row = NULL;
             for (size_t i = 0; i < nt; i++)
-                if (rows[i].auto_rank == rank) want = &rows[i];
-            MOQ_TEST_CHECK(want != NULL);
-            if (!want || rank > r.version_count) continue;
-            /* rank 1 is the FIRST offered version */
-            MOQ_TEST_CHECK_EQ_U64((uint64_t)r.versions[rank - 1],
-                                  (uint64_t)want->draft);
+                if (rows[i].auto_rank == rank) row = &rows[i];
+            MOQ_TEST_CHECK(row != NULL);
+            if (!row) continue;
+            if (row->draft == 22 && !TEST_DEFAULT_BACKEND_HOSTS_D22) continue;
+            if (nw < MOQ_ENDPOINT_MAX_VERSIONS) want[nw++] = row->draft;
         }
-        /* nothing beyond the declared ranks is offered */
-        for (size_t i = ranked; i < MOQ_ENDPOINT_MAX_VERSIONS; i++)
+        MOQ_TEST_CHECK_EQ_SIZE(r.version_count, nw);
+        for (size_t i = 0; i < nw && i < r.version_count; i++)
+            MOQ_TEST_CHECK_EQ_U64((uint64_t)r.versions[i], want[i]);
+        /* nothing beyond the projected declaration is offered */
+        for (size_t i = nw; i < MOQ_ENDPOINT_MAX_VERSIONS; i++)
             if (i < r.version_count) {
                 fprintf(stderr, "FAIL: AUTO offers an undeclared version %u at "
                                 "index %zu\n", (unsigned)r.versions[i], i);
@@ -99,8 +106,8 @@ int main(void)
      * An AVAILABLE transport may be omitted from AUTO without becoming
      * unsupported: availability and offering are separate columns. The probe
      * builds that declaration and asserts the availability comparison above
-     * still holds for it, while the AUTO list legitimately shrinks. Today's
-     * D16/D18 rows are untouched.
+     * still holds for it, while the AUTO list legitimately shrinks. The
+     * declared rows themselves are untouched.
      */
     {
         np_topology_t d = np_declared_topology();
@@ -120,9 +127,7 @@ int main(void)
                 t[i].endpoint_offered = false;
                 t[i].auto_rank = NP_AUTO_RANK_NONE;
             }
-        /* the remaining rank must be renumbered to stay contiguous */
-        for (size_t i = 0; i < d.n_transports; i++)
-            if (t[i].draft == 18) t[i].auto_rank = 1;
+        /* D16 held the last rank, so D22 (1) and D18 (2) stay contiguous */
 
         np_topology_t v;
         v.transports = t; v.n_transports = d.n_transports;

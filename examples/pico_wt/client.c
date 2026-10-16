@@ -216,8 +216,10 @@ static int client_loop_cb(picoquic_quic_t *quic,
 static void usage(const char *prog)
 {
     fprintf(stderr,
-        "usage: %s [--host H] [--port N] [--sni S] [--path /moq] "
-        "[--timeout-sec N] [--insecure-skip-verify]\n"
+        "usage: %s [--host H] [--port N] [--sni S] [--authority A] "
+        "[--path /moq] [--timeout-sec N] [--insecure-skip-verify]\n"
+        "  --authority A           CONNECT :authority (default H:N, an IPv6\n"
+        "                          literal bracketed); the SNI never stands in\n"
         "  --insecure-skip-verify  disable TLS certificate verification\n"
         "                          (LOCAL/self-signed testing ONLY)\n", prog);
 }
@@ -227,6 +229,7 @@ int main(int argc, char **argv)
     const char *host = "127.0.0.1";
     int port = 4433;
     const char *sni = "test.example.com";
+    const char *authority = NULL;   /* default: host:port */
     const char *path = "/moq";
     int timeout_sec = 5;
     int insecure_skip_verify = 0;   /* TLS verification ON by default */
@@ -236,6 +239,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--port") && i + 1 < argc)
             port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--sni") && i + 1 < argc) sni = argv[++i];
+        else if (!strcmp(argv[i], "--authority") && i + 1 < argc)
+            authority = argv[++i];
         else if (!strcmp(argv[i], "--path") && i + 1 < argc)
             path = argv[++i];
         else if (!strcmp(argv[i], "--timeout-sec") && i + 1 < argc)
@@ -243,6 +248,20 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--insecure-skip-verify"))
             insecure_skip_verify = 1;
         else { usage(argv[0]); return 2; }
+    }
+
+    /* The CONNECT names the authority of the https URI it targets
+     * (RFC 9114 Section 4.3.1): host and port, not the TLS server name. */
+    char authority_buf[300];
+    if (!authority) {
+        int v6 = strchr(host, ':') != NULL && host[0] != '[';
+        int n = snprintf(authority_buf, sizeof(authority_buf), "%s%s%s:%d",
+                         v6 ? "[" : "", host, v6 ? "]" : "", port);
+        if (n < 0 || (size_t)n >= sizeof(authority_buf)) {
+            fprintf(stderr, "[client] host too long\n");
+            return 2;
+        }
+        authority = authority_buf;
     }
 
     struct sockaddr_storage server_address;
@@ -280,7 +299,7 @@ int main(int argc, char **argv)
     }
     picowt_set_transport_parameters(c.cnx);
 
-    if (picowt_connect(c.cnx, c.h3_ctx, c.ctrl_ctx, sni, path,
+    if (picowt_connect(c.cnx, c.h3_ctx, c.ctrl_ctx, authority, path,
                        client_wt_cb, &c, NULL) != 0) {
         fprintf(stderr, "[client] picowt_connect failed\n");
         picoquic_free(c.quic);

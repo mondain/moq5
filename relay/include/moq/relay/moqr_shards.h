@@ -129,7 +129,8 @@ typedef struct moqr_shards_cfg {
     /* Per directed shard-pair demand-channel LOGICAL-BYTE cap: the sum of
      * queued payload bytes + properties bytes + control canonical-key bytes
      * a channel may hold. Data pushes are gated on it (control is counted
-     * but exempt — it carries no payload and must not starve). 0 = default:
+     * but exempt: bounded keys and Track Properties have a separate
+     * allocation ceiling and must not starve behind data). 0 = default:
      * the resolved per-track log byte budget, so any single legal record —
      * which the log bounds to that budget — is always eventually sendable.
      * An explicit value SMALLER than that resolved bound could strand a
@@ -154,6 +155,17 @@ typedef struct moqr_shards_cfg {
      * resolved max_open_subgroups (its default when the template leaves it
      * unset). */
     uint32_t           pump_subgroup_slots;
+    /* Appended: the fill wait every shard's binding applies (see
+     * moqr_bind_set_fill_timeouts, which the runtime calls with these): how
+     * long a fill fetch stream waits for an Object its log does not hold
+     * before reporting the run Timed-Out, without FILL_TIMEOUT
+     * (fill_timeout_default_ms) and at most with it (fill_timeout_max_ms).
+     * Milliseconds; 0 (or a struct_size that does not reach the field)
+     * selects the named default. A pair the binding refuses (a default above
+     * the maximum) fails create with MOQR_ERR_INVAL. They live here rather
+     * than in bind_cfg because bind_cfg is embedded above at a fixed size. */
+    uint64_t           fill_timeout_default_ms;
+    uint64_t           fill_timeout_max_ms;
 } moqr_shards_cfg_t;
 
 /* The pure, prefix-safe resolution moqr_shards_create applies to a config —
@@ -194,14 +206,15 @@ MOQR_API moqr_result_t moqr_shards_cfg_resolve(const moqr_shards_cfg_t *cfg,
 typedef struct moqr_shards_capacity {
     uint64_t core_structure_bytes;   /* per shard                          */
     uint64_t core_payload_bytes;     /* per shard                          */
-    uint64_t bind_structure_bytes;   /* per shard (incl. announce bytes)   */
+    uint64_t bind_structure_bytes;   /* per shard (incl. announce/metadata) */
     uint64_t trace_bytes;            /* per shard                          */
     uint64_t per_shard_bytes;
     uint64_t shards_structure_bytes; /* runtime container + K>1 pools      */
     uint64_t channel_byte_ceiling;   /* K^2 x (data cap + control-exempt
-                                        canon + clone headers)             */
-    uint64_t canon_byte_ceiling;     /* mailbox + journal + pending keys   */
-    uint64_t staging_byte_ceiling;   /* allocate-before-push, one/shard    */
+                                        canon/Track Properties + headers)  */
+    uint64_t canon_byte_ceiling;     /* mailbox + journal + pending keys,
+                                        + routed FETCH keys (admission)    */
+    uint64_t staging_byte_ceiling;   /* one/shard, incl. metadata + header */
     uint64_t relay_alloc_ceiling;    /* total of the above                 */
     uint32_t usable_bindings_per_shard;
     uint16_t shards;
@@ -298,11 +311,18 @@ MOQR_API const char *moqr_shards_msg_kind_name(moqr_shards_msg_kind_t kind);
 typedef struct moqr_shards_stats {
     /* -- counters (monotonic) -- */
     uint64_t pump_turns;        /* data phases that attempted extraction    */
-    uint64_t pump_messages;     /* data messages pushed (phase 6 only)      */
+    uint64_t pump_messages;     /* data messages pushed: the data phase,
+                                 * plus the end of a fill retrieval this
+                                 * shard could not take on, answered from
+                                 * the inbound drain                      */
     uint64_t pump_bytes;        /* logical bytes pushed by the data pump    */
     /* Successful DURABLE demand-channel enqueues by this shard as the
      * PRODUCER, indexed by moqr_shards_msg_kind_t. An attempt refused by a
-     * full channel, the byte gate, or the arbiter is never counted. */
+     * full channel, the byte gate, or the arbiter is never counted. The
+     * fill-retrieval messages (a shard serving a fill retrieves the part of
+     * its range that precedes its own feed of a track from the owner) are
+     * outside this vocabulary, as are latest Track Property notifications;
+     * neither is counted here. Initial metadata rides the counted ACK. */
     uint64_t enqueued[MOQR_SHARDS_MSG__COUNT];
     uint64_t remote_demand_refused;   /* requester-resolved owner refusals  */
     uint64_t remote_demand_resolved;  /* owner DONEs resolved as requester  */
@@ -317,11 +337,13 @@ typedef struct moqr_shards_stats {
      * mask) is a separate, CLI-owned number. */
     uint64_t wake_requests_push;
     uint64_t wake_requests_credit;
-    /* The LOCAL continuation cause, distinct from both above, from two exact
+    /* The LOCAL continuation cause, distinct from both above, from four exact
      * outcomes: (a) this step applied inbound DATA into its own core
      * (ingest/seal/reset/evict) AND its one bind-pump pass left RESIDUAL ready
      * work (a mark that landed during the pass, which nothing else re-signals),
-     * or (b) that pass ended on the delivery-budget guard with work remaining.
+     * (b) that pass ended on the delivery-budget guard with work remaining,
+     * (c) the step's namespace reconcile queued core intents after that pass,
+     * or (d) a fill-retrieval slot freed after a fill was refused one.
      * Either way the step requests exactly ONE coalesced self-wake. Never
      * counted as a push (nothing crossed toward another shard) or a credit (no
      * producer regained room). A step that applies inbound data but whose pass
@@ -396,7 +418,9 @@ MOQR_API moqr_result_t moqr_shards_get_stats_sized(
  * against different oracles: summed over every dst, data_messages ==
  * that producer's pump_messages and data_bytes == pump_bytes (the same
  * logical-byte currency), while control_messages sums to the control
- * kinds of its enqueued[] vector. The refusal split records THE
+ * kinds of its enqueued[] vector (so private fill-retrieval and latest
+ * metadata control messages are in neither; retrieval answers are data
+ * and counted as such). The refusal split records THE
  * predicate that fired (entries checked first, matching the admission
  * order; one increment per refusal event). Fields are maintained by the
  * producer inside the push critical section and snapshotted here under

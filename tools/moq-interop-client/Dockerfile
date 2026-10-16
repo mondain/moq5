@@ -24,46 +24,27 @@ COPY picotls/ picotls/
 COPY picoquic/ picoquic/
 COPY libmoq/ libmoq/
 
-# Apply the ordered lists from scripts/setup_picoquic_deps.sh. Accept patched
-# contexts, but refuse missing patches or conflicting sources before building.
-RUN cd /src/picoquic \
-    && { test -d .git && test "$(git rev-parse --show-toplevel 2>/dev/null)" = /src/picoquic \
-         || { echo 'picoquic patch input must be its own git root' >&2; exit 1; }; } \
-    && for name in 0002-reset-stream-after-fin 0006-own-application-close-reason; do \
-         patch=/src/libmoq/patches/picoquic/$name.patch; \
-         test -f "$patch" || { echo "picoquic patch $name missing" >&2; exit 1; }; \
-         if git apply --check "$patch" >/dev/null 2>&1; then \
-           git apply "$patch" || exit $?; \
-         elif git apply --reverse --check "$patch" >/dev/null 2>&1; then \
-           echo "picoquic patch $name already applied"; \
-         else \
-           echo "picoquic patch $name conflicts" >&2; exit 1; \
-         fi; \
-       done
+# Apply the tracked picoquic and picotls patches in the order of their series
+# manifests (patches/<provider>/series), the same lists
+# scripts/setup_picoquic_deps.sh applies. Patched inputs are accepted;
+# missing patches or conflicting sources fail before any build.
+RUN bash /src/libmoq/scripts/provider_patches.sh apply \
+        /src/libmoq/patches/picoquic /src/picoquic \
+    && bash /src/libmoq/scripts/provider_patches.sh apply \
+        /src/libmoq/patches/picotls /src/picotls
 
-# Initialize compiler-visible scratch and keep minicrypto archive members distinct.
-RUN cd /src/picotls \
-    && { test -d .git && test "$(git rev-parse --show-toplevel 2>/dev/null)" = /src/picotls \
-         || { echo 'picotls patch input must be its own git root' >&2; exit 1; }; } \
-    && for name in 0001-initialize-compiler-visible-scratch 0002-minicrypto-distinct-chacha20-object; do \
-         patch=/src/libmoq/patches/picotls/$name.patch; \
-         test -f "$patch" || { echo "picotls patch $name missing" >&2; exit 1; }; \
-         if git apply --check "$patch" >/dev/null 2>&1; then \
-           git apply "$patch" || exit $?; \
-         elif git apply --reverse --check "$patch" >/dev/null 2>&1; then \
-           echo "picotls patch $name already applied"; \
-         else \
-           echo "picotls patch $name conflicts" >&2; exit 1; \
-         fi; \
-       done
-
-# Build picotls (fresh build dir to avoid host CMakeCache)
-RUN cmake -B /build/picotls -S picotls \
+# Build picotls into the build-directory layout LibMoQ expects for
+# MOQ_PICOTLS_PREFIX: headers in <picotls>/include and libraries in
+# <picotls>/build, both from this one patched checkout, as
+# scripts/setup_picoquic_deps.sh produces. (picotls declares no install
+# rules, so there is no installed prefix to point at.) A fresh build
+# directory avoids any host CMakeCache copied with the context.
+RUN rm -rf /src/picotls/build \
+    && cmake -B /src/picotls/build -S picotls \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_PROJECT_picotls_INCLUDE=/src/libmoq/cmake/MoqPicotlsBuildPolicy.cmake \
-    -DCMAKE_INSTALL_PREFIX=/usr/local \
-    && cmake --build /build/picotls -j$(nproc) \
-    && cmake --install /build/picotls
+    && cmake --build /src/picotls/build -j$(nproc) \
+       --target picotls-core picotls-openssl picotls-minicrypto
 
 # Build libmoq with the interop client on the service tier.
 # The endpoint owns transport selection + version negotiation, so the client
@@ -82,8 +63,7 @@ RUN cmake -B /build/libmoq -S libmoq \
     -DMOQ_BUILD_INTEROP_CLIENT=ON \
     -DMOQ_BUILD_TESTS=OFF \
     -DMOQ_PICOQUIC_SOURCE_DIR=/src/picoquic \
-    -DMOQ_PICOTLS_PREFIX=/build/picotls \
-    -DPTLS_INCLUDE_DIR=/src/picotls/include \
+    -DMOQ_PICOTLS_PREFIX=/src/picotls/build \
     && cmake --build /build/libmoq -j$(nproc) --target moq-interop-client
 
 # Runtime image

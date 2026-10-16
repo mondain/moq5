@@ -17,6 +17,7 @@
 #include <moq/media_sender.h>
 #include <moq/msquic_managed.h>
 #include "test_support.h"
+#include "msq_loopback_port.h"
 
 #include <pthread.h>
 #include <stdbool.h>
@@ -85,7 +86,6 @@ static moq_msquic_managed_t *start_server(const char *cert, const char *key,
     cfg.alloc = moq_alloc_default();
     cfg.perspective = MOQ_PERSPECTIVE_SERVER;
     cfg.host = "127.0.0.1";
-    cfg.port = 0;
     cfg.cert_path = cert;
     cfg.key_path = key;
     cfg.on_lane_pump = server_pump;
@@ -96,7 +96,7 @@ static moq_msquic_managed_t *start_server(const char *cert, const char *key,
     cfg.version = MOQ_VERSION_DRAFT_16;
 
     moq_msquic_managed_t *m = NULL;
-    if (moq_msquic_managed_create(&cfg, &m) != MOQ_OK)
+    if (msqt_server_create(&cfg, &m) != MOQ_OK)
         return NULL;
     *out_port = moq_msquic_managed_port(m);
     return m;

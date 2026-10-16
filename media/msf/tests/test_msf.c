@@ -2,6 +2,7 @@
 #include <moq/rcbuf.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -1410,6 +1411,83 @@ int main(void)
         moq_rcbuf_decref(enc);   /* caller-built catalog: no cleanup */
     }
 
+    /* -- 5.1.1 version form: "draft-01" on request, "1" otherwise -------- *
+     * The draft-name form is emitted only when the caller selects it and its
+     * struct_size covers version_form; the parser reports the form it read. */
+    {
+        moq_msf_track_t tr;
+        memset(&tr, 0, sizeof(tr)); tr.struct_size = sizeof(tr);
+        tr.name = lit("v"); tr.packaging = lit("loc"); tr.is_live = true;
+        moq_msf_catalog_t cat;
+        memset(&cat, 0, sizeof(cat)); cat.struct_size = sizeof(cat);
+        cat.version = MOQ_MSF_VERSION; cat.tracks = &tr; cat.track_count = 1;
+        cat.version_form = MOQ_MSF_VERSION_FORM_DRAFT_NAME;
+
+        moq_rcbuf_t *enc = NULL;
+        CHECK(moq_msf_catalog_encode(alloc, &cat, &enc) == MOQ_OK);
+        static const char want[] =
+            "{\"version\":\"draft-01\",\"tracks\":[{\"name\":\"v\","
+            "\"packaging\":\"loc\",\"isLive\":true}]}";
+        CHECK(enc && moq_rcbuf_len(enc) == sizeof(want) - 1 &&
+              memcmp(moq_rcbuf_data(enc), want, sizeof(want) - 1) == 0);
+        moq_msf_catalog_t back;
+        if (enc) {
+            moq_bytes_t b = { moq_rcbuf_data(enc), moq_rcbuf_len(enc) };
+            CHECK(moq_msf_catalog_parse(alloc, b, &back) == MOQ_OK);
+            CHECK(back.version_form == MOQ_MSF_VERSION_FORM_DRAFT_NAME);
+            moq_msf_catalog_cleanup(alloc, &back);
+            moq_rcbuf_decref(enc);
+        }
+
+        /* A caller whose struct ends before version_form gets "1". */
+        cat.struct_size = (uint32_t)offsetof(moq_msf_catalog_t, version_form);
+        enc = NULL;
+        CHECK(moq_msf_catalog_encode(alloc, &cat, &enc) == MOQ_OK);
+        if (enc) {
+            moq_bytes_t out = { moq_rcbuf_data(enc), moq_rcbuf_len(enc) };
+            CHECK(contains_bytes(out, "{\"version\":\"1\","));
+            moq_bytes_t b = out;
+            CHECK(moq_msf_catalog_parse(alloc, b, &back) == MOQ_OK);
+            CHECK(back.version_form == MOQ_MSF_VERSION_FORM_NUMERAL);
+            moq_msf_catalog_cleanup(alloc, &back);
+            moq_rcbuf_decref(enc);
+        }
+    }
+
+    /* -- version form is a closed authoring input: an explicit NUMERAL
+     * (zero) emits "1"; a value outside the defined forms is rejected
+     * rather than spelled as "1" ------------------------------------- */
+    {
+        moq_msf_track_t tr;
+        memset(&tr, 0, sizeof(tr)); tr.struct_size = sizeof(tr);
+        tr.name = lit("v"); tr.packaging = lit("loc"); tr.is_live = true;
+        moq_msf_catalog_t cat;
+        memset(&cat, 0, sizeof(cat)); cat.struct_size = sizeof(cat);
+        cat.version = MOQ_MSF_VERSION; cat.tracks = &tr; cat.track_count = 1;
+
+        cat.version_form = MOQ_MSF_VERSION_FORM_NUMERAL;
+        moq_rcbuf_t *enc = NULL;
+        CHECK(moq_msf_catalog_encode(alloc, &cat, &enc) == MOQ_OK);
+        if (enc) {
+            moq_bytes_t out = { moq_rcbuf_data(enc), moq_rcbuf_len(enc) };
+            CHECK(contains_bytes(out, "{\"version\":\"1\","));
+            moq_rcbuf_decref(enc);
+        }
+
+        cat.version_form = MOQ_MSF_VERSION_FORM_DRAFT_NAME + 1;
+        enc = NULL;
+        CHECK(moq_msf_catalog_encode(alloc, &cat, &enc) == MOQ_ERR_INVAL);
+        CHECK(enc == NULL);
+        cat.version_form = UINT32_MAX;
+        CHECK(moq_msf_catalog_encode(alloc, &cat, &enc) == MOQ_ERR_INVAL);
+        CHECK(enc == NULL);
+
+        /* The same value past a shorter caller struct is not read. */
+        cat.struct_size = (uint32_t)offsetof(moq_msf_catalog_t, version_form);
+        CHECK(moq_msf_catalog_encode(alloc, &cat, &enc) == MOQ_OK);
+        if (enc) moq_rcbuf_decref(enc);
+    }
+
     /* -- initDataList present but not an array -> PROTO -------------- */
     {
         moq_msf_catalog_t cat;
@@ -2173,6 +2251,48 @@ int main(void)
         moq_msf_catalog_cleanup(alloc, &eff);
         moq_msf_catalog_cleanup(alloc, &delta);
         moq_msf_catalog_cleanup(alloc, &base);
+    }
+
+    /* -- apply_delta keeps the base's version spelling: a "draft-01" base
+     * re-encodes as "draft-01", a "1" base as "1" ---------------------- */
+    {
+        static const char *const bases[] = {
+            "{\"version\":\"draft-01\",\"tracks\":["
+            "{\"name\":\"v\",\"packaging\":\"loc\",\"isLive\":true}]}",
+            "{\"version\":\"1\",\"tracks\":["
+            "{\"name\":\"v\",\"packaging\":\"loc\",\"isLive\":true}]}",
+        };
+        static const moq_msf_version_form_t forms[] = {
+            MOQ_MSF_VERSION_FORM_DRAFT_NAME, MOQ_MSF_VERSION_FORM_NUMERAL,
+        };
+        static const char *const prefixes[] = {
+            "{\"version\":\"draft-01\",", "{\"version\":\"1\",",
+        };
+        const char *delta_json =
+            "{\"deltaUpdate\":[{\"op\":\"add\",\"tracks\":[{\"name\":\"a\","
+            "\"packaging\":\"loc\",\"isLive\":true}]}]}";
+        for (size_t k = 0; k < 2; k++) {
+            moq_msf_catalog_t base, delta, eff;
+            CHECK(moq_msf_catalog_parse(alloc, lit(bases[k]), &base) == MOQ_OK);
+            CHECK(base.version_form == forms[k]);
+            CHECK(moq_msf_catalog_parse(alloc, lit(delta_json), &delta) ==
+                  MOQ_OK);
+            CHECK(moq_msf_catalog_apply_delta(alloc, &base, &delta, &eff) ==
+                  MOQ_OK);
+            CHECK(eff.version_form == forms[k]);
+            CHECK_EQ_SIZE(eff.track_count, 2);
+            moq_rcbuf_t *enc = NULL;
+            CHECK(moq_msf_catalog_encode(alloc, &eff, &enc) == MOQ_OK);
+            if (enc) {
+                moq_bytes_t out = { moq_rcbuf_data(enc), moq_rcbuf_len(enc) };
+                CHECK(out.len > strlen(prefixes[k]) &&
+                      memcmp(out.data, prefixes[k], strlen(prefixes[k])) == 0);
+                moq_rcbuf_decref(enc);
+            }
+            moq_msf_catalog_cleanup(alloc, &eff);
+            moq_msf_catalog_cleanup(alloc, &delta);
+            moq_msf_catalog_cleanup(alloc, &base);
+        }
     }
 
     /* -- apply_delta keeps receive leniency: a base with non-CMSF-strict

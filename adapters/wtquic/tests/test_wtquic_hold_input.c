@@ -99,8 +99,21 @@ wtq_result_t wtq_stream_resume_receive(wtq_stream_t *st)
     if (close_on_resume) { close_on_resume = false; resume_terminal(st); }
     return g_resume_rc;
 }
-void wtq_session_events_init(wtq_session_events_t *e)
-{ memset(e, 0, sizeof(*e)); }
+void wtq_session_events_init_ex(wtq_session_events_t *e, size_t size)
+{
+    if (!e || size < sizeof(e->struct_size)) return;
+    size_t n = size < sizeof(*e) ? size : sizeof(*e);
+    memset(e, 0, n);
+    e->struct_size = (uint32_t)n;
+}
+wtq_send_commit_mode_t wtq_session_send_commit_mode(const wtq_session_t *s)
+{ (void)s; return WTQ_SEND_COMMIT_UNSUPPORTED; }
+wtq_local_flush_mode_t wtq_session_local_flush_mode(const wtq_session_t *s)
+{ (void)s; return WTQ_LOCAL_FLUSH_UNSUPPORTED; }
+wtq_result_t wtq_session_local_flush(const wtq_session_t *s)
+{ return s ? WTQ_ERR_UNSUPPORTED : WTQ_ERR_INVALID_ARG; }
+wtq_result_t wtq_stream_enable_send_commit(wtq_stream_t *st)
+{ (void)st; return WTQ_ERR_UNSUPPORTED; }
 wtq_result_t wtq_session_close(wtq_session_t *s, uint32_t code,
                               const uint8_t *r, size_t n)
 { (void)s; (void)code; (void)r; (void)n; return WTQ_OK; }
@@ -210,31 +223,42 @@ int main(int argc, char **argv)
         replacement_paused = close_on_resume;
         g_pause_rc = g_resume_rc = provider_rc;
         struct moq_wtq_stream *original = stream_find(c, watched_key);
+        /* Keep this generation discriminator to one resume operation. A
+         * replacement takes an earlier slot, already visited by this scan;
+         * the next service pass owns its independent pause reconciliation. */
+        struct moq_wtq_stream *last = &c->streams[MOQ_WTQ_MAX_STREAMS - 1];
+        CHECK(!last->in_use);
+        *last = *original;
+        memset(original, 0, sizeof(*original));
+        original = last;
         original->paused = close_on_resume;
         c->in_service = true;
         if (close_on_resume) resume_paused_streams(c);
         else pause_stream_for_backpressure(c, original, st);
         CHECK(c->term_count == 1);
-        CHECK(c->term_keys[0] == watched_key);
-        CHECK(stream_find(c, watched_key) == NULL);
+        CHECK(c->term_events[0].key == watched_key);
+        CHECK(c->term_events[0].kind == STREAM_EVENT_CLOSED);
+        CHECK(stream_find(c, watched_key) == original);
+        CHECK(original->pending_events == 1);
+        CHECK(original->in_use && original->st == NULL);
         CHECK(st->pauses == (unsigned)(pause_close || pause_reuse));
         CHECK(st->resumes == (unsigned)(resume_close || resume_reuse));
         CHECK(moq_transport_bridge_is_fatal(c->bridge) ==
               (provider_rc == WTQ_ERR_UNSUPPORTED));
         if (replace_on_resume) {
             CHECK(resume_replacement != watched_key);
-            CHECK(stream_find(c, resume_replacement) == original);
-            CHECK(original->st == st);
-            CHECK(original->paused == replacement_paused);
-        } else {
-            CHECK(!original->in_use);
-            CHECK(original->st == NULL);
-            CHECK(!original->paused);
+            struct moq_wtq_stream *replacement = stream_find(c, resume_replacement);
+            CHECK(replacement != NULL && replacement != original);
+            if (replacement) {
+                CHECK(replacement->st == st);
+                CHECK(replacement->paused == replacement_paused);
+            }
         }
         CHECK(stale_calls == 0);
         c->in_service = false;
         conn_service(c);
         CHECK(c->term_count == 0);
+        CHECK(stream_find(c, watched_key) == NULL);
         moq_wtquic_conn_destroy(c);
         moq_session_destroy(sess);
         CHECK(retained == 0);
@@ -278,7 +302,7 @@ int main(int argc, char **argv)
         expired = st;
         CHECK(c->term_count == 1);
         if (reuse) {
-            /* Same provider address and same adapter slot, new identity. */
+            /* Same provider address, different retained adapter slot/key. */
             expired = NULL;
             ev_stream_opened(ws, st, false, c);
             replacement_key = stream_find_by_handle(c, st)->id;

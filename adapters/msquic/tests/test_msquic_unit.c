@@ -204,8 +204,33 @@ static void t_cfg_validation(void)
     cfg.alloc = moq_alloc_default();
     cfg.session = r.session;
     cfg.api = fake_msq_table(&r.fake);
-    cfg.struct_size = sizeof(cfg) - 1; /* too small */
+    cfg.struct_size = (uint32_t)MOQ_MSQUIC_CONN_CFG_V0_SIZE - 1; /* below the prefix */
     CHECK(moq_msquic_conn_create(&cfg, &conn) == MOQ_ERR_INVAL);
+    /* a v0-sized caller is served: the appended target is not read. A
+     * session has one transport owner (the rig's conn owns r.session), so
+     * this row brings its own session. */
+    {
+        moq_session_cfg_t scfg;
+        moq_session_t *own = NULL;
+        moq_session_cfg_init_sized(&scfg, sizeof(scfg), moq_alloc_default(),
+                                   MOQ_PERSPECTIVE_CLIENT);
+        CHECK(moq_session_create(&scfg, 0, &own) == MOQ_OK);
+        cfg.session = own;
+        cfg.struct_size = (uint32_t)MOQ_MSQUIC_CONN_CFG_V0_SIZE;
+        cfg.target = (const moq_connection_target_t *)(uintptr_t)0x1;
+        CHECK(own != NULL && moq_msquic_conn_create(&cfg, &conn) == MOQ_OK);
+        if (conn != NULL)
+            moq_msquic_conn_destroy(conn);
+        conn = NULL;
+        cfg.target = NULL;
+        cfg.session = r.session;
+        if (own != NULL)
+            moq_session_destroy(own);
+        /* the rig's session already has its owner: a second is refused */
+        cfg.struct_size = sizeof(cfg);
+        CHECK(moq_msquic_conn_create(&cfg, &conn) == MOQ_ERR_WRONG_STATE);
+        CHECK(conn == NULL);
+    }
     cfg.struct_size = sizeof(cfg);
 
     cfg.session = NULL;
@@ -1242,6 +1267,166 @@ static void t_credit_gating(void)
         printf("PASS: credit_gating\n");
 }
 
+/* --- reliable reset ------------------------------------------------------------------- */
+
+/* MsQuic's reliable-reset event and stream parameter are preview API, which
+ * this test (like the rest of the fake rig) does not compile in; their
+ * values are spelled out here: event 16 carries one BOOLEAN IsNegotiated at
+ * the start of the event union, and the parameter is 0x08000005. */
+#define T_RELIABLE_RESET_NEGOTIATED ((QUIC_CONNECTION_EVENT_TYPE)16)
+#define T_PARAM_STREAM_RELIABLE_OFFSET 0x08000005u
+
+static void deliver_reliable_negotiated(struct rig *r, bool yes)
+{
+    QUIC_CONNECTION_EVENT ev;
+
+    memset(&ev, 0, sizeof(ev));
+    ev.Type = T_RELIABLE_RESET_NEGOTIATED;
+    *(BOOLEAN *)&ev.CONNECTED = yes ? TRUE : FALSE;
+    moq_msquic_conn_callback()(fake_msq_conn_handle(&r->fake), r->conn, &ev);
+}
+
+/* reset_stream_at: DROPPED (plain fallback) until RELIABLE_RESET_NEGOTIATED
+ * says yes, and for an offset beyond the bytes MsQuic accepted. Otherwise it
+ * waits (WOULD_BLOCK) until the peer has acknowledged the reliable prefix --
+ * on the worker or off it -- and then resets plainly: no RESET_STREAM_AT is
+ * ever handed to MsQuic. Bytes past the prefix, still in flight, do not hold
+ * the reset back. */
+static void t_reliable_reset(void)
+{
+    int before = failures;
+    struct rig r;
+    uint64_t id = 0, id2 = 0;
+    static const uint8_t hdr[5] = { 1, 2, 3, 4, 5 };
+    static const uint8_t obj[3] = { 6, 7, 8 };
+
+    CHECK(rig_up(&r, MOQ_PERSPECTIVE_CLIENT) == 0);
+    deliver_streams_available(&r, 8, 8);
+    CHECK((r.ops->capabilities & MOQ_TRANSPORT_CAP_RELIABLE_RESET) != 0);
+    CHECK(r.ops->reset_stream_at != NULL);
+
+    CHECK(r.ops->open_uni(r.conn, &id) == MOQ_TRANSPORT_OK);
+    CHECK(r.ops->write(r.conn, id, hdr, sizeof(hdr), false) == MOQ_TRANSPORT_OK);
+    moq_msquic_test_flush(r.conn);
+    fake_msq_stream_t *st = fake_msq_stream_at(&r.fake, 0);
+    CHECK(st != NULL);
+    if (st == NULL) { rig_down(&r); return; }
+
+    CHECK(r.ops->reset_stream_at(r.conn, id, 0x1, 5) == MOQ_TRANSPORT_DROPPED);
+    deliver_reliable_negotiated(&r, true);
+    CHECK(r.conn->reliable_reset);
+    CHECK(r.ops->reset_stream_at(r.conn, id, 0x1, 6) == MOQ_TRANSPORT_DROPPED);
+
+    /* the prefix in flight: the reset waits, off the worker and on it */
+    CHECK(r.ops->reset_stream_at(r.conn, id, 0x1, 5) == MOQ_TRANSPORT_WOULD_BLOCK);
+    r.conn->on_worker = 1;                 /* as inside an MsQuic callback */
+    CHECK(r.ops->reset_stream_at(r.conn, id, 0x1, 5) == MOQ_TRANSPORT_WOULD_BLOCK);
+    r.conn->on_worker = 0;
+    CHECK(st->shutdown_calls == 0);
+
+    /* the prefix acknowledged, more bytes still in flight: a plain reset */
+    CHECK(r.ops->write(r.conn, id, obj, sizeof(obj), false) == MOQ_TRANSPORT_OK);
+    moq_msquic_test_flush(r.conn);
+    CHECK(fake_msq_deliver_send_complete(&r.fake, false)); /* the prefix */
+    CHECK(r.ops->reset_stream_at(r.conn, id, 0x1, 5) == MOQ_TRANSPORT_OK);
+    CHECK(st->shutdown_calls == 1);
+    CHECK(st->last_shutdown_flags == QUIC_STREAM_SHUTDOWN_FLAG_ABORT_SEND);
+    CHECK(st->last_shutdown_code == 0x1);
+    CHECK(r.conn->reliable_resets == 1);
+    /* MsQuic's RESET_STREAM_AT is never used */
+    CHECK(r.fake.stream_setparam_calls == 0);
+
+    /* every byte acknowledged: reset at once, from any thread */
+    CHECK(r.ops->open_uni(r.conn, &id2) == MOQ_TRANSPORT_OK);
+    CHECK(r.ops->write(r.conn, id2, hdr, sizeof(hdr), false) == MOQ_TRANSPORT_OK);
+    moq_msquic_test_flush(r.conn);
+    while (fake_msq_deliver_send_complete(&r.fake, false))
+        ;
+    CHECK(r.ops->reset_stream_at(r.conn, id2, 0x1, 5) == MOQ_TRANSPORT_OK);
+    CHECK(r.conn->reliable_resets == 2);
+    CHECK(r.fake.stream_setparam_calls == 0);
+
+    rig_down(&r);
+    if (failures == before)
+        printf("PASS: reliable_reset\n");
+}
+
+/* A reset waiting for its prefix to be acknowledged is abandoned to a plain
+ * reset (DROPPED) once that acknowledgment can no longer come: when the
+ * prefix's send completes canceled, and when the connection starts closing,
+ * whichever side began it. Nothing is left waiting, so the stream finishes
+ * with the connection's teardown. */
+static void deliver_conn_shutdown(struct rig *r, bool by_peer)
+{
+    QUIC_CONNECTION_EVENT ev;
+
+    memset(&ev, 0, sizeof(ev));
+    if (by_peer) {
+        ev.Type = QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_PEER;
+        ev.SHUTDOWN_INITIATED_BY_PEER.ErrorCode = 0;
+    } else {
+        ev.Type = QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT;
+        ev.SHUTDOWN_INITIATED_BY_TRANSPORT.ErrorCode = 1;
+    }
+    moq_msquic_conn_callback()(fake_msq_conn_handle(&r->fake), r->conn, &ev);
+}
+
+static void t_reliable_reset_abandoned(void)
+{
+    int before = failures;
+    static const uint8_t hdr[5] = { 1, 2, 3, 4, 5 };
+
+    /* the prefix's send canceled */
+    {
+        struct rig r;
+        uint64_t id = 0;
+
+        CHECK(rig_up(&r, MOQ_PERSPECTIVE_CLIENT) == 0);
+        deliver_streams_available(&r, 8, 8);
+        deliver_reliable_negotiated(&r, true);
+        CHECK(r.ops->open_uni(r.conn, &id) == MOQ_TRANSPORT_OK);
+        CHECK(r.ops->write(r.conn, id, hdr, sizeof(hdr), false) ==
+              MOQ_TRANSPORT_OK);
+        moq_msquic_test_flush(r.conn);
+        CHECK(r.ops->reset_stream_at(r.conn, id, 0x1, 5) ==
+              MOQ_TRANSPORT_WOULD_BLOCK);
+        CHECK(fake_msq_deliver_send_complete(&r.fake, true));
+        CHECK(r.ops->reset_stream_at(r.conn, id, 0x1, 5) ==
+              MOQ_TRANSPORT_DROPPED);
+        CHECK(r.conn->reliable_resets == 0);
+        CHECK(r.fake.stream_setparam_calls == 0);
+        rig_down(&r);
+    }
+    /* the connection closing, by the peer and by the transport, with the
+     * prefix still in flight and with it acknowledged */
+    for (int by_peer = 0; by_peer < 2; by_peer++) {
+        for (int acked = 0; acked < 2; acked++) {
+            struct rig r;
+            uint64_t id = 0;
+
+            CHECK(rig_up(&r, MOQ_PERSPECTIVE_CLIENT) == 0);
+            deliver_streams_available(&r, 8, 8);
+            deliver_reliable_negotiated(&r, true);
+            CHECK(r.ops->open_uni(r.conn, &id) == MOQ_TRANSPORT_OK);
+            CHECK(r.ops->write(r.conn, id, hdr, sizeof(hdr), false) ==
+                  MOQ_TRANSPORT_OK);
+            moq_msquic_test_flush(r.conn);
+            CHECK(r.ops->reset_stream_at(r.conn, id, 0x1, 5) ==
+                  MOQ_TRANSPORT_WOULD_BLOCK);
+            if (acked)
+                CHECK(fake_msq_deliver_send_complete(&r.fake, false));
+            deliver_conn_shutdown(&r, by_peer != 0);
+            CHECK(r.ops->reset_stream_at(r.conn, id, 0x1, 5) ==
+                  MOQ_TRANSPORT_DROPPED);
+            CHECK(r.conn->reliable_resets == 0);
+            CHECK(r.fake.stream_setparam_calls == 0);
+            rig_down(&r);
+        }
+    }
+    if (failures == before)
+        printf("PASS: reliable_reset_abandoned\n");
+}
+
 /* --- idempotent teardown ops + pure FIN + close --------------------------------------- */
 
 static void t_teardown_ops(void)
@@ -2034,6 +2219,8 @@ int main(void)
     t_flush_failure_in_op();
     t_credit_gating();
     t_teardown_ops();
+    t_reliable_reset();
+    t_reliable_reset_abandoned();
     t_datagram_send();
     t_datagram_cap();
     t_datagram_too_large();

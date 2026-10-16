@@ -13,6 +13,14 @@
  * TRACK_ADDED per catalog track with structured codec information,
  * CATALOG_READY exactly once. Objects are parsed, queued, and handed to the
  * application with exclusive ownership via moq_media_receiver_poll_object().
+ * With the D22 companion, initial discovery waits for the retained
+ * catalog fill to complete: its independent base and all deltas through the
+ * initial ACK's Largest must be present. Live catalog updates are staged in
+ * the existing bounded object ring, not exposed as media or used to rescue
+ * failed history. A failed/incomplete fill or staging-capacity refusal latches
+ * CATALOG_UNUSABLE on this receiver, not its shared endpoint. An ACK without
+ * Largest followed by NO_STREAM instead waits for the first live independent
+ * catalog. Draft-16/18 retain the Joining FETCH bootstrap.
  *
  * Subscription modes. One rule decides what can be subscribed: the receiver
  * has a DELIVERY PATH for a track when it is a media track whose structured
@@ -84,8 +92,13 @@ typedef enum moq_media_overflow_policy {
 typedef struct moq_media_overflow_cfg {
     moq_media_overflow_policy_t policy;  /* REQUIRED: non-zero */
     uint32_t max_objects;                /* object-queue depth; 0 = 256 */
-    uint64_t max_bytes;                  /* queued payload byte budget;
-                                            0 = 32 MiB */
+    uint64_t max_bytes;                  /* 0 = 32 MiB. Policy threshold B:
+                                         * payload bytes, plus each D22 object's
+                                         * private track-properties bytes,
+                                         * reserved before copy allocation.
+                                         * FLOW_CONTROL absorbs through
+                                         * B + floor(B/2); other policies cap B.
+                                         * D16/18 remains payload-only. */
 } moq_media_overflow_cfg_t;
 
 /* -- Configuration (§6.1) --------------------------------------------- */
@@ -133,10 +146,36 @@ typedef struct moq_media_receiver_cfg {
      * (draft-gregoire-moq-msfts, Timestamp Mode: a receiver expecting 188
      * MUST remove it). The catalog's packet size on the desc is unchanged. */
     bool     mpeg2ts_strip_prefix;
-    /* Prefix the first Object delivered for each subscription with the
-     * catalog's PAT/PMT packets (the track's init_data), their continuity
-     * counters aligned to that Object (Use of MSF Initialization Data). */
+    /* Prefix the first Object delivered for each subscription -- LIVE, or
+     * from one of the subscription's fills, whichever comes first -- with
+     * the catalog's PAT/PMT packets (the track's init_data), their
+     * continuity counters aligned to that Object (Use of MSF Initialization
+     * Data). Delivered means returned by poll_object: an Object refused,
+     * dropped or evicted before it is polled never takes it. No later Object
+     * of the subscription carries it. */
     bool     mpeg2ts_join_psi;
+    /* Media companion. AUTO is the default: an absent or partially covered
+     * field, and every _sized initializer that covers it, select it. A zeroed
+     * field is LEGACY_MSF01_LOC01, not AUTO. AUTO resolves once, when the
+     * receiver first observes a draft-16/18/22 session and before anything
+     * is subscribed, to the matching companion (LEGACY_MSF01_LOC01 on D16/18,
+     * D22_MSF01_LOC04_PUBLIC on D22) and then behaves exactly as it does,
+     * including poll_object's draft-22 size floor. With SHARED_EPOCH, AUTO
+     * has no draft-22 match. Explicit LEGACY_MSF01_LOC01 requires negotiated
+     * D16/18; explicit D22_MSF01_LOC04_PUBLIC requires negotiated D22 and RAW
+     * time mode (SHARED_EPOCH is UNSUPPORTED at creation without an explicit
+     * clock mapping). A negotiated mismatch, or an unmatched AUTO, reports
+     * receiver-local FATAL_SETUP_FAILED; it does not close the
+     * endpoint/session. Unknown values are MOQ_ERR_INVAL. Aligned as uint64_t (the
+     * struct's own alignment), so it starts at the complete sizeof of the
+     * layout that ends with mpeg2ts_join_psi on every target: a caller
+     * passing that sizeof never covers it with its tail padding. */
+#ifdef __cplusplus
+    alignas(uint64_t)
+#else
+    _Alignas(uint64_t)
+#endif
+    moq_media_companion_profile_t companion_profile;
 } moq_media_receiver_cfg_t;
 
 /* Frozen v0 sizeof includes tail padding. Use the original embedded
@@ -164,17 +203,21 @@ typedef struct moq_media_receiver_cfg {
  * the overflow choice is forced, not defaulted. Use the presets.
  *
  * These pointer-only initializers clear and stamp ONLY the frozen v0 prefix
- * (MOQ_MEDIA_RECEIVER_CFG_V0_SIZE), so the appended mpeg2ts_ fields stay at
- * their defaults. To set any of them, use the _sized forms below. */
+ * (MOQ_MEDIA_RECEIVER_CFG_V0_SIZE, the complete frozen old config), so the
+ * appended mpeg2ts_ fields and companion_profile stay at their defaults
+ * (companion_profile: AUTO). To set any of them, use the _sized forms below.
+ * Every initializer leaves the companion AUTO. No initializer writes the new
+ * tail or beyond an old caller's allocation. */
 MOQ_API void moq_media_receiver_cfg_init(moq_media_receiver_cfg_t *cfg);
 MOQ_API void moq_media_receiver_cfg_init_live(moq_media_receiver_cfg_t *cfg);
 MOQ_API void moq_media_receiver_cfg_init_flow_control(
     moq_media_receiver_cfg_t *cfg);
 
 /* Sized forms: clear and stamp min(cfg_size, this library's struct size) and
- * apply the preset only where the prefix covers it. Safe for a caller
- * compiled against an older, smaller header too. No-op if cfg is NULL or
- * cfg_size cannot hold struct_size. */
+ * apply the preset only where the prefix covers it (each preset field is
+ * assigned only when completely covered). Safe for a caller compiled against
+ * an older, smaller header too. No-op if cfg is NULL or cfg_size cannot hold
+ * struct_size. Bytes beyond the library's known record stay untouched. */
 MOQ_API void moq_media_receiver_cfg_init_sized(moq_media_receiver_cfg_t *cfg,
                                                size_t cfg_size);
 MOQ_API void moq_media_receiver_cfg_init_live_sized(
@@ -360,7 +403,7 @@ typedef enum moq_media_track_event_kind {
                                     OBSERVATIONAL (where delivery resumed
                                     relative to what was missed); the receiver
                                     issues no catch-up FETCH. */
-    MOQ_MEDIA_TRACK_PARSE_DROP   /* one or more media objects for this track
+    MOQ_MEDIA_TRACK_PARSE_DROP,  /* one or more media objects for this track
                                     failed to parse and were dropped. NON-FATAL:
                                     a malformed object never tears down the
                                     receiver. Coalesced -- at most one parse-drop
@@ -371,6 +414,26 @@ typedef enum moq_media_track_event_kind {
                                     parse_drops_delta (below); `track` is always
                                     non-NULL (every parse drop is track-scoped)
                                     and `desc` is the handle's description. */
+    MOQ_MEDIA_TRACK_LOCAL_FAILURE = 8, /* initial ACK metadata could not be
+                                    retained locally. Exactly once per failed
+                                    track generation, even without media objects.
+                                    Read local_result only when wholly covered by
+                                    struct_size. This is not a peer rejection or
+                                    END_OF_TRACK; unrelated tracks continue. */
+    MOQ_MEDIA_TRACK_FILL_TERMINAL = 9, /* one child ended; parent track state
+                                    is unchanged. Read the stamped plain fill
+                                    tail below. Catalog children are private.
+                                    For a fill of an MPEG2TS media track it
+                                    follows every Object of that fill: it is
+                                    queued once each of them has been polled
+                                    or dropped, and carries the fill's
+                                    unreported-loss summary (below). Other
+                                    tracks get it when the fill ends. */
+    MOQ_MEDIA_TRACK_DELIVERY_LOCAL_FAILURE = 10 /* local delivery capacity
+                                    refusal, distinct from initial ACK loss.
+                                    LIVE permanently fails this generation;
+                                    FILL fails only the identified child.
+                                    Accepted objects retain ownership. */
 } moq_media_track_event_kind_t;
 
 /* Which receive path a coalesced MOQ_MEDIA_TRACK_PARSE_DROP came from. */
@@ -396,7 +459,11 @@ typedef struct moq_media_track_event {
                                             refuses it with MOQ_ERR_WRONG_STATE,
                                             unsubscribe_track() still succeeds
                                             (disable), track_state() reports
-                                            ENDED. A track REMOVED from the
+                                            ENDED. A locally FAILED track has
+                                            the same handle lifetime and control
+                                            behavior, but reports FAILED and
+                                            cannot rearm through live-to-VOD.
+                                            A track REMOVED from the
                                             catalog stays valid but inert: all
                                             three refuse it with
                                             MOQ_ERR_WRONG_STATE. */
@@ -432,7 +499,79 @@ typedef struct moq_media_track_event {
     uint64_t parse_drops_total;          /* cumulative parse drops for this track */
     uint64_t parse_drops_delta;          /* drops since the previous drained
                                             parse-drop event for this track */
+    /* Appended after the complete preceding allocation, never in its padding.
+     * LOCAL_FAILURE carries the exact signed MOQ_ERR_NOMEM or MOQ_ERR_BUFFER
+     * from initial ACK retention. DELIVERY_LOCAL_FAILURE carries MOQ_ERR_BUFFER
+     * from facade delivery admission. Neither is a wire error code. Read
+     * only when struct_size >= offsetof(local_result) + sizeof(local_result).
+     * Older/short callers still receive the event's supported prefix but must
+     * not infer an error value from an absent or partial field. Zero for every
+     * other event kind. */
+    int32_t  local_result;
+    uint32_t _reserved_local_failure;   /* zero; never read */
+    /* Appended after the complete LOCAL_FAILURE allocation. Valid only for
+     * FILL_TERMINAL, with the exact initiating SUBSCRIBE/UPDATE ID (zero is
+     * valid), MOQ_FILL_* reason and MOQ_FILL_ERROR_* domain from session.h.
+     * A STREAM code of zero is still a failure, not COMPLETE. Each field is
+     * observable only when wholly covered by struct_size. Short/old outputs
+     * consume the event's supported prefix; an absent tail is unobserved.
+     * These are plain values, with no cleanup and no borrowed child handle. */
+    uint64_t initiating_request_id;
+    uint32_t fill_reason;
+    uint32_t fill_error_domain;
+    uint64_t fill_error_code;
+    /* Appended after the complete FILL_TERMINAL allocation. Valid only for
+     * DELIVERY_LOCAL_FAILURE: LIVE includes whole objects and chunks; FILL
+     * identifies a child without ending its parent. The initiating ID is valid
+     * only for FILL (zero is valid); LIVE leaves it zero. This does not change
+     * the earlier FILL_TERMINAL initiating_request_id field. Read each field
+     * only when its complete extent is covered by struct_size. No owned refs. */
+    uint32_t delivery_origin;           /* MOQ_MEDIA_DELIVERY_* */
+    uint32_t _reserved_delivery;        /* zero; never read */
+    uint64_t delivery_initiating_request_id;
+    /* Appended after the complete DELIVERY_LOCAL_FAILURE allocation. Valid
+     * only for FILL_TERMINAL of a fill of an MPEG2TS media track; zero for
+     * every other event and track. Written and readable only when
+     * struct_size covers the whole block, through fill_unreported_loss_object;
+     * a shorter stamp leaves it unobserved.
+     *
+     * A coalesced summary of the fill's loss that no delivered Object of the
+     * fill reported: Objects of the fill dropped locally after the last one
+     * the application received (including drops after the fill's own end),
+     * and an Unknown or Timed-Out range the fill ended with. It is not a list
+     * of gaps, and carries no range or duration. Non-Existent ranges, and
+     * Location jumps a fill without Range Filters leaves unmarked, are not
+     * loss and never count.
+     *
+     *   fill_unreported_loss_causes  0 when there is none; else the OR of
+     *                        MOQ_MEDIA_FILL_LOSS_* for every contribution,
+     *                        mixed causes reported together;
+     *   fill_unreported_loss_group / fill_unreported_loss_object
+     *                        where the contribution earliest in the fill's
+     *                        delivery order starts: a dropped Object's own
+     *                        Location, or the start of the loss it reported;
+     *                        for a range, the Location after the fill's
+     *                        previous Object or range end, or the range's own
+     *                        end Location when nothing preceded it. A loss
+     *                        found later at an earlier delivery position
+     *                        replaces it.
+     *
+     * Fill Objects keep the fill stream's transport order. A descending fill
+     * is not a reconstruction of the packet stream: the position is by
+     * delivery order, never re-sorted by Location, and a Group reversal is
+     * not loss. Sort such Objects by Location (or request an ascending fill)
+     * before decoding. The unknown cause is distinct from an Object's
+     * gap_tail_unknown. */
+    uint32_t fill_unreported_loss_causes; /* MOQ_MEDIA_FILL_LOSS_* bits */
+    uint32_t _reserved_fill_loss;         /* zero; never read */
+    uint64_t fill_unreported_loss_group;
+    uint64_t fill_unreported_loss_object;
 } moq_media_track_event_t;
+
+/* Causes in fill_unreported_loss_causes. */
+#define MOQ_MEDIA_FILL_LOSS_LOCAL_DROP 0x1u /* this receiver dropped Objects */
+#define MOQ_MEDIA_FILL_LOSS_UNKNOWN    0x2u /* an End of Unknown Range */
+#define MOQ_MEDIA_FILL_LOSS_TIMED_OUT  0x4u /* an End of Timed-Out Range */
 
 /* The description for a track handle (handle-owned; same lifetime as the
  * TRACK_ADDED event's desc). NULL for a NULL track.
@@ -460,9 +599,9 @@ MOQ_API const moq_media_track_desc_t *moq_media_track_desc_get(
  *
  * `track` must be a handle of `r`: membership is checked against the
  * receiver's own handle table without dereferencing an unowned pointer.
- * Removed and ended tracks, and a terminal (fatal/closed) receiver, remain
- * readable until moq_media_receiver_destroy(). Spans and arrays in the copy
- * stay BORROWED from the handle (handle lifetime), exactly as through
+ * Removed, ended and locally failed tracks, and a terminal (fatal/closed)
+ * receiver, remain readable until moq_media_receiver_destroy(). Spans and arrays
+ * in the copy stay BORROWED from the handle (handle lifetime), exactly as through
  * moq_media_track_desc_get(); nested struct_size stamps (info, init) are
  * carried verbatim and are meaningful only inside the outer prefix.
  *
@@ -541,6 +680,19 @@ typedef struct moq_media_receiver_track_subscribe_cfg {
      * mpeg2tsProgramNumber, else the first program of the PAT. Auto-subscribe
      * uses 0. */
     uint32_t                mpeg2ts_program_number;
+    /* Appended beyond the complete old allocation. NULL leaves the existing
+     * start/join policy unchanged. A selected
+     * location supersedes start (which is then unread). Any explicit option
+     * suppresses the implicit current-group fill; only non-NULL fill requests
+     * a child. NONE is an explicit unconstrained location, not omission.
+     * Both records, including fill->location, borrow only for this call.
+     * Selected values are copied before returning; no caller storage is
+     * retained. D16/18 accept NONE, NEXT_OBJECT, RELATIVE_GROUP with offset 0,
+     * ABSOLUTE_START and GROUP_END. D16 locations must fit 62 bits; D18 accepts
+     * full uint64 values. Fill and the other locations require the D22
+     * companion (explicit, or AUTO resolved) with negotiated draft22. */
+    const moq_location_filter_cfg_t *location;
+    const moq_fill_cfg_t            *fill;
 } moq_media_receiver_track_subscribe_cfg_t;
 
 /* Frozen v0 sizeof: through priority, rounded to the original uint32_t
@@ -557,14 +709,16 @@ typedef struct moq_media_receiver_track_subscribe_cfg {
       sizeof(uint8_t) + MOQ_MEDIA_RECEIVER_TRACK_SUBSCRIBE_CFG_V0_ALIGNMENT - 1) & \
      ~(size_t)(MOQ_MEDIA_RECEIVER_TRACK_SUBSCRIBE_CFG_V0_ALIGNMENT - 1))
 
-/* Pointer-only initializer: clears and stamps ONLY the frozen v0 prefix, so
- * the appended fields keep their defaults. To set any of them, use
- * moq_media_receiver_track_subscribe_cfg_init_sized(cfg, sizeof *cfg). */
+/* Pointer-only initializer: clears and stamps ONLY the frozen v0 prefix (the
+ * complete original allocation), so the appended fields keep their defaults.
+ * To set any of them, use
+ * moq_media_receiver_track_subscribe_cfg_init_sized(cfg, sizeof *cfg)
+ * before selecting appended options. */
 MOQ_API void moq_media_receiver_track_subscribe_cfg_init(
     moq_media_receiver_track_subscribe_cfg_t *cfg);
-
 /* Sized initializer: clears and stamps min(cfg_size, this library's struct
- * size). No-op if cfg is NULL or cfg_size cannot hold struct_size. */
+ * size). No-op if cfg is NULL or cfg_size cannot hold struct_size. Partial
+ * option pointers are absent, not inspected. */
 MOQ_API void moq_media_receiver_track_subscribe_cfg_init_sized(
     moq_media_receiver_track_subscribe_cfg_t *cfg, size_t cfg_size);
 
@@ -579,25 +733,30 @@ MOQ_API void moq_media_receiver_track_subscribe_cfg_init_sized(
  *   MOQ_OK            desired state recorded and reconciliation scheduled
  *   MOQ_ERR_INVAL     NULL r/track, a foreign track, or a malformed cfg
  *                     (struct_size below
- *                     MOQ_MEDIA_RECEIVER_TRACK_SUBSCRIBE_CFG_V0_SIZE, or an
- *                     unknown `start` value)
- *   MOQ_ERR_WRONG_STATE  the track has already ended (TRACK_ENDED): a
- *                     rejected/finished track cannot be (re)subscribed
+ *                     MOQ_MEDIA_RECEIVER_TRACK_SUBSCRIBE_CFG_V0_SIZE, an
+ *                     unknown `start` or other selected value, or a selected
+ *                     location beyond D16's 62-bit range)
+ *   MOQ_ERR_ABI_MISMATCH  a selected nested option is below its frozen floor
+ *   MOQ_ERR_WRONG_STATE  the track has ended or failed locally: a
+ *                     rejected/finished/failed track cannot be (re)subscribed
  *   MOQ_ERR_UNSUPPORTED  the receiver has no delivery path for this track
  *                     (info not derived, packaging not parseable in this
  *                     build, a timeline of a kind it does not decode, or a
- *                     namespace override); nothing is recorded
+ *                     namespace override), or a location/fill is not
+ *                     representable by the negotiated draft and selected
+ *                     companion; nothing is recorded
  *   MOQ_ERR_CLOSED    the receiver is terminal
  *
  * Objects for the track surface via poll_object after the peer accepts; a peer
  * rejection surfaces MOQ_MEDIA_TRACK_ENDED for that track and does not fail the
- * receiver.
+ * receiver. Failure to retain initial ACK metadata instead surfaces
+ * MOQ_MEDIA_TRACK_LOCAL_FAILURE and permanently fails only that track generation.
  *
- * cfg lifetime: the start mode, priority and mpeg2ts_program_number are applied ONLY when the underlying
+ * cfg lifetime: the start mode, priority, mpeg2ts_program_number and options apply ONLY when the underlying
  * subscription is first issued for this track. Any later subscribe_track call --
  * while the first subscription is still pending, already active, or paused by a
  * prior unsubscribe_track -- is an idempotent enable/resume command: it (re)sets
- * the track to "wanted" but does NOT change the start mode or priority of the
+ * the track to "wanted" but does NOT change the start mode, priority or options of the
  * existing subscription (a non-NULL cfg is validated but otherwise has no effect
  * there). Changing those would require the subscription to end first. */
 MOQ_API moq_result_t moq_media_receiver_subscribe_track(
@@ -611,15 +770,36 @@ MOQ_API moq_result_t moq_media_receiver_subscribe_track(
  * cheaply -- repeated enable/disable never accumulates state. The catalog track
  * and the track's TRACK_ADDED handle remain valid -- only delivery stops.
  * Atomic like subscribe_track: MOQ_OK / MOQ_ERR_INVAL / MOQ_ERR_CLOSED; a no-op
- * (and MOQ_OK) for an already-unsubscribed track. */
+ * (and MOQ_OK) for an already-unsubscribed or locally failed track. */
 MOQ_API moq_result_t moq_media_receiver_unsubscribe_track(
     moq_media_receiver_t *r, moq_media_track_t *track);
+
+/* Cancel one owned D22 fill, selected by its initiating SUBSCRIBE/UPDATE ID.
+ * Zero is a valid ID. Records bounded intent and wakes the endpoint executor;
+ * only that executor calls the facade and supplies time. No application session
+ * access, task allocation or receiver pointer retained by a posted callback.
+ * MOQ_OK means scheduled (repeated pending cancellation is idempotent), not
+ * that LOCAL_CANCELLED has won a race with a peer terminal. The original
+ * winning terminal is observed exactly once through poll_track. Cancellation
+ * leaves the parent and other children active; already-owned objects stay valid.
+ *
+ * Returns INVAL for NULL/foreign track, UNSUPPORTED outside the D22 companion,
+ * STALE_HANDLE for unknown/completed keys, CLOSED for a terminal receiver or
+ * endpoint. Like subscribe_track, the nonblocking command is accepted while
+ * wait's interrupt latch is set; interruption does not cancel recorded intent.
+ * Receiver destruction follows the existing executor detach/teardown contract. */
+MOQ_API moq_result_t moq_media_receiver_cancel_fill(
+    moq_media_receiver_t *r, moq_media_track_t *track,
+    uint64_t initiating_request_id);
 
 /* A track's current delivery state, for UI/status without inferring it from the
  * event stream. The two pause states are distinct ON PURPOSE: PAUSED_APP is the
  * application's own unsubscribe_track (it stays paused until the app re-enables);
- * PAUSED_FLOW is automatic FLOW_CONTROL backpressure (it resumes on its own once
- * the queue drains). Collapsing them would hide that difference from a consumer
+ * PAUSED_FLOW is automatic FLOW_CONTROL backpressure. D22 resumes when object
+ * depth and combined charged bytes (including an owned conversion) are both at
+ * or below floor-half of their effective max_objects/max_bytes thresholds.
+ * D16/18 retains object-depth-only resume, with no byte low-water condition.
+ * Collapsing them would hide that difference from a consumer
  * and from resume logic. */
 typedef enum moq_media_track_state {
     MOQ_MEDIA_TRACK_STATE_DISCOVERED = 0, /* in the catalog, never subscribed */
@@ -627,13 +807,16 @@ typedef enum moq_media_track_state {
     MOQ_MEDIA_TRACK_STATE_ACTIVE,         /* subscribed and delivering */
     MOQ_MEDIA_TRACK_STATE_PAUSED_APP,     /* disabled by unsubscribe_track */
     MOQ_MEDIA_TRACK_STATE_PAUSED_FLOW,    /* paused by FLOW_CONTROL backpressure */
-    MOQ_MEDIA_TRACK_STATE_ENDED           /* ended (peer reject / end-of-track) */
+    MOQ_MEDIA_TRACK_STATE_ENDED,          /* ended (peer reject / end-of-track) */
+    MOQ_MEDIA_TRACK_STATE_FAILED = 6      /* local ACK retention or LIVE delivery failure;
+                                            remains failed, never rearmed */
 } moq_media_track_state_t;
 
 /* Write `track`'s current state to *out (a known handle from TRACK_ADDED).
  * Returns MOQ_ERR_INVAL for a NULL r/track/out or a foreign track (these are
  * programmer errors, surfaced rather than hidden); MOQ_OK otherwise, with *out
- * set (a terminal receiver or an ended track yields MOQ_MEDIA_TRACK_STATE_ENDED).
+ * set (a locally failed track stays FAILED; otherwise a terminal receiver or an
+ * ended track yields MOQ_MEDIA_TRACK_STATE_ENDED).
  * The value is a point-in-time snapshot: reconciliation runs on the network
  * thread, so PENDING may advance to ACTIVE (etc.) by the time the caller acts. */
 MOQ_API moq_result_t moq_media_receiver_track_state(
@@ -666,6 +849,11 @@ MOQ_API moq_result_t moq_media_receiver_track_state(
  * framework-owned buffer for downstream. True cross-thread zero-copy ingest
  * would require a future, separate thread-safe media-buffer API -- not
  * moq_rcbuf_t (a thread-safe zero-copy receive export is not offered). */
+
+/* Fixed-width delivery_origin values, available only in a complete stamped
+ * origin observation. FILL's initiating request ID may be zero. */
+#define MOQ_MEDIA_DELIVERY_LIVE 1u
+#define MOQ_MEDIA_DELIVERY_FILL 2u
 
 typedef struct moq_media_object {
     uint32_t              struct_size;        /* ABI guard: poll_object stamps the
@@ -757,7 +945,15 @@ typedef struct moq_media_object {
      *                        the run's PCR span, when the packaging has an
      *                        in-band clock;
      *   discontinuous        informational: no random access point on the
-     *                        selected stream since the gap. */
+     *                        selected stream since the gap.
+     *
+     * Each delivery source reports its own loss: LIVE Objects of one
+     * subscription, and each fill separately. A fill Object's gap is an
+     * Unknown or Timed-Out range, or a local drop, since the fill's previous
+     * Object reached the application; gap_group / gap_object is where the
+     * earliest of them in the fill's delivery order starts, its duration is
+     * not known, and gap_tail_unknown is false. Loss with no later Object of
+     * the fill is reported on the fill's FILL_TERMINAL. */
     bool                  has_loss_report;
     bool                  gap;
     uint64_t              gap_group;
@@ -766,6 +962,39 @@ typedef struct moq_media_object {
     bool                  gap_duration_known;
     uint64_t              gap_duration_27mhz;
     bool                  discontinuous;
+
+    /* D22's effective object metadata; complete old object layout preserved.
+     * Read only when struct_size covers this entire field. Object config
+     * spans borrow properties_ref and remain valid until object cleanup,
+     * including after receiver destruction (track itself does not survive).
+     * Inherited config spans borrow this object's private track_properties_ref;
+     * present object fields (including empty config) override the track block.
+     * Raw Track and Object Properties remain separate and unchanged.
+     * Legacy objects leave this metadata zero. No clock domain is inferred. */
+    moq_media_metadata_t   metadata;
+    /* Exact independent copy of this subscription generation's initial ACK
+     * block, NULL for an empty block or D16/18. Poll transfers its sole ref:
+     * neither the facade, receiver nor another object shares ownership. Valid
+     * through cleanup even after receiver/session destruction. Allocation or
+     * conversion failure drops/counts this object as PARSE_DROP, not a permanent
+     * track LOCAL_FAILURE. Cleanup reads/releases only a fully stamped field. */
+    moq_rcbuf_t          *track_properties_ref;
+
+    /* Appended after the complete metadata/ref allocation, including padding.
+     * Available only when struct_size covers initiating_request_id completely;
+     * a shorter stamp means unobserved, not LIVE or a missing fill. This is the
+     * source of the whole object (and every CMAF sample it contains), separate
+     * from wire location. LIVE has no valid initiator and stores zero. FILL
+     * carries the actual initiating SUBSCRIBE/UPDATE request ID; zero is valid.
+     * Plain values survive receiver destruction along with the owned object;
+     * the borrowed track handle does not. No ownership or thread rule changes. */
+#ifdef __cplusplus
+    alignas(uint64_t)
+#else
+    _Alignas(uint64_t)
+#endif
+    uint32_t              delivery_origin; /* MOQ_MEDIA_DELIVERY_* */
+    uint64_t              initiating_request_id;
 } moq_media_object_t;
 
 /* Release the buffers a successful poll transferred. Safe on a zeroed
@@ -780,10 +1009,15 @@ MOQ_API void moq_media_object_cleanup(moq_media_object_t *obj);
  * and a newer library never writes past an older caller's struct. MOQ_OK
  * transfers ownership (see above), MOQ_DONE = nothing now, MOQ_ERR_INTERRUPTED
  * while the endpoint latch is set, MOQ_ERR_CLOSED when empty AND terminal,
- * MOQ_ERR_INVAL for NULL args or obj_size below the v0 base size. An object for a
+ * MOQ_ERR_INVAL for NULL args or a legacy obj_size below the v0 base size. An object for a
  * track is never pollable before that track's TRACK_ADDED has been queued --
  * drain track events before objects on each wakeup and every handle is known
- * before its first object. */
+ * before its first object. For the D22 companion (explicit, or AUTO resolved on
+ * draft 22), obj_size must cover
+ * the whole metadata/ref and delivery-origin observation through the end of
+ * initiating_request_id; otherwise
+ * MOQ_ERR_UNSUPPORTED leaves output and queue untouched, with no transfer.
+ * Legacy D16/18 retains the v0 minimum. */
 MOQ_API moq_result_t moq_media_receiver_poll_object(moq_media_receiver_t *r,
                                                     moq_media_object_t *obj,
                                                     size_t obj_size);
@@ -894,6 +1128,9 @@ typedef struct moq_media_receiver_stats {
     uint64_t gaps_reported;
     uint64_t gap_tails_unknown;
     uint64_t reorder_refused;
+    /* Appended: media tracks whose subscription ended because the Track was
+     * malformed (draft-22 §12.1); each also ends (TRACK_ENDED). */
+    uint64_t tracks_malformed;
 } moq_media_receiver_stats_t;
 
 /* Snapshot stats into *out. Pass `out_size = sizeof(*out)`; same size contract as
@@ -965,11 +1202,14 @@ MOQ_API bool     moq_media_receiver_is_fatal(const moq_media_receiver_t *r);
 MOQ_API uint64_t moq_media_receiver_fatal_code(const moq_media_receiver_t *r);
 
 /* Receiver-fatal codes (moq_media_receiver_fatal_code). */
-#define MOQ_MEDIA_RECEIVER_FATAL_CATALOG_UNUSABLE 0x1u /* parse/derive failed */
+#define MOQ_MEDIA_RECEIVER_FATAL_CATALOG_UNUSABLE 0x1u /* parse/derive, ACK retention
+                                                          or catalog delivery failed;
+                                                          receiver-local only */
 #define MOQ_MEDIA_RECEIVER_FATAL_EVENT_OVERFLOW   0x2u /* track-event queue
                                                           overflow (§6.3) */
 #define MOQ_MEDIA_RECEIVER_FATAL_SETUP_FAILED     0x3u /* catalog subscription
-                                                          could not be issued */
+                                                          could not be issued,
+                                                          or companion/version mismatch */
 #define MOQ_MEDIA_RECEIVER_FATAL_CATALOG_REJECTED 0x4u /* the publisher refused
                                                           the catalog
                                                           subscription */

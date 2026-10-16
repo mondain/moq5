@@ -315,7 +315,18 @@ static void test_sized_contract(void)
     CHECK(moq_media_object_parse_sized(&t, &in, &cfg, NULL, 0,
           &box.aligner, sizeof(ts_old_parsed_t), &why) == MOQ_ERR_UNSUPPORTED);
     cfg.companion_profile = MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01;
+    /* A covered track record is read: one that is not a LOC metadata record
+     * is INVAL, and track timescale on the legacy companion is UNSUPPORTED,
+     * both before any output store. */
     cfg.track_loc_metadata = (const moq_loc_metadata_t *)(const void *)&t;
+    CHECK(moq_media_object_parse_sized(&t, &in, &cfg, NULL, 0,
+          &box.aligner, sizeof(ts_old_parsed_t), &why) == MOQ_ERR_INVAL);
+    CHECK(memcmp(&box, &before, sizeof(box)) == 0 && why == 99);
+    moq_loc_metadata_t track_loc;
+    moq_loc_metadata_init_sized(&track_loc, sizeof(track_loc));
+    track_loc.present = MOQ_LOC_METADATA_HAS_TIMESCALE;
+    track_loc.timescale = 90000;
+    cfg.track_loc_metadata = &track_loc;
     CHECK(moq_media_object_parse_sized(&t, &in, &cfg, NULL, 0,
           &box.aligner, sizeof(ts_old_parsed_t), &why) == MOQ_ERR_UNSUPPORTED);
     CHECK(memcmp(&box, &before, sizeof(box)) == 0 && why == 99);
@@ -332,7 +343,11 @@ static void test_sized_contract(void)
     CHECK(moq_media_object_parse(&t, &in, NULL, 0, &legacy, NULL) == MOQ_OK);
     CHECK(moq_media_object_parse_sized(&t, &in, NULL, NULL, 0,
           &box.aligner, sizeof(box), NULL) == MOQ_OK);
-    CHECK(memcmp(&legacy, &box.aligner, sizeof(legacy)) == 0);
+    CHECK(legacy.struct_size == MOQ_MEDIA_PARSED_OBJECT_V0_SIZE);
+    CHECK(box.aligner.struct_size == sizeof(moq_media_parsed_object_t));
+    CHECK(memcmp((const unsigned char *)&legacy + sizeof(uint32_t),
+                 (const unsigned char *)&box.aligner + sizeof(uint32_t),
+                 MOQ_MEDIA_PARSED_OBJECT_V0_SIZE - sizeof(uint32_t)) == 0);
     t.transport_version = (moq_version_t)0;
     before = box;
     why = 99;

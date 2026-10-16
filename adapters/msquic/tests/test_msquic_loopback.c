@@ -12,7 +12,11 @@
  *     freshly built pair;
  *   - a real second client refused at the admission cap, which is what a
  *     refused PEER observes rather than what the local listener decided;
- *   - a connect that can never complete, ending in a bounded fatal.
+ *   - a connect that can never complete, ending in a bounded fatal;
+ *   - a draft-22 pair, whose profile cannot start until the facade binds
+ *     each session to its connection (the handshake and DATAGRAM facts read
+ *     from MsQuic, the client's derived authority), and a server URI policy
+ *     refusing that client's PATH.
  *
  * Confinement: every moq_session_* call lives inside on_lane_pump. The main
  * thread only waits on terminal predicates and asserts recorded
@@ -38,6 +42,9 @@
 
 #include <moq/msquic_managed.h>
 #include <moq/rcbuf.h>
+#include <moq/transport_binding.h>
+
+#include "msq_loopback_port.h"
 
 static int failures = 0;
 
@@ -278,7 +285,7 @@ static bool wait_terminal(moq_msquic_managed_t *m, int max_ms)
 }
 
 static void t_streaming_objects(const char *cert, const char *key,
-                                bool streaming)
+                                moq_version_t version, bool streaming)
 {
     int before = failures;
     struct side sv, cl;
@@ -291,7 +298,6 @@ static void t_streaming_objects(const char *cert, const char *key,
     scfg.alloc = moq_alloc_default();
     scfg.perspective = MOQ_PERSPECTIVE_SERVER;
     scfg.host = "127.0.0.1";
-    scfg.port = 0; /* ephemeral */
     scfg.cert_path = cert;
     scfg.key_path = key;
     scfg.on_lane_pump = server_pump;
@@ -299,7 +305,8 @@ static void t_streaming_objects(const char *cert, const char *key,
     scfg.send_request_capacity = true;
     scfg.initial_request_capacity = 16;
     scfg.max_events = 64;
-    CHECK(moq_msquic_managed_create(&scfg, &sv.m) == MOQ_OK);
+    scfg.version = version;
+    CHECK(msqt_server_create(&scfg, &sv.m) == MOQ_OK);
     if (sv.m == NULL)
         return;
     uint16_t port = moq_msquic_managed_port(sv.m);
@@ -318,6 +325,7 @@ static void t_streaming_objects(const char *cert, const char *key,
     ccfg.initial_request_capacity = 16;
     ccfg.max_events = 64;
     ccfg.streaming_objects = streaming;
+    ccfg.version = version;
     CHECK(moq_msquic_managed_create(&ccfg, &cl.m) == MOQ_OK);
     if (cl.m == NULL) {
         (void)moq_msquic_managed_stop(sv.m);
@@ -355,7 +363,134 @@ static void t_streaming_objects(const char *cert, const char *key,
     side_destroy(&sv);
     side_destroy(&cl);
     if (failures == before)
-        printf("PASS: streaming_objects[streaming=%d]\n", (int)streaming);
+        printf("PASS: streaming_objects[version=%u streaming=%d]\n",
+               (unsigned)version, (int)streaming);
+}
+
+/* A server URI policy that records what the client's SETUP named and
+ * refuses its PATH. */
+struct uri_policy {
+    pthread_mutex_t mu;
+    int asked;
+    uint32_t present;
+    char authority[128];
+    size_t authority_len;
+    size_t path_len;
+    uint32_t verdict;
+};
+
+static uint32_t uri_policy_cb(void *ctx, uint32_t present,
+                              moq_bytes_t authority, moq_bytes_t path_query)
+{
+    struct uri_policy *pol = ctx;
+
+    pthread_mutex_lock(&pol->mu);
+    pol->asked++;
+    pol->present = present;
+    pol->authority_len = authority.len;
+    if (authority.len < sizeof(pol->authority))
+        memcpy(pol->authority, authority.data, authority.len);
+    pol->path_len = path_query.len;
+    uint32_t verdict = pol->verdict;
+    pthread_mutex_unlock(&pol->mu);
+    return verdict;
+}
+
+/*
+ * A server consults its URI policy with the identity the client's SETUP
+ * carried -- the facade derives "host:port" and an empty path from the
+ * client's dial parameters -- and a refusal closes the session with
+ * INVALID_PATH (0x8), observed by the client as an orderly peer close. The
+ * server never completes SETUP. The client may: on the profiles where each
+ * peer sends its SETUP as soon as it is able, the server's SETUP can be
+ * delivered to the client before the server has judged the client's PATH.
+ * Every profile carries the target natively over QUIC, draft-22 because it
+ * requires the binding and draft-16 / draft-18 because the facade binds them
+ * too.
+ */
+static void t_uri_refusal(const char *cert, const char *key, moq_version_t version)
+{
+    int before = failures;
+    struct side sv, cl;
+    struct uri_policy pol;
+
+    side_init(&sv);
+    side_init(&cl);
+    memset(&pol, 0, sizeof(pol));
+    pthread_mutex_init(&pol.mu, NULL);
+    pol.verdict = MOQ_URI_INVALID_PATH;
+
+    moq_connection_target_t policy;
+    memset(&policy, 0, sizeof(policy));
+    policy.struct_size = (uint32_t)sizeof(policy);
+    policy.accept_uri = uri_policy_cb;
+    policy.accept_uri_ctx = &pol;
+
+    moq_msquic_managed_cfg_t scfg;
+    moq_msquic_managed_cfg_init_sized(&scfg, sizeof(scfg));
+    scfg.alloc = moq_alloc_default();
+    scfg.perspective = MOQ_PERSPECTIVE_SERVER;
+    scfg.host = "127.0.0.1";
+    scfg.cert_path = cert;
+    scfg.key_path = key;
+    scfg.on_lane_pump = server_pump;
+    scfg.on_lane_pump_user = &sv;
+    scfg.send_request_capacity = true;
+    scfg.initial_request_capacity = 16;
+    scfg.max_events = 64;
+    scfg.version = version;
+    scfg.target = &policy;
+    CHECK(msqt_server_create(&scfg, &sv.m) == MOQ_OK);
+    if (sv.m == NULL)
+        return;
+    uint16_t port = moq_msquic_managed_port(sv.m);
+    CHECK(port != 0);
+
+    moq_msquic_managed_cfg_t ccfg;
+    moq_msquic_managed_cfg_init_sized(&ccfg, sizeof(ccfg));
+    ccfg.alloc = moq_alloc_default();
+    ccfg.perspective = MOQ_PERSPECTIVE_CLIENT;
+    ccfg.host = "127.0.0.1";
+    ccfg.port = port;
+    ccfg.insecure_skip_verify = true;
+    ccfg.on_lane_pump = client_pump;
+    ccfg.on_lane_pump_user = &cl;
+    ccfg.send_request_capacity = true;
+    ccfg.initial_request_capacity = 16;
+    ccfg.max_events = 64;
+    ccfg.version = version;
+    CHECK(moq_msquic_managed_create(&ccfg, &cl.m) == MOQ_OK);
+    if (cl.m == NULL) {
+        (void)moq_msquic_managed_stop(sv.m);
+        moq_msquic_managed_destroy(sv.m);
+        return;
+    }
+
+    CHECK(wait_terminal(cl.m, 30000));
+    CHECK(moq_msquic_managed_is_closed(cl.m));
+    CHECK(!moq_msquic_managed_is_fatal(cl.m));
+    CHECK(moq_msquic_managed_close_code(cl.m) == 0x8);
+    CHECK(moq_msquic_managed_stop(cl.m) == MOQ_OK);
+    CHECK(moq_msquic_managed_stop(sv.m) == MOQ_OK);
+    moq_msquic_managed_destroy(cl.m);
+    moq_msquic_managed_destroy(sv.m);
+
+    char expect_authority[64];
+    snprintf(expect_authority, sizeof(expect_authority), "127.0.0.1:%u",
+             (unsigned)port);
+    CHECK(pol.asked == 1);
+    CHECK(pol.present == MOQ_BINDING_TARGET_COMPLETE);
+    CHECK(pol.authority_len == strlen(expect_authority));
+    CHECK(memcmp(pol.authority, expect_authority, pol.authority_len) == 0);
+    CHECK(pol.path_len == 0);
+    CHECK(cl.setup <= 1);
+    CHECK(sv.setup == 0);
+
+    pthread_mutex_destroy(&pol.mu);
+    side_destroy(&sv);
+    side_destroy(&cl);
+    if (failures == before)
+        printf("PASS: uri_refusal draft-%u\n", (unsigned)version);
 }
 
 /* Server-side state for multi-connection scenarios: one slot per
@@ -468,7 +603,6 @@ static moq_msquic_managed_t *make_multi_server(struct msrv *sv,
     cfg.alloc = moq_alloc_default();
     cfg.perspective = MOQ_PERSPECTIVE_SERVER;
     cfg.host = "127.0.0.1";
-    cfg.port = 0;
     cfg.cert_path = cert;
     cfg.key_path = key;
     cfg.on_lane_pump = multi_server_pump;
@@ -477,7 +611,7 @@ static moq_msquic_managed_t *make_multi_server(struct msrv *sv,
     cfg.initial_request_capacity = 16;
     cfg.max_events = 64;
     cfg.max_connections = max_conns;
-    if (moq_msquic_managed_create(&cfg, &sv->m) != MOQ_OK)
+    if (msqt_server_create(&cfg, &sv->m) != MOQ_OK)
         return NULL;
     return sv->m;
 }
@@ -655,8 +789,14 @@ int main(int argc, char **argv)
     }
 
     /* two independent pairs: chunks iff configured */
-    t_streaming_objects(argv[1], argv[2], true);
-    t_streaming_objects(argv[1], argv[2], false);
+    t_streaming_objects(argv[1], argv[2], MOQ_VERSION_DRAFT_16, true);
+    t_streaming_objects(argv[1], argv[2], MOQ_VERSION_DRAFT_16, false);
+    /* a profile that requires a transport binding runs the same flow once
+     * the facade has bound each session to its connection */
+    t_streaming_objects(argv[1], argv[2], MOQ_VERSION_DRAFT_22, true);
+    t_uri_refusal(argv[1], argv[2], MOQ_VERSION_DRAFT_16);
+    t_uri_refusal(argv[1], argv[2], MOQ_VERSION_DRAFT_18);
+    t_uri_refusal(argv[1], argv[2], MOQ_VERSION_DRAFT_22);
     t_cap_refusal(argv[1], argv[2]);
     t_connect_failure_fatal();
 

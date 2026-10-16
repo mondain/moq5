@@ -16,6 +16,22 @@ void moqr_bind_debug_fail_probe(int nth, moqr_result_t result);
  * WITHOUT calling the session, so the production close -> detach -> purge
  * path runs from inside an ordered-ring retry. */
 void moqr_bind_debug_fail_sg_reset(int nth);
+/* The next n upstream cancellations a malformed Track owes observe
+ * WOULD_BLOCK without calling the session. */
+void moqr_bind_debug_block_upstream_cancels(int n);
+/* The next N upstream cancellations a malformed Track owes fail with
+ * MOQ_ERR_BUFFER -- the session's answer for a cancellation message that can
+ * never fit its send buffer -- without calling the session. Returns how many
+ * of the previous setting were left unused. */
+int moqr_bind_debug_fail_upstream_cancels(int n);
+/* Make the next subscription update that carries a replacement Location
+ * Filter read the given filter kind (MOQ_LOCATION_FILTER_*) in place of the
+ * session's: the relative form at offset two, or the object-end form, are the
+ * shapes a peer can send that this library's subscriber API cannot. */
+void moqr_bind_debug_update_filter_kind(uint32_t kind);
+/* Make the next `n` downstream update answers observe WOULD_BLOCK without
+ * calling the session, so the hold-and-retry path runs. */
+void moqr_bind_debug_block_update_answers(int n);
 /* Observe the instant an internal detach is retained for retry. */
 typedef void (*moqr_bind_debug_detach_pending_fn)(moqr_bind_t *b,
                                                   moq_session_t *session,
@@ -27,7 +43,21 @@ void moqr_bind_debug_on_detach_pending(moqr_bind_debug_detach_pending_fn fn,
  * production defer/retry arm must carry the retained descriptor to the wire. */
 void moqr_bind_debug_block_sub_done(int n);
 int moqr_bind_debug_sub_done_blocks_left(void);
+/* Make the next N subgroup resets a SUB_DONE owes observe WOULD_BLOCK without
+ * reaching the session: the terminal is deferred with the stream's obligation
+ * still recorded, and the retry must reset it before the terminal. */
+void moqr_bind_debug_block_sg_reset(int n);
+/* Refuse the Nth SUB_DONE terminal write from now with WRONG_STATE without
+ * reaching the session. kind: 0 either, 1 subscriptions only, 2 publications
+ * only. Proves the hard-refusal handling, not real-state reachability. */
+void moqr_bind_debug_fail_sub_done(int nth, int kind);
+int moqr_bind_debug_sg_reset_blocks_left(void);
 /* The first live upstream subscription: {conn slot, session handle}. */
+/* The downstream session handle of the subgroup stream the binding tracks
+ * for (group, subgroup) on the connection bound to `session`. */
+bool moqr_bind_debug_sg_handle(const moqr_bind_t *b,
+                               const moq_session_t *session, uint64_t group,
+                               uint64_t subgroup, moq_subgroup_handle_t *out);
 bool moqr_bind_debug_first_usub(const moqr_bind_t *b, uint32_t *slot,
                                 uint64_t *handle_raw);
 /* Forwarded Joining FETCH transaction gauges (test-internals build only):

@@ -42,8 +42,8 @@ source and standalone CMake file also install alongside the relay SDK docs.
 build/simple-relay/examples/relay/simple-relay/moq_simple_relay server.pem server-key.pem 4433
 ```
 
-The listener binds **127.0.0.1 only**, accepting drafts 18 and 16 in that server
-preference order. The certificate and private key must be valid PEM files.
+The listener binds **127.0.0.1 only**, accepting drafts 22, 18 and 16 in that
+server preference order. The certificate and private key must be valid PEM files.
 Clients must trust the certificate and verify the server identity. Port `0`
 requests an ephemeral port; the program prints the bound port after successful
 creation. SIGINT or SIGTERM stops the transport and joins its lane before
@@ -74,7 +74,7 @@ is driven by adapter activity and the SDK's explicit continuation requests.
 `simple_relay_lifecycle` drives this exact application through a substituted
 transport with real SDK/session state and caller-supplied time, without sockets
 or sleeps. `simple_relay_loopback` is a bounded real-transport test: all four
-draft pairings, exact binary payloads, subgroup FIN, cumulative connections
+pairings of drafts 16 and 18 plus draft 22 with itself, exact binary payloads, subgroup FIN, cumulative connections
 beyond the listener cap, and SIGTERM shutdown. Its peers bypass certificate
 verification for the committed test certificate; it is **not** TLS trust,
 browser, interop-runner, load or performance evidence. The SDK package test

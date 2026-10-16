@@ -1,3 +1,7 @@
+#if defined(__linux__) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 /*
  * moq_endpoint_t — configuration resolution (pure) + managed lifecycle.
  *
@@ -49,12 +53,52 @@
 #include "../../adapters/common/moq_alpn.h"
 #include "../../adapters/common/moq_setup_tokens.h"
 #include <moq/wire.h>
+#include "../../core/src/base/uri_internal.h"
 
 #include <assert.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <time.h>   /* clock_gettime: drain deadline (service tier may use the wall clock) */
 #include <string.h>
+
+/* Draft-22 requires exact STOP and ACK-through-FIN stream outcomes from the
+ * transport. picoquic provides them from stream-terminal contract version 1;
+ * the picoquic and pico_wt adapters refuse to attach a draft-22 session on a
+ * picoquic without it, so the endpoint never offers draft-22 on that backend. */
+#if defined(MOQ_SERVICE_HAVE_PQ_THREADED) || \
+    defined(MOQ_SERVICE_HAVE_PICO_WT_MANAGED)
+#include <picoquic.h>
+#endif
+#if defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) && \
+    PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1
+#define EP_PICOQUIC_HOSTS_DRAFT_22 true
+#else
+#define EP_PICOQUIC_HOSTS_DRAFT_22 false
+#endif
+
+#if defined(MOQ_MEDIA_SENDER_TESTING) || defined(MOQ_MEDIA_RECEIVER_TESTING)
+/* Test seam: -1 keeps the build's own picoquic capability; 0 or 1 replaces it
+ * so offer filtering is testable against a picoquic without the contract. */
+static int ep_test_picoquic_hosts_draft_22 = -1;
+void moq_endpoint_test_set_picoquic_draft_22(int hosts);
+void moq_endpoint_test_set_picoquic_draft_22(int hosts)
+{
+    ep_test_picoquic_hosts_draft_22 = hosts;
+}
+#endif
+
+/* Whether the selected backend can carry a session of version `v`. */
+static bool ep_backend_hosts_version(moq_transport_backend_t backend,
+                                     moq_version_t v)
+{
+    if (v != MOQ_VERSION_DRAFT_22 || backend != MOQ_TRANSPORT_BACKEND_PICOQUIC)
+        return true;
+#if defined(MOQ_MEDIA_SENDER_TESTING) || defined(MOQ_MEDIA_RECEIVER_TESTING)
+    if (ep_test_picoquic_hosts_draft_22 >= 0)
+        return ep_test_picoquic_hosts_draft_22 != 0;
+#endif
+    return EP_PICOQUIC_HOSTS_DRAFT_22;
+}
 
 #ifdef MOQ_SERVICE_HAVE_PQ_THREADED
 #include <moq/picoquic_threaded.h>
@@ -90,49 +134,65 @@
 
 bool moq_endpoint_version_supported(moq_version_t v)
 {
-    /* Single point of truth for the build's supported set. Both profiles are
-     * unconditionally compiled today (core/CMakeLists.txt lists profile_d16.c
-     * and profile_d18.c in every configuration); if a profile ever becomes a
-     * build option, thread its define through here -- the offer rules (§5.2)
-     * depend on this predicate being exact. */
-    return v == MOQ_VERSION_DRAFT_16 || v == MOQ_VERSION_DRAFT_18;
+    /* The core's registry is the single point of truth: a version is
+     * supported when its wire profile is complete in this build. The offer
+     * rules (§5.2) depend on this predicate being exact. */
+    return moq_version_supported(v);
 }
 
-/* The full supported set, NEWEST FIRST: both TLS ALPN selection and the
- * WebTransport protocol field honor the CLIENT's offer order (verified
- * end to end by the WT protocol-token negotiation test), so AUTO prefers
- * the newest version the peer also speaks. */
-static size_t supported_versions(moq_version_t *out, size_t cap)
+/* AUTO offers every draft this build supports, newest first. */
+#define EP_DEFAULT_PREFERRED_VERSION MOQ_VERSION_DRAFT_22
+
+static size_t default_versions(moq_version_t preferred, moq_version_t *out)
 {
-    size_t n = 0;
-    if (n < cap) out[n++] = MOQ_VERSION_DRAFT_18;
-    if (n < cap) out[n++] = MOQ_VERSION_DRAFT_16;
-    return n;
+    const moq_version_t candidates[] = {
+        preferred, MOQ_VERSION_DRAFT_22, MOQ_VERSION_DRAFT_18,
+        MOQ_VERSION_DRAFT_16
+    };
+    _Static_assert(sizeof(candidates) / sizeof(candidates[0]) <=
+                   MOQ_ENDPOINT_MAX_VERSIONS, "default offer fits");
+    size_t count = 0;
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        if (!moq_endpoint_version_supported(candidates[i])) continue;
+        bool present = false;
+        for (size_t j = 0; j < count; j++) {
+            if (out[j] == candidates[i]) present = true;
+        }
+        if (!present) out[count++] = candidates[i];
+    }
+    return count;
 }
 
 /* -- Resolution ------------------------------------------------------ */
 
 static bool bytes_empty(moq_bytes_t b) { return b.len == 0; }
 
+/* AUTO offers the preferred version first (the newest supported draft when
+ * none is named), then every other supported draft, newest first. */
+static moq_result_t resolve_auto(moq_version_t preferred,
+                                 moq_endpoint_resolved_t *out)
+{
+    out->policy = MOQ_VERSION_POLICY_AUTO;
+    if (preferred != 0 && !moq_endpoint_version_supported(preferred))
+        return MOQ_ERR_UNSUPPORTED;
+    out->preferred_version = preferred ? preferred : EP_DEFAULT_PREFERRED_VERSION;
+    out->version_count = default_versions(out->preferred_version, out->versions);
+    return MOQ_OK;
+}
+
 static moq_result_t resolve_versions(const moq_version_offer_t *offer,
+                                     moq_version_t preferred,
                                      moq_endpoint_resolved_t *out)
 {
     /* Zero-init (struct_size 0) means AUTO per the cfg comment; a non-zero
      * but undersized struct is a malformed offer. */
-    if (offer->struct_size == 0) {
-        out->policy = MOQ_VERSION_POLICY_AUTO;
-        out->version_count =
-            supported_versions(out->versions, MOQ_ENDPOINT_MAX_VERSIONS);
-        return MOQ_OK;
-    }
+    if (offer->struct_size == 0)
+        return resolve_auto(preferred, out);
     if (offer->struct_size < sizeof(moq_version_offer_t)) return MOQ_ERR_INVAL;
 
     switch (offer->policy) {
     case MOQ_VERSION_POLICY_AUTO:
-        out->policy = MOQ_VERSION_POLICY_AUTO;
-        out->version_count =
-            supported_versions(out->versions, MOQ_ENDPOINT_MAX_VERSIONS);
-        return MOQ_OK;
+        return resolve_auto(preferred, out);
     case MOQ_VERSION_POLICY_LIST:
     case MOQ_VERSION_POLICY_EXACT:
         break;
@@ -140,6 +200,9 @@ static moq_result_t resolve_versions(const moq_version_offer_t *offer,
         return MOQ_ERR_INVAL;
     }
 
+    /* LIST and EXACT state their own order; a preference beside them is a
+     * contradiction, not a hint. */
+    if (preferred != 0) return MOQ_ERR_INVAL;
     if (!offer->versions || offer->version_count == 0) return MOQ_ERR_INVAL;
     if (offer->policy == MOQ_VERSION_POLICY_EXACT && offer->version_count != 1)
         return MOQ_ERR_INVAL;
@@ -174,28 +237,80 @@ moq_result_t moq_endpoint_resolve_cfg(const moq_endpoint_cfg_t *cfg,
     if (cfg->ca_file.len > 0 && !cfg->ca_file.data) return MOQ_ERR_INVAL;
     if (cfg->wt_path.len > 0 && !cfg->wt_path.data) return MOQ_ERR_INVAL;
 
-    /* URL: required; the parser owns scheme/host/port/path validation
+    /* URI mode: an appended tail field, read only when struct_size covers it
+     * (LEGACY, the zero value, otherwise); an unknown mode is a clean
+     * MOQ_ERR_INVAL. */
+    if ((size_t)cfg->struct_size >=
+        offsetof(moq_endpoint_cfg_t, uri_mode) + sizeof(cfg->uri_mode)) {
+        if (cfg->uri_mode > MOQ_ENDPOINT_URI_STANDARD) return MOQ_ERR_INVAL;
+        out->uri_mode = cfg->uri_mode;
+    }
+
+    /* URL: required. LEGACY keeps the original parser and its defaults
      * (moqt/moq/https only, so an unknown scheme is MOQ_ERR_INVAL whether or
-     * not the protocol field would have overridden it -- the URL itself must
-     * be well-formed). */
+     * not the protocol field would have overridden it). STANDARD validates
+     * the encoded MOQT URI syntax first and then applies its managed-client
+     * subset. */
     if (bytes_empty(cfg->url) || !cfg->url.data) return MOQ_ERR_INVAL;
-    /* URI fragments are local to the caller, never a connection target
-     * (transport-18 section 3.1.2). Keep the core application parser's
-     * contract unchanged; resolve only the server-visible prefix here. */
-    moq_bytes_t connection_url = cfg->url;
-    const uint8_t *fragment = memchr(connection_url.data, '#', connection_url.len);
-    if (fragment) connection_url.len = (size_t)(fragment - connection_url.data);
-    moq_result_t urc = moq_url_parse(connection_url, &out->url);
+    moq_result_t urc;
+    if (out->uri_mode == MOQ_ENDPOINT_URI_STANDARD) {
+        if (cfg->wt_path.len ||
+            (cfg->sni.len && memchr(cfg->sni.data, 0, cfg->sni.len)))
+            return MOQ_ERR_INVAL;
+        urc = moq_endpoint_uri_parse(cfg->url, &out->uri);
+        if (urc == MOQ_OK) out->url = out->uri.url;
+    } else {
+        /* URI fragments are local to the caller, never a connection target
+         * (transport-18 section 3.1.2). Keep the core application parser's
+         * contract unchanged; resolve only the server-visible prefix here. */
+        moq_bytes_t connection_url = cfg->url;
+        const uint8_t *fragment =
+            memchr(connection_url.data, '#', connection_url.len);
+        if (fragment)
+            connection_url.len = (size_t)(fragment - connection_url.data);
+        urc = moq_url_parse(connection_url, &out->url);
+    }
     if (urc < 0) return urc;
+
+    /* The connection target (§6.2.2): the authority as spelled and the
+     * path-abempty with "?" query. STANDARD has validated both; LEGACY takes
+     * them from the URL bytes and keeps them only when they follow RFC 3986
+     * with a nonempty host, so a legacy URL the grammar does not admit yields
+     * no target rather than a target a peer would refuse as malformed. */
+    out->target.struct_size = (uint32_t)sizeof(out->target);
+    if (out->uri_mode == MOQ_ENDPOINT_URI_STANDARD) {
+        out->target.target_present = MOQ_BINDING_TARGET_COMPLETE;
+        out->target.authority = out->uri.authority;
+        out->target.path_query = out->uri.path_query;
+    } else {
+        size_t start = out->url.scheme.len + 3;   /* past "://" */
+        size_t end = start;
+        while (end < cfg->url.len && cfg->url.data[end] != '#') end++;
+        size_t path = start;
+        while (path < end && cfg->url.data[path] != '/' &&
+               cfg->url.data[path] != '?') path++;
+        moq_bytes_t authority = { cfg->url.data + start, path - start };
+        moq_bytes_t path_query = { cfg->url.data + path, end - path };
+        if (start <= cfg->url.len && moq_uri_authority_valid(authority) &&
+            moq_uri_path_query_valid(path_query) &&
+            path_query.len <= UINT16_MAX - authority.len) {
+            out->target.target_present = MOQ_BINDING_TARGET_COMPLETE;
+            out->target.authority = authority;
+            out->target.path_query = path_query;
+        }
+    }
 
     /* Protocol: an explicit non-AUTO field WINS over the URL scheme (§5.1 --
      * the field is the override knob, a scheme/field conflict is not an
      * error). AUTO derives from the scheme. */
     switch (cfg->protocol) {
     case MOQ_TRANSPORT_PROTOCOL_AUTO: {
-        /* moq_url_parse admits exactly moqt/moq/https. */
-        bool https = out->url.scheme.len == 5 &&
-                     memcmp(out->url.scheme.data, "https", 5) == 0;
+        /* LEGACY admits exactly moqt/moq/https spelled in lowercase;
+         * STANDARD has already matched the scheme case-insensitively. */
+        bool https = out->uri_mode == MOQ_ENDPOINT_URI_STANDARD
+            ? out->uri.https
+            : (out->url.scheme.len == 5 &&
+               memcmp(out->url.scheme.data, "https", 5) == 0);
         out->protocol = https ? MOQ_TRANSPORT_PROTOCOL_WEBTRANSPORT
                               : MOQ_TRANSPORT_PROTOCOL_RAW_QUIC;
         break;
@@ -288,18 +403,33 @@ moq_result_t moq_endpoint_resolve_cfg(const moq_endpoint_cfg_t *cfg,
         return MOQ_ERR_INVAL;
     }
 
+    /* URI policy: a server's field, carried in the connection target's shape.
+     * A client endpoint names a target and never a policy; the tail is read
+     * only when struct_size covers both fields. */
+    if ((size_t)cfg->struct_size >=
+        offsetof(moq_endpoint_cfg_t, accept_uri_ctx) + sizeof(cfg->accept_uri_ctx)) {
+        if (cfg->accept_uri || cfg->accept_uri_ctx) return MOQ_ERR_INVAL;
+        out->target.accept_uri = cfg->accept_uri;
+        out->target.accept_uri_ctx = cfg->accept_uri_ctx;
+    }
+
     /* SNI: explicit value wins; the mandatory default is the URL host
      * (an SNI mismatch already cost a debug round -- §5.1). */
     out->sni = bytes_empty(cfg->sni) ? out->url.host : cfg->sni;
 
-    /* WT target: an explicit value wins. Otherwise preserve the URL query,
-     * including a present but empty "?", after its path (default "/moq").
+    /* WT target. STANDARD: the raw path and query. LEGACY: an explicit value
+     * wins. Otherwise preserve the URL query, including a present but empty
+     * "?", after its path (default "/moq").
      * Separate borrowed spans keep resolution allocation-free even when
      * the default path comes from static storage. RAW_QUIC leaves both
      * empty (the URL path is carried in the
      * PATH setup option there, which the endpoint does not emit yet). */
     if (out->protocol == MOQ_TRANSPORT_PROTOCOL_WEBTRANSPORT) {
-        if (!bytes_empty(cfg->wt_path)) {
+        if (out->uri_mode == MOQ_ENDPOINT_URI_STANDARD) {
+            /* The raw path/query; connect supplies the "/" an empty path
+             * projects to, leaving the URI identity as written. */
+            out->wt_path = out->uri.path_query;
+        } else if (!bytes_empty(cfg->wt_path)) {
             out->wt_path = cfg->wt_path;
         } else if (out->url.path.len > 0) {
             out->wt_path = out->url.path;
@@ -308,13 +438,30 @@ moq_result_t moq_endpoint_resolve_cfg(const moq_endpoint_cfg_t *cfg,
             out->wt_path.data = k_default_path;
             out->wt_path.len = sizeof(k_default_path) - 1;
         }
-        if (bytes_empty(cfg->wt_path) && out->url.query.data) {
+        if (out->uri_mode != MOQ_ENDPOINT_URI_STANDARD &&
+            bytes_empty(cfg->wt_path) && out->url.query.data) {
             out->wt_query.data = out->url.query.data - 1; /* include "?" */
             out->wt_query.len = out->url.query.len + 1;
         }
         if (out->wt_path.len == SIZE_MAX ||
             out->wt_query.len > SIZE_MAX - out->wt_path.len - 1)
             return MOQ_ERR_INVAL;
+        /* LEGACY WebTransport dereferences wt_path + wt_query (an explicit
+         * wt_path, or the "/moq" default), which need not be the URL's own
+         * path/query. The session binds that resource, so it is the target
+         * path: connect stores it, and a resource the grammar does not admit
+         * yields no target, as a legacy URL does. */
+        if (out->uri_mode != MOQ_ENDPOINT_URI_STANDARD &&
+            out->target.target_present &&
+            !(moq_uri_path_query_valid(out->wt_path) &&
+              moq_uri_path_query_valid(out->wt_query) &&
+              out->wt_query.len <= UINT16_MAX - out->target.authority.len &&
+              out->wt_path.len <=
+                  UINT16_MAX - out->target.authority.len - out->wt_query.len)) {
+            out->target.target_present = 0;
+            out->target.authority = (moq_bytes_t){ NULL, 0 };
+            out->target.path_query = (moq_bytes_t){ NULL, 0 };
+        }
     }
 
     /* WebTransport wire profile: an appended tail field, so read it ONLY when
@@ -356,11 +503,12 @@ moq_result_t moq_endpoint_resolve_cfg(const moq_endpoint_cfg_t *cfg,
         out->handshake_timeout_us = cfg->handshake_timeout_us;
     }
 
-    /* SETUP authorization tokens: the same complete-presence gate. The
-     * session refuses invalid ones at create; refusing them here keeps the
-     * error at connect, before a backend starts. The SETUP must also fit the
-     * default send arena the backends give their sessions. Only the picoquic
-     * facades forward them, so another backend refuses a non-empty list. */
+    /* SETUP authorization tokens: the session's own limits, and that the
+     * SETUP carrying them fits the default session send arena the backends
+     * use (and so a default peer's receive buffer), counting the URL as the
+     * connection target; checked here so create fails only on allocation.
+     * Only the picoquic facades forward them, so another backend refuses a
+     * non-empty list. */
     if ((size_t)cfg->struct_size >=
             offsetof(moq_endpoint_cfg_t, setup_auth_token_count) +
             sizeof(cfg->setup_auth_token_count) &&
@@ -375,7 +523,7 @@ moq_result_t moq_endpoint_resolve_cfg(const moq_endpoint_cfg_t *cfg,
                 return MOQ_ERR_INVAL;
         }
         if (!moq_setup_tokens_fit(cfg->setup_auth_tokens,
-                                  cfg->setup_auth_token_count, 0,
+                                  cfg->setup_auth_token_count, cfg->url.len,
                                   MOQ_SETUP_TOKENS_DEFAULT_ARENA))
             return MOQ_ERR_INVAL;
         if (out->backend != MOQ_TRANSPORT_BACKEND_PICOQUIC)
@@ -421,7 +569,53 @@ moq_result_t moq_endpoint_resolve_cfg(const moq_endpoint_cfg_t *cfg,
         }
     }
 
-    return resolve_versions(&cfg->versions, out);
+    /* Preferred version: an appended tail field; 0 (absent or unset) is the
+     * library default. */
+    moq_version_t preferred = 0;
+    if ((size_t)cfg->struct_size >=
+        offsetof(moq_endpoint_cfg_t, preferred_version) +
+            sizeof(cfg->preferred_version))
+        preferred = cfg->preferred_version;
+    moq_result_t vrc = resolve_versions(&cfg->versions, preferred, out);
+    if (vrc < 0) return vrc;
+
+    /* A profile that must be told its connection target cannot be offered
+     * without one: AUTO drops it, an explicit offer is refused. */
+    if (!out->target.target_present) {
+        size_t kept = 0;
+        for (size_t i = 0; i < out->version_count; i++) {
+            if (moq_version_binding_requirements(out->versions[i]) != 0) {
+                if (out->policy != MOQ_VERSION_POLICY_AUTO) return MOQ_ERR_UNSUPPORTED;
+                continue;
+            }
+            out->versions[kept++] = out->versions[i];
+        }
+        out->version_count = kept;
+        if (kept == 0) return MOQ_ERR_UNSUPPORTED;
+    }
+
+    /* A version the selected backend cannot carry is filtered exactly like a
+     * version the URI cannot carry: an AUTO offer drops it -- a
+     * preferred_version included, since a preference orders the eligible
+     * versions and never makes one required -- while a LIST or EXACT offer
+     * naming it is refused, never silently downgraded. */
+    {
+        size_t kept = 0;
+        for (size_t i = 0; i < out->version_count; i++) {
+            moq_version_t v = out->versions[i];
+            if (!ep_backend_hosts_version(out->backend, v)) {
+                if (out->policy != MOQ_VERSION_POLICY_AUTO)
+                    return MOQ_ERR_UNSUPPORTED;
+                continue;
+            }
+            out->versions[kept++] = v;
+        }
+        out->version_count = kept;
+        if (kept == 0) return MOQ_ERR_UNSUPPORTED;
+        if (out->policy == MOQ_VERSION_POLICY_AUTO)
+            out->preferred_version = out->versions[0];
+    }
+    return MOQ_OK;
 }
 
 /* -- Endpoint instance ----------------------------------------------- */
@@ -454,7 +648,9 @@ typedef struct ep_backend_vtable {
      * outbound is idle enough to stop without truncating queued reliable stream
      * data; 0 = still draining; -1 = the backend cannot prove drain (caller maps
      * to MOQ_ERR_UNSUPPORTED); -2 = called on the managed context (MOQ_ERR_WRONG
-     * _STATE). Evaluated only by the facade's own managed-context view, exposed
+     * _STATE); -3 = stopped/terminal (MOQ_ERR_CLOSED); -4 = unsuccessful flush
+     * (MOQ_ERR_INTERNAL), which does not itself make the endpoint terminal.
+     * Evaluated only by the facade's own managed-context view, exposed
      * thread-safely. */
     int           (*drain_state)(void *facade);
     moq_result_t  (*stop)(void *facade);
@@ -469,6 +665,8 @@ typedef struct ep_backend_vtable {
 /* drain_state return codes. */
 #define EP_DRAIN_UNSUPPORTED  (-1)
 #define EP_DRAIN_WRONG_THREAD (-2)
+#define EP_DRAIN_CLOSED       (-3)
+#define EP_DRAIN_FAILED       (-4)
 #define EP_DRAIN_PENDING      (0)
 #define EP_DRAIN_DONE         (1)
 
@@ -481,6 +679,10 @@ struct moq_endpoint {
     char *sni;     size_t sni_len;
     char *path;    size_t path_len;    /* WT path; NULL for RAW_QUIC */
     char *ca_file; size_t ca_file_len; /* NULL = backend default roots if available */
+    /* The connection target, owned: the URI identity a managed facade binds
+     * the session with (uri holds the bytes; target points into them). */
+    moq_endpoint_uri_owned_t uri;
+    moq_connection_target_t  target;
     bool  insecure;
     uint64_t handshake_timeout_us;     /* 0 = backend default; picoquic only */
     moq_setup_tokens_t setup_tokens;   /* presented in SETUP; picoquic only */
@@ -495,6 +697,7 @@ struct moq_endpoint {
      * the WT offer is one owned comma-joined string. */
     const char *alpn_offer[MOQ_ENDPOINT_MAX_VERSIONS];
     size_t      alpn_offer_count;
+    moq_version_t offer_versions[MOQ_ENDPOINT_MAX_VERSIONS];   /* the same offer */
     char       *wt_offer; size_t wt_offer_len;
 
     /* Selected backend: an opaque managed-facade handle + its vtable. Set by
@@ -527,6 +730,12 @@ struct moq_endpoint {
     bool                 stopped;      /* stop() joined the thread */
     int                  attachments;  /* media services (none yet in v0) */
     ep_task_t *q_head, *q_tail;        /* post() FIFO */
+    /* The session-wide GOAWAY's New Session URI, as a facade reported it
+     * (under mu). */
+    bool       goaway_received;
+    bool       goaway_uri_lost;        /* the copy could not be allocated */
+    uint8_t   *goaway_uri;
+    size_t     goaway_uri_len;
 };
 
 /* Pop the head task, or NULL. */
@@ -605,7 +814,8 @@ static void ep_drain_posted(moq_endpoint_t *ep, moq_session_t *session,
     defined(MOQ_MEDIA_SENDER_TESTING) || defined(MOQ_MEDIA_RECEIVER_TESTING)
 static moq_version_t ep_facade_negotiated_version(const moq_endpoint_t *ep);
 /*
- * One pump cycle, on the facade's managed execution context: drain accepted post()
+ * One pump cycle, on the facade's managed execution context: cache the
+ * negotiated version once the session is established, drain accepted post()
  * tasks FIFO (calling moq_session_* is legal here), then refresh the cached
  * endpoint state from the session.
  */
@@ -622,6 +832,15 @@ static void ep_pump_cycle(moq_endpoint_t *ep, moq_session_t *session,
      * session exists; a pre-establishment (NULL) cycle still refreshes the
      * cached endpoint state and runs attached hooks below, leaving the queue
      * intact for a later live cycle or the terminal drain. */
+    /* The negotiated version is cached before any task of this cycle runs, so
+     * a task that observes the established session -- and any thread it
+     * signals -- reads it from moq_endpoint_negotiated_version(). */
+    if (session && moq_session_state(session) == MOQ_SESS_ESTABLISHED) {
+        pthread_mutex_lock(&ep->mu);
+        if (ep->negotiated == 0)
+            ep->negotiated = ep_facade_negotiated_version(ep);
+        pthread_mutex_unlock(&ep->mu);
+    }
     if (session)
         ep_drain_posted(ep, session, now_us);
 
@@ -971,15 +1190,17 @@ static uint64_t      msquic_vt_fatal_code(void *f) { return moq_msquic_managed_f
  * with is_fatal clear (fatal wins over closed when both latch, and
  * ep_classify_generic checks is_fatal first), so this maps to a CLEAN terminal. */
 static bool          msquic_vt_clean_closed(void *f) { return moq_msquic_managed_is_closed((moq_msquic_managed_t *)f); }
-/* Unlike mvfst, MsQuic exposes public outbound-flush probes: the drain is idle
- * once no connection is live and no stream send / datagram is still in flight.
- * All three probes are thread-safe, so no wrong-thread case arises. */
+/* Observe all local output under one client lane lock. A healthy live
+ * connection can flush; pending-count mirrors cannot establish that fact. */
 static int           msquic_vt_drain_state(void *f) {
-    moq_msquic_managed_t *m = (moq_msquic_managed_t *)f;
-    bool idle = moq_msquic_managed_conn_count(m) == 0 &&
-                moq_msquic_managed_pending_sends(m) <= 0 &&
-                moq_msquic_managed_pending_datagrams(m) <= 0;
-    return idle ? EP_DRAIN_DONE : EP_DRAIN_PENDING;
+    switch (moq_msquic_managed_poll_flush((moq_msquic_managed_t *)f)) {
+    case MOQ_OK: return EP_DRAIN_DONE;
+    case MOQ_ERR_WRONG_STATE: return EP_DRAIN_WRONG_THREAD;
+    case MOQ_ERR_UNSUPPORTED: return EP_DRAIN_UNSUPPORTED;
+    case MOQ_ERR_CLOSED: return EP_DRAIN_CLOSED;
+    case MOQ_ERR_INTERNAL: return EP_DRAIN_FAILED;
+    default: return EP_DRAIN_PENDING;
+    }
 }
 static moq_result_t  msquic_vt_stop(void *f) { return moq_msquic_managed_stop((moq_msquic_managed_t *)f); }
 static void          msquic_vt_destroy(void *f) { moq_msquic_managed_destroy((moq_msquic_managed_t *)f); }
@@ -1103,14 +1324,19 @@ static moq_version_t wtquic_msquic_vt_negver(void *f) { return moq_wtquic_msquic
 static bool          wtquic_msquic_vt_is_fatal(void *f) { return moq_wtquic_msquic_managed_is_fatal((moq_wtquic_msquic_managed_t *)f); }
 static uint64_t      wtquic_msquic_vt_fatal_code(void *f) { return moq_wtquic_msquic_managed_fatal_code((moq_wtquic_msquic_managed_t *)f); }
 static bool          wtquic_msquic_vt_clean_closed(void *f) { return moq_wtquic_msquic_managed_is_closed((moq_wtquic_msquic_managed_t *)f); }
-/* No truthful outbound-flush probe: this facade exposes no per-connection
- * pending send/datagram count, and conn_count is not maintained for the single
- * client connection -- so any "idle" answer would be a guess that reports DONE
- * for a live client and truncates the drain. Report UNSUPPORTED (the caller maps
- * it to MOQ_ERR_UNSUPPORTED) rather than claim a drain the backend cannot prove;
- * same stance as mvfst/proxygen/wtquic-Network. A truthful probe would require an
- * attach-level pending-bytes API this facade does not expose. */
-static int           wtquic_msquic_vt_drain_state(void *f) { (void)f; return EP_DRAIN_UNSUPPORTED; }
+static int wtquic_msquic_vt_drain_state(void *f)
+{
+    switch (moq_wtquic_msquic_managed_poll_flush(
+                (const moq_wtquic_msquic_managed_t *)f)) {
+    case MOQ_OK:              return EP_DRAIN_DONE;
+    case MOQ_DONE:            return EP_DRAIN_PENDING;
+    case MOQ_ERR_UNSUPPORTED: return EP_DRAIN_UNSUPPORTED;
+    case MOQ_ERR_WRONG_STATE: return EP_DRAIN_WRONG_THREAD;
+    case MOQ_ERR_CLOSED:      return EP_DRAIN_CLOSED;
+    case MOQ_ERR_INTERNAL:    return EP_DRAIN_FAILED;
+    default:                 return EP_DRAIN_FAILED;
+    }
+}
 static moq_result_t  wtquic_msquic_vt_stop(void *f) { return moq_wtquic_msquic_managed_stop((moq_wtquic_msquic_managed_t *)f); }
 static void          wtquic_msquic_vt_destroy(void *f) { moq_wtquic_msquic_managed_destroy((moq_wtquic_msquic_managed_t *)f); }
 static void          wtquic_msquic_vt_terminal(void *f, moq_endpoint_terminal_reason_t *r, uint64_t *d) {
@@ -1257,7 +1483,12 @@ static void ep_free_strings(moq_endpoint_t *ep)
     if (ep->wt_offer) ep->alloc.free(ep->wt_offer, ep->wt_offer_len, ep->alloc.ctx);
     ep->host = ep->sni = ep->path = ep->ca_file = NULL;
     ep->wt_offer = NULL;
+    moq_endpoint_uri_cleanup(&ep->alloc, &ep->uri);
+    memset(&ep->target, 0, sizeof(ep->target));
     moq_setup_tokens_free(&ep->alloc, &ep->setup_tokens);
+    if (ep->goaway_uri) ep->alloc.free(ep->goaway_uri, ep->goaway_uri_len, ep->alloc.ctx);
+    ep->goaway_uri = NULL;
+    ep->goaway_uri_len = 0;
 }
 
 /* -- Backend registry ----------------------------------------------- *
@@ -1302,6 +1533,9 @@ static moq_result_t ep_create_pq(moq_endpoint_t *ep,
     fc.alpn_count = ep->alpn_offer_count;
     fc.port = (int)r->url.port;
     fc.insecure_skip_verify = cfg->insecure_skip_verify;
+    /* The URI identity the session is bound with when its profile needs a
+     * transport binding; the facade knows the transport facts. */
+    fc.target = ep->target.target_present ? &ep->target : NULL;
     fc.configure_quic = ep_configure_quic;
     fc.configure_quic_ctx = ep;
     fc.on_lane_pump = ep_pq_pump;
@@ -1345,6 +1579,7 @@ static moq_result_t ep_create_wt(moq_endpoint_t *ep,
     fc.port = (int)r->url.port;
     fc.insecure_skip_verify = cfg->insecure_skip_verify;
     fc.wt_protocols = ep->wt_offer;
+    fc.target = ep->target.target_present ? &ep->target : NULL;
     fc.configure_quic = ep_configure_quic;
     fc.configure_quic_ctx = ep;
     fc.on_pump = ep_wt_pump;
@@ -1393,6 +1628,7 @@ static moq_result_t ep_create_mvfst(moq_endpoint_t *ep,
     fc.alpn_list = ep->alpn_offer;      /* exactly one entry */
     fc.alpn_count = ep->alpn_offer_count;
     fc.insecure_skip_verify = cfg->insecure_skip_verify;
+    fc.target = ep->target.target_present ? &ep->target : NULL;
     /* mvfst has no configure_quic hook; it verifies internally. Mirror the
      * verifier policy: skip when insecure, else trust ep->ca_file when set,
      * otherwise mvfst's default roots, with the SNI as the checked identity. */
@@ -1461,6 +1697,9 @@ static moq_result_t ep_create_msquic(moq_endpoint_t *ep,
     fc.send_request_capacity = true;
     fc.initial_request_capacity = 64;
     fc.version = version;
+    /* The URI identity the session is bound with when its profile needs a
+     * transport binding; the facade knows the transport facts. */
+    fc.target = ep->target.target_present ? &ep->target : NULL;
     fc.on_lane_pump = ep_msquic_pump;
     fc.on_lane_pump_user = ep;
     /* Same idle-publisher policy as the picoquic raw-QUIC backend: emit QUIC
@@ -1509,6 +1748,7 @@ static moq_result_t ep_create_proxygen(moq_endpoint_t *ep,
      * negotiated. */
     fc.alpn_list = ep->alpn_offer;
     fc.alpn_count = ep->alpn_offer_count;
+    fc.target = ep->target.target_present ? &ep->target : NULL;
     fc.on_pump = ep_proxygen_pump;
     fc.user_ctx = ep;
     moq_proxygen_wt_managed_t *fac = NULL;
@@ -1561,6 +1801,9 @@ static moq_result_t ep_create_wtquic_network(moq_endpoint_t *ep,
     fc.path = ep->path;
     fc.wt_protocols = ep->alpn_offer_count > 0 ? offer : NULL;
     fc.insecure_skip_verify = cfg->insecure_skip_verify;
+    /* The URI identity the session is bound with when its profile needs a
+     * transport binding; the facade knows the transport facts. */
+    fc.target = ep->target.target_present ? &ep->target : NULL;
     /* See the picoquic branch: grant the peer request capacity so it can
      * subscribe to tracks this endpoint publishes. */
     fc.send_request_capacity = true;
@@ -1610,6 +1853,9 @@ static moq_result_t ep_create_wtquic_msquic(moq_endpoint_t *ep,
     fc.port = (uint16_t)r->url.port;
     fc.wt_path = ep->path;
     fc.insecure_skip_verify = cfg->insecure_skip_verify;
+    /* The URI identity the session is bound with when its profile needs a
+     * transport binding; the facade knows the transport facts. */
+    fc.target = ep->target.target_present ? &ep->target : NULL;
     /* The facade takes the WT-protocol token vector directly (it builds the
      * WT-Available-Protocols header itself, negotiation is real): pass the
      * parsed offer array and count, so the full multi-version offer (AUTO/LIST)
@@ -1811,11 +2057,53 @@ moq_result_t moq_endpoint_connect(const moq_endpoint_cfg_t *cfg,
     pthread_mutex_init(&ep->mu, NULL);
     ep->pump_state = MOQ_ENDPOINT_CONNECTING;
 
+    /* The connection target outlives the caller's cfg: copy its bytes once
+     * and point the target at the copy. A STANDARD WebTransport path is the
+     * HTTP projection of the raw target ("/" for an empty path). */
+    bool oom = false;
+    bool legacy_wt = r.protocol == MOQ_TRANSPORT_PROTOCOL_WEBTRANSPORT &&
+                     r.uri_mode != MOQ_ENDPOINT_URI_STANDARD;
+    if (legacy_wt) {
+        ep->path = ep_strdup_wt_target(alloc, &r, &ep->path_len);
+        if (!ep->path) {
+            pthread_mutex_destroy(&ep->mu);
+            alloc->free(ep, sizeof(*ep), alloc->ctx);
+            return MOQ_ERR_NOMEM;
+        }
+    }
+    if (r.target.target_present) {
+        moq_endpoint_uri_t identity;
+        memset(&identity, 0, sizeof(identity));
+        identity.authority = r.target.authority;
+        /* LEGACY WebTransport binds the resource its CONNECT dereferences
+         * (see the resolver). */
+        identity.path_query = legacy_wt
+            ? (moq_bytes_t){ (const uint8_t *)ep->path, ep->path_len - 1 }
+            : r.target.path_query;
+        bool wt = r.protocol == MOQ_TRANSPORT_PROTOCOL_WEBTRANSPORT &&
+                  r.uri_mode == MOQ_ENDPOINT_URI_STANDARD;
+        moq_result_t trc = moq_endpoint_uri_clone(alloc, &identity, wt, &ep->uri);
+        if (trc < 0) {
+            if (ep->path) alloc->free(ep->path, ep->path_len, alloc->ctx);
+            pthread_mutex_destroy(&ep->mu);
+            alloc->free(ep, sizeof(*ep), alloc->ctx);
+            return trc;
+        }
+        ep->target = r.target;
+        ep->target.authority = ep->uri.authority;
+        ep->target.path_query = ep->uri.path_query;
+    }
+
     ep->host = ep_strdup_bytes(alloc, r.url.host, &ep->host_len);
     ep->sni  = ep_strdup_bytes(alloc, r.sni, &ep->sni_len);
-    bool oom = !ep->host || !ep->sni;
+    oom = oom || !ep->host || !ep->sni;
     if (!oom && r.protocol == MOQ_TRANSPORT_PROTOCOL_WEBTRANSPORT) {
-        ep->path = ep_strdup_wt_target(alloc, &r, &ep->path_len);
+        if (r.uri_mode == MOQ_ENDPOINT_URI_STANDARD && ep->uri.wt_path) {
+            ep->path = ep_strdup_bytes(alloc,
+                (moq_bytes_t){ (const uint8_t *)ep->uri.wt_path,
+                               strlen(ep->uri.wt_path) },
+                &ep->path_len);
+        }
         oom = oom || !ep->path;
     }
     if (!oom && cfg->ca_file.len > 0) {
@@ -1835,6 +2123,7 @@ moq_result_t moq_endpoint_connect(const moq_endpoint_cfg_t *cfg,
             const char *tok = moq_alpn_for_version(r.versions[i]);
             if (!tok) { oom = true; break; }   /* unreachable: validated */
             ep->alpn_offer[i] = tok;
+            ep->offer_versions[i] = r.versions[i];
         }
         ep->alpn_offer_count = r.version_count;
     }
@@ -2099,6 +2388,8 @@ moq_result_t moq_endpoint_drain(moq_endpoint_t *ep, uint64_t timeout_us)
     int ds = ep_facade_drain_state(ep);
     if (ds == EP_DRAIN_UNSUPPORTED)  return MOQ_ERR_UNSUPPORTED;
     if (ds == EP_DRAIN_WRONG_THREAD) return MOQ_ERR_WRONG_STATE;
+    if (ds == EP_DRAIN_CLOSED) return MOQ_ERR_CLOSED;
+    if (ds == EP_DRAIN_FAILED) return MOQ_ERR_INTERNAL;
 
     uint64_t start = ep_mono_now_us();
     for (;;) {
@@ -2111,7 +2402,10 @@ moq_result_t moq_endpoint_drain(moq_endpoint_t *ep, uint64_t timeout_us)
         if (moq_endpoint_is_closed(ep)) return MOQ_ERR_CLOSED;
 
         ds = ep_facade_drain_state(ep);
+        if (ds == EP_DRAIN_UNSUPPORTED) return MOQ_ERR_UNSUPPORTED;
         if (ds == EP_DRAIN_WRONG_THREAD) return MOQ_ERR_WRONG_STATE;
+        if (ds == EP_DRAIN_CLOSED) return MOQ_ERR_CLOSED;
+        if (ds == EP_DRAIN_FAILED) return MOQ_ERR_INTERNAL;
         if (ds == EP_DRAIN_DONE) return MOQ_OK;
 
         uint64_t elapsed = ep_mono_now_us() - start;
@@ -2131,6 +2425,49 @@ moq_result_t moq_endpoint_drain(moq_endpoint_t *ep, uint64_t timeout_us)
 }
 
 /* -- State -------------------------------------------------------------- */
+
+size_t moq_endpoint_offered_versions_internal(const moq_endpoint_t *ep,
+                                              moq_version_t *out, size_t cap)
+{
+    if (!ep) return 0;
+    for (size_t i = 0; i < ep->alpn_offer_count && i < cap; i++)
+        out[i] = ep->offer_versions[i];
+    return ep->alpn_offer_count;
+}
+
+void moq_endpoint_note_goaway_locked(moq_endpoint_t *ep, moq_bytes_t new_session_uri)
+{
+    if (!ep || ep->goaway_received) return;   /* one session-wide GOAWAY */
+    ep->goaway_received = true;
+    if (new_session_uri.len == 0) return;
+    uint8_t *copy = (uint8_t *)ep->alloc.alloc(new_session_uri.len, ep->alloc.ctx);
+    if (!copy) {
+        ep->goaway_uri_lost = true;
+        return;
+    }
+    memcpy(copy, new_session_uri.data, new_session_uri.len);
+    ep->goaway_uri = copy;
+    ep->goaway_uri_len = new_session_uri.len;
+}
+
+moq_result_t moq_endpoint_get_goaway_uri(moq_endpoint_t *ep, uint8_t *buf,
+                                         size_t cap, size_t *uri_len)
+{
+    if (!ep || !uri_len || (!buf && cap > 0)) return MOQ_ERR_INVAL;
+    moq_result_t rc = MOQ_OK;
+    pthread_mutex_lock(&ep->mu);
+    if (!ep->goaway_received) {
+        rc = MOQ_DONE;
+    } else if (ep->goaway_uri_lost) {
+        rc = MOQ_ERR_NOMEM;
+    } else {
+        *uri_len = ep->goaway_uri_len;
+        if (cap < ep->goaway_uri_len) rc = MOQ_ERR_BUFFER;
+        else if (ep->goaway_uri_len) memcpy(buf, ep->goaway_uri, ep->goaway_uri_len);
+    }
+    pthread_mutex_unlock(&ep->mu);
+    return rc;
+}
 
 moq_endpoint_state_t moq_endpoint_state(const moq_endpoint_t *ep)
 {
@@ -2336,4 +2673,33 @@ int moq_endpoint_test_attachments(moq_endpoint_t *ep)
     pthread_mutex_unlock(&ep->mu);
     return n;
 }
+/* A facade stand-in that reports only a negotiated version: never terminal,
+ * nothing to wake. Lets a bare endpoint's pump cycle cache a version from a
+ * facade the way a managed transport does. */
+static moq_version_t test_facade_version;
+static moq_version_t test_facade_negotiated(void *facade) { (void)facade; return test_facade_version; }
+static void test_facade_wake(void *facade) { (void)facade; }
+static bool test_facade_false(void *facade) { (void)facade; return false; }
+static const ep_backend_vtable_t test_facade_vt = {
+    .wake = test_facade_wake,
+    .negotiated_version = test_facade_negotiated,
+    .is_fatal = test_facade_false,
+    .clean_closed = test_facade_false,
+};
+void moq_endpoint_test_set_facade_version(moq_endpoint_t *ep, moq_version_t v);
+void moq_endpoint_test_set_facade_version(moq_endpoint_t *ep, moq_version_t v)
+{
+    test_facade_version = v;
+    ep->vt = &test_facade_vt;
+    ep->facade = ep;
+}
+
+/* The version offer a bare endpoint reports (no ALPN tokens). */
+void moq_endpoint_test_set_offer(moq_endpoint_t *ep, const moq_version_t *v, size_t n)
+{
+    if (n > MOQ_ENDPOINT_MAX_VERSIONS) n = MOQ_ENDPOINT_MAX_VERSIONS;
+    for (size_t i = 0; i < n; i++) ep->offer_versions[i] = v[i];
+    ep->alpn_offer_count = n;
+}
+
 #endif /* MOQ_MEDIA_SENDER_TESTING || MOQ_MEDIA_RECEIVER_TESTING */

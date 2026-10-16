@@ -74,13 +74,14 @@ static inline bool pico_wt_wt_err_to_moq(uint64_t h3_code, uint64_t *out)
     return true;
 }
 
-/* A reset accepted from the bridge whose WebTransport preamble picoquic has
- * not sent yet. */
+/* A reset accepted from the bridge whose reliable prefix picoquic has not
+ * sent yet: the WebTransport stream preamble alone (a plain stream reset), or
+ * the preamble plus the MoQ stream header (a MoQ reliable reset). */
 #define PICO_WT_DEFERRED_RESETS_MAX 64u   /* the bridge's default max_pending */
 typedef struct {
     uint64_t sid;
     uint64_t wt_code;
-    uint64_t reliable_size;   /* the preamble */
+    uint64_t reliable_size;   /* preamble [+ MoQ reliable bytes] */
 } pico_wt_deferred_reset_t;
 
 typedef struct {
@@ -108,6 +109,11 @@ typedef struct {
      * application just stopped). Invoked ONLY after picoquic_stop_sending
      * returns success; a failed stop leaves receive state untouched. */
     void (*on_local_stop_sending)(void *ctx, uint64_t stream_id);
+    /* Private (adapter-owned) question asked before a stop_sending: true
+     * when the adapter's own record shows the stream's receive half already
+     * terminal at the transport, in which case the adapter has discarded what
+     * it held for the stream and no STOP_SENDING is sent. */
+    bool (*rx_terminal_discard)(void *ctx, uint64_t stream_id);
     void *cb_ctx;
 
     /* App callback set on locally-created WT data streams so h3zero
@@ -136,6 +142,15 @@ typedef struct {
      * bridge keeps it in its own bounded pending queue and retries it. */
     pico_wt_deferred_reset_t deferred[PICO_WT_DEFERRED_RESETS_MAX];
     size_t deferred_count;
+
+    /* MoQ reliable resets waiting for their prefix (the preamble plus the MoQ
+     * stream header) to be sent (see ep_reset_at), and the number of
+     * RESET_STREAM_AT frames issued for MoQ reliable resets. */
+    moq_alloc_t alloc;
+    pico_wt_deferred_reset_t *deferred_at;
+    size_t deferred_at_count;
+    size_t deferred_at_cap;
+    uint64_t reliable_resets;
 } pico_wt_endpoint_ctx_t;
 
 #if defined(MOQ_PICO_WT_TESTING)
@@ -155,11 +170,14 @@ int pico_wt_endpoint_init(moq_transport_endpoint_ops_t *ops,
 
 void pico_wt_endpoint_cleanup(pico_wt_endpoint_ctx_t *ctx);
 
-/* Issue every deferred reset whose preamble picoquic has now sent. Called
- * outside the provide_data callback: from moq_pico_wt_service and at the
- * start of the other WebTransport callbacks. Returns 0, or -1 when picoquic
- * failed to issue one of them; the caller then fails the transport, as it
- * would for a reset refused on the spot. */
+/* Issue every deferred reset whose prefix picoquic has now sent. Called
+ * outside the provide_data callback (the stream's sent offset only advances
+ * once it returns): from moq_pico_wt_service and at the start of the other
+ * WebTransport callbacks. Each issued entry is removed, never retried.
+ * Returns 0, or -1 when picoquic failed to issue one of the plain stream
+ * resets, or refused both a RESET_STREAM_AT and its plain fallback; the
+ * caller then fails the transport, as it would for a reset refused on the
+ * spot. */
 int pico_wt_endpoint_flush_resets(pico_wt_endpoint_ctx_t *ctx);
 
 /* Forget every deferred reset once the session is detached. The streams

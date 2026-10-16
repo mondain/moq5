@@ -40,6 +40,14 @@ struct moq_pq_conn {
     struct pq_rx_stream        *rx;
     size_t                      rx_count;
     size_t                      rx_cap;
+
+    /* The peer-unidirectional stream credit (initial_max_stream_id_unidir)
+     * this endpoint's transport parameters carried when the adapter attached.
+     * Attach comes after the caller's transport-parameter preparation; a
+     * later picoquic_set_transport_parameters on the connection is outside
+     * the attach contract (see <moq/picoquic.h>), and a change of this value
+     * found by a service pass fails the connection closed. */
+    uint64_t                    tp_max_streams_uni;
 };
 
 /* -- Per-stream receive backpressure --------------------------------- *
@@ -237,6 +245,38 @@ static void pq_rx_drop(moq_pq_conn_t *c, uint64_t stream_id)
     if (st->buf != NULL)
         c->alloc.free(st->buf, st->buf_cap, c->alloc.ctx);
     memset(st, 0, sizeof(*st));   /* active = false */
+}
+
+/* Asked before a STOP_SENDING (pq_endpoint_ctx_t.rx_terminal_discard). True
+ * only for a stream this adapter still holds a refused chunk of whose receive
+ * half its own record shows terminal at the transport: the held chunk carried
+ * the FIN (held_fin), or a later callback retained behind it did (buf_fin).
+ * picoquic reports a FIN only once every byte before it was delivered, and may
+ * then release the stream, so a STOP_SENDING would have nothing to stop. A
+ * peer RESET needs no fact here: its callback drops this state and settles
+ * the bridge's hold before any cancellation can be issued. The held bytes are
+ * discarded -- never delivered: the session never admitted the stream. */
+static bool pq_rx_terminal_discard(void *owner, uint64_t stream_id)
+{
+    moq_pq_conn_t *c = (moq_pq_conn_t *)owner;
+    pq_rx_stream_t *st = pq_rx_find(c, stream_id);
+    if (st == NULL || !st->held_input || !(st->held_fin || st->buf_fin))
+        return false;
+    pq_rx_drop(c, stream_id);
+    return true;
+}
+
+/* Told after an accepted STOP_SENDING (pq_endpoint_ctx_t.rx_stopped): the
+ * cancellation discharges a held chunk, so it and anything retained behind it
+ * are dropped and no later service pass redelivers them. A stream the session
+ * itself stops keeps its state: its remaining bytes and FIN still settle the
+ * bridge's discarding entry. */
+static void pq_rx_stopped(void *owner, uint64_t stream_id)
+{
+    moq_pq_conn_t *c = (moq_pq_conn_t *)owner;
+    pq_rx_stream_t *st = pq_rx_find(c, stream_id);
+    if (st != NULL && st->held_input)
+        pq_rx_drop(c, stream_id);
 }
 
 static void pq_rx_free_all(moq_pq_conn_t *c)
@@ -442,6 +482,18 @@ static int pq_rx_on_data(moq_pq_conn_t *c, uint64_t sid, pq_rx_kind_t kind,
  * that drains too, resume the window. Called on the picoquic loop thread. */
 static void pq_rx_after_service(moq_pq_conn_t *c, uint64_t now)
 {
+    /* The attach contract fixes the transport parameters: a changed
+     * peer-unidirectional stream credit means a later
+     * picoquic_set_transport_parameters reset picoquic's stream accounting
+     * under this adapter. Fail closed. A released cnx has nothing to read. */
+    if (c->cnx) {
+        const picoquic_tp_t *tp = picoquic_get_transport_parameters(c->cnx, 1);
+        if (tp == NULL ||
+            tp->initial_max_stream_id_unidir != c->tp_max_streams_uni) {
+            moq_transport_bridge_on_transport_error(c->bridge, 0, now);
+            return;
+        }
+    }
     for (size_t i = 0; i < c->rx_count; i++) {
         pq_rx_stream_t *st = &c->rx[i];
         if (!st->active) continue;
@@ -538,6 +590,13 @@ static void pq_rx_after_service(moq_pq_conn_t *c, uint64_t now)
 #ifdef MOQ_PICOQUIC_TESTING
 #include "tests/support/pq_test_seam.h"
 
+static bool g_pq_test_hold_bidi = false;
+
+void moq_pq_test_create_with_hold_bidi(bool on)
+{
+    g_pq_test_hold_bidi = on;
+}
+
 void moq_pq_test_set_hold_input(moq_pq_conn_t *conn, bool on)
 {
     if (on)
@@ -616,6 +675,17 @@ int moq_pq_conn_create(const moq_pq_conn_cfg_t *cfg,
     if (!cfg->session || !cfg->cnx || !cfg->alloc) return -1;
     if (!cfg->alloc->alloc || !cfg->alloc->free || !cfg->alloc->realloc)
         return -1;
+#if !defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) || PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION < 1
+    if (moq_session_version(cfg->session) == MOQ_VERSION_DRAFT_22)
+        return -1; /* Exact STOP and ACK-through-FIN outcomes are required. */
+#endif
+
+    /* The transport parameters are final by now (attach contract) and are
+     * the receive accounting's basis: unreadable ones refuse the attach
+     * before anything is allocated or any callback is taken. picoquic
+     * returns them for every valid connection; this guards the contract. */
+    const picoquic_tp_t *tp = picoquic_get_transport_parameters(cfg->cnx, 1);
+    if (tp == NULL) return -1;
 
     moq_pq_conn_t *c = (moq_pq_conn_t *)cfg->alloc->alloc(
         sizeof(moq_pq_conn_t), cfg->alloc->ctx);
@@ -633,12 +703,21 @@ int moq_pq_conn_create(const moq_pq_conn_cfg_t *cfg,
         sizeof(cfg->after_callback))
         c->after_callback = cfg->after_callback;
 
+    c->tp_max_streams_uni = tp->initial_max_stream_id_unidir;
+
     /* Initialize endpoint ops and bridge. */
     if (pq_endpoint_init(&c->endpoint_ops, &c->endpoint_ctx, cfg->cnx,
                          &c->alloc) != 0) {
         c->alloc.free(c, sizeof(*c), c->alloc.ctx);
         return -1;
     }
+    c->endpoint_ctx.rx_terminal_discard = pq_rx_terminal_discard;
+    c->endpoint_ctx.rx_stopped = pq_rx_stopped;
+    c->endpoint_ctx.rx_owner = c;
+#ifdef MOQ_PICOQUIC_TESTING
+    if (g_pq_test_hold_bidi)
+        c->endpoint_ops.capabilities |= MOQ_TRANSPORT_CAP_HOLD_BIDI_INPUT;
+#endif
 
     moq_transport_bridge_cfg_t bcfg;
     moq_transport_bridge_cfg_init(&bcfg, cfg->alloc);
@@ -808,6 +887,14 @@ int moq_pq_callback(picoquic_cnx_t *cnx,
                           picoquic_state_disconnected;
     }
 
+    /* Reliable resets whose prefix an earlier prepare_to_send handed over.
+     * A stream that cannot be ended at all fails the transport with the
+     * local failure code the bridge uses for a reset refused on the spot; an
+     * already terminal bridge keeps its cause. The time is read here, while
+     * the connection is still bound. */
+    if (pq_endpoint_flush_resets(&c->endpoint_ctx) != 0)
+        moq_transport_bridge_on_transport_error(c->bridge, 0x1, pq_now_us(cnx));
+
     if (moq_transport_bridge_is_terminal(c->bridge)) {
         /* No processing on a terminal adapter, but the hook contract is
          * state-independent: it fires on ALL callback exits. */
@@ -882,12 +969,24 @@ int moq_pq_callback(picoquic_cnx_t *cnx,
     }
 
     case picoquic_callback_stop_sending: {
+#if defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) && PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1
+        uint64_t error_code;
+        if (picoquic_get_remote_stop_error(cnx, stream_id, &error_code) != 0)
+            return -1;
+#else
         uint64_t error_code = picoquic_get_remote_stream_error(
             cnx, stream_id);
+#endif
         moq_transport_bridge_on_peer_stop_sending(
             c->bridge, stream_id, error_code, now);
         break;
     }
+
+#if defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) && PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1
+    case picoquic_callback_stream_send_committed:
+        moq_transport_bridge_on_local_stream_committed(c->bridge, stream_id, now);
+        break;
+#endif
 
     case picoquic_callback_datagram:
         moq_transport_bridge_on_peer_datagram(
@@ -932,6 +1031,11 @@ int moq_pq_service(moq_pq_conn_t *conn, uint64_t now_us)
         rc = MOQ_ERR_INTERNAL;
     } else if (moq_transport_bridge_is_closed(conn->bridge)) {
         rc = MOQ_OK;
+    } else if (pq_endpoint_flush_resets(&conn->endpoint_ctx) != 0) {
+        /* A deferred reset that cannot end its stream: fail the transport,
+         * as for a reset refused on the spot, and do no further work. */
+        moq_transport_bridge_on_transport_error(conn->bridge, 0x1, now_us);
+        rc = MOQ_ERR_INTERNAL;
     } else {
         rc = moq_transport_bridge_service(conn->bridge, now_us);
 

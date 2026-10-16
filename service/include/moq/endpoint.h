@@ -23,7 +23,8 @@
  * sharded relay work), and WEBTRANSPORT by proxygen (moq_proxygen_wt_managed,
  * full negotiation); AUTO keeps choosing picoquic/pico_wt (msquic/mvfst are
  * opt-in only, never selected ahead of picoquic). Offers go out in PREFERENCE ORDER (AUTO =
- * every version this build supports, newest first); the negotiated version
+ * every draft this build supports, newest first: draft-22, draft-18, then
+ * draft-16, with a named preferred version moved to the front); the negotiated version
  * configures the session before any SETUP byte is parsed, and an un-negotiable
  * connection fails terminally rather than silently downgrading.
  *
@@ -35,6 +36,7 @@
 
 #include <moq/types.h>
 #include <moq/session.h>
+#include <moq/connection_target.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -48,11 +50,17 @@ typedef struct moq_endpoint moq_endpoint_t;
  * AUTO derives from the scheme: moqt:// or moq:// => RAW_QUIC, https:// =>
  * WEBTRANSPORT.
  *
- * The URL itself must always be well-formed in a RECOGNIZED scheme (moqt,
- * moq, or https): an unknown scheme is MOQ_ERR_INVAL even when an explicit
- * protocol would have overridden it -- the override knob re-interprets a
- * known URL, it does not admit arbitrary ones (host/port/path defaults all
- * derive from the parse). */
+ * Error precedence at connect()/resolve, the same in both URI modes (see
+ * uri_mode below): the URL is read first. Malformed syntax, or a scheme the
+ * endpoint reads in NO mode (anything but moqt, moq and https), is
+ * MOQ_ERR_INVAL -- even when an explicit protocol would have overridden the
+ * scheme; the override knob re-interprets a known URL, it does not admit
+ * arbitrary ones (host/port/path defaults all derive from the parse). A
+ * well-formed URL the selected mode does not support is MOQ_ERR_UNSUPPORTED.
+ * Only then are protocol and backend resolved: a backend that cannot speak
+ * the resolved transport, or is not compiled in, is MOQ_ERR_UNSUPPORTED,
+ * while an out-of-range field value is MOQ_ERR_INVAL before any backend
+ * capability check. */
 
 typedef enum moq_transport_protocol {
     MOQ_TRANSPORT_PROTOCOL_AUTO = 0,    /* derive from the URL scheme */
@@ -128,13 +136,18 @@ typedef enum moq_transport_backend {
 
 /* -- Version negotiation (§5.2) -------------------------------------- *
  * The endpoint owns version offer and readback for both protocols; apps
- * never touch ALPN or WT protocol tokens. AUTO offers the FULL set this
- * build supports (never "pick the newest and hope"). Offering a version
- * whose profile is not compiled in fails with MOQ_ERR_UNSUPPORTED at
- * create -- never silently downgraded. */
+ * never touch ALPN or WT protocol tokens. AUTO offers every supported
+ * version, newest first. Offering a version whose profile is not compiled in
+ * fails with MOQ_ERR_UNSUPPORTED at create -- never silently downgraded. The
+ * offer also follows what the selected backend can carry: a picoquic built
+ * without its stream-terminal contract cannot host draft-22, so on that
+ * backend AUTO leaves draft-22 out (a preferred_version of draft-22 only
+ * orders the versions offered, as when the URI cannot carry it), and a LIST
+ * or EXACT offer naming it makes moq_endpoint_connect fail with
+ * MOQ_ERR_UNSUPPORTED before any connection is started. */
 
 typedef enum moq_version_policy {
-    MOQ_VERSION_POLICY_AUTO = 0,   /* offer ALL versions this build supports */
+    MOQ_VERSION_POLICY_AUTO = 0,   /* offer the legacy defaults; see preferred_version */
     MOQ_VERSION_POLICY_LIST,       /* offer exactly versions[], peer/TLS picks */
     MOQ_VERSION_POLICY_EXACT       /* offer exactly one; mismatch = fatal connect */
 } moq_version_policy_t;
@@ -297,9 +310,10 @@ typedef struct moq_endpoint_cfg {
      * presents in its SETUP (moq_session_cfg_t.setup_auth_tokens: sent by
      * value, at most 16, each value at most 65535 bytes), copied at connect.
      * The SETUP carrying them must fit the session's default 4096-byte send
-     * arena (the send-arena rule on moq_session_cfg_t.setup_auth_tokens),
-     * else MOQ_ERR_INVAL at connect, rather than a connection that fails when
-     * it starts. Only the picoquic backend (raw QUIC and
+     * arena (the send-arena rule on moq_session_cfg_t.setup_auth_tokens:
+     * each token takes its value plus up to 32 bytes, beside the URL and the
+     * other options), else MOQ_ERR_INVAL at connect, rather than a connection
+     * that fails when it starts. Only the picoquic backend (raw QUIC and
      * WebTransport) carries them; any other backend refuses a non-empty list
      * with MOQ_ERR_UNSUPPORTED. Because it is past the v0 floor, connect()
      * reads it ONLY when struct_size covers setup_auth_token_count -- set it
@@ -363,7 +377,55 @@ typedef struct moq_endpoint_cfg {
      * endpoint and is not an implicit stop. */
     moq_tls_certificate_verify_fn verify_certificate;
     void                         *verify_certificate_ctx;
+    /* appended (enabled by struct_size): how the URL is read.
+     * MOQ_ENDPOINT_URI_LEGACY (0, the default, also when the field is absent)
+     * selects the original parser: exact lowercase "moqt" / "moq" / "https"
+     * schemes, port 4433 for moqt and moq, the wt_path override and the
+     * "/moq" WebTransport default.
+     * MOQ_ENDPOINT_URI_STANDARD (1) reads the URL as the MOQT URI scheme
+     * defines it: "moqt" and
+     * "https" case-insensitively, port 443 when omitted, the encoded
+     * authority and path/query preserved exactly, a WebTransport path of
+     * "/" for an empty path (query retained), and no wt_path override (a
+     * non-empty wt_path is MOQ_ERR_INVAL).
+     * STANDARD's managed-client
+     * subset is ASCII unencoded host names, IPv4 and bracketed IPv6, and
+     * explicit ports 1..65535; well-formed input the subset does not admit
+     * (the legacy "moq" scheme, userinfo, IPvFuture, encoded hosts, empty or
+     * out-of-range ports, typed fragments) is MOQ_ERR_UNSUPPORTED and
+     * malformed syntax is MOQ_ERR_INVAL; a scheme other than moqt, moq and
+     * https is MOQ_ERR_INVAL in both modes (the error precedence above). No
+     * fragment type is implemented and fragments are never transmitted. An
+     * unknown mode is MOQ_ERR_INVAL.
+     *
+     * In both modes the endpoint derives the connection target -- the URL's
+     * authority as spelled and its path-abempty with "?" query -- that a
+     * wire profile carried natively over QUIC sends in its SETUP. A target
+     * exists whenever those two components follow RFC 3986 syntax with a
+     * nonempty host; when they do not, a version whose profile requires a
+     * transport binding is dropped from an AUTO offer and refused with
+     * MOQ_ERR_UNSUPPORTED in a LIST or EXACT offer. Authority plus path/query
+     * is limited to 65535 bytes. */
+    uint32_t uri_mode;
+    /* appended (enabled by struct_size): the version placed FIRST in an AUTO
+     * offer, 0 for the library default. Applies to AUTO only -- a non-zero
+     * value with a LIST or EXACT policy, whose order is already explicit, is
+     * MOQ_ERR_INVAL -- and must be a version this build offers, else
+     * MOQ_ERR_UNSUPPORTED. The rest of the offer follows it newest first
+     * (draft-22, draft-18, draft-16, each only when supported), without
+     * duplicates. */
+    moq_version_t preferred_version;
+    /* appended (enabled by struct_size): a server endpoint's URI policy, in
+     * the shape moq_connection_target_t carries it (see
+     * <moq/connection_target.h>). A client endpoint supplies neither; a
+     * client cfg carrying either is MOQ_ERR_INVAL. The server perspective is
+     * reserved in v0, so today these fields can only be left zero. */
+    moq_uri_accept_fn accept_uri;
+    void *accept_uri_ctx;
 } moq_endpoint_cfg_t;
+
+#define MOQ_ENDPOINT_URI_LEGACY   UINT32_C(0)
+#define MOQ_ENDPOINT_URI_STANDARD UINT32_C(1)
 
 /* Largest accepted moq_endpoint_cfg_t.handshake_timeout_us (see its doc above).
  * A practical no-limit ceiling -- roughly 292,000 years -- chosen so a backend
@@ -386,16 +448,18 @@ typedef struct moq_endpoint_cfg {
  * leaves every appended tail field untouched. A config produced this way runs
  * with the tail ABSENT (struct_size stops at the v0 floor), which resolves to
  * MOQ_WT_PROFILE_BACKEND_DEFAULT for wt_profile (no explicit selection), to 0
- * (the backend default) for handshake_timeout_us, to no setup tokens, and to no
- * application certificate callback. Because it never writes past the v0 floor,
- * it can NEVER overflow the buffer of an old caller that predates a later tail
- * field. To SET any tail field, use moq_endpoint_cfg_init_sized(). */
+ * (the backend default) for handshake_timeout_us, to no setup tokens, to no
+ * application certificate callback, LEGACY for uri_mode, the library default
+ * for preferred_version and no URI policy. Because it never writes past the v0
+ * floor, it can NEVER overflow the buffer of an old caller that predates a
+ * later tail field. To SET any tail field, use moq_endpoint_cfg_init_sized(). */
 MOQ_API void moq_endpoint_cfg_init(moq_endpoint_cfg_t *cfg);
 
 /* Sized initializer: clears and stamps min(cfg_size, current sizeof) -- the
  * initializer to use whenever you set anything beyond the v0 floor (wt_profile,
  * handshake_timeout_us, setup_auth_tokens + setup_auth_token_count,
- * verify_certificate + verify_certificate_ctx). Pass sizeof(moq_endpoint_cfg_t).
+ * verify_certificate + verify_certificate_ctx, uri_mode, preferred_version,
+ * accept_uri). Pass sizeof(moq_endpoint_cfg_t).
  * Never writes past cfg_size, so it is safe for a caller compiled against an older, smaller
  * header too. */
 MOQ_API void moq_endpoint_cfg_init_sized(moq_endpoint_cfg_t *cfg,
@@ -457,12 +521,20 @@ MOQ_API void moq_endpoint_wake(moq_endpoint_t *ep);
  * in libmoq/picoquic's stream send queues.
  *
  * Scope of the guarantee:
- *   - It DOES mean every reliable stream byte and FIN has been handed to the
- *     transport for sending (local stream backlog empty).
+ *   - It DOES mean each still-required reliable stream byte and FIN has been
+ *     handed to the transport for sending (local stream backlog empty).
  *   - It does NOT mean all packets were acknowledged by the peer (the QUIC
  *     packet/retransmission backlog can remain non-empty on an idle connection
  *     long after the bytes and FIN were sent).
  *   - It does NOT mean the peer application has consumed the media.
+ *
+ * Direct MsQuic and WTQuic-MsQuic may conservatively wait for acknowledgment
+ * of non-superseded output. Accepted send cancellation or lawful peer STOP
+ * of ordinary stream output can withdraw that stream's remaining byte/FIN
+ * intent, but success must wait for retained ownership to settle. This does not
+ * prove delivery of canceled bytes, FIN or RESET. Unexpected or critical-stream
+ * output loss remains an unsuccessful flush. Datagrams are outside the
+ * reliable-stream guarantee.
  *
  * Returns:
  *   MOQ_OK              local stream flush complete: stopping will not truncate
@@ -474,6 +546,8 @@ MOQ_API void moq_endpoint_wake(moq_endpoint_t *ep);
  *                       context (a hook).
  *   MOQ_ERR_UNSUPPORTED the active backend cannot prove a local stream flush (it
  *                       never claims a drain it cannot verify; mvfst/proxygen).
+ *   MOQ_ERR_INTERNAL    unsuccessful flush, including accepted-output loss;
+ *                       this result does not itself make the endpoint terminal.
  *
  * moq_endpoint_stop() is unchanged and remains an abrupt stop when graceful
  * drain is not wanted. */
@@ -489,6 +563,19 @@ typedef enum moq_endpoint_state {
 } moq_endpoint_state_t;
 
 MOQ_API moq_endpoint_state_t moq_endpoint_state(const moq_endpoint_t *ep);
+
+/* The New Session URI of the session-wide GOAWAY the peer sent (the endpoint
+ * is then DRAINING): where to reconnect, empty meaning the current URI. The
+ * attached media sender and receiver record it as their facades observe the
+ * GOAWAY. MOQ_OK copies the bytes (not NUL-terminated) into buf and sets
+ * *uri_len; MOQ_ERR_BUFFER when cap is short (*uri_len is the length
+ * needed, nothing copied); MOQ_DONE when no GOAWAY was recorded;
+ * MOQ_ERR_NOMEM when one was received but its URI could not be kept;
+ * MOQ_ERR_INVAL for a NULL ep or uri_len, or a NULL buf with cap > 0.
+ * Callable from any thread. */
+MOQ_API moq_result_t moq_endpoint_get_goaway_uri(moq_endpoint_t *ep,
+                                                 uint8_t *buf, size_t cap,
+                                                 size_t *uri_len);
 MOQ_API bool     moq_endpoint_is_closed(const moq_endpoint_t *ep);
 MOQ_API bool     moq_endpoint_is_fatal(const moq_endpoint_t *ep);
 /* The MoQ/bridge fatal code (nonzero => a protocol-level fatal). It is 0 for a

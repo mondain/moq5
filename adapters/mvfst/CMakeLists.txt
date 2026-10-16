@@ -190,6 +190,26 @@ if(MOQ_BUILD_TESTS)
     add_test(NAME mvfst_loopback_d18 COMMAND test_mvfst_loopback_d18)
     set_tests_properties(mvfst_loopback_d18 PROPERTIES TIMEOUT 10)
 
+    # Draft-22 loopback: the attaching harness binds both sessions to the
+    # connection before starting them. Own binary (one QuicServer per process).
+    add_executable(test_mvfst_loopback_d22 tests/test_loopback_d22.cpp)
+    target_link_libraries(test_mvfst_loopback_d22 PRIVATE
+        moq::adapter-mvfst mvfst::mvfst)
+    add_test(NAME mvfst_loopback_d22 COMMAND test_mvfst_loopback_d22)
+    set_tests_properties(mvfst_loopback_d22 PROPERTIES TIMEOUT 10 LABELS "d22")
+
+    # Data-stream resets over real mvfst: a subgroup reset in the pass that
+    # opened it, counted by PUBLISH_DONE, on the plain-reset fallback (mvfst
+    # rejects a received RESET_STREAM_AT, so reliable reset is not
+    # advertised). One QuicServer per process: one run per draft.
+    add_executable(test_mvfst_reset_header tests/test_reset_header.cpp)
+    target_link_libraries(test_mvfst_reset_header PRIVATE
+        moq::adapter-mvfst mvfst::mvfst)
+    foreach(_v 16 22)
+        add_test(NAME mvfst_reset_header_d${_v} COMMAND test_mvfst_reset_header ${_v})
+        set_tests_properties(mvfst_reset_header_d${_v} PROPERTIES TIMEOUT 30)
+    endforeach()
+
     add_executable(test_mvfst_managed_loopback tests/test_managed_loopback.cpp)
     target_link_libraries(test_mvfst_managed_loopback PRIVATE moq::adapter-mvfst mvfst::mvfst)
     add_test(NAME mvfst_managed_loopback COMMAND test_mvfst_managed_loopback)
@@ -224,6 +244,11 @@ if(MOQ_BUILD_TESTS)
     target_link_libraries(test_mvfst_managed_server_loopback PRIVATE moq::adapter-mvfst mvfst::mvfst)
     add_test(NAME mvfst_managed_server_loopback COMMAND test_mvfst_managed_server_loopback)
     set_tests_properties(mvfst_managed_server_loopback PROPERTIES TIMEOUT 10)
+    # The same flow at draft-22: both managed facades bind their sessions to
+    # the connection (deferred to the first pump after the handshake).
+    add_test(NAME mvfst_managed_server_loopback_d22
+        COMMAND test_mvfst_managed_server_loopback 22)
+    set_tests_properties(mvfst_managed_server_loopback_d22 PROPERTIES TIMEOUT 10 LABELS "d22")
 
     # Event-driven server on_lane_pump: a reactive server accepts + publishes with
     # NO explicit server wakes, driven only by EventBase scheduling on server_evb.

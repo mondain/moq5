@@ -1,7 +1,8 @@
 /*
  * Managed pico WT edge cases: config validation, NULL safety, connect
  * failure, certificate-verification failure, stop/wake/wait lifecycle,
- * and stop-from-on_pump rejection.
+ * stop-from-on_pump rejection, and the CONNECT :authority (the URI
+ * authority, independent of the TLS SNI).
  *
  * Args: --cert <file> --key <file>
  */
@@ -494,6 +495,298 @@ static void test_ip_host_sni_policy(void)
     if (cli) { moq_pico_wt_managed_stop(cli); moq_pico_wt_managed_destroy(cli); }
 }
 
+/* -- CONNECT identity --------------------------------------------- */
+
+/* One CONNECT row: what the client is configured with and what the server
+ * must observe. target_authority NULL leaves the target to be derived from
+ * host/port and cfg_path. */
+typedef struct {
+    const char *host, *sni;
+    const char *target_authority, *target_path_query;
+    const char *cfg_path;        /* NULL: not configured */
+    const char *server_path;     /* the server's route */
+    const char *want_authority_fmt, *want_path, *want_sni;
+} connect_row_t;
+
+static void set_target(moq_connection_target_t *t, const char *authority,
+                       const char *path_query)
+{
+    memset(t, 0, sizeof(*t));
+    t->struct_size = (uint32_t)sizeof(*t);
+    t->target_present = MOQ_BINDING_TARGET_COMPLETE;
+    t->authority.data = (const uint8_t *)authority;
+    t->authority.len = strlen(authority);
+    t->path_query.data = (const uint8_t *)path_query;
+    t->path_query.len = strlen(path_query);
+}
+
+static void client_cfg(moq_pico_wt_managed_cfg_t *cfg, const char *host,
+                       int port)
+{
+    moq_pico_wt_managed_cfg_init_sized(cfg, sizeof(*cfg));
+    cfg->alloc = moq_alloc_default();
+    cfg->perspective = MOQ_PERSPECTIVE_CLIENT;
+    cfg->host = host;
+    cfg->port = port;
+    cfg->on_pump = noop_pump;
+    cfg->insecure_skip_verify = true;
+}
+
+/* One client against a fresh server routing `server_path`: the server
+ * records the CONNECT's :authority and :path and the connection's TLS SNI.
+ * Returns 1 once a session came up and the observation was checked, 0 when
+ * the server never served (busy port), so the caller tries the next one. */
+static int connect_row(const char *cert, const char *key, int port,
+                       const connect_row_t *row)
+{
+    moq_pico_wt_managed_cfg_t scfg;
+    moq_pico_wt_managed_cfg_init(&scfg);
+    scfg.alloc = moq_alloc_default();
+    scfg.perspective = MOQ_PERSPECTIVE_SERVER;
+    scfg.cert_path = cert; scfg.key_path = key;
+    scfg.port = port;
+    scfg.path = row->server_path;
+    scfg.on_pump = noop_pump;
+    moq_pico_wt_managed_t *srv = NULL;
+    if (moq_pico_wt_managed_create(&scfg, &srv) != MOQ_OK) return 0;
+    for (int i = 0; i < 3; i++) moq_pico_wt_managed_wait(srv, 100000);
+    int bound = moq_pico_wt_managed_local_port(srv);
+
+    moq_connection_target_t target;
+    if (row->target_authority)
+        set_target(&target, row->target_authority, row->target_path_query);
+    moq_pico_wt_managed_cfg_t cfg;
+    client_cfg(&cfg, row->host, bound);
+    cfg.sni = row->sni;
+    cfg.path = row->cfg_path;
+    cfg.target = row->target_authority ? &target : NULL;
+
+    int served = 0;
+    moq_pico_wt_managed_t *cli = NULL;
+    CHECK(moq_pico_wt_managed_create(&cfg, &cli) == MOQ_OK);
+    if (cli) {
+        for (int k = 0; k < 40 && !served; k++) {
+            moq_pico_wt_managed_wait(cli, 100000);
+            served = moq_pico_wt_managed_session(cli) != NULL;
+            if (moq_pico_wt_managed_is_fatal(cli)) break;
+        }
+        moq_pico_wt_managed_stop(cli);
+        moq_pico_wt_managed_destroy(cli);
+    }
+    moq_pico_wt_managed_stop(srv);          /* joins the recording thread */
+    if (served) {
+        char want[300];
+        snprintf(want, sizeof(want), row->want_authority_fmt, bound);
+        const char *got = moq_pico_wt_managed_test_connect_authority(srv);
+        const char *got_path = moq_pico_wt_managed_test_connect_path(srv);
+        const char *got_sni = moq_pico_wt_managed_test_connect_sni(srv);
+        if (strcmp(got, want) != 0 || strcmp(got_path, row->want_path) != 0 ||
+            strcmp(got_sni, row->want_sni) != 0)
+            fprintf(stderr, "  connect row host=%s: :authority \"%s\" "
+                    "(want \"%s\"), :path \"%s\" (want \"%s\"), SNI \"%s\" "
+                    "(want \"%s\")\n", row->host, got, want, got_path,
+                    row->want_path, got_sni, row->want_sni);
+        CHECK(strcmp(got, want) == 0);
+        CHECK(strcmp(got_path, row->want_path) == 0);
+        CHECK(strcmp(got_sni, row->want_sni) == 0);
+    }
+    moq_pico_wt_managed_destroy(srv);
+    return served;
+}
+
+/* The CONNECT dereferences the client's one identity (RFC 9114 Section
+ * 4.3.1; draft-ietf-moq-transport-22 Section 6.2.1): :authority is the
+ * target's authority exactly as spelled, or host:port (IPv6 bracketed) when
+ * derived; :path is the target's path/query exactly as spelled -- percent
+ * escapes kept -- with "/" in front of an empty or query-only one. A path
+ * configured alongside the target either matches that projection or is
+ * refused. The TLS SNI is independent: a bare name, never the port. */
+static void test_connect_identity(const char *cert, const char *key)
+{
+    static const int ports[] = { 26443, 26587, 26731, 26877 };
+    static const connect_row_t rows[] = {
+        /* derived: https://127.0.0.1:<port>/moq */
+        { "127.0.0.1", "test.example.com", NULL, NULL, NULL, "/moq",
+          "127.0.0.1:%d", "/moq", "test.example.com" },
+        /* derived, IPv6 literal: https://[::1]:<port>/moq */
+        { "::1", "test.example.com", NULL, NULL, NULL, "/moq",
+          "[::1]:%d", "/moq", "test.example.com" },
+        /* derived, default SNI from a DNS host stays the bare name */
+        { "localhost", NULL, NULL, NULL, NULL, "/moq",
+          "localhost:%d", "/moq", "localhost" },
+        /* https://relay.example:4433/moq dialed at a loopback address */
+        { "127.0.0.1", "relay.example", "relay.example:4433", "/moq", NULL,
+          "/moq", "relay.example:4433", "/moq", "relay.example" },
+        /* https://relay.example/moq: the default port stays elided */
+        { "127.0.0.1", "relay.example", "relay.example", "/moq", NULL,
+          "/moq", "relay.example", "/moq", "relay.example" },
+        /* https://[::1]:4433/moq spelled by the caller */
+        { "127.0.0.1", "test.example.com", "[::1]:4433", "/moq", NULL,
+          "/moq", "[::1]:4433", "/moq", "test.example.com" },
+        /* a percent-encoded path and query: sent as spelled, no path set */
+        { "127.0.0.1", "relay.example", "relay.example:4433",
+          "/tenant%2Fone?token=a%26b", NULL, "/tenant%2Fone",
+          "relay.example:4433", "/tenant%2Fone?token=a%26b", "relay.example" },
+        /* the same target with a matching configured path */
+        { "127.0.0.1", "relay.example", "relay.example:4433",
+          "/tenant%2Fone?token=a%26b", "/tenant%2Fone?token=a%26b",
+          "/tenant%2Fone", "relay.example:4433",
+          "/tenant%2Fone?token=a%26b", "relay.example" },
+        /* https://relay.example: no path component sends "/" */
+        { "127.0.0.1", "relay.example", "relay.example", "", NULL, "/",
+          "relay.example", "/", "relay.example" },
+        /* https://relay.example?q=1: the query follows that "/" */
+        { "127.0.0.1", "relay.example", "relay.example", "?q=1", "/?q=1",
+          "/", "relay.example", "/?q=1", "relay.example" },
+    };
+    for (size_t r = 0; r < sizeof(rows) / sizeof(rows[0]); r++) {
+        int proven = 0;
+        for (size_t i = 0; i < sizeof(ports) / sizeof(ports[0]) && !proven;
+             i++)
+            proven = connect_row(cert, key, ports[i], &rows[r]);
+        if (!proven)
+            fprintf(stderr, "  connect row %zu never served\n", r);
+        CHECK(proven);
+    }
+}
+
+/* Refused identities fail create before any transport effect: no facade
+ * exists, so nothing was dialed. */
+static void expect_refused(const char *what, moq_pico_wt_managed_cfg_t *cfg)
+{
+    moq_pico_wt_managed_t *cli = (moq_pico_wt_managed_t *)1;
+    moq_result_t rc = moq_pico_wt_managed_create(cfg, &cli);
+    if (rc != MOQ_ERR_INVAL || cli != NULL)
+        fprintf(stderr, "  %s: create %d, facade %p\n", what, (int)rc,
+                (void *)cli);
+    CHECK(rc == MOQ_ERR_INVAL);
+    CHECK(cli == NULL);
+    if (rc == MOQ_OK && cli) {
+        moq_pico_wt_managed_stop(cli);
+        moq_pico_wt_managed_destroy(cli);
+    }
+}
+
+/* Accepted identities are kept whole: the client's owned target is the one
+ * it will bind. Dials a dead port; only create's result is examined. */
+static void expect_target(const char *what, moq_pico_wt_managed_cfg_t *cfg,
+                          const char *authority, const char *path_query)
+{
+    moq_pico_wt_managed_t *cli = NULL;
+    CHECK(moq_pico_wt_managed_create(cfg, &cli) == MOQ_OK);
+    if (!cli) {
+        fprintf(stderr, "  %s: create refused\n", what);
+        return;
+    }
+    const moq_connection_target_t *t = moq_pico_wt_managed_test_target(cli);
+    int ok = t && t->target_present == MOQ_BINDING_TARGET_COMPLETE &&
+             t->authority.len == strlen(authority) &&
+             memcmp(t->authority.data, authority, t->authority.len) == 0 &&
+             t->path_query.len == strlen(path_query) &&
+             (!t->path_query.len ||
+              memcmp(t->path_query.data, path_query, t->path_query.len) == 0);
+    if (!ok)
+        fprintf(stderr, "  %s: target present=%u authority %zu path %zu "
+                "(want %zu, %zu)\n", what, t ? t->target_present : 0u,
+                t ? t->authority.len : (size_t)0,
+                t ? t->path_query.len : (size_t)0, strlen(authority),
+                strlen(path_query));
+    CHECK(ok);
+    moq_pico_wt_managed_stop(cli);
+    moq_pico_wt_managed_destroy(cli);
+}
+
+/* The identity is one value or a create error, never two resources and
+ * never an absent target: a configured path that conflicts with the target
+ * is refused, a long derived path keeps its target, and the binding's bound
+ * (authority plus path/query at most 65535 bytes) holds on both sides. */
+static void test_connect_identity_limits(void)
+{
+    moq_pico_wt_managed_cfg_t cfg;
+    moq_connection_target_t t;
+
+    /* a path that names another resource than the target */
+    client_cfg(&cfg, "127.0.0.1", 1);
+    set_target(&t, "relay.example:4433", "/tenant%2Fone?token=a%26b");
+    cfg.path = "/moq";
+    cfg.target = &t;
+    expect_refused("conflicting path", &cfg);
+
+    /* the target's :path projection, not its raw spelling, is what a
+     * configured path is compared with */
+    client_cfg(&cfg, "127.0.0.1", 1);
+    set_target(&t, "relay.example", "?q=1");
+    cfg.path = "?q=1";
+    cfg.target = &t;
+    expect_refused("unprojected query-only path", &cfg);
+
+    /* an incomplete target, or one carrying a URI policy */
+    client_cfg(&cfg, "127.0.0.1", 1);
+    set_target(&t, "relay.example", "/moq");
+    t.target_present = MOQ_BINDING_AUTHORITY_PRESENT;
+    cfg.target = &t;
+    expect_refused("incomplete target", &cfg);
+    client_cfg(&cfg, "127.0.0.1", 1);
+    set_target(&t, "", "/moq");
+    cfg.target = &t;
+    expect_refused("empty target authority", &cfg);
+
+    /* embedded NUL in either component */
+    client_cfg(&cfg, "127.0.0.1", 1);
+    set_target(&t, "relay.example", "/moq");
+    t.authority.data = (const uint8_t *)"relay\0.example";
+    t.authority.len = 14;
+    cfg.target = &t;
+    expect_refused("NUL in authority", &cfg);
+    client_cfg(&cfg, "127.0.0.1", 1);
+    set_target(&t, "relay.example", "/moq");
+    t.path_query.data = (const uint8_t *)"/m\0q";
+    t.path_query.len = 4;
+    cfg.target = &t;
+    expect_refused("NUL in path", &cfg);
+
+    /* derived: "/" + 1100 'a' with host localhost:443 keeps its target */
+    static char long_path[1102];
+    long_path[0] = '/';
+    memset(long_path + 1, 'a', 1100);
+    long_path[1101] = '\0';
+    client_cfg(&cfg, "localhost", 443);
+    cfg.path = long_path;
+    expect_target("derived long path", &cfg, "localhost:443", long_path);
+
+    /* the binding bound, derived: "localhost:1" is 11 bytes */
+    static char edge[65536];
+    edge[0] = '/';
+    memset(edge + 1, 'b', sizeof(edge) - 2);
+    edge[65535 - 11] = '\0';                     /* 65524-byte path */
+    client_cfg(&cfg, "localhost", 1);
+    cfg.path = edge;
+    expect_target("derived at the bound", &cfg, "localhost:1", edge);
+    edge[65535 - 11] = 'b';
+    edge[65535 - 11 + 1] = '\0';                 /* one byte over */
+    client_cfg(&cfg, "localhost", 1);
+    cfg.path = edge;
+    expect_refused("derived over the bound", &cfg);
+
+    /* the binding bound, explicit target */
+    edge[65535 - 11] = '\0';
+    client_cfg(&cfg, "127.0.0.1", 1);
+    set_target(&t, "relay.ex:1", edge);           /* 10 + 65524 bytes */
+    cfg.target = &t;
+    expect_target("target under the bound", &cfg, "relay.ex:1", edge);
+    edge[65535 - 11] = 'b';                       /* 10 + 65525 = 65535 */
+    client_cfg(&cfg, "127.0.0.1", 1);
+    set_target(&t, "relay.ex:1", edge);
+    cfg.target = &t;
+    expect_target("target at the bound", &cfg, "relay.ex:1", edge);
+    edge[65535 - 11 + 1] = 'b';
+    edge[65535 - 11 + 2] = '\0';                  /* 10 + 65526 */
+    client_cfg(&cfg, "127.0.0.1", 1);
+    set_target(&t, "relay.ex:1", edge);
+    cfg.target = &t;
+    expect_refused("target over the bound", &cfg);
+}
+
 /* -- stop() from on_pump must be rejected -------------------------- */
 
 typedef struct { atomic_int done; int stop_rc; } stopcheck_app_t;
@@ -578,6 +871,8 @@ int main(int argc, char **argv)
     test_helper_cert_failure(cert, key);
     test_default_cert_failure(cert, key);
     test_stop_from_pump(cert, key);
+    test_connect_identity(cert, key);
+    test_connect_identity_limits();
 
     if (failures == 0)
         printf("test_pico_wt_managed_edges: PASS\n");

@@ -2,7 +2,7 @@
  * WebTransport MoQ media server for the .wtquicNetwork runtime proof
  * (test support only -- never installed).
  *
- * A wtquic MsQuic ATTACH server on 127.0.0.1:<ephemeral> serving the
+ * A wtquic MsQuic ATTACH server on a free 127.0.0.1 port serving the
  * REAL media vertical the Swift service tier consumes: an MSF catalog
  * track (retained group) declaring one LOC track "v", and one
  * deterministic 256-byte object (group 0, object 0, independent,
@@ -32,6 +32,7 @@
 #include <moq/wtquic.h>
 
 #include <wtquic/wtquic_msquic.h>
+#include "wtq_loopback_port.h"
 
 #include <signal.h>
 #include <stdio.h>
@@ -286,7 +287,6 @@ int main(int argc, char **argv)
 
     wtq_msquic_listener_cfg_t lcfg = WTQ_MSQUIC_LISTENER_CFG_INIT;
     lcfg.bind_address = "127.0.0.1";
-    lcfg.port = 0;
     lcfg.cert_file = cert;
     lcfg.key_file = key;
     lcfg.paths = &serve;
@@ -294,7 +294,7 @@ int main(int argc, char **argv)
     lcfg.events = moq_wtquic_conn_events();
     lcfg.user = v.conn;
     wtq_msquic_listener_t *listener = NULL;
-    if (wtq_msquic_listener_start(env, &lcfg, &listener) != WTQ_OK)
+    if (wtqt_listener_start(env, &lcfg, &listener) != WTQ_OK)
         return 1;
 
     signal(SIGTERM, on_signal);

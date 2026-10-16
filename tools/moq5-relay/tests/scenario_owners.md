@@ -58,7 +58,8 @@ Named here so the checker fails if a claim's last owner disappears.
 | lane/child reclamation, orphan retirement, poll-then-ack ordering | `relay_lane_lifecycle` |
 | every production nonzero-return branch of the lane pumps | `relay_pump_branches` |
 | fail-closed operands of the retirement pass | `relay_lane_boundary` |
-| real-transport forwarding and drain-to-zero, same-lane and cross-lane | `relay_loopback_same_d18` `relay_loopback_cross_d18` |
+| real-transport forwarding and drain-to-zero, same-lane and cross-lane | `relay_loopback_same_d18` `relay_loopback_cross_d18` `relay_loopback_same_d22` `relay_loopback_cross_d22` |
+| draft-22 forwarding through the relay over real transport, every session bound to its connection | `relay_loopback_relay_d22` |
 | cross-draft terminal translation on decoded peer wire | `relay_mixed_draft` |
 | the retirement pass is wired into every pump | `relay_reap_wiring` |
 | the bounded HTTP request grammar and the decided content-negotiation table, the finite response table, and the rule that no error response carries a metrics body | `relay_http_parse` |
@@ -88,9 +89,11 @@ Named here so the checker fails if a claim's last owner disappears.
 
 ## Boundary fixture
 
-The three thin real-transport cells (`relay_loopback_same_d18`,
-`relay_loopback_cross_d18`, `relay_multiversion`) read LibMoQ's committed
-test-only certificate and key:
+The thin real-transport cells (`relay_loopback_same_d18`,
+`relay_loopback_cross_d18`, `relay_loopback_same_d22`,
+`relay_loopback_cross_d22`, `relay_loopback_relay_d22`, `relay_multiversion`
+and `relay_multiversion_port_shadow`) read LibMoQ's committed test-only
+certificate and key:
 
 ```
 adapters/msquic/tests/test_only_loopback_cert.pem

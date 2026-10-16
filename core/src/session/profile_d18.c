@@ -1,68 +1,48 @@
 /*
- * Draft-18 profile (partial).
+ * Draft-18 wire profile.
  *
- * Implements the pieces needed to bring up a draft-18 session's control
- * channel: each peer opens its own unidirectional control channel and sends a
- * unified SETUP, and the session reaches ESTABLISHED once it has both sent and
- * received SETUP. Request and data-plane messages are added as the
- * corresponding implementation is added; their vtable ops are intentionally
- * left NULL until then.
+ * Setup handshake over a unidirectional control channel per side, the
+ * draft-18 codec adapters that feed the shared request-stream engine
+ * (request_stream.c), the outbound control encoders, and the data-plane
+ * framing for subgroup, datagram and fetch streams. Request admission and
+ * request/response dispatch live in the engine; this file owns only what
+ * differs on the wire.
  */
 
 #include "session_internal.h"
+#include "request_stream_internal.h"
+#include "profile_d18_ops_internal.h"
 #include "moq/control_d18.h"
 #include "../wire/control_d18_internal.h"
+#include "../wire/kvp_internal.h"
 #include "moq/vi64.h"
 
 /* -- D18 profile state --------------------------------------------- */
-
-typedef struct d18_id_range {
-    uint64_t first;
-    uint64_t last;
-} d18_id_range_t;
-
-/* Limits retained gaps, not the numeric distance to a reordered request. */
-#define D18_PEER_ID_MAX_RANGES 1024u
-
 typedef struct moq_d18_profile_state {
+    /* Request-stream engine state; must stay first (see request_stream_internal.h). */
+    moq_request_stream_state_t rs;
     moq_version_t version;
     bool          setup_sent;
     bool          setup_received;
-    /* Request IDs are parity-allocated (client even, server odd). Draft-18 has
-     * no MAX_REQUEST_ID; QUIC stream limits provide flow control. */
-    uint64_t      next_local_request_id;
-    uint64_t      peer_next_request_id;
-    d18_id_range_t *peer_seen_later;
-    size_t          peer_seen_count;
-    size_t          peer_seen_cap;
-    moq_alloc_t   alloc;
-    bool          peer_ids_exhausted;
-    uint64_t      next_track_alias;
 } moq_d18_profile_state_t;
+
+_Static_assert(offsetof(moq_d18_profile_state_t, rs) == 0,
+               "request-stream state leads the draft-18 profile state");
 
 static void d18_init_in_place(void *profile_state, const moq_session_cfg_t *cfg)
 {
     moq_d18_profile_state_t *d18 = (moq_d18_profile_state_t *)profile_state;
     memset(d18, 0, sizeof(*d18));
+    moq_request_stream_state_init(&d18->rs, cfg->perspective, cfg->alloc);
     d18->version = MOQ_VERSION_DRAFT_18;
-    d18->next_local_request_id =
-        (cfg->perspective == MOQ_PERSPECTIVE_CLIENT) ? 0 : 1;
-    d18->peer_next_request_id =
-        (cfg->perspective == MOQ_PERSPECTIVE_CLIENT) ? 1 : 0;
-    d18->alloc = *cfg->alloc;
-    d18->next_track_alias = 1;
 }
 
 static void d18_destroy(void *profile_state)
 {
     moq_d18_profile_state_t *d18 = (moq_d18_profile_state_t *)profile_state;
-    if (d18->peer_seen_later)
-        d18->alloc.free(d18->peer_seen_later,
-                        d18->peer_seen_cap * sizeof(d18_id_range_t),
-                        d18->alloc.ctx);
+    moq_request_stream_state_destroy(&d18->rs);
 }
 
-/* -- Setup handshake ----------------------------------------------- */
 
 static void d18_fill_setup_complete_event(moq_session_t *s, moq_event_t *e)
 {
@@ -95,11 +75,21 @@ static moq_result_t d18_maybe_complete(moq_session_t *s)
 
 /* Encode this side's SETUP into `w`: the auth-token cache size when
  * configured (§10.3.1.3) so the peer may register aliases, and the configured
- * authorization tokens by value (§10.3.1.4). */
+ * authorization tokens by value (§10.3.1.4). A client carried natively over
+ * QUIC names its connection target: PATH is the URI's path-abempty with "?"
+ * and the query appended when present, AUTHORITY the URI's authority
+ * (§10.3.1.1, §10.3.1.2). Neither is sent by a server, over WebTransport, or
+ * by a session never told its target. */
 static moq_result_t d18_encode_own_setup(moq_session_t *s, moq_buf_writer_t *w)
 {
     moq_d18_setup_opts_t opts;
-    memset(&opts, 0, sizeof(opts));
+    moq_d18_setup_opts_init(&opts);
+    if (moq_binding_sends_target(s)) {
+        opts.has_path = true;
+        opts.path = s->binding.value.path_query;
+        opts.has_authority = true;
+        opts.authority = s->binding.value.authority;
+    }
     if (s->send_auth_token_cache_size) {
         opts.has_max_auth_token_cache_size = true;
         opts.max_auth_token_cache_size = s->auth_token_cache_size;
@@ -110,7 +100,7 @@ static moq_result_t d18_encode_own_setup(moq_session_t *s, moq_buf_writer_t *w)
         opts.auth_tokens[i].token_value = s->setup_tokens[i].token_value;
     }
     opts.auth_token_count = s->setup_token_count;
-    return moq_d18_encode_setup_opts(w, &opts);
+    return moq_d18_encode_setup_opts(w, &opts, sizeof(opts));
 }
 
 /*
@@ -126,6 +116,9 @@ static moq_result_t d18_start(moq_session_t *s)
     size_t cap = 32;
     for (size_t i = 0; i < s->setup_token_count; i++)
         cap += s->setup_tokens[i].token_value.len + 32u;
+    if (moq_binding_sends_target(s))
+        cap += s->binding.value.path_query.len +
+               s->binding.value.authority.len + 32u;
     uint8_t stack_buf[32];
     uint8_t *buf = stack_buf;
     if (cap > sizeof(stack_buf)) {
@@ -150,10 +143,6 @@ static moq_result_t d18_start(moq_session_t *s)
     return d18_maybe_complete(s);
 }
 
-static moq_result_t d18_resolve_auth_token_list(
-    moq_session_t *s, const moq_d18_auth_token_t *tokens, size_t count,
-    moq_resolved_token_t *out_tokens, size_t *out_token_count,
-    bool *out_staged, moq_auth_txn_t *txn, uint64_t *out_reject_code);
 
 static moq_result_t d18_handle_setup(moq_session_t *s,
                                      const moq_control_envelope_t *env)
@@ -174,7 +163,7 @@ static moq_result_t d18_handle_setup(moq_session_t *s,
      * draft-16: the peer broke no rule. */
     moq_d18_setup_opts_t opts;
     moq_result_t orc = moq_d18_decode_setup_opts(env->payload, env->payload_len,
-                                                 &opts);
+                                                 &opts, sizeof(opts));
     if (orc == MOQ_D18_ERR_KVP_FORMAT)
         return close_with_error(s, 0x6, "malformed auth token structure");
     if (orc == MOQ_ERR_BUFFER)
@@ -183,15 +172,16 @@ static moq_result_t d18_handle_setup(moq_session_t *s,
     if (orc < 0)
         return close_with_error(s, 0x3, "malformed SETUP options");
 
-    /* PATH / AUTHORITY (§10.3.1.1-2): client-to-server only. Mirror the draft-16
-     * setup-parameter handling: a server-sent PATH/AUTHORITY closes with
-     * INVALID_PATH (0x8) / INVALID_AUTHORITY (0x19); a server receiving them
-     * records presence (the application owns URI policy). */
-    bool peer_is_client = (s->perspective == MOQ_PERSPECTIVE_SERVER);
-    if (opts.has_path && !peer_is_client)
-        return close_with_error(s, 0x8, "PATH from server");
-    if (opts.has_authority && !peer_is_client)
-        return close_with_error(s, 0x19, "AUTHORITY from server");
+    /* PATH and AUTHORITY travel client to server, natively over QUIC only
+     * (§10.3.1.1, §10.3.1.2): from a server or over WebTransport each is
+     * INVALID_*, a value outside RFC 3986 syntax is MALFORMED_*, and a raw
+     * server bound with a URI policy lets it decide whether it serves the
+     * named target. The policy runs before any token takes effect and may run
+     * again if this SETUP has to be retried before it commits. */
+    const char *reason = NULL;
+    uint64_t target_err = moq_binding_judge_peer_target(
+        s, opts.has_path, opts.path, opts.has_authority, opts.authority, &reason);
+    if (target_err) return close_with_error(s, target_err, reason);
 
     /* SETUP auth tokens (§10.3.1.4): functionally equivalent to the message
      * parameter. DELETE/USE_ALIAS reference an alias, and nothing can be
@@ -203,146 +193,34 @@ static moq_result_t d18_handle_setup(moq_session_t *s,
             return close_with_error(s, 0x3, "DELETE/USE_ALIAS in SETUP");
     }
 
-    /* §10.3.1.4: a SETUP REGISTER exceeding MAX_AUTH_TOKEN_CACHE_SIZE MUST NOT
-     * fail the session with AUTH_TOKEN_CACHE_OVERFLOW; it is treated as
-     * USE_VALUE (the token still authorizes, the alias is just not registered;
-     * the sender purges aliases that failed per our advertised size). Project
-     * capacity cumulatively across this SETUP's own REGISTERs on top of the
-     * current cache usage, downgrading each one that would not fit BEFORE the
-     * shared resolution path (whose overflow close is the request-path rule). */
-    {
-        size_t proj_bytes = s->peer_token_cache.used_bytes;
-        size_t proj_active = 0;
-        for (size_t i = 0; i < s->peer_token_cache.cap; i++)
-            if (s->peer_token_cache.entries[i].active) proj_active++;
-        for (size_t i = 0; i < opts.auth_token_count; i++) {
-            if (opts.auth_tokens[i].alias_type != MOQ_AUTH_TOKEN_REGISTER)
-                continue;
-            size_t esize = MOQ_TOKEN_ENTRY_OVERHEAD +
-                           opts.auth_tokens[i].token_value.len;
-            bool fits = esize >= MOQ_TOKEN_ENTRY_OVERHEAD &&
-                        proj_bytes <= s->peer_token_cache.max_bytes &&
-                        esize <= s->peer_token_cache.max_bytes - proj_bytes &&
-                        proj_active < s->peer_token_cache.cap;
-            if (fits) {
-                proj_bytes += esize;
-                proj_active++;
-            } else {
-                opts.auth_tokens[i].alias_type = MOQ_AUTH_TOKEN_USE_VALUE;
-            }
+    /* The remainder is draft-neutral: resolve the tokens against the cache,
+     * surface SETUP_COMPLETE, commit. */
+    moq_setup_workspace_t workspace;
+    moq_result_t rc = session_setup_workspace_acquire(s, &workspace);
+    if (rc < 0 || s->state == MOQ_SESS_CLOSED) return rc;
+    moq_decoded_auth_token_t *in = workspace.decoded->setup_tokens;
+    for (size_t i = 0; i < opts.auth_token_count; i++) {
+        const moq_d18_auth_token_t *t = &opts.auth_tokens[i];
+        switch (t->alias_type) {
+        case MOQ_AUTH_TOKEN_DELETE:    in[i].op = MOQ_AUTH_OP_DELETE; break;
+        case MOQ_AUTH_TOKEN_REGISTER:  in[i].op = MOQ_AUTH_OP_REGISTER; break;
+        case MOQ_AUTH_TOKEN_USE_ALIAS: in[i].op = MOQ_AUTH_OP_USE_ALIAS; break;
+        default:                       in[i].op = MOQ_AUTH_OP_USE_VALUE; break;
         }
+        in[i].alias = t->alias;
+        in[i].token_type = t->token_type;
+        in[i].token_value = t->token_value.data;
+        in[i].token_value_len = t->token_value.len;
     }
-
-    moq_resolved_token_t resolved[MOQ_DECODED_MAX_TOKENS];
-    bool staged[MOQ_DECODED_MAX_TOKENS];
-    size_t token_count = 0;
-    uint64_t reject_code = 0;
-    moq_auth_txn_t txn;
-    memset(&txn, 0, sizeof(txn));
-    moq_result_t arc = d18_resolve_auth_token_list(s,
-        opts.auth_tokens, opts.auth_token_count,
-        resolved, &token_count, staged, &txn, &reject_code);
-    if (arc < 0) return arc;
-    /* close_with_error inside the resolution (duplicate alias) returns MOQ_OK
-     * with the session CLOSED; the close must stick -- never fall through to
-     * establish below. */
-    if (s->state == MOQ_SESS_CLOSED) return MOQ_OK;
-    if (reject_code != 0) {
-        /* There is no request to reject at SETUP time: an unusable token here
-         * is a session error. A request-level MALFORMED_AUTH_TOKEN (0x4 -- a
-         * duplicate resolved value) maps to the MALFORMED_AUTH_TOKEN session
-         * error (0x16); anything else keeps the generic formatting close. */
-        process_auth_tokens_free_staging(s, resolved, staged, token_count);
-        process_auth_tokens_abort_txn(s, &txn);
-        if (reject_code == 0x4)
-            return close_with_error(s, 0x16, "malformed auth token in SETUP");
-        return close_with_error(s, 0x6, "invalid auth token in SETUP");
-    }
-
-    /* Classify the completion event's whole token requirement before copying
-     * any of it: a shortfall an empty arena could satisfy is transient (the
-     * arena recycles once events drain), while one no empty arena could
-     * satisfy can never be retried into success. */
-    size_t scratch_saved = s->event_scratch_len;
-    {
-        moq_event_scratch_verdict_t v =
-            setup_event_scratch_classify(s, resolved, token_count);
-        if (v != MOQ_EVENT_SCRATCH_FITS) {
-            process_auth_tokens_free_staging(s, resolved, staged, token_count);
-            process_auth_tokens_abort_txn(s, &txn);
-            if (v == MOQ_EVENT_SCRATCH_PERMANENT)
-                return close_with_error(s, 0x1,
-                    "event scratch permanently too small");
-            return MOQ_ERR_WOULD_BLOCK;
-        }
-    }
-
-    /* Scratch-copy the resolved token values for the SETUP_COMPLETE event,
-     * freeing any staged heap values (mirrors the request paths). */
-    moq_resolved_token_t *ev_tokens = NULL;
-    for (size_t i = 0; i < token_count; i++) {
-        if (resolved[i].token_value.len > 0) {
-            const uint8_t *src = resolved[i].token_value.data;
-            size_t slen = resolved[i].token_value.len;
-            uint8_t *copy = event_scratch_copy(s, src, slen);
-            if (staged[i])
-                s->alloc.free((void *)(uintptr_t)src, slen, s->alloc.ctx);
-            staged[i] = false;
-            if (!copy) {
-                /* The preflight said the whole requirement fits: a failure
-                 * here is an internal inconsistency, not arena pressure. */
-                s->event_scratch_len = scratch_saved;
-                process_auth_tokens_free_staging(s, resolved, staged, token_count);
-                process_auth_tokens_abort_txn(s, &txn);
-                return close_with_error(s, 0x1,
-                    "internal: setup scratch preflight mismatch");
-            }
-            resolved[i].token_value.data = copy;
-        } else {
-            resolved[i].token_value.data = NULL;
-        }
-    }
-    if (token_count > 0) {
-        ev_tokens = (moq_resolved_token_t *)event_scratch_alloc_aligned(s,
-            token_count * sizeof(moq_resolved_token_t),
-            _Alignof(moq_resolved_token_t));
-        if (!ev_tokens) {
-            s->event_scratch_len = scratch_saved;
-            process_auth_tokens_abort_txn(s, &txn);
-            return close_with_error(s, 0x1,
-                "internal: setup scratch preflight mismatch");
-        }
-        memcpy(ev_tokens, resolved, token_count * sizeof(moq_resolved_token_t));
-    }
-
-    /* Commit: record peer options, complete the handshake, surface the event
-     * with the tokens, then commit the auth transaction (commit-last). */
-    s->peer_setup.has_path = opts.has_path;
-    s->peer_setup.has_authority = opts.has_authority;
-    s->peer_setup.has_max_auth_token_cache_size =
-        opts.has_max_auth_token_cache_size;
-    s->peer_setup.max_auth_token_cache_size = opts.max_auth_token_cache_size;
-    d18->setup_received = true;
-    bool established_now = false;
-    if (d18->setup_sent && s->state != MOQ_SESS_ESTABLISHED) {
-        s->state = MOQ_SESS_ESTABLISHED;
-        established_now = true;
-        moq_event_t e;
-        d18_fill_setup_complete_event(s, &e);
-        e.u.setup_complete.tokens = ev_tokens;
-        e.u.setup_complete.token_count = ev_tokens ? token_count : 0;
-        moq_result_t prc = push_event(s, &e);   /* slot reserved above */
-        if (prc < 0) {
-            process_auth_tokens_abort_txn(s, &txn);
-            return prc;
-        }
-    }
-    process_auth_tokens_commit_txn(s, &txn);
-    /* After the token commit (dispatched requests may reference the cache):
-     * dispatch request bidis that arrived before establishment (§3.3). */
-    if (established_now)
-        return request_streams_refeed_deferred(s);
-    return MOQ_OK;
+    workspace.count = opts.auth_token_count;
+    moq_setup_params_t peer;
+    memset(&peer, 0, sizeof(peer));
+    peer.has_path = opts.has_path;
+    peer.has_authority = opts.has_authority;
+    peer.has_max_auth_token_cache_size = opts.has_max_auth_token_cache_size;
+    peer.max_auth_token_cache_size = opts.max_auth_token_cache_size;
+    return session_setup_complete_peer(s, &workspace, &peer,
+                                       &d18->setup_received, d18->setup_sent);
 }
 
 /* GOAWAY on the control stream (§10.4). The profile owns the wire decode and the
@@ -370,7 +248,7 @@ static moq_result_t d18_handle_goaway(moq_session_t *s,
     if ((ga.request_id & 1u) != our_parity)
         return close_with_error(s, 0x4, "GOAWAY Request ID parity");
 
-    return session_core_on_goaway(s, ga.uri.data, ga.uri.len);
+    return session_core_on_goaway(s, ga.uri.data, ga.uri.len, true, ga.timeout_ms);
 }
 
 static moq_result_t d18_process_control_data(moq_session_t *s,
@@ -419,7 +297,7 @@ static moq_result_t d18_process_control_data(moq_session_t *s,
 }
 
 /* Classify an inbound unidirectional stream by its leading stream type. */
-static moq_uni_class_t d18_classify_uni_stream(const uint8_t *data, size_t len)
+moq_uni_class_t moq_d18_op_classify_uni_stream(const uint8_t *data, size_t len)
 {
     uint64_t type = 0;
     size_t n = moq_vi64_decode(data, len, &type);
@@ -441,174 +319,6 @@ static moq_uni_class_t d18_classify_uni_stream(const uint8_t *data, size_t len)
     }
 }
 
-/* -- Request admission --------------------------------------------- *
- * Request IDs are parity-allocated; there is no MAX_REQUEST_ID gate (QUIC
- * stream limits provide flow control). Each outbound request travels on its own
- * bidi stream; the session core mints the stream_ref and registers it. */
-
-static moq_result_t d18_prepare_request(moq_session_t *s,
-                                        struct moq_request_endpoint *out)
-{
-    moq_d18_profile_state_t *d18 = (moq_d18_profile_state_t *)s->profile_state;
-    memset(out, 0, sizeof(*out));
-    out->has_request_id = true;
-    out->request_id = d18->next_local_request_id;
-    return MOQ_OK;
-}
-
-static void d18_commit_request(moq_session_t *s,
-                               const struct moq_request_endpoint *ep)
-{
-    (void)ep;
-    moq_d18_profile_state_t *d18 = (moq_d18_profile_state_t *)s->profile_state;
-    d18->next_local_request_id += 2;   /* keep parity */
-}
-
-static void d18_abort_request(moq_session_t *s,
-                              const struct moq_request_endpoint *ep)
-{
-    (void)s; (void)ep;   /* request ID not consumed until commit */
-}
-
-static void d18_release_request(moq_session_t *s,
-                                const struct moq_request_endpoint *ep)
-{
-    (void)s; (void)ep;   /* request IDs are not recycled */
-}
-
-static uint64_t d18_next_track_alias(const moq_session_t *s)
-{
-    return ((const moq_d18_profile_state_t *)s->profile_state)->next_track_alias;
-}
-
-static void d18_advance_track_alias(moq_session_t *s, uint64_t next_after)
-{
-    moq_d18_profile_state_t *d18 = (moq_d18_profile_state_t *)s->profile_state;
-    if (next_after >= d18->next_track_alias)
-        d18->next_track_alias = next_after + 1;
-}
-
-/* Later request bidis can arrive first. Keep merged ranges above the lowest
- * missing peer ID; resource use follows disjoint gaps, not ID distance. */
-static size_t d18_peer_seen_position(const moq_d18_profile_state_t *d18,
-                                     uint64_t request_id)
-{
-    size_t lo = 0, hi = d18->peer_seen_count;
-    while (lo < hi) {
-        size_t mid = lo + (hi - lo) / 2;
-        if (d18->peer_seen_later[mid].last < request_id)
-            lo = mid + 1;
-        else
-            hi = mid;
-    }
-    return lo;
-}
-
-static moq_result_t d18_validate_inbound_request_stream(
-    moq_session_t *s, moq_stream_ref_t ref, uint64_t msg_type,
-    uint64_t wire_request_id, struct moq_request_endpoint *out)
-{
-    (void)msg_type;
-    moq_d18_profile_state_t *d18 = (moq_d18_profile_state_t *)s->profile_state;
-    bool peer_is_client = (s->perspective == MOQ_PERSPECTIVE_SERVER);
-    uint64_t expected_parity = peer_is_client ? 0 : 1;
-    if ((wire_request_id & 1) != expected_parity)
-        return close_with_error(s, 0x4, "wrong request ID parity");
-    if (d18->peer_ids_exhausted ||
-        wire_request_id < d18->peer_next_request_id)
-        return close_with_error(s, 0x4, "duplicate request ID");
-    if (wire_request_id > d18->peer_next_request_id) {
-        size_t pos = d18_peer_seen_position(d18, wire_request_id);
-        if (pos < d18->peer_seen_count &&
-            d18->peer_seen_later[pos].first <= wire_request_id)
-            return close_with_error(s, 0x4, "duplicate request ID");
-        bool join_before = pos > 0 &&
-            d18->peer_seen_later[pos - 1].last == wire_request_id - 2;
-        bool join_after = pos < d18->peer_seen_count &&
-            wire_request_id <= UINT64_MAX - 2 &&
-            d18->peer_seen_later[pos].first == wire_request_id + 2;
-        /* Commit is void and must remain allocation-free after the request
-         * handler has performed its other fallible work. */
-        if (!join_before && !join_after &&
-            d18->peer_seen_count == d18->peer_seen_cap) {
-            if (d18->peer_seen_count == D18_PEER_ID_MAX_RANGES)
-                return close_with_error(s, 0x1, "request ID ranges exhausted");
-            size_t cap = d18->peer_seen_cap ? d18->peer_seen_cap * 2 : 8;
-            if (cap > D18_PEER_ID_MAX_RANGES)
-                cap = D18_PEER_ID_MAX_RANGES;
-            d18_id_range_t *ranges = d18->peer_seen_later
-                ? d18->alloc.realloc(d18->peer_seen_later,
-                    d18->peer_seen_cap * sizeof(d18_id_range_t),
-                    cap * sizeof(d18_id_range_t), d18->alloc.ctx)
-                : d18->alloc.alloc(cap * sizeof(d18_id_range_t),
-                                   d18->alloc.ctx);
-            if (!ranges)
-                return close_with_error(s, 0x1, "request ID storage exhausted");
-            d18->peer_seen_later = ranges;
-            d18->peer_seen_cap = cap;
-        }
-    }
-    memset(out, 0, sizeof(*out));
-    out->has_request_id = true;
-    out->request_id = wire_request_id;
-    out->has_stream_ref = true;
-    out->stream_ref = ref;
-    return MOQ_OK;
-}
-
-static void d18_commit_inbound_request(moq_session_t *s,
-                                       const struct moq_request_endpoint *ep)
-{
-    moq_d18_profile_state_t *d18 = (moq_d18_profile_state_t *)s->profile_state;
-    if (ep->request_id != d18->peer_next_request_id) {
-        size_t pos = d18_peer_seen_position(d18, ep->request_id);
-        bool join_before = pos > 0 &&
-            d18->peer_seen_later[pos - 1].last == ep->request_id - 2;
-        bool join_after = pos < d18->peer_seen_count &&
-            ep->request_id <= UINT64_MAX - 2 &&
-            d18->peer_seen_later[pos].first == ep->request_id + 2;
-        if (join_before && join_after) {
-            d18->peer_seen_later[pos - 1].last = d18->peer_seen_later[pos].last;
-            memmove(&d18->peer_seen_later[pos],
-                    &d18->peer_seen_later[pos + 1],
-                    (d18->peer_seen_count - pos - 1) * sizeof(d18_id_range_t));
-            d18->peer_seen_count--;
-        } else if (join_before) {
-            d18->peer_seen_later[pos - 1].last = ep->request_id;
-        } else if (join_after) {
-            d18->peer_seen_later[pos].first = ep->request_id;
-        } else {
-            memmove(&d18->peer_seen_later[pos + 1],
-                    &d18->peer_seen_later[pos],
-                    (d18->peer_seen_count - pos) * sizeof(d18_id_range_t));
-            d18->peer_seen_later[pos] =
-                (d18_id_range_t){ ep->request_id, ep->request_id };
-            d18->peer_seen_count++;
-        }
-        return;
-    }
-    if (d18->peer_next_request_id > UINT64_MAX - 2) {
-        d18->peer_ids_exhausted = true;
-        return;
-    }
-    d18->peer_next_request_id += 2;
-    while (d18->peer_seen_count &&
-           d18->peer_seen_later[0].first == d18->peer_next_request_id) {
-        uint64_t last = d18->peer_seen_later[0].last;
-        d18->peer_seen_count--;
-        memmove(&d18->peer_seen_later[0], &d18->peer_seen_later[1],
-                d18->peer_seen_count * sizeof(d18_id_range_t));
-        if (last > UINT64_MAX - 2) {
-            d18->peer_ids_exhausted = true;
-            return;
-        }
-        d18->peer_next_request_id = last + 2;
-    }
-}
-
-/* Map the representable SUBSCRIBE/FETCH settings onto draft-18 Message
- * Parameters, emitting a parameter only when it differs from the protocol
- * default (so the omitted form yields the default on the peer). */
 static void d18_fill_request_params(moq_d18_msg_params_t *p,
                                     uint8_t subscriber_priority,
                                     bool has_forward, bool forward,
@@ -632,10 +342,10 @@ static void d18_fill_request_params(moq_d18_msg_params_t *p,
 /* §9.8 pure scanner (vtable op): draft-18 per-type extraction; structural
  * failure, duplicate timeout types (mutable UNION immutable), and nested
  * immutable blocks error in every mode. */
-static moq_result_t d18_scan_delivery_timeouts_op(const uint8_t *data,
-                                                  size_t len,
-                                                  bool strict_local,
-                                                  moq_dt_scan_t *out)
+moq_result_t moq_d18_op_scan_delivery_timeouts(const uint8_t *data,
+                                               size_t len,
+                                               bool strict_local,
+                                               moq_dt_scan_t *out)
 {
     (void)strict_local;
     return moq_d18_scan_delivery_timeouts(data, len,
@@ -666,9 +376,15 @@ static moq_result_t d18_map_delivery_timeout(const moq_d18_msg_params_t *p,
     return MOQ_OK;
 }
 
+
 /* Copy this message's exact per-type carriers into a decoded struct's dt_*
- * fields (all four decoded shapes share the field names via macro). */
-#define D18_FILL_DT(dst, p) do {         (dst)->dt_has_object   = (p)->has_object_delivery_timeout;         (dst)->dt_object_ms    = (p)->object_delivery_timeout_ms;         (dst)->dt_has_subgroup = (p)->has_subgroup_delivery_timeout;         (dst)->dt_subgroup_ms  = (p)->subgroup_delivery_timeout_ms;     } while (0)
+ * fields (all decoded shapes share the field names via macro). */
+#define D18_FILL_DT(dst, p) do {                                           \
+        (dst)->dt_has_object   = (p)->has_object_delivery_timeout;         \
+        (dst)->dt_object_ms    = (p)->object_delivery_timeout_ms;          \
+        (dst)->dt_has_subgroup = (p)->has_subgroup_delivery_timeout;       \
+        (dst)->dt_subgroup_ms  = (p)->subgroup_delivery_timeout_ms;        \
+    } while (0)
 
 /* The codec token array and the session-core decoded-token array share a cap, so
  * a message that decodes within one fits the other. */
@@ -693,48 +409,7 @@ static moq_result_t d18_fill_auth_tokens(moq_d18_msg_params_t *p,
     return MOQ_OK;
 }
 
-/* Resolve decoded wire authorization tokens against the shared session token
- * cache (REGISTER/DELETE/USE_ALIAS/USE_VALUE), staging into the caller's
- * resolved-token array. Mirrors the draft-16 inbound auth path; the cache and
- * resolution live in session_auth.c (draft-neutral). Shared by the request
- * message-parameter path and the SETUP option path (§10.3.1.4). */
-static moq_result_t d18_resolve_auth_token_list(
-    moq_session_t *s, const moq_d18_auth_token_t *tokens, size_t count,
-    moq_resolved_token_t *out_tokens, size_t *out_token_count,
-    bool *out_staged, moq_auth_txn_t *txn, uint64_t *out_reject_code)
-{
-    moq_decoded_auth_token_t in[MOQ_DECODED_MAX_TOKENS];
-    for (size_t i = 0; i < count; i++) {
-        const moq_d18_auth_token_t *t = &tokens[i];
-        switch (t->alias_type) {
-        case MOQ_AUTH_TOKEN_DELETE:    in[i].op = MOQ_AUTH_OP_DELETE; break;
-        case MOQ_AUTH_TOKEN_REGISTER:  in[i].op = MOQ_AUTH_OP_REGISTER; break;
-        case MOQ_AUTH_TOKEN_USE_ALIAS: in[i].op = MOQ_AUTH_OP_USE_ALIAS; break;
-        default:                       in[i].op = MOQ_AUTH_OP_USE_VALUE; break;
-        }
-        in[i].alias = t->alias;
-        in[i].token_type = t->token_type;
-        in[i].token_value = t->token_value.data;
-        in[i].token_value_len = t->token_value.len;
-    }
-    return process_auth_tokens(s, in, count, out_tokens, out_token_count,
-                               MOQ_DECODED_MAX_TOKENS, out_reject_code,
-                               out_staged, txn);
-}
 
-static moq_result_t d18_resolve_auth_tokens(moq_session_t *s,
-                                            const moq_d18_msg_params_t *params,
-                                            moq_resolved_token_t *out_tokens,
-                                            size_t *out_token_count,
-                                            bool *out_staged,
-                                            moq_auth_txn_t *txn,
-                                            uint64_t *out_reject_code)
-{
-    return d18_resolve_auth_token_list(s, params->auth_tokens,
-                                       params->auth_token_count,
-                                       out_tokens, out_token_count,
-                                       out_staged, txn, out_reject_code);
-}
 
 /* SUBSCRIBE encode. Priority/forward/group-order/filter and authorization tokens
  * travel as Message Parameters. */
@@ -751,6 +426,11 @@ static moq_result_t d18_encode_subscribe(
                                             args->auth_token_count);
     if (arc < 0) return arc;
     if (args->filter != MOQ_SUBSCRIBE_FILTER_NONE) {
+        /* A relative start more than one group back and an absolute end
+         * object have no form on this draft. */
+        if (args->filter == MOQ_SUBSCRIBE_FILTER_RELATIVE_GROUP_INTERNAL ||
+            args->filter == MOQ_SUBSCRIBE_FILTER_OBJECT_END_INTERNAL)
+            return MOQ_ERR_UNSUPPORTED;
         p.has_filter = true;
         p.filter_type = args->filter;
         p.filter_start_group = args->start_group;
@@ -799,7 +479,7 @@ static moq_result_t d18_encode_publish(
 /* Lenient outbound-side extraction of dynamic-group support: reuses the
  * shared property walker without the mandatory/violation outcomes (a blob
  * the encoder would refuse simply reads as unsupported). */
-static bool d18_track_properties_dynamic_groups(const uint8_t *data,
+bool moq_d18_op_track_properties_dynamic_groups(const uint8_t *data,
                                                 size_t len)
 {
     if (!data || len == 0) return false;
@@ -807,6 +487,106 @@ static bool d18_track_properties_dynamic_groups(const uint8_t *data,
     if (moq_d18_scan_dynamic_groups(data, len, &dyn) < 0)
         return false;
     return dyn;
+}
+
+/* §12.6 DYNAMIC_GROUPS (0x30) = 1 added to a Track Property list, which
+ * draft-22 shares (§10.6). The property is looked up at the top level and in
+ * IMMUTABLE_PROPERTIES together (§12.7, draft-22 §10.7): a set that already
+ * advertises 1 is copied unchanged, one that states 0 (or states it twice)
+ * is refused. */
+moq_result_t moq_d18_op_track_properties_add_dynamic_groups(const uint8_t *in,
+                                                            size_t len,
+                                                            uint8_t *out,
+                                                            size_t cap,
+                                                            size_t *out_len)
+{
+    if (!out_len) return MOQ_ERR_INVAL;
+    return moq_kvp_list_merge_int(in, len, true, 0x30, 1, 0x0B, out, cap, out_len);
+}
+
+/* §12.5 DEFAULT_PUBLISHER_GROUP_ORDER, searched in the mutable list and in
+ * IMMUTABLE_PROPERTIES (§12.7). Shared with draft-22, whose Track Properties
+ * use the same encoding and code points. */
+#define D18_PROP_GROUP_ORDER 0x22u
+#define D18_PROP_IMMUTABLE_PROPERTIES 0x0Bu
+static uint8_t d18_props_group_order(const uint8_t *data, size_t len, bool nested)
+{
+    uint8_t order = MOQ_GROUP_ORDER_DEFAULT;
+    if (!data || len == 0) return order;
+    moq_buf_reader_t r;
+    moq_buf_reader_init(&r, data, len);
+    uint64_t prev = 0;
+    while (moq_buf_reader_remaining(&r) > 0) {
+        uint64_t delta;
+        if (moq_buf_read_vi64(&r, &delta) < 0 || delta > UINT64_MAX - prev) break;
+        uint64_t type = prev + delta;
+        prev = type;
+        if (type & 1) {
+            uint64_t vlen;
+            if (moq_buf_read_vi64(&r, &vlen) < 0 ||
+                vlen > moq_buf_reader_remaining(&r)) break;
+            if (type == D18_PROP_IMMUTABLE_PROPERTIES && !nested) {
+                uint8_t inner = d18_props_group_order(moq_buf_reader_ptr(&r),
+                                                      (size_t)vlen, true);
+                if (inner != MOQ_GROUP_ORDER_DEFAULT) order = inner;
+            }
+            r.pos += (size_t)vlen;
+        } else {
+            uint64_t v;
+            if (moq_buf_read_vi64(&r, &v) < 0) break;
+            if (type == D18_PROP_GROUP_ORDER &&
+                (v == MOQ_GROUP_ORDER_ASCENDING || v == MOQ_GROUP_ORDER_DESCENDING))
+                order = (uint8_t)v;
+        }
+    }
+    return order;
+}
+
+uint8_t moq_d18_op_track_properties_group_order(const uint8_t *data, size_t len)
+{
+    return d18_props_group_order(data, len, false);
+}
+
+/* §12.3 MAX_CACHE_DURATION (0x04): an integer of milliseconds. */
+#define D18_PROP_MAX_CACHE_DURATION 0x04u
+static bool d18_props_max_cache(const uint8_t *data, size_t len, bool nested,
+                                uint64_t *out_ms)
+{
+    bool found = false;
+    if (!data || len == 0) return false;
+    moq_buf_reader_t r;
+    moq_buf_reader_init(&r, data, len);
+    uint64_t prev = 0;
+    while (moq_buf_reader_remaining(&r) > 0) {
+        uint64_t delta;
+        if (moq_buf_read_vi64(&r, &delta) < 0 || delta > UINT64_MAX - prev) break;
+        uint64_t type = prev + delta;
+        prev = type;
+        if (type & 1) {
+            uint64_t vlen;
+            if (moq_buf_read_vi64(&r, &vlen) < 0 ||
+                vlen > moq_buf_reader_remaining(&r)) break;
+            if (type == D18_PROP_IMMUTABLE_PROPERTIES && !nested &&
+                d18_props_max_cache(moq_buf_reader_ptr(&r), (size_t)vlen, true,
+                                    out_ms))
+                found = true;
+            r.pos += (size_t)vlen;
+        } else {
+            uint64_t v;
+            if (moq_buf_read_vi64(&r, &v) < 0) break;
+            if (type == D18_PROP_MAX_CACHE_DURATION) {
+                *out_ms = v;
+                found = true;
+            }
+        }
+    }
+    return found;
+}
+
+bool moq_d18_op_track_properties_max_cache(const uint8_t *data, size_t len,
+                                           uint64_t *out_ms)
+{
+    return d18_props_max_cache(data, len, false, out_ms);
 }
 
 /* PUBLISH_OK encode (§10.10 / §10.5): the subscriber's delivery parameters
@@ -1149,686 +929,6 @@ static moq_result_t d18_decode_ns_sub_response(
  * reserved slot and buffering. */
 /* Map an internal request kind to the public migration family (0 if the kind has
  * no request bidi / is not eligible for a request-stream GOAWAY here). */
-static moq_request_family_t d18_family_from_req_kind(uint32_t kind)
-{
-    switch (kind) {
-    case MOQ_REQ_SUBSCRIPTION:     return MOQ_REQUEST_FAMILY_SUBSCRIBE;
-    case MOQ_REQ_FETCH:            return MOQ_REQUEST_FAMILY_FETCH;
-    case MOQ_REQ_TRACK_STATUS:     return MOQ_REQUEST_FAMILY_TRACK_STATUS;
-    case MOQ_REQ_ANNOUNCEMENT:     return MOQ_REQUEST_FAMILY_ANNOUNCEMENT;
-    case MOQ_REQ_NAMESPACE_SUB:    return MOQ_REQUEST_FAMILY_NS_SUB;
-    case MOQ_REQ_PUBLISH:          return MOQ_REQUEST_FAMILY_PUBLISH;
-    case MOQ_REQ_SUBSCRIBE_TRACKS: return MOQ_REQUEST_FAMILY_SUBSCRIBE_TRACKS;
-    default:                       return (moq_request_family_t)0;
-    }
-}
-
-/* Handle a GOAWAY (§10.4) decoded on an established request bidi: validate
- * (no trailing bytes; a server must not receive a non-zero New Session URI),
- * then migrate + free via the draft-neutral core, which strict-drains the bidi
- * unless the peer's FIN has already been observed. `r` is the dispatcher's
- * reader positioned just past the GOAWAY envelope. `peer_fin_observed` is the
- * owner's cumulative FIN fact as its dispatcher received it -- a FIN latched on
- * an earlier call counts, not only one riding this chunk. */
-static moq_result_t d18_request_goaway(moq_session_t *s, moq_stream_ref_t ref,
-    moq_request_family_t family, int slot,
-    const moq_control_envelope_t *env, const moq_buf_reader_t *r,
-    size_t len, bool peer_fin_observed, size_t *out_consumed)
-{
-    moq_d18_goaway_t ga;
-    moq_result_t rc = moq_d18_decode_goaway_request(env->payload,
-                                                    env->payload_len, &ga);
-    if (rc < 0)
-        return close_with_error(s, 0x3, "malformed request-stream GOAWAY");
-    size_t off = moq_buf_reader_offset(r);
-    if (off < len)   /* GOAWAY is terminal on this bidi; nothing may follow it */
-        return close_with_error(s, 0x3, "extra bytes after GOAWAY");
-    if (s->perspective == MOQ_PERSPECTIVE_SERVER && ga.uri.len > 0)
-        return close_with_error(s, 0x3,
-            "server received GOAWAY with non-zero New Session URI");
-    rc = session_core_on_request_goaway(s, family, slot, ref, ga.uri.data,
-                                        ga.uri.len, ga.timeout_ms,
-                                        peer_fin_observed);
-    if (rc < 0)
-        return rc;
-    if (s->state == MOQ_SESS_CLOSED)
-        return MOQ_OK;
-    *out_consumed = off;
-    return MOQ_OK;
-}
-
-static moq_result_t d18_process_request_stream(
-    moq_session_t *s, moq_stream_ref_t ref, int slot,
-    const uint8_t *buf, size_t len, bool fin, size_t *out_consumed)
-{
-    *out_consumed = 0;
-
-    moq_buf_reader_t r;
-    moq_buf_reader_init(&r, buf, len);
-    moq_control_envelope_t env;
-    moq_result_t rc = moq_d18_decode_envelope(&r, &env);
-    if (rc == MOQ_ERR_BUFFER)
-        return MOQ_OK;            /* incomplete; the core waits / handles FIN */
-    if (rc < 0)
-        return close_with_error(s, 0x3, "malformed request envelope");
-
-    /* A GOAWAY on a *committed* request bidi migrates that single request (§10.4).
-     * It is valid only once the request owns the bidi; as a first message on a
-     * fresh staging stream (no committed request) it is a protocol violation. */
-    if (env.msg_type == MOQ_D18_GOAWAY) {
-        moq_request_endpoint_t gep = request_registry_find_by_streamref(s, ref);
-        moq_request_family_t fam = d18_family_from_req_kind((uint32_t)gep.kind);
-        bool committed = (fam != (moq_request_family_t)0) &&
-            !(gep.kind == MOQ_REQ_SUBSCRIPTION &&
-              s->subs[gep.slot].state == MOQ_SUB_RECVING_REQUEST);
-        if (!committed)
-            return close_with_error(s, 0x3,
-                "GOAWAY as first message on a request stream");
-        return d18_request_goaway(s, ref, fam, gep.slot, &env, &r, len, fin,
-                                  out_consumed);
-    }
-
-    /* An established announce bidi (keyed ANNOUNCEMENT after the PUBLISH_NAMESPACE
-     * handoff) carries only a REQUEST_UPDATE. Handle that kind definitively here,
-     * before the first-message branches, so a peer cannot send SUBSCRIBE / FETCH /
-     * PUBLISH_NAMESPACE on it and have the announce slot used as a subscription or
-     * fetch slot (cross-pool corruption / out-of-bounds when ann_cap > sub_cap).
-     * §10.9.1: a failed announce REQUEST_UPDATE closes the bidi; real
-     * announce-update is unsupported, so reject + terminate. */
-    {
-        moq_request_endpoint_t aep = request_registry_find_by_streamref(s, ref);
-        if (aep.kind == MOQ_REQ_ANNOUNCEMENT) {
-            if (env.msg_type != MOQ_D18_REQUEST_UPDATE)
-                return close_with_error(s, 0x3,
-                    "unexpected message on announce request bidi");
-            if (s->announcements[aep.slot].state != MOQ_ANN_ESTABLISHED ||
-                s->announcements[aep.slot].role != MOQ_ANN_ROLE_RECEIVER)
-                return close_with_error(s, 0x3,
-                    "REQUEST_UPDATE on non-established announcement");
-            moq_d18_request_update_t u;
-            rc = moq_d18_decode_request_update(env.payload, env.payload_len, &u);
-            if (rc == MOQ_D18_ERR_KVP_FORMAT)
-                return close_with_error(s, 0x6, "malformed auth token structure");
-            if (rc < 0)
-                return close_with_error(s, 0x3, "malformed REQUEST_UPDATE");
-            moq_request_endpoint_t uep;
-            rc = d18_validate_inbound_request_stream(s, ref, env.msg_type,
-                                                     u.request_id, &uep);
-            if (rc < 0)
-                return rc;
-            if (s->state == MOQ_SESS_CLOSED)
-                return MOQ_OK;
-            rc = session_core_on_announce_update_rejected(s, aep.slot, &uep);
-            if (rc < 0)
-                return rc;
-            if (s->state == MOQ_SESS_CLOSED)
-                return MOQ_OK;
-            *out_consumed = moq_buf_reader_offset(&r);
-            return MOQ_OK;
-        }
-    }
-
-    /* An established/pending SUBSCRIBE_TRACKS publisher-side bidi (keyed
-     * MOQ_REQ_SUBSCRIBE_TRACKS after the handoff) carries only a REQUEST_UPDATE
-     * (re-prefix), which is deferred (§10.9.1): reject and close the bidi, not the
-     * session. Handle it definitively here, before the first-message branches, so
-     * a peer cannot reuse the established bidi as a fresh request. */
-    {
-        moq_request_endpoint_t tep = request_registry_find_by_streamref(s, ref);
-        if (tep.kind == MOQ_REQ_SUBSCRIBE_TRACKS) {
-            if (env.msg_type != MOQ_D18_REQUEST_UPDATE)
-                return close_with_error(s, 0x3,
-                    "unexpected message on subscribe-tracks request bidi");
-            /* A REQUEST_UPDATE is only valid once the subscription is established
-             * on the publisher side; one before the app accepts/rejects (or on
-             * the subscriber side) is a protocol violation -- close, no mutation
-             * (mirrors the announcement-update guard). */
-            if (s->track_subs[tep.slot].state != MOQ_TRACK_SUB_ESTABLISHED ||
-                s->track_subs[tep.slot].role != MOQ_TRACK_SUB_ROLE_PUBLISHER)
-                return close_with_error(s, 0x3,
-                    "REQUEST_UPDATE on non-established subscribe-tracks");
-            moq_d18_request_update_t u;
-            rc = moq_d18_decode_request_update(env.payload, env.payload_len, &u);
-            if (rc == MOQ_D18_ERR_KVP_FORMAT)
-                return close_with_error(s, 0x6, "malformed auth token structure");
-            if (rc < 0)
-                return close_with_error(s, 0x3, "malformed REQUEST_UPDATE");
-            moq_request_endpoint_t uep;
-            rc = d18_validate_inbound_request_stream(s, ref, env.msg_type,
-                                                     u.request_id, &uep);
-            if (rc < 0)
-                return rc;
-            if (s->state == MOQ_SESS_CLOSED)
-                return MOQ_OK;
-            rc = session_core_on_track_sub_update_rejected(s, tep.slot, &uep);
-            if (rc < 0)
-                return rc;
-            if (s->state == MOQ_SESS_CLOSED)
-                return MOQ_OK;
-            *out_consumed = moq_buf_reader_offset(&r);
-            return MOQ_OK;
-        }
-    }
-
-    /* An established PUBLISH bidi (keyed MOQ_REQ_PUBLISH after the handoff) is
-     * read here only on the subscriber (responder) side: the publisher (opener)
-     * sends the terminal PUBLISH_DONE, or a REQUEST_OK acknowledging our pending
-     * REQUEST_UPDATE. Handle these definitively before the first-message branches
-     * so a peer cannot reuse the established bidi as a fresh request. */
-    {
-        moq_request_endpoint_t pep = request_registry_find_by_streamref(s, ref);
-        if (pep.kind == MOQ_REQ_PUBLISH) {
-            moq_pub_entry_t *pe = &s->publishes[pep.slot];
-            if (env.msg_type == MOQ_D18_PUBLISH_DONE) {
-                /* §5.1: the publisher may terminate a PUBLISH-initiated
-                 * subscription from Pending (Publisher) -- before our
-                 * PUBLISH_OK -- as well as from Established. */
-                if (pe->state != MOQ_PUB_ESTABLISHED &&
-                    pe->state != MOQ_PUB_PENDING_SUBSCRIBER)
-                    return close_with_error(s, 0x3,
-                        "PUBLISH_DONE on non-active publish");
-                moq_d18_publish_done_t pd;
-                rc = moq_d18_decode_publish_done(env.payload, env.payload_len,
-                                                 &pd);
-                if (rc < 0)
-                    return close_with_error(s, 0x3, "malformed PUBLISH_DONE");
-                /* PUBLISH_DONE is terminal: nothing but the FIN may follow. */
-                if (moq_buf_reader_offset(&r) < len)
-                    return close_with_error(s, 0x3,
-                        "extra bytes after PUBLISH_DONE");
-                /* A failed update mandates termination via PUBLISH_DONE(UPDATE_FAILED);
-                 * any other status after an update failure is a violation. */
-                if (pe->update_failed && pd.status_code != 0x8)
-                    return close_with_error(s, 0x3,
-                        "PUBLISH_DONE after update failure must be UPDATE_FAILED");
-                moq_decoded_publish_done_t d;
-                memset(&d, 0, sizeof(d));
-                d.target_slot = pep.slot;
-                d.status_code = pd.status_code;
-                d.stream_count = pd.stream_count;
-                d.reason = pd.reason.data;
-                d.reason_len = pd.reason.len;
-                rc = session_core_on_publish_done(s, &d, false /* drain FIN */);
-                if (rc < 0)
-                    return rc;
-                if (s->state == MOQ_SESS_CLOSED)
-                    return MOQ_OK;
-                *out_consumed = moq_buf_reader_offset(&r);
-                return MOQ_OK;
-            }
-            if (env.msg_type == MOQ_D18_REQUEST_OK &&
-                pe->state == MOQ_PUB_ESTABLISHED && pe->update_pending) {
-                /* The publisher acknowledged our REQUEST_UPDATE (stream-correlated,
-                 * so no request id); surface PUBLICATION_UPDATE_OK and clear the
-                 * pending update. */
-                moq_d18_msg_params_t up;
-                rc = moq_d18_decode_request_update_ok(env.payload,
-                                                      env.payload_len, &up);
-                if (rc < 0)
-                    return close_with_error(s, 0x3, "malformed REQUEST_OK");
-                rc = session_core_on_publish_update_ok(s,
-                        (int)(pe - s->publishes),
-                        up.has_largest, up.largest_group, up.largest_object,
-                        up.has_expires, up.expires_ms);
-                if (rc < 0)
-                    return rc;   /* WOULD_BLOCK: not consumed, retried */
-                if (s->state == MOQ_SESS_CLOSED)
-                    return MOQ_OK;
-                *out_consumed = moq_buf_reader_offset(&r);
-                return MOQ_OK;
-            }
-            if (env.msg_type == MOQ_D18_REQUEST_ERROR &&
-                pe->state == MOQ_PUB_ESTABLISHED && pe->update_pending) {
-                /* The publisher rejected our REQUEST_UPDATE (§10.9): clear the
-                 * pending update and require the terminating PUBLISH_DONE to carry
-                 * UPDATE_FAILED. Further updates are blocked until then. */
-                moq_d18_request_error_t er;
-                rc = moq_d18_decode_request_error(env.payload, env.payload_len,
-                                                  &er);
-                if (rc < 0)
-                    return close_with_error(s, 0x3, "malformed REQUEST_ERROR");
-                pe->update_pending = false;
-                pe->update_request_id = 0;
-                pe->update_has_forward = false;   /* never acknowledged */
-                pe->dt_upd_has_object = false;
-                pe->dt_upd_has_subgroup = false;
-                pe->update_failed = true;
-                *out_consumed = moq_buf_reader_offset(&r);
-                return MOQ_OK;
-            }
-            return close_with_error(s, 0x3,
-                "unexpected message on publish request bidi");
-        }
-    }
-
-    /* An established publisher-side SUBSCRIBE bidi carries only a
-     * REQUEST_UPDATE (GOAWAY was handled above). It consumes a fresh peer
-     * request id; the response correlates by the stream, so the target is the
-     * committed slot, not a by-id lookup. Handle it definitively here, before
-     * the first-message branches, so a peer cannot send a second SUBSCRIBE or
-     * another initial-request message on the established bidi and overwrite or
-     * re-key the live subscription slot. */
-    if (s->subs[slot].state != MOQ_SUB_RECVING_REQUEST) {
-        if (env.msg_type != MOQ_D18_REQUEST_UPDATE ||
-            s->subs[slot].state != MOQ_SUB_ESTABLISHED ||
-            s->subs[slot].role != MOQ_SUB_ROLE_PUBLISHER)
-            return close_with_error(s, 0x3,
-                "unexpected message on subscribe request bidi");
-
-        moq_d18_request_update_t u;
-        rc = moq_d18_decode_request_update(env.payload, env.payload_len, &u);
-        if (rc == MOQ_D18_ERR_KVP_FORMAT)
-            return close_with_error(s, 0x6, "malformed auth token structure");
-        if (rc < 0)
-            return close_with_error(s, 0x3, "malformed REQUEST_UPDATE");
-
-        moq_request_endpoint_t ep;
-        rc = d18_validate_inbound_request_stream(s, ref, env.msg_type,
-                                                 u.request_id, &ep);
-        if (rc < 0)
-            return rc;
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;
-
-        moq_decoded_request_update_t d;
-        memset(&d, 0, sizeof(d));
-        d.endpoint = ep;
-        d.request_id = u.request_id;
-        d.target_kind = MOQ_REQ_SUBSCRIPTION;
-        d.target_slot = slot;
-        d.has_forward = u.params.has_forward;
-        d.forward = u.params.forward != 0;
-        d.has_subscriber_priority = u.params.has_subscriber_priority;
-        d.subscriber_priority = u.params.subscriber_priority;
-        d.has_filter = u.params.has_filter;
-        d.filter_type = u.params.filter_type;
-        d.start_group = u.params.filter_start_group;
-        d.start_object = u.params.filter_start_object;
-        d.end_group = u.params.filter_end_group;
-        D18_FILL_DT(&d, &u.params);
-        (void)d18_map_delivery_timeout(&u.params, &d.has_delivery_timeout,
-                                       &d.delivery_timeout_us);
-        d.has_new_group_request = u.params.has_new_group_request;
-        d.new_group_request = u.params.new_group_request;
-
-        rc = d18_resolve_auth_tokens(s, &u.params, d.tokens, &d.token_count,
-                                     d.token_staged, &d.auth_txn,
-                                     &d.auth_reject_code);
-        if (rc < 0)
-            return rc;            /* NOMEM */
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;        /* cache overflow / duplicate alias */
-
-        rc = session_core_on_request_update(s, &d);
-        if (rc < 0)
-            return rc;
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;
-        *out_consumed = moq_buf_reader_offset(&r);
-        return MOQ_OK;
-    }
-
-    /* The first message on a request stream is the request itself -- i.e. the
-     * peer opening a NEW request. After our GOAWAY (§10.4) that is forbidden.
-     * Messages on an already-committed bidi (GOAWAY / REQUEST_UPDATE /
-     * PUBLISH_DONE / REQUEST_OK ...) were handled and returned above, so
-     * reaching here with one of these first-message types means a fresh
-     * request; refuse it as a protocol violation. */
-    if (session_refuses_new_requests(s) &&
-        (env.msg_type == MOQ_D18_SUBSCRIBE ||
-         env.msg_type == MOQ_D18_PUBLISH ||
-         env.msg_type == MOQ_D18_FETCH ||
-         env.msg_type == MOQ_D18_PUBLISH_NAMESPACE ||
-         env.msg_type == MOQ_D18_TRACK_STATUS ||
-         env.msg_type == MOQ_D18_SUBSCRIBE_TRACKS ||
-         env.msg_type == MOQ_D18_SUBSCRIBE_NAMESPACE))
-        return close_with_error(s, 0x3, "new request after local GOAWAY");
-
-    /* The first message on a request stream is the request itself. */
-    if (env.msg_type == MOQ_D18_SUBSCRIBE) {
-        moq_decoded_subscribe_t d;
-        memset(&d, 0, sizeof(d));
-        moq_d18_subscribe_t sub;
-        rc = moq_d18_decode_subscribe(env.payload, env.payload_len,
-                                      d.track_namespace_parts,
-                                      MOQ_DECODED_MAX_NAMESPACE_PARTS, &sub);
-        if (rc == MOQ_D18_ERR_KVP_FORMAT)
-            return close_with_error(s, 0x6, "malformed auth token structure");
-        if (rc < 0)
-            return close_with_error(s, 0x3, "malformed SUBSCRIBE");
-
-        d.track_namespace = sub.track_namespace; /* parts = d.track_namespace_parts */
-        d.track_name = sub.track_name;
-        d.request_id = sub.request_id;
-        /* Surface the decoded Message Parameters (defaults apply when omitted)
-         * so the publisher/relay sees the real request. */
-        d.subscriber_priority = sub.params.has_subscriber_priority
-            ? sub.params.subscriber_priority : 128;
-        d.group_order = sub.params.has_group_order
-            ? sub.params.group_order : MOQ_GROUP_ORDER_DEFAULT;
-        d.has_forward = true;
-        d.forward = sub.params.has_forward ? (sub.params.forward != 0) : true;
-        d.has_filter = sub.params.has_filter;
-        d.filter_type = sub.params.has_filter
-            ? sub.params.filter_type : MOQ_SUBSCRIBE_FILTER_NONE;
-        d.start_group = sub.params.filter_start_group;
-        d.start_object = sub.params.filter_start_object;
-        d.end_group = sub.params.filter_end_group;
-        D18_FILL_DT(&d, &sub.params);
-        (void)d18_map_delivery_timeout(&sub.params, &d.has_delivery_timeout,
-                                       &d.delivery_timeout_us);
-        d.has_new_group_request = sub.params.has_new_group_request;
-        d.new_group_request = sub.params.new_group_request;
-
-        rc = d18_validate_inbound_request_stream(s, ref, env.msg_type,
-                                                 sub.request_id, &d.endpoint);
-        if (rc < 0)
-            return rc;
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;        /* validate failed closed (bad request id) */
-
-        /* Resolve AUTHORIZATION_TOKEN parameters against the session token cache
-         * (fatal errors close; a message-level reject is carried in
-         * d.auth_reject_code for the core to turn into REQUEST_ERROR). */
-        rc = d18_resolve_auth_tokens(s, &sub.params, d.tokens, &d.token_count,
-                                     d.token_staged, &d.auth_txn,
-                                     &d.auth_reject_code);
-        if (rc < 0)
-            return rc;            /* NOMEM */
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;        /* cache overflow / duplicate alias */
-
-        rc = session_core_on_subscribe(s, &d, slot, fin);
-        if (rc < 0)
-            return rc;
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;        /* core failed/closed (e.g. duplicate) */
-        *out_consumed = moq_buf_reader_offset(&r);
-        return MOQ_OK;
-    }
-
-    /* PUBLISH (§10.10): a publisher-initiated subscription. The first message on
-     * the bidi; the subscriber (us) replies PUBLISH_OK / REQUEST_ERROR. The core
-     * hands the request off from the staging slot to the publishes pool, re-keying
-     * the bidi to MOQ_REQ_PUBLISH. */
-    if (env.msg_type == MOQ_D18_PUBLISH) {
-        moq_decoded_publish_t d;
-        memset(&d, 0, sizeof(d));
-        moq_d18_publish_t pub;
-        rc = moq_d18_decode_publish(env.payload, env.payload_len,
-                                    d.track_namespace_parts,
-                                    MOQ_DECODED_MAX_NAMESPACE_PARTS, &pub);
-        if (rc == MOQ_D18_ERR_KVP_FORMAT)
-            return close_with_error(s, 0x6, "malformed auth token structure");
-        if (rc < 0)
-            return close_with_error(s, 0x3, "malformed PUBLISH");
-
-        d.track_namespace = pub.track_namespace; /* parts = d.track_namespace_parts */
-        d.track_name = pub.track_name;
-        d.request_id = pub.request_id;
-        d.track_alias = pub.track_alias;
-        /* Omitted FORWARD means forward = 1 (§5.4.1). */
-        d.has_forward = true;
-        d.forward = pub.params.has_forward ? (pub.params.forward != 0) : true;
-        d.track_properties = pub.track_properties.data;
-        d.track_properties_len = pub.track_properties.len;
-        d.track_properties_unsupported = pub.track_properties_unsupported;
-        d.dynamic_groups = pub.dynamic_groups;
-        d.has_largest = pub.params.has_largest;
-        d.largest_group = pub.params.largest_group;
-        d.largest_object = pub.params.largest_object;
-        d.has_expires = pub.params.has_expires;
-        d.expires_ms = pub.params.expires_ms;
-
-        rc = d18_validate_inbound_request_stream(s, ref, env.msg_type,
-                                                 pub.request_id, &d.endpoint);
-        if (rc < 0)
-            return rc;
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;
-
-        rc = d18_resolve_auth_tokens(s, &pub.params, d.tokens, &d.token_count,
-                                     d.token_staged, &d.auth_txn,
-                                     &d.auth_reject_code);
-        if (rc < 0)
-            return rc;            /* NOMEM */
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;        /* cache overflow / duplicate alias */
-
-        /* `fin` here is the staging owner's observed request FIN, which
-         * `handle_request_stream_bytes()` supplies from its retained latch --
-         * not merely this transport call's flag. */
-        rc = session_core_on_publish(s, &d, fin);
-        if (rc < 0)
-            return rc;
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;        /* core failed closed (e.g. duplicate alias) */
-        *out_consumed = moq_buf_reader_offset(&r);
-        return MOQ_OK;
-    }
-
-    if (env.msg_type == MOQ_D18_FETCH) {
-        moq_decoded_fetch_t fd;
-        memset(&fd, 0, sizeof(fd));
-        fd.joining_sub_slot = -1;
-        fd.joining_pub_slot = -1;
-        moq_d18_fetch_t f;
-        rc = moq_d18_decode_fetch(env.payload, env.payload_len,
-                                  fd.track_namespace_parts,
-                                  MOQ_DECODED_MAX_NAMESPACE_PARTS, &f);
-        if (rc == MOQ_D18_ERR_KVP_FORMAT)
-            return close_with_error(s, 0x6, "malformed auth token structure");
-        if (rc < 0)
-            return close_with_error(s, 0x3, "malformed FETCH");
-
-        fd.request_id = f.request_id;
-        fd.fetch_type = (uint32_t)f.fetch_type;
-        fd.track_namespace = f.track_namespace; /* parts = fd.track_namespace_parts */
-        fd.track_name = f.track_name;
-        fd.start_group = f.start.group;
-        fd.start_object = f.start.object;
-        fd.end_group = f.end.group;
-        fd.end_object = f.end.object;
-        fd.joining_request_id = f.joining_request_id;
-        fd.joining_start = f.joining_start;
-        fd.subscriber_priority = f.params.has_subscriber_priority
-            ? f.params.subscriber_priority : 128;
-        /* Omitted GROUP_ORDER on a FETCH means Ascending (§10.2.8). */
-        fd.group_order = f.params.has_group_order
-            ? f.params.group_order : MOQ_GROUP_ORDER_ASCENDING;
-
-        rc = d18_validate_inbound_request_stream(s, ref, env.msg_type,
-                                                 f.request_id, &fd.endpoint);
-        if (rc < 0)
-            return rc;
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;
-
-        rc = d18_resolve_auth_tokens(s, &f.params, fd.tokens, &fd.token_count,
-                                     fd.token_staged, &fd.auth_txn,
-                                     &fd.auth_reject_code);
-        if (rc < 0)
-            return rc;            /* NOMEM */
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;        /* cache overflow / duplicate alias */
-
-        fd.request_fin = fin;     /* request bidi FIN'd in this chunk? */
-        rc = session_core_on_fetch(s, &fd);
-        if (rc < 0)
-            return rc;
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;        /* core failed closed (e.g. joining/pool-full) */
-        *out_consumed = moq_buf_reader_offset(&r);
-        return MOQ_OK;
-    }
-
-    if (env.msg_type == MOQ_D18_PUBLISH_NAMESPACE) {
-        moq_decoded_publish_namespace_t d;
-        memset(&d, 0, sizeof(d));
-        moq_d18_publish_namespace_t pn;
-        rc = moq_d18_decode_publish_namespace(env.payload, env.payload_len,
-                                              d.track_namespace_parts,
-                                              MOQ_DECODED_MAX_NAMESPACE_PARTS, &pn);
-        if (rc == MOQ_D18_ERR_KVP_FORMAT)
-            return close_with_error(s, 0x6, "malformed auth token structure");
-        if (rc < 0)
-            return close_with_error(s, 0x3, "malformed PUBLISH_NAMESPACE");
-
-        d.track_namespace = pn.track_namespace; /* parts = d.track_namespace_parts */
-        d.request_id = pn.request_id;
-
-        rc = d18_validate_inbound_request_stream(s, ref, env.msg_type,
-                                                 pn.request_id, &d.endpoint);
-        if (rc < 0)
-            return rc;
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;
-
-        rc = d18_resolve_auth_tokens(s, &pn.params, d.tokens, &d.token_count,
-                                     d.token_staged, &d.auth_txn,
-                                     &d.auth_reject_code);
-        if (rc < 0)
-            return rc;            /* NOMEM */
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;        /* cache overflow / duplicate alias */
-
-        /* The staging owner's observed request FIN (see PUBLISH above). */
-        rc = session_core_on_publish_namespace(s, &d, fin);
-        if (rc < 0)
-            return rc;
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;
-        *out_consumed = moq_buf_reader_offset(&r);
-        return MOQ_OK;
-    }
-
-    if (env.msg_type == MOQ_D18_TRACK_STATUS) {
-        moq_decoded_track_status_request_t d;
-        memset(&d, 0, sizeof(d));
-        moq_d18_track_status_t ts;
-        rc = moq_d18_decode_track_status(env.payload, env.payload_len,
-                                         d.track_namespace_parts,
-                                         MOQ_DECODED_MAX_NAMESPACE_PARTS, &ts);
-        if (rc == MOQ_D18_ERR_KVP_FORMAT)
-            return close_with_error(s, 0x6, "malformed auth token structure");
-        if (rc < 0)
-            return close_with_error(s, 0x3, "malformed TRACK_STATUS");
-
-        d.track_namespace = ts.track_namespace; /* parts = d.track_namespace_parts */
-        d.track_name = ts.track_name;
-
-        rc = d18_validate_inbound_request_stream(s, ref, env.msg_type,
-                                                 ts.request_id, &d.endpoint);
-        if (rc < 0)
-            return rc;
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;
-
-        rc = d18_resolve_auth_tokens(s, &ts.params, d.tokens, &d.token_count,
-                                     d.token_staged, &d.auth_txn,
-                                     &d.auth_reject_code);
-        if (rc < 0)
-            return rc;            /* NOMEM */
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;        /* cache overflow / duplicate alias */
-
-        rc = session_core_on_track_status_request(s, &d, fin);
-        if (rc < 0)
-            return rc;
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;
-        /* TRACK_STATUS is the first and only message, so the requester's FIN
-         * rides this chunk. The commit re-keyed the bidi to the new owner; the
-         * FIN is handed over and driven through this family's own FIN handling
-         * by the request-stream handoff, not recorded here. */
-        *out_consumed = moq_buf_reader_offset(&r);
-        return MOQ_OK;
-    }
-
-    if (env.msg_type == MOQ_D18_SUBSCRIBE_TRACKS) {
-        moq_decoded_subscribe_tracks_request_t d;
-        memset(&d, 0, sizeof(d));
-        moq_d18_subscribe_tracks_t st;
-        rc = moq_d18_decode_subscribe_tracks(env.payload, env.payload_len,
-                                             d.prefix_parts,
-                                             MOQ_DECODED_MAX_NAMESPACE_PARTS, &st);
-        if (rc == MOQ_D18_ERR_KVP_FORMAT)
-            return close_with_error(s, 0x6, "malformed auth token structure");
-        if (rc < 0)
-            return close_with_error(s, 0x3, "malformed SUBSCRIBE_TRACKS");
-
-        d.track_namespace_prefix = st.track_namespace_prefix; /* parts = d.prefix_parts */
-        d.forward = st.params.has_forward ? (st.params.forward != 0) : true;
-
-        rc = d18_validate_inbound_request_stream(s, ref, env.msg_type,
-                                                 st.request_id, &d.endpoint);
-        if (rc < 0)
-            return rc;
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;
-
-        rc = d18_resolve_auth_tokens(s, &st.params, d.tokens, &d.token_count,
-                                     d.token_staged, &d.auth_txn,
-                                     &d.auth_reject_code);
-        if (rc < 0)
-            return rc;            /* NOMEM */
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;        /* cache overflow / duplicate alias */
-
-        rc = session_core_on_subscribe_tracks(s, &d, fin);
-        if (rc < 0)
-            return rc;
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;
-        *out_consumed = moq_buf_reader_offset(&r);
-        return MOQ_OK;
-    }
-
-    if (env.msg_type == MOQ_D18_SUBSCRIBE_NAMESPACE) {
-        /* Hand the request off to the namespace-sub pool, then drive the shared
-         * ns_sub commit. Buffer the full message into a fresh ns_sub entry (keyed
-         * in idx_ns_by_ref, which owns the bidi from here) and process it; the
-         * core releases this generic staging slot once the ns_sub entry owns the
-         * bidi -- including on a WOULD_BLOCK, which the index-first router sends
-         * to the ns_sub path, never back here. The retry is therefore carried by
-         * the ns_sub entry, not this staging slot; the idx_ns_by_ref lookup makes
-         * the create idempotent. The decode (and any malformed-token close) lives
-         * in the ns_sub profile op driven by the shared handler. */
-        size_t msg_len = moq_buf_reader_offset(&r);
-        int32_t ns_slot = moq_index_find(s->idx_ns_by_ref, s->idx_ns_mask, ref._v);
-        if (ns_slot < 0) {
-            rc = ns_sub_on_new_bidi(s, ref, buf, msg_len);
-            if (rc == MOQ_ERR_BUFFER)
-                return close_with_error(s, 0x3,
-                    "SUBSCRIBE_NAMESPACE too large for buffer");
-            if (rc < 0)
-                return rc;            /* WOULD_BLOCK: ns_sub pool full; nothing
-                                       * consumed, staging retained for re-feed */
-            ns_slot = moq_index_find(s->idx_ns_by_ref, s->idx_ns_mask, ref._v);
-        }
-        /* The message bytes are now owned by the ns_sub entry, so report them
-         * consumed even if processing blocks. This lets the core's handoff cleanup
-         * detect (and reject) any trailing bytes the same chunk carried after the
-         * SUBSCRIBE_NAMESPACE envelope, on the WOULD_BLOCK path as on the OK path. */
-        *out_consumed = msg_len;
-        /* The ownership transition is HERE: this entry now owns the bidi and the
-         * request bytes, and the core will release the generic staging slot even
-         * if processing refuses below. So a FIN that rode the creating
-         * SUBSCRIBE_NAMESPACE becomes this entry's transitional ownership NOW --
-         * before any event-, scratch- or action-capacity refusal can strand it.
-         * It is never written into `pending_fin`, and it is installed only on
-         * this draft-18 handoff: a draft-16 direct request reaches the shared
-         * commit by another route and must not acquire it. */
-        if (fin) s->ns_subs[ns_slot].handoff_fin_pending = true;
-        rc = ns_sub_process_recving_publisher(s, ns_slot, fin);
-        if (rc < 0)
-            return rc;                /* WOULD_BLOCK keeps the entry for a re-feed */
-        return MOQ_OK;
-    }
-
-    return close_with_error(s, 0x3, "unexpected first request message");
-}
-
 /* SUBSCRIBE_OK encode. The bidi stream correlates the response, so no request
  * id is carried. LARGEST_OBJECT / EXPIRES travel as Message Parameters; the
  * Track Properties tail is carried opaquely (validated by the codec). */
@@ -1848,24 +948,27 @@ static moq_result_t d18_encode_subscribe_ok(
         p.has_expires = true;
         p.expires_ms = args->expires_ms;
     }
-    moq_bytes_t props = { args->track_properties, args->track_properties_len };
+    moq_bytes_t props = {
+        args->omit_track_properties ? NULL : args->track_properties,
+        args->omit_track_properties ? 0 : args->track_properties_len
+    };
     return moq_d18_encode_subscribe_ok(w, args->track_alias, &p, props);
 }
 
-/* REQUEST_ERROR encode. No request id (stream-correlated). The wire Retry
- * Interval is "the minimum time (in milliseconds) before the request SHOULD be
- * sent again, plus one. If the value is 0, the request SHOULD NOT be retried"
- * (§10.6), so an offered retry of N ms is N + 1 on the wire and no retry is 0.
- * The optional Redirect structure (§10.6.1) is encoded when args->has_redirect
- * (an all-empty Redirect is valid). */
+/* REQUEST_ERROR encode. No request id (stream-correlated). Retry Interval is
+ * "the minimum time (in milliseconds) before the request SHOULD be sent again,
+ * plus one", 0 when retry is not offered (§10.6.2). The optional Redirect
+ * structure (§10.6.1) is encoded when args->has_redirect (an all-empty
+ * Redirect is valid). */
 static moq_result_t d18_encode_request_error(
     moq_session_t *s, struct moq_buf_writer *w,
     const struct moq_request_error_encode_args *args)
 {
     (void)s;
     moq_bytes_t reason = { args->reason, args->reason_len };
-    if (args->can_retry && args->retry_after_ms == UINT64_MAX) return MOQ_ERR_INVAL;
-    uint64_t retry = args->can_retry ? args->retry_after_ms + 1u : 0;
+    if (args->can_retry && args->retry_after_ms >= MOQ_VI64_MAX)
+        return MOQ_ERR_INVAL;   /* the plus-one form has no wire value */
+    uint64_t retry = args->can_retry ? args->retry_after_ms + 1 : 0;
     if (args->has_redirect) {
         moq_d18_redirect_t rd = {
             .connect_uri     = { args->connect_uri, args->connect_uri_len },
@@ -1897,6 +1000,7 @@ static moq_result_t d18_encode_request_update(
     const struct moq_request_update_encode_args *args)
 {
     (void)s;
+    if (args->sender != MOQ_UPDATE_SENDER_SUBSCRIBER) return MOQ_ERR_UNSUPPORTED;
     moq_d18_msg_params_t p;
     memset(&p, 0, sizeof(p));
     p.has_forward = args->has_forward;
@@ -2014,12 +1118,79 @@ static moq_result_t d18_encode_fetch_ok_op(
     return moq_d18_encode_fetch_ok(w, args->end_of_track, end, props);
 }
 
+/* An Object Property block as the profile receives it. Draft-18 refuses every
+ * structural or semantic failure (MOQ_ERR_PROTO, a session close). With
+ * `track_scoped` the failures draft-22 makes Track-level are reported in
+ * *malformed instead (§3.7, §10.7, §10.8, §10.9, §12.1). The Prior Group and
+ * Object ID Gaps are reported for a block without such a failure. */
+#define D18_OBJECT_PROP_PRIOR_GROUP_GAP  0x3Cu   /* §12.8 */
+#define D18_OBJECT_PROP_PRIOR_OBJECT_GAP 0x3Eu   /* §12.9 */
+
+_Static_assert(MOQ_OBJ_PROPS_UNPARSEABLE == MOQ_MALFORMED_PROPS_UNPARSEABLE &&
+               MOQ_OBJ_PROPS_NESTED_IMMUTABLE == MOQ_MALFORMED_NESTED_IMMUTABLE &&
+               MOQ_OBJ_PROPS_DUPLICATE_IMMUTABLE ==
+                   MOQ_MALFORMED_DUPLICATE_IMMUTABLE &&
+               MOQ_OBJ_PROPS_MANDATORY == MOQ_MALFORMED_MANDATORY_PROPERTY &&
+               MOQ_OBJ_PROPS_DUPLICATE_GAP == MOQ_MALFORMED_DUPLICATE_GAP,
+               "property violations share the malformed reason values");
+
+moq_result_t moq_d18_op_scan_object_gaps(const uint8_t *props, size_t len,
+                                         moq_obj_gaps_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    moq_obj_props_scan_t scan;
+    moq_result_t rc = moq_d18_scan_object_properties(props, len, &scan);
+    if (rc < 0) return rc;
+    out->has_group_gap = scan.has_prior_group_gap;
+    out->group_gap = scan.prior_group_gap;
+    out->has_object_gap = scan.has_prior_object_gap;
+    out->object_gap = scan.prior_object_gap;
+    return MOQ_OK;
+}
+
+/* A Prior Group/Object ID Gap is one property whether it sits in the list or
+ * inside Immutable Properties (§12.7, draft-22 §10.7), and an Object carries
+ * at most one instance (§12.8/§12.9, draft-22 §10.8/§10.9): an equal value
+ * already stated in either place is kept as it is, a different one or a
+ * second instance is refused, and the Immutable Properties are never
+ * rewritten. */
+moq_result_t moq_d18_op_add_object_gap(const uint8_t *in, size_t len,
+                                       bool object_gap, uint64_t value,
+                                       uint8_t *out, size_t cap, size_t *out_len)
+{
+    return moq_kvp_list_merge_int(in, len, true,
+                                  object_gap ? D18_OBJECT_PROP_PRIOR_OBJECT_GAP
+                                             : D18_OBJECT_PROP_PRIOR_GROUP_GAP,
+                                  value, D18_PROP_IMMUTABLE_PROPERTIES, out, cap, out_len);
+}
+
+static moq_result_t d18_object_props(const uint8_t *pp, size_t len,
+                                     bool track_scoped, uint8_t *malformed,
+                                     moq_obj_gaps_t *gaps)
+{
+    if (!track_scoped) {
+        moq_result_t prc = moq_d18_validate_properties(pp, len);
+        if (prc < 0) return prc;
+    }
+    moq_obj_props_scan_t scan;
+    moq_result_t src = moq_d18_scan_object_properties(pp, len, &scan);
+    if (src < 0) return src;
+    if (track_scoped) *malformed = scan.malformed;
+    if (scan.malformed == MOQ_OBJ_PROPS_OK) {
+        gaps->has_group_gap = scan.has_prior_group_gap;
+        gaps->group_gap = scan.prior_group_gap;
+        gaps->has_object_gap = scan.has_prior_object_gap;
+        gaps->object_gap = scan.prior_object_gap;
+    }
+    return MOQ_OK;
+}
+
 /* -- Fetch data plane (draft-18 §11.4.4) --------------------------- *
  * FETCH_HEADER (Request ID) leads a fetch data uni; objects follow with a vi64
  * Serialization Flags field. Object Properties (0x20) and the Datagram forwarding-
  * preference bit (0x40, §11.4.4.1 -- the subgroup LSBs are ignored) are supported
- * in both directions. Group reconstruction is ascending-only; the session refuses
- * a DESCENDING fetch request via the fetch_descending_supported capability. */
+ * in both directions. Group reconstruction uses the request's retained order;
+ * draft-18's local descending-request refusal remains a separate policy. */
 #define D18_FETCH_OBJ_SUBGROUP_MASK  0x03u
 #define D18_FETCH_OBJ_OBJECT_DELTA   0x04u
 #define D18_FETCH_OBJ_GROUP_DELTA    0x08u
@@ -2029,7 +1200,7 @@ static moq_result_t d18_encode_fetch_ok_op(
 #define D18_FETCH_END_NON_EXISTENT   0x8Cu
 #define D18_FETCH_END_UNKNOWN        0x10Cu
 
-static moq_result_t d18_decode_fetch_header_op(
+moq_result_t moq_d18_op_decode_fetch_header(
     moq_session_t *s, moq_buf_reader_t *r,
     moq_decoded_fetch_stream_header_t *out)
 {
@@ -2039,9 +1210,13 @@ static moq_result_t d18_decode_fetch_header_op(
 
 static moq_result_t d18_decode_fetch_object_op(
     moq_session_t *s, moq_buf_reader_t *r,
+    moq_group_order_t effective_order,
     const moq_fetch_prior_object_t *prev, moq_decoded_fetch_object_t *out)
 {
-    (void)s;
+    bool track_scoped = s && s->profile && s->profile->malformed_track_local;
+    if (effective_order != MOQ_GROUP_ORDER_ASCENDING &&
+        effective_order != MOQ_GROUP_ORDER_DESCENDING)
+        return MOQ_ERR_INVAL;
     memset(out, 0, sizeof(*out));
 
     uint64_t flags;
@@ -2080,8 +1255,6 @@ static moq_result_t d18_decode_fetch_object_op(
         if (!has_group || !has_object || !has_priority || refs_prior_subgroup)
             return MOQ_ERR_PROTO;
     }
-    /* A present group delta requires the (absolute) object id alongside it. */
-    if (has_group && !has_object) return MOQ_ERR_PROTO;
     /* References to prior actual-object metadata require such an object. */
     if (refs_prior_subgroup && !has_act) return MOQ_ERR_PROTO;
     if (!has_priority && !has_act) return MOQ_ERR_PROTO;
@@ -2107,10 +1280,15 @@ static moq_result_t d18_decode_fetch_object_op(
     if (flags & D18_FETCH_OBJ_PROPERTIES) {
         uint64_t props_len;
         if (moq_buf_read_vi64(r, &props_len) < 0) return MOQ_ERR_BUFFER;
-        if ((size_t)props_len > moq_buf_reader_remaining(r)) return MOQ_ERR_BUFFER;
+        /* Compare at full width: a length beyond the buffered input (which
+         * includes any length above SIZE_MAX) waits for more bytes rather than
+         * narrowing to a smaller size_t. */
+        if (props_len > moq_buf_reader_remaining(r)) return MOQ_ERR_BUFFER;
         if (props_len > 0) {
             const uint8_t *pp = moq_buf_reader_ptr(r);
-            moq_result_t prc = moq_d18_validate_properties(pp, (size_t)props_len);
+            moq_result_t prc = d18_object_props(pp, (size_t)props_len,
+                                                track_scoped, &out->malformed,
+                                                &out->gaps);
             if (prc < 0) return prc;
             out->properties = pp;
             out->properties_len = (size_t)props_len;
@@ -2129,21 +1307,26 @@ static moq_result_t d18_decode_fetch_object_op(
     if (has_group) {
         if (!has_loc) {
             group_id = group_delta;
+        } else if (effective_order == MOQ_GROUP_ORDER_DESCENDING) {
+            if (group_delta >= pg) return MOQ_ERR_PROTO;
+            group_id = pg - group_delta - 1;
         } else {
-            /* Ascending order (the only order this profile emits/accepts). */
-            if (group_delta > UINT64_MAX - 1 - pg) return MOQ_ERR_PROTO;
+            if (pg == UINT64_MAX || group_delta > UINT64_MAX - pg - 1)
+                return MOQ_ERR_PROTO;
             group_id = pg + group_delta + 1;
         }
-        object_id = obj_delta;                 /* absolute within the new group */
     } else {
         group_id = pg;
-        if (has_object) {
-            if (obj_delta > UINT64_MAX - po) return MOQ_ERR_PROTO;
-            object_id = po + obj_delta;
-        } else {
-            if (po == UINT64_MAX) return MOQ_ERR_PROTO;
-            object_id = po + 1;
-        }
+    }
+    if (!has_object) {
+        /* An omitted Object Delta increments the prior ID across groups too. */
+        if (po == UINT64_MAX) return MOQ_ERR_PROTO;
+        object_id = po + 1;
+    } else if (has_group) {
+        object_id = obj_delta;
+    } else {
+        if (obj_delta > UINT64_MAX - po) return MOQ_ERR_PROTO;
+        object_id = po + obj_delta;
     }
     switch (sg_mode) {
     case 0x00: subgroup = 0; break;
@@ -2163,12 +1346,16 @@ static moq_result_t d18_decode_fetch_object_op(
     return MOQ_OK;
 }
 
-static moq_result_t d18_encode_fetch_object_op(
+moq_result_t moq_d18_op_encode_fetch_object(
     moq_session_t *s, moq_buf_writer_t *w,
+    moq_group_order_t effective_order,
     const moq_fetch_object_encode_args_t *args,
     const moq_fetch_prior_object_t *prev)
 {
     (void)s;
+    if (effective_order != MOQ_GROUP_ORDER_ASCENDING &&
+        effective_order != MOQ_GROUP_ORDER_DESCENDING)
+        return MOQ_ERR_INVAL;
     bool has_loc = prev && prev->has_prev;
     bool has_act = prev && prev->has_actual;
     /* Always carry priority so an object never references prior-object priority
@@ -2201,17 +1388,24 @@ static moq_result_t d18_encode_fetch_object_op(
 
     bool new_group = !has_loc || args->group_id != prev->group_id;
     if (new_group) {
-        if (has_loc && args->group_id <= prev->group_id)
-            return MOQ_ERR_INVAL;              /* ascending only (MVP) */
+        if (!has_loc) {
+            group_delta = args->group_id;
+        } else if (effective_order == MOQ_GROUP_ORDER_DESCENDING) {
+            if (args->group_id >= prev->group_id) return MOQ_ERR_INVAL;
+            group_delta = prev->group_id - args->group_id - 1;
+        } else {
+            if (args->group_id <= prev->group_id) return MOQ_ERR_INVAL;
+            group_delta = args->group_id - prev->group_id - 1;
+        }
         flags |= D18_FETCH_OBJ_GROUP_DELTA | D18_FETCH_OBJ_OBJECT_DELTA;
-        group_delta = has_loc ? args->group_id - prev->group_id - 1
-                              : args->group_id;
         obj_delta = args->object_id;           /* absolute within the group */
-    } else if (args->object_id != prev->object_id + 1) {
-        if (args->object_id <= prev->object_id)
-            return MOQ_ERR_INVAL;              /* ascending only (MVP) */
-        flags |= D18_FETCH_OBJ_OBJECT_DELTA;
-        obj_delta = args->object_id - prev->object_id;
+    } else {
+        /* Check progress before the omission predicate can wrap MAX + 1. */
+        if (args->object_id <= prev->object_id) return MOQ_ERR_INVAL;
+        if (args->object_id != prev->object_id + 1) {
+            flags |= D18_FETCH_OBJ_OBJECT_DELTA;
+            obj_delta = args->object_id - prev->object_id;
+        }
     }
 
     size_t saved = w->pos;
@@ -2260,7 +1454,7 @@ static moq_result_t d18_encode_fetch_range_op(
     return rc;
 }
 
-static moq_result_t d18_encode_fetch_header_op(
+moq_result_t moq_d18_op_encode_fetch_header(
     moq_session_t *s, struct moq_buf_writer *w, uint64_t request_id)
 {
     (void)s;
@@ -2271,488 +1465,12 @@ static moq_result_t d18_encode_fetch_header_op(
  * stream. The core passes the request `kind`; the first response must be valid
  * for it (SUBSCRIBE_OK / FETCH_OK, or the shared REQUEST_ERROR). The core owns
  * the slot, buffering, and lifecycle. */
-static moq_result_t d18_process_response_stream(
-    moq_session_t *s, moq_stream_ref_t ref, int slot, uint32_t kind,
-    const uint8_t *buf, size_t len, bool fin, size_t *out_consumed)
-{
-    *out_consumed = 0;
-
-    moq_buf_reader_t r;
-    moq_buf_reader_init(&r, buf, len);
-    moq_control_envelope_t env;
-    moq_result_t rc = moq_d18_decode_envelope(&r, &env);
-    if (rc == MOQ_ERR_BUFFER)
-        return MOQ_OK;            /* incomplete; the core waits / handles FIN */
-    if (rc < 0)
-        return close_with_error(s, 0x3, "malformed response envelope");
-
-    /* A GOAWAY on this (committed) request bidi migrates the single request
-     * (§10.4). The opener side already has the committed (kind, slot). */
-    if (env.msg_type == MOQ_D18_GOAWAY) {
-        moq_request_family_t fam = d18_family_from_req_kind(kind);
-        if (fam == (moq_request_family_t)0)
-            return close_with_error(s, 0x3, "GOAWAY on unsupported request kind");
-        return d18_request_goaway(s, ref, fam, slot, &env, &r, len, fin,
-                                  out_consumed);
-    }
-
-    /* REQUEST_ERROR is valid for either request kind; route by kind and state. */
-    if (env.msg_type == MOQ_D18_REQUEST_ERROR) {
-        moq_d18_request_error_t er;
-        moq_d18_redirect_t wire_rd;
-        moq_bytes_t rd_parts[MOQ_DECODED_MAX_NAMESPACE_PARTS];
-        rc = moq_d18_decode_request_error_redirect(env.payload, env.payload_len,
-                 rd_parts, MOQ_DECODED_MAX_NAMESPACE_PARTS, &er, &wire_rd);
-        if (rc < 0)
-            return close_with_error(s, 0x3, "malformed REQUEST_ERROR");
-        size_t off = moq_buf_reader_offset(&r);
-        /* §10.6: wire Retry Interval = minimum milliseconds + 1; 0 = no retry. */
-        bool can_retry = er.retry_interval != 0;
-        uint64_t retry_ms = can_retry ? er.retry_interval - 1u : 0;
-
-        /* REDIRECT (§10.6) carries a Redirect tail and is valid only for SUBSCRIBE,
-         * FETCH, TRACK_STATUS and PUBLISH_NAMESPACE here (SUBSCRIBE_NAMESPACE is on
-         * its own response path); it is a protocol violation on any other family,
-         * and on an established subscription's update. */
-        bool is_redirect = (er.error_code == MOQ_D18_ERROR_REDIRECT);
-        moq_decoded_redirect_t rd_core;
-        const moq_decoded_redirect_t *redirect = NULL;
-        if (is_redirect) {
-            if (kind == (uint32_t)MOQ_REQ_PUBLISH ||
-                kind == (uint32_t)MOQ_REQ_SUBSCRIBE_TRACKS)
-                return close_with_error(s, 0x3,
-                    "REDIRECT on a family that does not permit it");
-            if (s->perspective == MOQ_PERSPECTIVE_SERVER &&
-                wire_rd.connect_uri.len > 0)
-                return close_with_error(s, 0x3,
-                    "server received REDIRECT with non-zero Connect URI");
-            if (kind == (uint32_t)MOQ_REQ_ANNOUNCEMENT &&
-                wire_rd.track_name.len > 0)
-                return close_with_error(s, 0x3,
-                    "REDIRECT Track Name on namespace-scoped request");
-            rd_core.connect_uri = wire_rd.connect_uri.data;
-            rd_core.connect_uri_len = wire_rd.connect_uri.len;
-            rd_core.track_namespace = wire_rd.track_namespace;   /* parts in rd_parts */
-            rd_core.track_name = wire_rd.track_name.data;
-            rd_core.track_name_len = wire_rd.track_name.len;
-            redirect = &rd_core;
-        }
-
-        if (kind == (uint32_t)MOQ_REQ_FETCH) {
-            /* Terminal for a fetch: nothing follows on the bidi. */
-            if (off < len)
-                return close_with_error(s, 0x3, "extra bytes after REQUEST_ERROR");
-            /* Defer the free: the core drains the request stream's FIN. */
-            rc = session_core_on_fetch_error(s, slot, er.error_code, can_retry,
-                retry_ms, er.reason.data, er.reason.len, false, redirect);
-        } else if (kind == (uint32_t)MOQ_REQ_ANNOUNCEMENT) {
-            /* Terminal rejection of a pending PUBLISH_NAMESPACE. A REQUEST_ERROR
-             * after the announcement is established is not a valid response. */
-            if (s->announcements[slot].state != MOQ_ANN_PENDING_ANNOUNCER)
-                return close_with_error(s, 0x3,
-                    "REQUEST_ERROR on non-pending announcement");
-            if (off < len)
-                return close_with_error(s, 0x3, "extra bytes after REQUEST_ERROR");
-            moq_decoded_announcement_error_t d;
-            memset(&d, 0, sizeof(d));
-            d.target_slot = slot;
-            d.error_code = er.error_code;
-            d.can_retry = can_retry;
-            d.retry_after_ms = retry_ms;
-            d.reason = er.reason.data;
-            d.reason_len = er.reason.len;
-            rc = session_core_on_announcement_error(s, &d, redirect);
-        } else if (kind == (uint32_t)MOQ_REQ_TRACK_STATUS) {
-            /* Terminal: a failed TRACK_STATUS; nothing follows but the FIN. */
-            if (off < len)
-                return close_with_error(s, 0x3, "extra bytes after REQUEST_ERROR");
-            rc = session_core_on_track_status_error(s, slot, er.error_code,
-                can_retry, retry_ms, er.reason.data, er.reason.len,
-                redirect);
-        } else if (kind == (uint32_t)MOQ_REQ_SUBSCRIBE_TRACKS) {
-            /* Terminal first-response rejection of a pending SUBSCRIBE_TRACKS.
-             * REDIRECT is not permitted here (excluded above). */
-            if (s->track_subs[slot].state != MOQ_TRACK_SUB_PENDING_SUBSCRIBER)
-                return close_with_error(s, 0x3,
-                    "REQUEST_ERROR on non-pending subscribe-tracks");
-            if (off < len)
-                return close_with_error(s, 0x3, "extra bytes after REQUEST_ERROR");
-            rc = session_core_on_subscribe_tracks_error(s, slot, er.error_code,
-                can_retry, retry_ms, er.reason.data, er.reason.len);
-        } else if (kind == (uint32_t)MOQ_REQ_PUBLISH) {
-            /* Terminal rejection of a pending outbound PUBLISH. REDIRECT is not
-             * permitted here (excluded above). */
-            if (s->publishes[slot].state != MOQ_PUB_PENDING_PUBLISHER)
-                return close_with_error(s, 0x3,
-                    "REQUEST_ERROR on non-pending publish");
-            if (off < len)
-                return close_with_error(s, 0x3, "extra bytes after REQUEST_ERROR");
-            /* Defer the free: the core drains the request stream's FIN and closes
-             * our send half reciprocally. */
-            rc = session_core_on_publish_error(s, slot, er.error_code, can_retry,
-                retry_ms, er.reason.data, er.reason.len, false);
-        } else if (s->subs[slot].state == MOQ_SUB_ESTABLISHED) {
-            /* A REQUEST_ERROR on an established subscription is an update
-             * failure: clear the pending update. The publisher must follow with
-             * PUBLISH_DONE(UPDATE_FAILED) to terminate the subscription, so more
-             * messages may follow -- do not reject trailing bytes here. REDIRECT
-             * is not a valid update response. */
-            if (is_redirect)
-                return close_with_error(s, 0x3,
-                    "REDIRECT on a subscription update");
-            rc = session_core_on_subscribe_update_error(s, slot);
-        } else {
-            /* First-response rejection of a pending subscription: terminal. */
-            if (off < len)
-                return close_with_error(s, 0x3, "extra bytes after REQUEST_ERROR");
-            moq_decoded_subscribe_error_t d;
-            memset(&d, 0, sizeof(d));
-            d.target_slot = slot;
-            d.error_code = er.error_code;
-            d.can_retry = can_retry;
-            d.retry_after_ms = retry_ms;
-            d.reason = er.reason.data;
-            d.reason_len = er.reason.len;
-            rc = session_core_on_subscribe_error(s, &d, false, redirect);
-        }
-        if (rc < 0)
-            return rc;
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;
-        *out_consumed = off;
-        return MOQ_OK;
-    }
-
-    /* PUBLISH_DONE terminates an established subscription (publisher -> the
-     * subscriber); it is the final message before FIN. §5.1: the publisher
-     * terminates only Established or Pending (Publisher) -- PUBLISH-initiated
-     * -- subscriptions this way; a pending SUBSCRIBE must receive exactly one
-     * SUBSCRIBE_OK or REQUEST_ERROR first, so PUBLISH_DONE is accepted only
-     * once the subscription is established. Surface SUBSCRIBE_DONE and keep
-     * the entry to drain the FIN. */
-    if (kind == (uint32_t)MOQ_REQ_SUBSCRIPTION &&
-        env.msg_type == MOQ_D18_PUBLISH_DONE &&
-        s->subs[slot].state == MOQ_SUB_ESTABLISHED) {
-        moq_d18_publish_done_t pd;
-        rc = moq_d18_decode_publish_done(env.payload, env.payload_len, &pd);
-        if (rc < 0)
-            return close_with_error(s, 0x3, "malformed PUBLISH_DONE");
-        /* A failed update mandates termination via PUBLISH_DONE(UPDATE_FAILED);
-         * any other status after an update failure is a protocol violation. */
-        if (s->subs[slot].update_failed && pd.status_code != 0x8)
-            return close_with_error(s, 0x3,
-                "PUBLISH_DONE after update failure must be UPDATE_FAILED");
-        moq_decoded_publish_done_t d;
-        memset(&d, 0, sizeof(d));
-        d.target_slot = slot;
-        d.status_code = pd.status_code;
-        d.stream_count = pd.stream_count;
-        d.reason = pd.reason.data;
-        d.reason_len = pd.reason.len;
-        rc = session_core_on_subscribe_done(s, slot, &d, false /* drain FIN */);
-        if (rc < 0)
-            return rc;
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;
-        *out_consumed = moq_buf_reader_offset(&r);
-        return MOQ_OK;
-    }
-
-    if (kind == (uint32_t)MOQ_REQ_SUBSCRIPTION &&
-        env.msg_type == MOQ_D18_SUBSCRIBE_OK) {
-        moq_d18_subscribe_ok_t ok;
-        rc = moq_d18_decode_subscribe_ok(env.payload, env.payload_len, &ok);
-        if (rc < 0)
-            return close_with_error(s, 0x3, "malformed SUBSCRIBE_OK");
-        moq_decoded_subscribe_ok_t d;
-        memset(&d, 0, sizeof(d));
-        d.track_alias = ok.track_alias;
-        d.has_largest = ok.params.has_largest;
-        d.largest_group = ok.params.largest_group;
-        d.largest_object = ok.params.largest_object;
-        d.has_expires = ok.params.has_expires;
-        d.expires_ms = ok.params.expires_ms;
-        d.track_properties = ok.track_properties.data;
-        d.track_properties_len = ok.track_properties.len;
-        d.track_properties_unsupported = ok.track_properties_unsupported;
-        d.dynamic_groups = ok.dynamic_groups;
-        rc = session_core_on_subscribe_ok(s, &d, slot);
-        if (rc < 0)
-            return rc;
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;        /* core failed closed (e.g. duplicate alias) */
-        *out_consumed = moq_buf_reader_offset(&r);
-        return MOQ_OK;
-    }
-
-    if (kind == (uint32_t)MOQ_REQ_FETCH &&
-        env.msg_type == MOQ_D18_FETCH_OK) {
-        moq_d18_fetch_ok_t ok;
-        rc = moq_d18_decode_fetch_ok(env.payload, env.payload_len, &ok);
-        if (rc < 0)
-            return close_with_error(s, 0x3, "malformed FETCH_OK");
-        moq_decoded_fetch_ok_t d;
-        memset(&d, 0, sizeof(d));
-        d.target_slot = slot;
-        d.end_of_track = ok.end_of_track;
-        d.end_group = ok.end.group;
-        d.end_object = ok.end.object;
-        d.track_properties = ok.track_properties.data;
-        d.track_properties_len = ok.track_properties.len;
-        d.track_properties_unsupported = ok.track_properties_unsupported;
-        rc = session_core_on_fetch_ok(s, &d);
-        if (rc < 0)
-            return rc;
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;
-        *out_consumed = moq_buf_reader_offset(&r);
-        return MOQ_OK;
-    }
-
-    /* REQUEST_OK accepting a pending PUBLISH_NAMESPACE (PUBLISH_NAMESPACE_OK):
-     * carries no parameters and empty Track Properties. The announce bidi stays
-     * open (ESTABLISHED) until teardown. */
-    if (kind == (uint32_t)MOQ_REQ_ANNOUNCEMENT &&
-        env.msg_type == MOQ_D18_REQUEST_OK) {
-        /* PUBLISH_NAMESPACE_OK is the single first response; a second REQUEST_OK
-         * after establishment is a protocol violation. */
-        if (s->announcements[slot].state != MOQ_ANN_PENDING_ANNOUNCER)
-            return close_with_error(s, 0x3,
-                "REQUEST_OK on non-pending announcement");
-        rc = moq_d18_decode_request_ok(env.payload, env.payload_len);
-        if (rc < 0)
-            return close_with_error(s, 0x3, "malformed REQUEST_OK");
-        if (moq_buf_reader_offset(&r) < len)
-            return close_with_error(s, 0x3, "extra bytes after REQUEST_OK");
-        moq_decoded_announcement_ok_t d;
-        memset(&d, 0, sizeof(d));
-        d.target_slot = slot;
-        rc = session_core_on_announcement_ok(s, &d);
-        if (rc < 0)
-            return rc;
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;
-        *out_consumed = moq_buf_reader_offset(&r);
-        return MOQ_OK;
-    }
-
-    /* TRACK_STATUS_OK: a REQUEST_OK carrying LARGEST_OBJECT / EXPIRES params and
-     * a Track Properties tail. Terminal (FIN follows); the core surfaces the
-     * status and drains the request bidi. */
-    if (kind == (uint32_t)MOQ_REQ_TRACK_STATUS &&
-        env.msg_type == MOQ_D18_REQUEST_OK) {
-        if (s->track_statuses[slot].state != MOQ_TS_PENDING_REQUESTER)
-            return close_with_error(s, 0x3,
-                "REQUEST_OK on non-pending track-status");
-        moq_d18_track_status_ok_t ok;
-        rc = moq_d18_decode_track_status_ok(env.payload, env.payload_len, &ok);
-        if (rc < 0)
-            return close_with_error(s, 0x3, "malformed TRACK_STATUS_OK");
-        if (moq_buf_reader_offset(&r) < len)
-            return close_with_error(s, 0x3, "extra bytes after TRACK_STATUS_OK");
-        moq_decoded_track_status_ok_t d;
-        memset(&d, 0, sizeof(d));
-        d.target_slot = slot;
-        d.has_largest = ok.params.has_largest;
-        d.largest_group = ok.params.largest_group;
-        d.largest_object = ok.params.largest_object;
-        d.has_expires = ok.params.has_expires;
-        d.expires_ms = ok.params.expires_ms;
-        d.track_properties = ok.track_properties.data;
-        d.track_properties_len = ok.track_properties.len;
-        rc = session_core_on_track_status_ok(s, &d);
-        if (rc < 0)
-            return rc;
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;
-        *out_consumed = moq_buf_reader_offset(&r);
-        return MOQ_OK;
-    }
-
-    /* REQUEST_OK on an established subscription's request bidi acknowledges a
-     * pending REQUEST_UPDATE (REQUEST_UPDATE_OK). It correlates by the stream;
-     * the core clears the pending-update state. */
-    if (kind == (uint32_t)MOQ_REQ_SUBSCRIPTION &&
-        env.msg_type == MOQ_D18_REQUEST_OK) {
-        moq_d18_msg_params_t up;
-        rc = moq_d18_decode_request_update_ok(env.payload, env.payload_len, &up);
-        if (rc < 0)
-            return close_with_error(s, 0x3, "malformed REQUEST_OK");
-        rc = session_core_on_subscribe_update_ok(s, slot,
-                up.has_largest, up.largest_group, up.largest_object,
-                up.has_expires, up.expires_ms);
-        if (rc < 0)
-            return rc;
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;
-        *out_consumed = moq_buf_reader_offset(&r);
-        return MOQ_OK;
-    }
-
-    /* REQUEST_OK accepting a pending SUBSCRIBE_TRACKS: the bidi stays established
-     * for PUBLISH_BLOCKED (and future PUBLISH on separate bidis). */
-    if (kind == (uint32_t)MOQ_REQ_SUBSCRIBE_TRACKS &&
-        env.msg_type == MOQ_D18_REQUEST_OK) {
-        if (s->track_subs[slot].state != MOQ_TRACK_SUB_PENDING_SUBSCRIBER)
-            return close_with_error(s, 0x3,
-                "REQUEST_OK on non-pending subscribe-tracks");
-        rc = moq_d18_decode_request_ok(env.payload, env.payload_len);
-        if (rc < 0)
-            return close_with_error(s, 0x3, "malformed REQUEST_OK");
-        rc = session_core_on_subscribe_tracks_ok(s, slot);
-        if (rc < 0)
-            return rc;
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;
-        *out_consumed = moq_buf_reader_offset(&r);
-        return MOQ_OK;
-    }
-
-    /* PUBLISH_BLOCKED on an established SUBSCRIBE_TRACKS response stream. */
-    if (kind == (uint32_t)MOQ_REQ_SUBSCRIBE_TRACKS &&
-        env.msg_type == MOQ_D18_PUBLISH_BLOCKED) {
-        if (s->track_subs[slot].state != MOQ_TRACK_SUB_ESTABLISHED)
-            return close_with_error(s, 0x3, "PUBLISH_BLOCKED before REQUEST_OK");
-        moq_decoded_publish_blocked_t d;
-        memset(&d, 0, sizeof(d));
-        moq_d18_publish_blocked_t pb;
-        rc = moq_d18_decode_publish_blocked(env.payload, env.payload_len,
-                                            d.suffix_parts,
-                                            MOQ_DECODED_MAX_NAMESPACE_PARTS, &pb);
-        if (rc < 0)
-            return close_with_error(s, 0x3, "malformed PUBLISH_BLOCKED");
-        d.target_slot = slot;
-        d.track_namespace_suffix = pb.track_namespace_suffix; /* parts = d.suffix_parts */
-        d.track_name = pb.track_name;
-        rc = session_core_on_publish_blocked(s, slot, &d);
-        if (rc < 0)
-            return rc;
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;
-        *out_consumed = moq_buf_reader_offset(&r);
-        return MOQ_OK;
-    }
-
-    /* PUBLISH_OK: a REQUEST_OK carrying the subscriber's delivery parameters
-     * (and empty Track Properties). The single first response to a pending
-     * outbound PUBLISH; it establishes the publication. */
-    if (kind == (uint32_t)MOQ_REQ_PUBLISH &&
-        env.msg_type == MOQ_D18_REQUEST_OK) {
-        if (s->publishes[slot].state != MOQ_PUB_PENDING_PUBLISHER)
-            return close_with_error(s, 0x3, "PUBLISH_OK on non-pending publish");
-        moq_d18_publish_ok_t ok;
-        rc = moq_d18_decode_publish_ok(env.payload, env.payload_len, &ok);
-        if (rc < 0)
-            return close_with_error(s, 0x3, "malformed PUBLISH_OK");
-        moq_decoded_publish_ok_t d;
-        memset(&d, 0, sizeof(d));
-        d.target_slot = slot;
-        /* Omitted FORWARD means forward = 1 (§5.4.1). */
-        d.forward = ok.params.has_forward ? (ok.params.forward != 0) : true;
-        d.subscriber_priority = ok.params.has_subscriber_priority
-            ? ok.params.subscriber_priority : 128;
-        d.group_order = ok.params.has_group_order
-            ? ok.params.group_order : MOQ_GROUP_ORDER_DEFAULT;
-        /* Legacy _ms projection stays EXACT milliseconds (§9.8 A5): the
-         * min_nonzero of this message's carriers, no unit conversion. */
-        D18_FILL_DT(&d, &ok.params);
-        d.has_delivery_timeout = ok.params.has_object_delivery_timeout ||
-                                 ok.params.has_subgroup_delivery_timeout;
-        d.delivery_timeout_ms = dt_negotiate_ms(
-            ok.params.has_object_delivery_timeout,
-            ok.params.object_delivery_timeout_ms,
-            ok.params.has_subgroup_delivery_timeout,
-            ok.params.subgroup_delivery_timeout_ms);
-        d.has_new_group_request = ok.params.has_new_group_request;
-        d.new_group_request = ok.params.new_group_request;
-        d.has_expires = ok.params.has_expires;
-        d.expires_ms = ok.params.expires_ms;
-        d.has_filter = ok.params.has_filter;
-        d.filter_type = ok.params.filter_type;
-        d.filter_start_group = ok.params.filter_start_group;
-        d.filter_start_object = ok.params.filter_start_object;
-        d.filter_end_group = ok.params.filter_end_group;
-        rc = session_core_on_publish_ok(s, &d);
-        if (rc < 0)
-            return rc;
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;
-        *out_consumed = moq_buf_reader_offset(&r);
-        return MOQ_OK;
-    }
-
-    /* REQUEST_UPDATE inbound on an established PUBLISH (the subscriber updates
-     * the forward state); the publisher (us, the opener) reads it on the bidi's
-     * response stream and acknowledges with REQUEST_OK. It consumes a fresh peer
-     * request id and correlates by the stream. */
-    if (kind == (uint32_t)MOQ_REQ_PUBLISH &&
-        env.msg_type == MOQ_D18_REQUEST_UPDATE &&
-        s->publishes[slot].state == MOQ_PUB_ESTABLISHED &&
-        s->publishes[slot].role == MOQ_PUB_ROLE_PUBLISHER) {
-        moq_d18_request_update_t u;
-        rc = moq_d18_decode_request_update(env.payload, env.payload_len, &u);
-        if (rc == MOQ_D18_ERR_KVP_FORMAT)
-            return close_with_error(s, 0x6, "malformed auth token structure");
-        if (rc < 0)
-            return close_with_error(s, 0x3, "malformed REQUEST_UPDATE");
-
-        moq_request_endpoint_t ep;
-        rc = d18_validate_inbound_request_stream(s, ref, env.msg_type,
-                                                 u.request_id, &ep);
-        if (rc < 0)
-            return rc;
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;
-
-        moq_decoded_request_update_t d;
-        memset(&d, 0, sizeof(d));
-        d.endpoint = ep;
-        d.request_id = u.request_id;
-        d.target_kind = MOQ_REQ_PUBLISH;
-        d.target_slot = slot;
-        d.has_forward = u.params.has_forward;
-        d.forward = u.params.forward != 0;
-        d.has_subscriber_priority = u.params.has_subscriber_priority;
-        d.subscriber_priority = u.params.subscriber_priority;
-        d.has_filter = u.params.has_filter;
-        d.filter_type = u.params.filter_type;
-        d.start_group = u.params.filter_start_group;
-        d.start_object = u.params.filter_start_object;
-        d.end_group = u.params.filter_end_group;
-        D18_FILL_DT(&d, &u.params);
-        (void)d18_map_delivery_timeout(&u.params, &d.has_delivery_timeout,
-                                       &d.delivery_timeout_us);
-        d.has_new_group_request = u.params.has_new_group_request;
-        d.new_group_request = u.params.new_group_request;
-
-        rc = d18_resolve_auth_tokens(s, &u.params, d.tokens, &d.token_count,
-                                     d.token_staged, &d.auth_txn,
-                                     &d.auth_reject_code);
-        if (rc < 0)
-            return rc;            /* NOMEM */
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;        /* cache overflow / duplicate alias */
-
-        rc = session_core_on_publish_request_update(s, &d);
-        if (rc < 0)
-            return rc;
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;
-        *out_consumed = moq_buf_reader_offset(&r);
-        return MOQ_OK;
-    }
-
-    /* First-response enforcement: only the response valid for this request
-     * kind (or REQUEST_ERROR) may appear. */
-    return close_with_error(s, 0x3, "unexpected first response message");
-}
-
 /* -- Data plane: subgroup streams ---------------------------------- *
  * Object Properties (vi64 KVP, §11.2.1.2) are decoded and encoded on subgroup
  * objects; datagrams are handled by the OBJECT_DATAGRAM ops. (FETCH data
  * streams are handled below.) */
 
-static uint32_t d18_classify_data_stream(const uint8_t *data, size_t len)
+uint32_t moq_d18_op_classify_data_stream(const uint8_t *data, size_t len)
 {
     if (len == 0) return (uint32_t)MOQ_STREAM_KIND_NEED_MORE;
 
@@ -2772,7 +1490,7 @@ static uint32_t d18_classify_data_stream(const uint8_t *data, size_t len)
     return (uint32_t)MOQ_STREAM_KIND_UNKNOWN;
 }
 
-static moq_result_t d18_decode_subgroup_header_op(
+moq_result_t moq_d18_op_decode_subgroup_header(
     moq_session_t *s, moq_buf_reader_t *r, moq_decoded_subgroup_header_t *out)
 {
     (void)s;
@@ -2782,9 +1500,11 @@ static moq_result_t d18_decode_subgroup_header_op(
 
     out->track_alias = hdr.track_alias;
     out->group_id = hdr.group_id;
-    out->publisher_priority = hdr.default_priority ? 128 : hdr.publisher_priority;
+    out->publisher_priority = hdr.publisher_priority;
+    out->default_priority = hdr.default_priority;
     out->has_extensions = hdr.has_properties;
     out->end_of_group = hdr.end_of_group;
+    out->first_object = hdr.first_object;
     switch (hdr.subgroup_id_mode) {
     case MOQ_SUBGROUP_ID_MODE_ZERO:
         out->subgroup_id = 0;
@@ -2805,7 +1525,7 @@ static moq_result_t d18_decode_subgroup_header_op(
     return MOQ_OK;
 }
 
-static moq_result_t d18_encode_subgroup_header_op(
+moq_result_t moq_d18_op_encode_subgroup_header(
     moq_session_t *s, moq_buf_writer_t *w,
     const moq_subgroup_header_encode_args_t *args)
 {
@@ -2816,7 +1536,7 @@ static moq_result_t d18_encode_subgroup_header_op(
     hdr.subgroup_id_mode = MOQ_SUBGROUP_ID_MODE_PRESENT;
     hdr.end_of_group = args->end_of_group;
     hdr.default_priority = false;
-    hdr.first_object = false;
+    hdr.first_object = args->first_object;
     hdr.track_alias = args->track_alias;
     hdr.group_id = args->group_id;
     hdr.subgroup_id = args->subgroup_id;
@@ -2834,7 +1554,7 @@ static moq_object_status_t d18_wire_status_to_semantic(uint64_t wire_status)
     }
 }
 
-static moq_result_t d18_encode_object_header_op(
+moq_result_t moq_d18_op_encode_object_header(
     moq_session_t *s, moq_buf_writer_t *w,
     const moq_object_header_encode_args_t *args)
 {
@@ -2865,10 +1585,10 @@ static moq_result_t d18_encode_object_header_op(
     return MOQ_OK;
 }
 
-static moq_result_t d18_encode_object_payload_prefix_op(moq_session_t *s,
-                                                        moq_buf_writer_t *w,
-                                                        uint64_t payload_len,
-                                                        bool with_status)
+moq_result_t moq_d18_op_encode_object_payload_prefix(moq_session_t *s,
+                                                     moq_buf_writer_t *w,
+                                                     uint64_t payload_len,
+                                                     bool with_status)
 {
     (void)s;
     moq_result_t rc = moq_buf_write_vi64(w, payload_len);
@@ -2883,21 +1603,21 @@ static moq_result_t d18_encode_object_payload_prefix_op(moq_session_t *s,
 /* Refuse to emit a Mandatory Track Property (0x4000-0x7FFF) as an object
  * property — symmetric with the inbound malformed check (§11.2.1.2). Also rejects
  * a structurally malformed block. */
-static moq_result_t d18_validate_object_properties_op(moq_session_t *s,
-                                                      const uint8_t *props,
-                                                      size_t len)
+moq_result_t moq_d18_op_validate_object_properties(moq_session_t *s,
+                                                   const uint8_t *props,
+                                                   size_t len)
 {
     (void)s;
     return moq_d18_validate_properties(props, len);
 }
 
-static moq_result_t d18_decode_object_header_op(
+moq_result_t moq_d18_op_decode_object_header(
     moq_session_t *s, moq_buf_reader_t *r, bool has_extensions,
     uint64_t prev_object_id, bool has_prev_object,
     moq_decoded_object_header_t *out)
 {
-    (void)s;
     memset(out, 0, sizeof(*out));
+    bool track_scoped = s && s->profile && s->profile->malformed_track_local;
 
     uint64_t delta;
     if (moq_buf_read_vi64(r, &delta) < 0) return MOQ_ERR_BUFFER;
@@ -2908,10 +1628,15 @@ static moq_result_t d18_decode_object_header_op(
     if (has_extensions) {
         uint64_t props_len;
         if (moq_buf_read_vi64(r, &props_len) < 0) return MOQ_ERR_BUFFER;
-        if ((size_t)props_len > moq_buf_reader_remaining(r)) return MOQ_ERR_BUFFER;
+        /* Compare at full width: a length beyond the buffered input (which
+         * includes any length above SIZE_MAX) waits for more bytes rather than
+         * narrowing to a smaller size_t. */
+        if (props_len > moq_buf_reader_remaining(r)) return MOQ_ERR_BUFFER;
         if (props_len > 0) {
             const uint8_t *pp = moq_buf_reader_ptr(r);
-            moq_result_t prc = moq_d18_validate_properties(pp, (size_t)props_len);
+            moq_result_t prc = d18_object_props(pp, (size_t)props_len,
+                                                track_scoped, &out->malformed,
+                                                &out->gaps);
             if (prc < 0) return prc;
             out->has_properties = true;
             out->properties = pp;
@@ -2955,14 +1680,14 @@ static moq_result_t d18_decode_object_header_op(
  * bidi); the bidi classify hook is pre-empted by the request-stream router;
  * request-capacity has no draft-18 wire form (no MAX_REQUEST_ID). */
 
-static moq_result_t d18_unimpl_encode_unsubscribe(
+moq_result_t moq_d18_op_encode_unsubscribe(
     moq_session_t *s, struct moq_buf_writer *w, uint64_t request_id)
 { (void)s; (void)w; (void)request_id; return MOQ_ERR_INVAL; }
 
-static moq_result_t d18_unimpl_classify_bidi_stream(moq_session_t *s,
-                                                    moq_stream_ref_t ref,
-                                                    const uint8_t *data,
-                                                    size_t len)
+moq_result_t moq_d18_op_classify_bidi_stream(moq_session_t *s,
+                                             moq_stream_ref_t ref,
+                                             const uint8_t *data,
+                                             size_t len)
 {
     (void)ref; (void)data; (void)len;
     /* Unreachable for draft-18: unknown inbound bidis route through
@@ -2975,14 +1700,17 @@ static moq_result_t d18_unimpl_classify_bidi_stream(moq_session_t *s,
  * sub/pub slot, and map the wire status to the semantic enum. Returns MOQ_DONE
  * (caller discards) for a padding datagram or an unknown track alias, MOQ_ERR_PROTO
  * for a malformed/invalid datagram (caller closes 0x3). */
-static moq_result_t d18_decode_object_datagram(
+moq_result_t moq_d18_op_decode_object_datagram(
     moq_session_t *s, const uint8_t *data, size_t len,
     struct moq_decoded_object_datagram *out)
 {
     memset(out, 0, sizeof(*out));
 
     moq_d18_object_datagram_t dg;
-    moq_result_t rc = moq_d18_decode_object_datagram(data, len, &dg);
+    moq_obj_props_scan_t scan;
+    bool track_scoped = s->profile->malformed_track_local;
+    moq_result_t rc = moq_d18_decode_object_datagram_scan(data, len, track_scoped,
+                                                          &dg, &scan);
     if (rc != MOQ_OK) return rc;   /* MOQ_DONE (padding) / MOQ_ERR_PROTO propagate */
 
     int sub_slot = sub_find_by_alias_subscriber(s, dg.track_alias);
@@ -2999,6 +1727,7 @@ static moq_result_t d18_decode_object_datagram(
 
     out->sub_slot           = sub_slot;
     out->pub_slot           = pub_slot;
+    out->track_alias        = dg.track_alias;
     out->group_id           = dg.group_id;
     out->object_id          = dg.object_id;
     out->publisher_priority = dg.publisher_priority;
@@ -3014,10 +1743,17 @@ static moq_result_t d18_decode_object_datagram(
     }
     out->payload     = dg.payload;
     out->payload_len = dg.payload_len;
+    if (track_scoped) out->malformed = scan.malformed;
+    if (out->malformed == MOQ_MALFORMED_NONE) {
+        out->gaps.has_group_gap = scan.has_prior_group_gap;
+        out->gaps.group_gap = scan.prior_group_gap;
+        out->gaps.has_object_gap = scan.has_prior_object_gap;
+        out->gaps.object_gap = scan.prior_object_gap;
+    }
     return MOQ_OK;
 }
 
-static moq_result_t d18_encode_object_datagram(
+moq_result_t moq_d18_op_encode_object_datagram(
     moq_session_t *s, moq_buf_writer_t *w,
     const struct moq_datagram_encode_args *args)
 {
@@ -3042,15 +1778,15 @@ static moq_result_t d18_encode_object_datagram(
     return moq_d18_encode_object_datagram(w, &dg);
 }
 
-static moq_result_t d18_unimpl_grant_capacity(moq_session_t *s,
-                                              uint64_t new_capacity,
-                                              uint64_t now_us)
+moq_result_t moq_d18_op_grant_capacity(moq_session_t *s,
+                                       uint64_t new_capacity,
+                                       uint64_t now_us)
 {
     (void)s; (void)new_capacity; (void)now_us;
     return MOQ_ERR_INVAL;
 }
 
-static uint64_t d18_unimpl_request_capacity(const moq_session_t *s)
+uint64_t moq_d18_op_request_capacity(const moq_session_t *s)
 {
     (void)s;
     return 0;
@@ -3064,12 +1800,454 @@ static moq_result_t d18_encode_goaway(moq_session_t *s,
                                       struct moq_buf_writer *w,
                                       const struct moq_goaway_encode_args *args)
 {
-    const moq_d18_profile_state_t *d18 =
-        (const moq_d18_profile_state_t *)s->profile_state;
     uint64_t timeout_ms = s->goaway_timeout_us / 1000;
     return moq_d18_encode_goaway(w, args->uri, args->uri_len, timeout_ms,
-                                 d18->peer_next_request_id);
+                                 moq_request_stream_peer_next_id(s));
 }
+
+
+/* -- Request-stream codec table ------------------------------------- *
+ * Draft-18 bodies decoded into the core's records for the shared engine
+ * (request_stream.c). Each adapter zeroes its record, maps omitted Message
+ * Parameters onto their protocol defaults, and reports the token list; the
+ * engine admits the request ID and resolves tokens afterwards. */
+
+/* Decoded tokens in wire order, alias ops mapped onto the cache operations. */
+static void d18_tokens_out(const moq_d18_msg_params_t *p, moq_request_tokens_t *tk)
+{
+    tk->count = p->auth_token_count;
+    for (size_t i = 0; i < p->auth_token_count; i++) {
+        const moq_d18_auth_token_t *w = &p->auth_tokens[i];
+        moq_decoded_auth_token_t *d = &tk->in[i];
+        switch (w->alias_type) {
+        case MOQ_AUTH_TOKEN_DELETE:    d->op = MOQ_AUTH_OP_DELETE; break;
+        case MOQ_AUTH_TOKEN_REGISTER:  d->op = MOQ_AUTH_OP_REGISTER; break;
+        case MOQ_AUTH_TOKEN_USE_ALIAS: d->op = MOQ_AUTH_OP_USE_ALIAS; break;
+        default:                       d->op = MOQ_AUTH_OP_USE_VALUE; break;
+        }
+        d->alias = w->alias;
+        d->token_type = w->token_type;
+        d->token_value = w->token_value.data;
+        d->token_value_len = w->token_value.len;
+    }
+}
+
+/* A malformed parameter block has its own close code at the engine. */
+static moq_result_t d18_rq_rc(moq_result_t rc)
+{
+    return rc == MOQ_D18_ERR_KVP_FORMAT ? MOQ_REQUEST_DECODE_BAD_PARAMS : rc;
+}
+
+static moq_result_t d18_rq_envelope(const uint8_t *buf, size_t len,
+                                    moq_request_envelope_t *env, size_t *consumed)
+{
+    moq_buf_reader_t r;
+    moq_buf_reader_init(&r, buf, len);
+    moq_control_envelope_t e;
+    moq_result_t rc = moq_d18_decode_envelope(&r, &e);
+    if (rc < 0) return rc;
+    env->msg_type = e.msg_type;
+    env->payload = e.payload;
+    env->payload_len = e.payload_len;
+    *consumed = moq_buf_reader_offset(&r);
+    return MOQ_OK;
+}
+
+static moq_result_t d18_rq_subscribe(const uint8_t *p, size_t n,
+                                     moq_decoded_subscribe_t *d,
+                                     uint64_t *request_id, moq_request_tokens_t *tk)
+{
+    memset(d, 0, sizeof(*d));
+    moq_d18_subscribe_t sub;
+    moq_result_t rc = moq_d18_decode_subscribe(p, n, d->track_namespace_parts,
+                                               MOQ_DECODED_MAX_NAMESPACE_PARTS, &sub);
+    if (rc < 0) return d18_rq_rc(rc);
+    d->track_namespace = sub.track_namespace; /* parts = d->track_namespace_parts */
+    d->track_name = sub.track_name;
+    d->request_id = sub.request_id;
+    /* Surface the decoded Message Parameters (defaults apply when omitted)
+     * so the publisher/relay sees the real request. */
+    d->subscriber_priority = sub.params.has_subscriber_priority
+        ? sub.params.subscriber_priority : 128;
+    d->group_order = sub.params.has_group_order
+        ? sub.params.group_order : MOQ_GROUP_ORDER_DEFAULT;
+    d->has_forward = true;
+    d->forward = sub.params.has_forward ? (sub.params.forward != 0) : true;
+    d->has_filter = sub.params.has_filter;
+    d->filter_type = sub.params.has_filter
+        ? sub.params.filter_type : MOQ_SUBSCRIBE_FILTER_NONE;
+    d->start_group = sub.params.filter_start_group;
+    d->start_object = sub.params.filter_start_object;
+    d->end_group = sub.params.filter_end_group;
+    D18_FILL_DT(d, &sub.params);
+    (void)d18_map_delivery_timeout(&sub.params, &d->has_delivery_timeout,
+                                   &d->delivery_timeout_us);
+    d->has_new_group_request = sub.params.has_new_group_request;
+    d->new_group_request = sub.params.new_group_request;
+    *request_id = sub.request_id;
+    d18_tokens_out(&sub.params, tk);
+    return MOQ_OK;
+}
+
+static moq_result_t d18_rq_publish(const uint8_t *p, size_t n,
+                                   moq_decoded_publish_t *d,
+                                   uint64_t *request_id, moq_request_tokens_t *tk)
+{
+    memset(d, 0, sizeof(*d));
+    moq_d18_publish_t pub;
+    moq_result_t rc = moq_d18_decode_publish(p, n, d->track_namespace_parts,
+                                             MOQ_DECODED_MAX_NAMESPACE_PARTS, &pub);
+    if (rc < 0) return d18_rq_rc(rc);
+    d->track_namespace = pub.track_namespace; /* parts = d->track_namespace_parts */
+    d->track_name = pub.track_name;
+    d->request_id = pub.request_id;
+    d->track_alias = pub.track_alias;
+    /* Omitted FORWARD means forward = 1 (§5.4.1). */
+    d->has_forward = true;
+    d->forward = pub.params.has_forward ? (pub.params.forward != 0) : true;
+    d->track_properties = pub.track_properties.data;
+    d->track_properties_len = pub.track_properties.len;
+    d->track_properties_unsupported = pub.track_properties_unsupported;
+    d->dynamic_groups = pub.dynamic_groups;
+    d->has_largest = pub.params.has_largest;
+    d->largest_group = pub.params.largest_group;
+    d->largest_object = pub.params.largest_object;
+    d->has_expires = pub.params.has_expires;
+    d->expires_ms = pub.params.expires_ms;
+    *request_id = pub.request_id;
+    d18_tokens_out(&pub.params, tk);
+    return MOQ_OK;
+}
+
+static moq_result_t d18_rq_fetch(const uint8_t *p, size_t n,
+                                 moq_decoded_fetch_t *fd,
+                                 uint64_t *request_id, moq_request_tokens_t *tk)
+{
+    memset(fd, 0, sizeof(*fd));
+    fd->joining_sub_slot = -1;
+    fd->joining_pub_slot = -1;
+    moq_d18_fetch_t f;
+    moq_result_t rc = moq_d18_decode_fetch(p, n, fd->track_namespace_parts,
+                                           MOQ_DECODED_MAX_NAMESPACE_PARTS, &f);
+    if (rc < 0) return d18_rq_rc(rc);
+    fd->request_id = f.request_id;
+    fd->fetch_type = (uint32_t)f.fetch_type;
+    fd->track_namespace = f.track_namespace; /* parts = fd->track_namespace_parts */
+    fd->track_name = f.track_name;
+    fd->start_group = f.start.group;
+    fd->start_object = f.start.object;
+    fd->end_group = f.end.group;
+    fd->end_object = f.end.object;
+    fd->joining_request_id = f.joining_request_id;
+    fd->joining_start = f.joining_start;
+    fd->subscriber_priority = f.params.has_subscriber_priority
+        ? f.params.subscriber_priority : 128;
+    /* Omitted GROUP_ORDER on a FETCH means Ascending (§10.2.8). */
+    fd->group_order = f.params.has_group_order
+        ? f.params.group_order : MOQ_GROUP_ORDER_ASCENDING;
+    *request_id = f.request_id;
+    d18_tokens_out(&f.params, tk);
+    return MOQ_OK;
+}
+
+static moq_result_t d18_rq_publish_namespace(const uint8_t *p, size_t n,
+                                             moq_decoded_publish_namespace_t *d,
+                                             uint64_t *request_id,
+                                             moq_request_tokens_t *tk)
+{
+    memset(d, 0, sizeof(*d));
+    moq_d18_publish_namespace_t pn;
+    moq_result_t rc = moq_d18_decode_publish_namespace(p, n, d->track_namespace_parts,
+                                                       MOQ_DECODED_MAX_NAMESPACE_PARTS, &pn);
+    if (rc < 0) return d18_rq_rc(rc);
+    d->track_namespace = pn.track_namespace; /* parts = d->track_namespace_parts */
+    d->request_id = pn.request_id;
+    *request_id = pn.request_id;
+    d18_tokens_out(&pn.params, tk);
+    return MOQ_OK;
+}
+
+static moq_result_t d18_rq_track_status(const uint8_t *p, size_t n,
+                                        moq_decoded_track_status_request_t *d,
+                                        uint64_t *request_id, moq_request_tokens_t *tk)
+{
+    memset(d, 0, sizeof(*d));
+    moq_d18_track_status_t ts;
+    moq_result_t rc = moq_d18_decode_track_status(p, n, d->track_namespace_parts,
+                                                  MOQ_DECODED_MAX_NAMESPACE_PARTS, &ts);
+    if (rc < 0) return d18_rq_rc(rc);
+    d->track_namespace = ts.track_namespace; /* parts = d->track_namespace_parts */
+    d->track_name = ts.track_name;
+    *request_id = ts.request_id;
+    d18_tokens_out(&ts.params, tk);
+    return MOQ_OK;
+}
+
+static moq_result_t d18_rq_subscribe_tracks(const uint8_t *p, size_t n,
+                                            moq_decoded_subscribe_tracks_request_t *d,
+                                            uint64_t *request_id,
+                                            moq_request_tokens_t *tk)
+{
+    memset(d, 0, sizeof(*d));
+    moq_d18_subscribe_tracks_t st;
+    moq_result_t rc = moq_d18_decode_subscribe_tracks(p, n, d->prefix_parts,
+                                                      MOQ_DECODED_MAX_NAMESPACE_PARTS, &st);
+    if (rc < 0) return d18_rq_rc(rc);
+    d->track_namespace_prefix = st.track_namespace_prefix; /* parts = d->prefix_parts */
+    d->forward = st.params.has_forward ? (st.params.forward != 0) : true;
+    *request_id = st.request_id;
+    d18_tokens_out(&st.params, tk);
+    return MOQ_OK;
+}
+
+static moq_result_t d18_rq_request_update(const uint8_t *p, size_t n,
+                                          moq_request_family_t target_family,
+                                          bool from_subscriber,
+                                          moq_decoded_request_update_t *d,
+                                          moq_request_tokens_t *tk)
+{
+    (void)from_subscriber;
+    moq_d18_request_update_t u;
+    moq_result_t rc = moq_d18_decode_request_update(p, n, &u);
+    if (rc < 0) return d18_rq_rc(rc);
+    /* §10.2.1: a parameter in a message its definition does not name closes
+     * the session with PROTOCOL_VIOLATION. FORWARD, SUBSCRIPTION_FILTER and
+     * NEW_GROUP_REQUEST appear in a REQUEST_UPDATE "for a subscription"
+     * (one begun by SUBSCRIBE or by PUBLISH), SUBSCRIBER_PRIORITY "for a
+     * subscription or FETCH". AUTHORIZATION_TOKEN and the two delivery
+     * timeouts name REQUEST_UPDATE without a family. */
+    bool subscription = target_family == MOQ_REQUEST_FAMILY_SUBSCRIBE ||
+                        target_family == MOQ_REQUEST_FAMILY_PUBLISH;
+    if (!subscription &&
+        (u.params.has_forward || u.params.has_filter ||
+         u.params.has_new_group_request ||
+         (u.params.has_subscriber_priority &&
+          target_family != MOQ_REQUEST_FAMILY_FETCH)))
+        return MOQ_ERR_PROTO;
+    memset(d, 0, sizeof(*d));
+    d->request_id = u.request_id;
+    d->has_forward = u.params.has_forward;
+    d->forward = u.params.forward != 0;
+    d->has_subscriber_priority = u.params.has_subscriber_priority;
+    d->subscriber_priority = u.params.subscriber_priority;
+    d->has_filter = u.params.has_filter;
+    d->filter_type = u.params.filter_type;
+    d->start_group = u.params.filter_start_group;
+    d->start_object = u.params.filter_start_object;
+    d->end_group = u.params.filter_end_group;
+    D18_FILL_DT(d, &u.params);
+    (void)d18_map_delivery_timeout(&u.params, &d->has_delivery_timeout,
+                                   &d->delivery_timeout_us);
+    d->has_new_group_request = u.params.has_new_group_request;
+    d->new_group_request = u.params.new_group_request;
+    d18_tokens_out(&u.params, tk);
+    return MOQ_OK;
+}
+
+static moq_result_t d18_rq_goaway(const uint8_t *p, size_t n,
+                                  moq_request_goaway_msg_t *out)
+{
+    moq_d18_goaway_t ga;
+    moq_result_t rc = moq_d18_decode_goaway_request(p, n, &ga);
+    if (rc < 0) return rc;
+    out->uri = ga.uri;
+    out->timeout_ms = ga.timeout_ms;
+    return MOQ_OK;
+}
+
+static moq_result_t d18_rq_publish_done(const uint8_t *p, size_t n,
+                                        moq_request_publish_done_msg_t *out)
+{
+    moq_d18_publish_done_t pd;
+    moq_result_t rc = moq_d18_decode_publish_done(p, n, &pd);
+    if (rc < 0) return rc;
+    out->status_code = pd.status_code;
+    out->stream_count = pd.stream_count;
+    out->reason = pd.reason;
+    return MOQ_OK;
+}
+
+static moq_result_t d18_rq_request_error(const uint8_t *p, size_t n,
+                                         moq_bytes_t *rd_parts, size_t rd_parts_max,
+                                         moq_request_error_msg_t *out,
+                                         moq_decoded_redirect_t *rd)
+{
+    moq_d18_request_error_t er;
+    moq_d18_redirect_t wire_rd;
+    moq_result_t rc = moq_d18_decode_request_error_redirect(p, n, rd_parts,
+                                                            rd_parts_max, &er, &wire_rd);
+    if (rc < 0) return rc;
+    out->error_code = er.error_code;
+    out->retry_interval = er.retry_interval;
+    out->reason = er.reason;
+    out->is_redirect = (er.error_code == MOQ_D18_ERROR_REDIRECT);
+    if (out->is_redirect) {
+        rd->connect_uri = wire_rd.connect_uri.data;
+        rd->connect_uri_len = wire_rd.connect_uri.len;
+        rd->track_namespace = wire_rd.track_namespace;   /* parts in rd_parts */
+        rd->track_name = wire_rd.track_name.data;
+        rd->track_name_len = wire_rd.track_name.len;
+    }
+    return MOQ_OK;
+}
+
+static moq_result_t d18_rq_subscribe_ok(const uint8_t *p, size_t n,
+                                        moq_decoded_subscribe_ok_t *d)
+{
+    moq_d18_subscribe_ok_t ok;
+    moq_result_t rc = moq_d18_decode_subscribe_ok(p, n, &ok);
+    if (rc < 0) return rc;
+    memset(d, 0, sizeof(*d));
+    d->track_alias = ok.track_alias;
+    d->has_largest = ok.params.has_largest;
+    d->largest_group = ok.params.largest_group;
+    d->largest_object = ok.params.largest_object;
+    d->has_expires = ok.params.has_expires;
+    d->expires_ms = ok.params.expires_ms;
+    d->track_properties = ok.track_properties.data;
+    d->track_properties_len = ok.track_properties.len;
+    d->track_properties_unsupported = ok.track_properties_unsupported;
+    d->dynamic_groups = ok.dynamic_groups;
+    return MOQ_OK;
+}
+
+static moq_result_t d18_rq_fetch_ok(const uint8_t *p, size_t n,
+                                    moq_decoded_fetch_ok_t *d)
+{
+    moq_d18_fetch_ok_t ok;
+    moq_result_t rc = moq_d18_decode_fetch_ok(p, n, &ok);
+    if (rc < 0) return rc;
+    memset(d, 0, sizeof(*d));
+    d->end_of_track = ok.end_of_track;
+    d->end_group = ok.end.group;
+    d->end_object = ok.end.object;
+    d->track_properties = ok.track_properties.data;
+    d->track_properties_len = ok.track_properties.len;
+    d->track_properties_unsupported = ok.track_properties_unsupported;
+    return MOQ_OK;
+}
+
+static moq_result_t d18_rq_request_ok(const uint8_t *p, size_t n)
+{
+    return moq_d18_decode_request_ok(p, n);
+}
+
+static moq_result_t d18_rq_track_status_ok(const uint8_t *p, size_t n,
+                                           moq_decoded_track_status_ok_t *d)
+{
+    moq_d18_track_status_ok_t ok;
+    moq_result_t rc = moq_d18_decode_track_status_ok(p, n, &ok);
+    if (rc < 0) return rc;
+    memset(d, 0, sizeof(*d));
+    d->has_largest = ok.params.has_largest;
+    d->largest_group = ok.params.largest_group;
+    d->largest_object = ok.params.largest_object;
+    d->has_expires = ok.params.has_expires;
+    d->expires_ms = ok.params.expires_ms;
+    d->track_properties = ok.track_properties.data;
+    d->track_properties_len = ok.track_properties.len;
+    return MOQ_OK;
+}
+
+static moq_result_t d18_rq_update_ok(const uint8_t *p, size_t n,
+                                     moq_request_update_ok_msg_t *out)
+{
+    moq_d18_msg_params_t up;
+    moq_result_t rc = moq_d18_decode_request_update_ok(p, n, &up);
+    if (rc < 0) return rc;
+    out->has_largest = up.has_largest;
+    out->largest_group = up.largest_group;
+    out->largest_object = up.largest_object;
+    out->has_expires = up.has_expires;
+    out->expires_ms = up.expires_ms;
+    return MOQ_OK;
+}
+
+static moq_result_t d18_rq_publish_blocked(const uint8_t *p, size_t n,
+                                           moq_decoded_publish_blocked_t *d)
+{
+    memset(d, 0, sizeof(*d));
+    moq_d18_publish_blocked_t pb;
+    moq_result_t rc = moq_d18_decode_publish_blocked(p, n, d->suffix_parts,
+                                                     MOQ_DECODED_MAX_NAMESPACE_PARTS, &pb);
+    if (rc < 0) return rc;
+    d->track_namespace_suffix = pb.track_namespace_suffix; /* parts = d->suffix_parts */
+    d->track_name = pb.track_name;
+    return MOQ_OK;
+}
+
+static moq_result_t d18_rq_publish_ok(const uint8_t *p, size_t n,
+                                      moq_decoded_publish_ok_t *d)
+{
+    moq_d18_publish_ok_t ok;
+    moq_result_t rc = moq_d18_decode_publish_ok(p, n, &ok);
+    if (rc < 0) return rc;
+    memset(d, 0, sizeof(*d));
+    /* Omitted FORWARD means forward = 1 (§5.4.1). */
+    d->forward = ok.params.has_forward ? (ok.params.forward != 0) : true;
+    d->subscriber_priority = ok.params.has_subscriber_priority
+        ? ok.params.subscriber_priority : 128;
+    d->group_order = ok.params.has_group_order
+        ? ok.params.group_order : MOQ_GROUP_ORDER_DEFAULT;
+    /* Legacy _ms projection stays EXACT milliseconds (§9.8 A5): the
+     * min_nonzero of this message's carriers, no unit conversion. */
+    D18_FILL_DT(d, &ok.params);
+    d->has_delivery_timeout = ok.params.has_object_delivery_timeout ||
+                              ok.params.has_subgroup_delivery_timeout;
+    d->delivery_timeout_ms = dt_negotiate_ms(
+        ok.params.has_object_delivery_timeout,
+        ok.params.object_delivery_timeout_ms,
+        ok.params.has_subgroup_delivery_timeout,
+        ok.params.subgroup_delivery_timeout_ms);
+    d->has_new_group_request = ok.params.has_new_group_request;
+    d->new_group_request = ok.params.new_group_request;
+    d->has_expires = ok.params.has_expires;
+    d->expires_ms = ok.params.expires_ms;
+    d->has_filter = ok.params.has_filter;
+    d->filter_type = ok.params.filter_type;
+    d->filter_start_group = ok.params.filter_start_group;
+    d->filter_start_object = ok.params.filter_start_object;
+    d->filter_end_group = ok.params.filter_end_group;
+    return MOQ_OK;
+}
+
+static const moq_request_codec_t d18_request_codec = {
+    .decode_envelope          = d18_rq_envelope,
+    .type = {
+        .subscribe           = MOQ_D18_SUBSCRIBE,
+        .publish             = MOQ_D18_PUBLISH,
+        .fetch               = MOQ_D18_FETCH,
+        .publish_namespace   = MOQ_D18_PUBLISH_NAMESPACE,
+        .track_status        = MOQ_D18_TRACK_STATUS,
+        .subscribe_tracks    = MOQ_D18_SUBSCRIBE_TRACKS,
+        .subscribe_namespace = MOQ_D18_SUBSCRIBE_NAMESPACE,
+        .request_update      = MOQ_D18_REQUEST_UPDATE,
+        .request_ok          = MOQ_D18_REQUEST_OK,
+        .request_error       = MOQ_D18_REQUEST_ERROR,
+        .publish_done        = MOQ_D18_PUBLISH_DONE,
+        .publish_blocked     = MOQ_D18_PUBLISH_BLOCKED,
+        .goaway              = MOQ_D18_GOAWAY,
+        .subscribe_ok        = MOQ_D18_SUBSCRIBE_OK,
+        .fetch_ok            = MOQ_D18_FETCH_OK,
+    },
+    .decode_subscribe         = d18_rq_subscribe,
+    .decode_publish           = d18_rq_publish,
+    .decode_fetch             = d18_rq_fetch,
+    .decode_publish_namespace = d18_rq_publish_namespace,
+    .decode_track_status      = d18_rq_track_status,
+    .decode_subscribe_tracks  = d18_rq_subscribe_tracks,
+    .decode_request_update    = d18_rq_request_update,
+    .decode_goaway_request    = d18_rq_goaway,
+    .decode_publish_done      = d18_rq_publish_done,
+    .decode_request_error     = d18_rq_request_error,
+    .decode_subscribe_ok      = d18_rq_subscribe_ok,
+    .decode_fetch_ok          = d18_rq_fetch_ok,
+    .decode_request_ok        = d18_rq_request_ok,
+    .decode_track_status_ok   = d18_rq_track_status_ok,
+    .decode_update_ok         = d18_rq_update_ok,
+    .decode_publish_blocked   = d18_rq_publish_blocked,
+    .decode_publish_ok        = d18_rq_publish_ok,
+};
 
 /* -- Vtable -------------------------------------------------------- *
  * Fully populated. The d18_unimpl_* entries are defensive stubs for ops that
@@ -3133,22 +2311,51 @@ static const moq_profile_ops_t d18_ops = {
     .fetch_datagram_supported = true,   /* fetch object header carries the datagram bit */
     .request_error_wire_max  = MOQ_VI64_MAX,
     .semantic_request_error  = d18_semantic_request_error,
-    .fetch_descending_supported = false,   /* ascending-only delta reconstruction */
+    .fetch_descending_supported = false,   /* retained local selection policy */
     .uses_uni_control_channel = true,
-    .classify_uni_stream     = d18_classify_uni_stream,
+    .wire_ready               = true,
+    .request_retains_pending_original_input = false,
+    .request_fin_is_not_cancel = false,
+    .premature_fin_fails_request = false,
+    .request_drain_requires_receive_terminal = false,
+    .allows_concurrent_subscriptions = false,
+    .duplicate_subscription_error = MOQ_REQUEST_ERROR_DUPLICATE_SUBSCRIPTION,
+    .publish_initial_parameters = false,
+    .publish_ok_carries_params = true,
+    .supports_joining_fetch   = true,
+    .supports_fill            = false,
+    .stream_count_unknown     = MOQ_QUIC_VARINT_MAX,
+    .subgroup_timer_at_fin    = true,
+    .object_timer_at_header   = false,
+    .first_object_timeout_override = false,
+    .publish_done_subscription_ended = true,
+    .redirect_on_any_request = false,
+    .request_update_errors_coalesce = true,
+    .request_updates_max     = 0,   /* no bound is advertised */
+    .request_updates_exceeded_error = 0,
+    .going_away_request_error       = MOQ_REQUEST_ERROR_GOING_AWAY,
+    .capacity_request_error         = MOQ_REQUEST_ERROR_EXCESSIVE_LOAD,
+    .capacity_request_error_retryable = true,
+    .reserved_session_namespaces    = true,
+    .binding_requirements     = 0,
+    .auth_token_type_max      = UINT64_MAX,   /* §10.2.2: vi64 */
+    .classify_uni_stream     = moq_d18_op_classify_uni_stream,
     /* Request admission + SUBSCRIBE outbound. */
-    .prepare_request         = d18_prepare_request,
-    .commit_request          = d18_commit_request,
-    .abort_request           = d18_abort_request,
-    .release_request         = d18_release_request,
-    .next_track_alias        = d18_next_track_alias,
-    .advance_track_alias     = d18_advance_track_alias,
-    .validate_inbound_request_stream = d18_validate_inbound_request_stream,
-    .commit_inbound_request  = d18_commit_inbound_request,
-    .process_request_stream  = d18_process_request_stream,
-    .process_response_stream = d18_process_response_stream,
-    .scan_delivery_timeouts  = d18_scan_delivery_timeouts_op,
+    .prepare_request         = moq_request_stream_prepare_request,
+    .commit_request          = moq_request_stream_commit_request,
+    .abort_request           = moq_request_stream_abort_request,
+    .release_request         = moq_request_stream_release_request,
+    .next_track_alias        = moq_request_stream_next_track_alias,
+    .advance_track_alias     = moq_request_stream_advance_track_alias,
+    .validate_inbound_request_stream = moq_request_stream_validate_inbound,
+    .commit_inbound_request  = moq_request_stream_commit_inbound,
+    .process_request_stream  = moq_request_stream_process_request,
+    .process_response_stream = moq_request_stream_process_response,
+    .request_codec           = &d18_request_codec,
     .encode_own_setup        = d18_encode_own_setup,
+    .scan_delivery_timeouts  = moq_d18_op_scan_delivery_timeouts,
+    .scan_default_publisher_priority = moq_d18_scan_default_publisher_priority,
+    .validate_track_properties = moq_d18_validate_track_properties,
     .encode_subscribe        = d18_encode_subscribe,
     .encode_subscribe_ok     = d18_encode_subscribe_ok,
     .encode_request_error    = d18_encode_request_error,
@@ -3157,24 +2364,27 @@ static const moq_profile_ops_t d18_ops = {
     .encode_request_update_ok = d18_encode_request_update_ok,
     .encode_publish_done     = d18_encode_publish_done,
     /* Data plane: subgroup object streams. */
-    .classify_data_stream    = d18_classify_data_stream,
-    .decode_subgroup_header  = d18_decode_subgroup_header_op,
-    .encode_subgroup_header  = d18_encode_subgroup_header_op,
-    .encode_object_header    = d18_encode_object_header_op,
+    .classify_data_stream    = moq_d18_op_classify_data_stream,
+    .decode_subgroup_header  = moq_d18_op_decode_subgroup_header,
+    .encode_subgroup_header  = moq_d18_op_encode_subgroup_header,
+    .encode_object_header    = moq_d18_op_encode_object_header,
     .encode_request_goaway   = d18_encode_request_goaway,
-    .encode_object_payload_prefix = d18_encode_object_payload_prefix_op,
-    .validate_object_properties = d18_validate_object_properties_op,
-    .decode_object_header    = d18_decode_object_header_op,
+    .encode_object_payload_prefix = moq_d18_op_encode_object_payload_prefix,
+    .validate_object_properties = moq_d18_op_validate_object_properties,
+    .decode_object_header    = moq_d18_op_decode_object_header,
     /* Not-yet-implemented guards (first op on each reachable path). */
     .encode_fetch            = d18_encode_fetch_op,
     .encode_fetch_ok         = d18_encode_fetch_ok_op,
-    .encode_fetch_header     = d18_encode_fetch_header_op,
-    .decode_fetch_header     = d18_decode_fetch_header_op,
-    .encode_fetch_object     = d18_encode_fetch_object_op,
+    .encode_fetch_header     = moq_d18_op_encode_fetch_header,
+    .decode_fetch_header     = moq_d18_op_decode_fetch_header,
+    .encode_fetch_object     = moq_d18_op_encode_fetch_object,
     .decode_fetch_object     = d18_decode_fetch_object_op,
     .encode_fetch_range      = d18_encode_fetch_range_op,
     .encode_publish          = d18_encode_publish,
-    .track_properties_dynamic_groups = d18_track_properties_dynamic_groups,
+    .track_properties_dynamic_groups = moq_d18_op_track_properties_dynamic_groups,
+    .track_properties_add_dynamic_groups = moq_d18_op_track_properties_add_dynamic_groups,
+    .track_properties_group_order = moq_d18_op_track_properties_group_order,
+    .track_properties_max_cache = moq_d18_op_track_properties_max_cache,
     .encode_publish_ok       = d18_encode_publish_ok,
     .encode_track_status     = d18_encode_track_status,
     .encode_track_status_ok  = d18_encode_track_status_ok,
@@ -3185,14 +2395,23 @@ static const moq_profile_ops_t d18_ops = {
     .decode_ns_sub_request   = d18_decode_ns_sub_request,
     .decode_ns_sub_response  = d18_decode_ns_sub_response,
     .encode_publish_namespace   = d18_encode_publish_namespace,
-    .encode_unsubscribe      = d18_unimpl_encode_unsubscribe,
-    .classify_bidi_stream    = d18_unimpl_classify_bidi_stream,
-    .encode_object_datagram  = d18_encode_object_datagram,
-    .decode_object_datagram  = d18_decode_object_datagram,
-    .grant_capacity          = d18_unimpl_grant_capacity,
-    .peer_request_capacity   = d18_unimpl_request_capacity,
-    .local_request_capacity  = d18_unimpl_request_capacity,
+    .encode_unsubscribe      = moq_d18_op_encode_unsubscribe,
+    .classify_bidi_stream    = moq_d18_op_classify_bidi_stream,
+    .encode_object_datagram  = moq_d18_op_encode_object_datagram,
+    .decode_object_datagram  = moq_d18_op_decode_object_datagram,
+    .grant_capacity          = moq_d18_op_grant_capacity,
+    .peer_request_capacity   = moq_d18_op_request_capacity,
+    .local_request_capacity  = moq_d18_op_request_capacity,
     .encode_goaway           = d18_encode_goaway,
+    .relative_group_clamps   = false,
+    /* §12.8, §12.9: Prior Group ID Gap and Prior Object ID Gap are draft-18
+     * Object Properties. */
+    .scan_object_gaps        = moq_d18_op_scan_object_gaps,
+    .add_object_gap          = moq_d18_op_add_object_gap,
+    /* §2.4.2: "When a subscriber detects a Malformed Track, it MUST cancel
+     * any corresponding subscription or fetches for that Track from that
+     * publisher". */
+    .malformed_track_local   = true,
 };
 
 const moq_profile_ops_t *moq_d18_profile_ops(void)

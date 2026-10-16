@@ -26,6 +26,7 @@
 #include <moq/codec.h>
 #include "../../tests/unit/test_support.h"
 #include "../../tests/unit/test_session_support.h"
+#include "scenario_version.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -1320,6 +1321,7 @@ static int run_random_phase(uint64_t seed, moq_alloc_t *alloc,
                              run_summary_t *ts, int run_id, int max_steps)
 {
     moq_session_cfg_t tiny = MOQ_SESSION_CFG_INIT;
+    tiny.version = MOQ_VERSION_DRAFT_16;
     tiny.alloc = alloc;
     tiny.max_actions = 2;
     tiny.max_events = 3;
@@ -1335,6 +1337,15 @@ static int run_random_phase(uint64_t seed, moq_alloc_t *alloc,
 
     moq_session_t *c = NULL, *sv = NULL;
     establish_pair(alloc, 64, 64, &c, &sv, &tiny, &tiny);
+    if (!c || !sv || moq_session_state(c) != MOQ_SESS_ESTABLISHED ||
+        moq_session_state(sv) != MOQ_SESS_ESTABLISHED ||
+        moq_session_version(c) != MOQ_VERSION_DRAFT_16 ||
+        moq_session_version(sv) != MOQ_VERSION_DRAFT_16) {
+        fprintf(stderr, "FAIL: backpressure.random.pair.actual.draft16\n");
+        moq_session_destroy(c);
+        moq_session_destroy(sv);
+        return 1;
+    }
     drain_both(c, sv);
 
     rnd_state_t st;
@@ -1409,6 +1420,7 @@ static int run_scenario(uint64_t seed, moq_alloc_t *alloc,
     summary->rnd_recv_hash = 0xCBF29CE484222325ULL;
 
     moq_session_cfg_t tiny = MOQ_SESSION_CFG_INIT;
+    tiny.version = MOQ_VERSION_DRAFT_16;
     tiny.alloc = alloc;
     tiny.max_actions = 2;
     tiny.max_events = 3;
@@ -1424,6 +1436,15 @@ static int run_scenario(uint64_t seed, moq_alloc_t *alloc,
 
     moq_session_t *c = NULL, *sv = NULL;
     establish_pair(alloc, 64, 64, &c, &sv, &tiny, &tiny);
+    if (!c || !sv || moq_session_state(c) != MOQ_SESS_ESTABLISHED ||
+        moq_session_state(sv) != MOQ_SESS_ESTABLISHED ||
+        moq_session_version(c) != MOQ_VERSION_DRAFT_16 ||
+        moq_session_version(sv) != MOQ_VERSION_DRAFT_16) {
+        fprintf(stderr, "FAIL: backpressure.prelude.pair.actual.draft16\n");
+        moq_session_destroy(c);
+        moq_session_destroy(sv);
+        return 1;
+    }
 
     drain_both(c, sv);
 
@@ -1454,6 +1475,7 @@ static int run_scenario(uint64_t seed, moq_alloc_t *alloc,
 
 int main(void)
 {
+    if (scenario_require_version("test_scenario_backpressure", "16")) return 1;
     int failures = 0;
     const char *env_seeds = getenv("MOQ_SCENARIO_SEEDS");
     const char *env_start = getenv("MOQ_SCENARIO_SEED_START");
@@ -1623,5 +1645,5 @@ int main(void)
                 "(%d failures in %llu seeds)\n",
                 failures, (unsigned long long)num_seeds);
 
-    return failures;
+    return failures != 0;
 }

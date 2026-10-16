@@ -20,6 +20,7 @@
  */
 
 #include <moq/sim.h>
+#include "scenario_pair_version.h"
 #include <moq/codec.h>
 #include "../../tests/unit/test_support.h"
 #include <stdlib.h>
@@ -223,6 +224,7 @@ static int execute_step(moq_simpair_t *sp, shadow_state_t *st,
 
         moq_subscribe_namespace_cfg_t cfg;
         moq_subscribe_namespace_cfg_init(&cfg);
+        cfg.namespace_interest = MOQ_NAMESPACE_INTEREST_NAMESPACE_STATE;
         char name[16];
         snprintf(name, sizeof(name), "ns%llu",
                  (unsigned long long)(rng_next(rng) % 100));
@@ -406,6 +408,7 @@ static int run_prelude(moq_simpair_t *sp, trace_summary_t *ts)
     /* 1. Subscribe namespace. */
     moq_subscribe_namespace_cfg_t cfg;
     moq_subscribe_namespace_cfg_init(&cfg);
+    cfg.namespace_interest = MOQ_NAMESPACE_INTEREST_NAMESPACE_STATE;
     moq_bytes_t parts[] = { MOQ_BYTES_LITERAL("pre") };
     cfg.track_namespace_prefix.parts = parts;
     cfg.track_namespace_prefix.count = 1;
@@ -506,6 +509,7 @@ static int run_scenario(uint64_t seed, const moq_alloc_t *alloc,
     summary->hash = 0xCBF29CE484222325ULL;
 
     moq_simpair_cfg_t cfg = MOQ_SIMPAIR_CFG_INIT;
+    cfg.version = scenario_selected_version(MOQ_VERSION_DRAFT_16);
     cfg.alloc = alloc;
     cfg.seed = seed;
     cfg.initial_now_us = 1000;
@@ -590,6 +594,7 @@ static int run_scenario(uint64_t seed, const moq_alloc_t *alloc,
 
 int main(void)
 {
+    if (scenario_selected_version(MOQ_VERSION_DRAFT_16) == 0) return 1;
     int failures = 0;
     const char *env_seeds = getenv("MOQ_SCENARIO_SEEDS");
     const char *env_start = getenv("MOQ_SCENARIO_SEED_START");

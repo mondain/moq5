@@ -1,8 +1,33 @@
 #include "simpair_internal.h"
 
+/* Prefix hash over the v0 record fields and bytes, matching the twin-run
+ * suites, so two builds can be compared record for record. */
+static void trace_hash_fold(moq_simpair_t *sp, const moq_sim_trace_record_t *r)
+{
+    uint64_t h = sp->trace_hash;
+    h ^= r->seed;                  h *= 0x100000001B3ULL;
+    h ^= r->step;                  h *= 0x100000001B3ULL;
+    h ^= r->now_us;                h *= 0x100000001B3ULL;
+    h ^= (uint64_t)r->kind;        h *= 0x100000001B3ULL;
+    h ^= (uint64_t)r->from;        h *= 0x100000001B3ULL;
+    h ^= (uint64_t)r->to;          h *= 0x100000001B3ULL;
+    h ^= (uint64_t)r->action_kind; h *= 0x100000001B3ULL;
+    h ^= (uint64_t)r->input_kind;  h *= 0x100000001B3ULL;
+    h ^= (uint64_t)r->result;      h *= 0x100000001B3ULL;
+    h ^= r->code;                  h *= 0x100000001B3ULL;
+    h ^= r->bytes.len;             h *= 0x100000001B3ULL;
+    if (r->bytes.data && r->bytes.len > 0)
+        for (size_t i = 0; i < r->bytes.len; i++) {
+            h ^= r->bytes.data[i]; h *= 0x100000001B3ULL;
+        }
+    sp->trace_hash = h;
+}
+
 void trace_record(moq_simpair_t *sp,
                   const moq_sim_trace_record_t *record)
 {
+    if (sp->trace_hash_enabled)
+        trace_hash_fold(sp, record);
     if (sp->trace_fn)
         sp->trace_fn(sp->trace_ctx, record);
 }

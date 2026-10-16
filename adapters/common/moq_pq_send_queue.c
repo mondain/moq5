@@ -15,6 +15,7 @@ typedef struct pq_chunk {
     struct pq_chunk *next;
     moq_rcbuf_t     *rcbuf;   /* retained payload ref, or NULL */
     uint8_t         *copied;  /* owned copy buffer, or NULL */
+    size_t           copy_len;/* allocated size of `copied` */
     const uint8_t   *data;    /* base pointer (rcbuf data or copied) */
     size_t           len;
     size_t           offset;  /* bytes already provided from this chunk */
@@ -30,8 +31,24 @@ typedef struct {
     uint32_t    priority_key;
 } pq_stream_t;
 
+/* Bytes handed to the provider so far on a stream whose FIN has not yet been
+ * handed over, and that has not been dropped. Counted at commit, so bytes a
+ * truncate discards are never mistaken for bytes provided. Outlives the
+ * stream's queue slot, which is released whenever the queue runs empty, so a
+ * reset can tell how much of a prefix was provided, including a reset after
+ * the FIN was pushed but before it was provided. Created by the first push
+ * that carries bytes; forgotten when the FIN is handed over (commit), on
+ * drop, on a truncate that leaves nothing, and on destroy. */
+typedef struct {
+    uint64_t sid;
+    uint64_t provided;
+} pq_offset_t;
+
 struct moq_pq_send_queue {
     moq_alloc_t  alloc;
+    pq_offset_t *offs;
+    size_t       noffs;
+    size_t       offs_cap;
     uint64_t     cap;
     uint64_t     queued;      /* aggregate remaining bytes across streams */
     pq_stream_t *streams;
@@ -74,10 +91,48 @@ moq_pq_send_queue_t *moq_pq_send_queue_create(const moq_alloc_t *alloc,
     return q;
 }
 
+static pq_offset_t *pq_offset_find(moq_pq_send_queue_t *q, uint64_t sid)
+{
+    for (size_t i = 0; i < q->noffs; i++)
+        if (q->offs[i].sid == sid) return &q->offs[i];
+    return NULL;
+}
+
+static void pq_offset_forget(moq_pq_send_queue_t *q, uint64_t sid)
+{
+    pq_offset_t *o = pq_offset_find(q, sid);
+    if (o) *o = q->offs[--q->noffs];
+}
+
+/* Make sure `sid` has a record before `len` bytes are queued on it,
+ * including bytes carried by the push that also carries the FIN: the record
+ * stays until that FIN is handed to the provider. A zero-byte push needs no
+ * record and never allocates. Returns -1 on allocation failure, before
+ * anything is queued. */
+static int pq_offset_note(moq_pq_send_queue_t *q, uint64_t sid, size_t len)
+{
+    if (len == 0) return 0;
+    pq_offset_t *o = pq_offset_find(q, sid);
+    if (!o) {
+        if (q->noffs == q->offs_cap) {
+            size_t ncap = q->offs_cap ? q->offs_cap * 2 : 8;
+            pq_offset_t *n = (pq_offset_t *)q->alloc.realloc(
+                q->offs, q->offs_cap * sizeof(*n), ncap * sizeof(*n), q->alloc.ctx);
+            if (!n) return -1;
+            q->offs = n;
+            q->offs_cap = ncap;
+        }
+        o = &q->offs[q->noffs++];
+        o->sid = sid;
+        o->provided = 0;
+    }
+    return 0;
+}
+
 static void pq_chunk_free(moq_pq_send_queue_t *q, pq_chunk_t *c)
 {
     if (c->rcbuf) moq_rcbuf_decref(c->rcbuf);
-    if (c->copied) q->alloc.free(c->copied, c->len, q->alloc.ctx);
+    if (c->copied) q->alloc.free(c->copied, c->copy_len, q->alloc.ctx);
     q->alloc.free(c, sizeof(*c), q->alloc.ctx);
 }
 
@@ -109,6 +164,8 @@ void moq_pq_send_queue_destroy(moq_pq_send_queue_t *q)
     if (q->streams)
         q->alloc.free(q->streams, q->nstreams * sizeof(pq_stream_t),
                       q->alloc.ctx);
+    if (q->offs)
+        q->alloc.free(q->offs, q->offs_cap * sizeof(pq_offset_t), q->alloc.ctx);
     q->alloc.free(q, sizeof(*q), q->alloc.ctx);
 }
 
@@ -230,8 +287,8 @@ int moq_pq_send_queue_push_copy(moq_pq_send_queue_t *q, uint64_t sid,
     pq_stream_t *s = pq_find_or_create(q, sid);
     if (!s) return -1;
 
-    if (len == 0)
-        return pq_push_bare_fin(q, s);   /* len == 0 && fin */
+    if (len == 0)                         /* len == 0 && fin */
+        return pq_push_bare_fin(q, s);
 
     pq_chunk_t *c = (pq_chunk_t *)q->alloc.alloc(sizeof(*c), q->alloc.ctx);
     if (!c) { if (!s->head) s->in_use = false; return -1; }
@@ -242,7 +299,14 @@ int moq_pq_send_queue_push_copy(moq_pq_send_queue_t *q, uint64_t sid,
         if (!s->head) s->in_use = false;
         return -1;
     }
+    if (pq_offset_note(q, sid, len) != 0) {
+        q->alloc.free(c->copied, len, q->alloc.ctx);
+        q->alloc.free(c, sizeof(*c), q->alloc.ctx);
+        if (!s->head) s->in_use = false;
+        return -1;
+    }
     memcpy(c->copied, data, len);
+    c->copy_len = len;
     c->data = c->copied;
     c->len = len;
     c->fin = fin;
@@ -272,6 +336,11 @@ int moq_pq_send_queue_push_rcbuf(moq_pq_send_queue_t *q, uint64_t sid,
     pq_chunk_t *c = (pq_chunk_t *)q->alloc.alloc(sizeof(*c), q->alloc.ctx);
     if (!c) { if (!s->head) s->in_use = false; return -1; }
     memset(c, 0, sizeof(*c));
+    if (pq_offset_note(q, sid, len) != 0) {
+        q->alloc.free(c, sizeof(*c), q->alloc.ctx);
+        if (!s->head) s->in_use = false;
+        return -1;
+    }
     moq_rcbuf_incref(buf);
     c->rcbuf = buf;
     c->data = moq_rcbuf_data(buf);
@@ -318,6 +387,8 @@ void moq_pq_send_queue_commit(moq_pq_send_queue_t *q, uint64_t sid,
     if (!s) return;
 
     size_t need = nbytes;
+    bool fin_handed = false;
+    pq_offset_t *o = pq_offset_find(q, sid);
     /* Consume `need` data bytes, popping each chunk as it is fully drained.
      * Continue past need==0 only to pop a trailing fully-consumed chunk (the
      * zero-length FIN marker), never a partially-consumed data chunk. */
@@ -332,8 +403,12 @@ void moq_pq_send_queue_commit(moq_pq_send_queue_t *q, uint64_t sid,
             rem -= take;
             s->remaining -= take;
             q->queued = (q->queued >= take) ? q->queued - take : 0;
+            if (o) o->provided += take;
         }
         if (c->offset == c->len) {
+            /* The FIN rides on the last chunk: popping it hands the FIN to
+             * the provider (the matching plan reported is_fin). */
+            if (c->fin) fin_handed = true;
             s->head = c->next;
             if (!s->head) s->tail = NULL;
             pq_chunk_free(q, c);
@@ -343,6 +418,11 @@ void moq_pq_send_queue_commit(moq_pq_send_queue_t *q, uint64_t sid,
     }
     if (!s->head)
         pq_stream_clear(q, s);   /* drop the now-empty stream slot */
+    /* Nothing of the stream remains to be provided: its offset record ends
+     * here. Before the FIN is handed over the record is kept, even while the
+     * queue is momentarily empty, because later pushes continue the count. */
+    if (fin_handed)
+        pq_offset_forget(q, sid);
 }
 
 void moq_pq_send_queue_drop(moq_pq_send_queue_t *q, uint64_t sid)
@@ -350,6 +430,67 @@ void moq_pq_send_queue_drop(moq_pq_send_queue_t *q, uint64_t sid)
     if (!q) return;
     pq_stream_t *s = pq_find(q, sid);
     if (s) pq_stream_clear(q, s);
+    pq_offset_forget(q, sid);
+}
+
+uint64_t moq_pq_send_queue_truncate(moq_pq_send_queue_t *q, uint64_t sid,
+                                    uint64_t reliable)
+{
+    if (!q) return 0;
+    pq_stream_t *s = pq_find(q, sid);
+    const pq_offset_t *o = pq_offset_find(q, sid);
+    if (!s) {                             /* everything pushed was provided */
+        pq_offset_forget(q, sid);
+        return 0;
+    }
+    /* Provided so far: bytes handed over at commit. Bytes an earlier
+     * truncate discarded were never handed over and do not count, so a
+     * repeated or tighter truncate still keeps what is owed. */
+    uint64_t provided = o ? o->provided : 0;
+    uint64_t keep = reliable > provided ? reliable - provided : 0;
+    if (keep == 0) {
+        pq_stream_clear(q, s);
+        pq_offset_forget(q, sid);
+        return 0;
+    }
+
+    uint64_t left = keep;
+    pq_chunk_t *prev = NULL, *c = s->head;
+    while (c && left > 0) {
+        size_t rem = c->len - c->offset;
+        if ((uint64_t)rem > left) {
+            /* Shorten this chunk; its tail stays allocated but is never
+             * provided (len bounds every read). */
+            size_t cut = rem - (size_t)left;
+            c->len -= cut;
+            s->remaining -= cut;
+            q->queued = q->queued >= cut ? q->queued - cut : 0;
+            left = 0;
+        } else {
+            left -= rem;
+        }
+        c->fin = false;
+        prev = c;
+        c = c->next;
+    }
+    /* Release everything after the kept prefix. */
+    while (c) {
+        pq_chunk_t *n = c->next;
+        size_t rem = c->len - c->offset;
+        s->remaining -= rem;
+        q->queued = q->queued >= rem ? q->queued - rem : 0;
+        pq_chunk_free(q, c);
+        c = n;
+    }
+    if (prev) prev->next = NULL;
+    s->tail = prev;
+    if (!prev) s->head = NULL;
+    if (s->remaining == 0) {
+        pq_stream_clear(q, s);
+        pq_offset_forget(q, sid);
+        return 0;
+    }
+    return s->remaining;
 }
 
 uint64_t moq_pq_send_queue_queued_bytes(const moq_pq_send_queue_t *q)

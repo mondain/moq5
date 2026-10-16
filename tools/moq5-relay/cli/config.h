@@ -11,10 +11,13 @@
  *     "port": 4443,                     // required, 1..65535
  *     "cert": "/path/cert.pem",         // required for serve
  *     "key":  "/path/key.pem",          // required for serve
- *     "versions": [18],                 // optional; default [18]. An ORDERED,
+ *     "versions": [18],                 // optional; default: [18].
+ *                                       // Draft 22 requires explicit opt-in.
+ *                                       // An ORDERED,
  *                                       // non-empty set of supported drafts,
  *                                       // most preferred first; entries must be
- *                                       // exact integers from {18,16}, unique.
+ *                                       // exact integers from {22,18,16},
+ *                                       // unique.
  *                                       // One entry keeps exact-listener
  *                                       // semantics; several offer several
  *                                       // ALPNs on ONE listener and ALPN
@@ -88,6 +91,11 @@ extern "C" {
 #endif
 
 #define MOQR_CLI_MAX_VERSIONS 4
+
+/* The draft placed first in a default offer. Both the native listener and
+ * the WebTransport listener default to every draft this build supports,
+ * newest first (22, 18, 16). A configured `versions` list replaces that set. */
+#define MOQR_CLI_DEFAULT_PREFERRED_VERSION MOQ_VERSION_DRAFT_22
 
 /* Upper bound on listener.lanes. Kept decoupled from the shard runtime here;
  * main.c _Static_asserts it equals MOQR_SHARDS_MAX where both headers meet. */
@@ -341,7 +349,7 @@ typedef struct moqr_cli_config {
     char     alpn_buf[MOQR_CLI_MAX_VERSIONS][16];
     const char *alpns[MOQR_CLI_MAX_VERSIONS];
     size_t   alpn_count;          /* == version_count after a successful parse */
-    uint32_t version;             /* FIRST listener draft number (16 or 18);
+    uint32_t version;             /* FIRST listener draft number (16, 18 or 22);
                                    * authoritative only when version_count == 1 */
     /* The ordered supported set, most preferred first. Always >= 1 entry after
      * a successful parse; count 1 is the exact-listener case. */
@@ -519,7 +527,7 @@ moqr_result_t moqr_cli_describe_capacity(const moqr_cli_config_t *cfg,
  * The ONE shard-config builder both `capacity` and `serve` consume, so the
  * two can never disagree about the effective multi-lane config. It sets
  * admit_remote_demand = (lanes > 1): production admission is automatically
- * on for a multi-lane relay and off for the single-lane M1 path. This is
+ * on for a multi-lane relay and off for the direct single-lane path. This is
  * the sole place that rule lives — no user-facing admission key exists.
  */
 void moqr_cli_build_shards_cfg(const moqr_cli_config_t *cfg,

@@ -94,6 +94,7 @@
  */
 
 #include <moq/pico_wt.h>
+#include <moq/connection_target.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -113,8 +114,9 @@ typedef struct moq_pico_wt_managed_cfg {
 
     /* Network. */
     const char        *host;           /* client: remote host; required */
-    const char        *sni;            /* client TLS SNI / :authority and the
-                                          name the default verifier checks.
+    const char        *sni;            /* client TLS SNI and the name the
+                                          default verifier checks; never the
+                                          CONNECT :authority (see `target`).
                                           Default: a DNS host is used as-is. An
                                           IP-literal host has no valid SNI, so it
                                           uses "localhost"; but authenticating a
@@ -122,7 +124,10 @@ typedef struct moq_pico_wt_managed_cfg {
                                           verifier (verified mode and no
                                           configure_quic) REQUIRES an explicit
                                           sni, else _create fails MOQ_ERR_INVAL. */
-    const char        *path;           /* WT path; default "/moq" */
+    const char        *path;           /* WT path; default "/moq". A client
+                                          with a `target` may omit it; set,
+                                          it must equal the target's :path
+                                          (see `target`) */
     int                port;           /* 1..65535; required */
 
     /* Session tuning (0 = default). */
@@ -214,10 +219,44 @@ typedef struct moq_pico_wt_managed_cfg {
      * value at most 65535 bytes). Copied during _create; a session refuses
      * invalid tokens when it is created. The SETUP carrying them must fit the
      * session's default 4096-byte send arena (the send-arena rule on
-     * moq_session_cfg_t.setup_auth_tokens), else MOQ_ERR_INVAL at _create. Read only when struct_size covers setup_auth_token_count. Set
-     * via moq_pico_wt_managed_cfg_init_sized. */
+     * moq_session_cfg_t.setup_auth_tokens; each token takes its value plus up
+     * to 32 bytes, beside the connection target and the other options), else
+     * MOQ_ERR_INVAL at _create. A client whose SETUP still cannot be queued
+     * when its session starts ends as a failed connection (is_fatal,
+     * fatal_code 0). Read only when struct_size covers
+     * setup_auth_token_count. Set via moq_pico_wt_managed_cfg_init_sized. */
     const moq_auth_token_t *setup_auth_tokens;
     size_t             setup_auth_token_count;
+    /* Reserved: covers the tail padding the layout that ended at
+     * setup_auth_token_count leaves on targets that align pointers to four
+     * bytes and uint64_t to eight, so target lands at or past that old
+     * sizeof. Never read. */
+    uint32_t           _reserved_target;
+    /* Appended — connection target (struct_size append-only ABI).
+     *
+     * target: the URI identity this facade binds the session with when the
+     * negotiated wire profile requires a transport binding (see
+     * <moq/connection_target.h>; draft-22 does, draft-16/18 do not). The
+     * facade supplies the transport facts itself -- the session is created
+     * once the WebTransport session is up, and QUIC DATAGRAM support is read
+     * from both sides' transport parameters and the peer's HTTP/3 datagram
+     * setting -- and copies the target's fields and bytes during _create
+     * (accept_uri_ctx is borrowed until _destroy; a policy is never consulted
+     * over WebTransport). CLIENT: a complete target with no policy, the one
+     * identity the CONNECT dereferences and the session binds; NULL derives
+     * it from `host`, `port` and `path`. The CONNECT's :authority is the
+     * target authority as spelled (e.g. "relay.example" for
+     * https://relay.example/moq, "[::1]:4433" for https://[::1]:4433/moq), or
+     * "host:port" when derived -- independent of `sni`. Its :path is the
+     * target path/query as spelled, with "/" in front of an empty or
+     * query-only one (RFC 9114 Section 4.3.1); a `path` that differs from
+     * that projection is refused rather than sent instead. An identity above
+     * the binding's bound (authority plus path/query over 65535 bytes) or
+     * embedding a NUL is refused. SERVER: ignored -- each accepted session is
+     * bound with the authority and path the client's CONNECT named. A
+     * malformed or refused target is MOQ_ERR_INVAL at _create, before any
+     * transport effect. Set via moq_pico_wt_managed_cfg_init_sized. */
+    const moq_connection_target_t *target;
 } moq_pico_wt_managed_cfg_t;
 
 /* Pointer-only initializer: clears and stamps the original frozen prefix

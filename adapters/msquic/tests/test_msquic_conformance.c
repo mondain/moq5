@@ -488,6 +488,86 @@ static void t_version_match_d18(void)
         printf("PASS: version_match_d18\n");
 }
 
+/* Both sides at draft-22: the profile cannot start until the facade binds
+ * each session to its connection, so a completed setup, a verified object
+ * and a clean close prove the binding through the production contract. */
+static void t_version_match_d22(void)
+{
+    int before = failures;
+    msqc_pair_t p;
+    msqc_pair_cfg_t cfg;
+
+    memset(&p, 0, sizeof(p));
+    default_cfg(&cfg);
+    cfg.client_version = MOQ_VERSION_DRAFT_22;
+    cfg.server_version = MOQ_VERSION_DRAFT_22;
+    p.client.steps[0] =
+        (msqc_step_t){ .when = MSQC_ON_SETUP, .act = MSQC_DO_SUBSCRIBE };
+    p.client.steps[1] = (msqc_step_t){ .when = MSQC_ON_OBJECTS,
+                                       .when_arg = 1,
+                                       .act = MSQC_DO_CLOSE };
+    p.client.step_count = 2;
+    p.client.expect_size = 64;
+
+    p.server.steps[0] = (msqc_step_t){ .when = MSQC_ON_SUB_REQUEST,
+                                       .act = MSQC_DO_ACCEPT };
+    p.server.steps[1] = (msqc_step_t){ .when = MSQC_ON_SUB_REQUEST,
+                                       .act = MSQC_DO_PUBLISH,
+                                       .a1 = 1,
+                                       .a2 = 64 };
+    p.server.step_count = 2;
+
+    if (msqc_pair_setup(&p, &cfg) != 0) {
+        CHECK(0 && "pair setup");
+        msqc_pair_teardown(&p);
+        return;
+    }
+    CHECK(msqc_wait_count(&p.client, &p.client.obs.objects, 1));
+    CHECK(msqc_wait_flag(&p.client, &p.client.obs.closed));
+    CHECK(msqc_wait_flag(&p.server, &p.server.obs.closed));
+    msqc_pair_teardown(&p);
+
+    CHECK(p.client.obs.setup == 1);
+    CHECK(p.server.obs.setup == 1);
+    CHECK(p.client.obs.objects == 1);
+    CHECK(p.client.obs.seen_g0 == 0x1);
+    CHECK(p.client.obs.object_errors == 0);
+    CHECK(p.server.obs.publish_errors == 0);
+    CHECK(!p.client.obs.fatal);
+    CHECK(!p.server.obs.fatal);
+    if (failures == before)
+        printf("PASS: version_match_d22\n");
+}
+
+/* A draft-22 client against a draft-18 server has no ALPN in common: the
+ * refusal happens at the handshake, as between any two distinct drafts. */
+static void t_version_refusal_d22(void)
+{
+    int before = failures;
+    msqc_pair_t p;
+    msqc_pair_cfg_t cfg;
+
+    memset(&p, 0, sizeof(p));
+    default_cfg(&cfg);
+    cfg.client_version = MOQ_VERSION_DRAFT_22;
+    cfg.server_version = MOQ_VERSION_DRAFT_18;
+
+    if (msqc_pair_setup(&p, &cfg) != 0) {
+        CHECK(0 && "pair setup");
+        msqc_pair_teardown(&p);
+        return;
+    }
+    CHECK(msqc_wait_flag(&p.client, &p.client.obs.fatal));
+    CHECK(moq_msquic_managed_conn_count(p.server.m) == 0);
+    msqc_pair_teardown(&p);
+
+    CHECK(p.client.obs.setup == 0);
+    CHECK(p.client.obs.fatal);
+    CHECK(p.server.obs.setup == 0);
+    if (failures == before)
+        printf("PASS: version_refusal_d22\n");
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 3) {
@@ -506,6 +586,8 @@ int main(int argc, char **argv)
     t_datagram_object();
     t_version_refusal();
     t_version_match_d18();
+    t_version_match_d22();
+    t_version_refusal_d22();
 
     /* intentional gaps (see the header comment for the reasoning) */
     printf("SKIP: timer/virtual-time scenarios (real time only; no "

@@ -13,6 +13,8 @@
  */
 
 #include <moq/mvfst.h>
+#include "../../common/moq_alpn.h"
+#include <cstdlib>
 #include <moq/session.h>
 #include <moq/rcbuf.h>
 
@@ -49,12 +51,19 @@ struct test_cert { std::string cert_pem, key_pem; bool ok = false; };
 static test_cert gen_cert()
 {
     test_cert r;
-    auto pkey = folly::ssl::EvpPkeyUniquePtr(EVP_PKEY_new());
-    if (!pkey) return r;
-    auto *ec = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
-    if (!ec) return r;
-    if (!EC_KEY_generate_key(ec)) { EC_KEY_free(ec); return r; }
-    if (!EVP_PKEY_assign_EC_KEY(pkey.get(), ec)) { EC_KEY_free(ec); return r; }
+    /* P-256 key through the EVP keygen interface (OpenSSL 1.1 and 3). */
+    folly::ssl::EvpPkeyUniquePtr pkey;
+    {
+        EVP_PKEY_CTX *kctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr);
+        EVP_PKEY *raw = nullptr;
+        bool keyed = kctx && EVP_PKEY_keygen_init(kctx) > 0 &&
+            EVP_PKEY_CTX_set_ec_paramgen_curve_nid(kctx,
+                NID_X9_62_prime256v1) > 0 &&
+            EVP_PKEY_keygen(kctx, &raw) > 0;
+        EVP_PKEY_CTX_free(kctx);
+        if (!keyed) { EVP_PKEY_free(raw); return r; }
+        pkey.reset(raw);
+    }
     auto x509 = folly::ssl::X509UniquePtr(X509_new());
     if (!x509) return r;
     if (!ASN1_INTEGER_set(X509_get_serialNumber(x509.get()), 1)) return r;
@@ -367,6 +376,18 @@ static bool wait_for(moq_mvfst_managed_t *ms, moq_mvfst_managed_t *mc,
 /* Test: full managed server/client flow                              */
 /* ================================================================== */
 
+/* The MoQ version both facades are configured for ("16" default); draft-22
+ * exercises the managed facades' transport binding on both sides. */
+static moq_version_t g_version = MOQ_VERSION_DRAFT_16;
+
+static void configure_version(moq_mvfst_managed_cfg_t &cfg)
+{
+    static const char *alpn_one[1];
+    alpn_one[0] = moq_alpn_for_version(g_version);
+    cfg.alpn_list = alpn_one;
+    cfg.alpn_count = 1;
+}
+
 static void test_managed_server_client_flow()
 {
     auto cm = gen_cert();
@@ -379,7 +400,8 @@ static void test_managed_server_client_flow()
     /* --- Create managed server --- */
     server_state ss;
     moq_mvfst_managed_cfg_t scfg;
-    moq_mvfst_managed_cfg_init(&scfg);
+    moq_mvfst_managed_cfg_init_sized(&scfg, sizeof(scfg));
+    configure_version(scfg);
     scfg.perspective = MOQ_PERSPECTIVE_SERVER;
     scfg.port = 0;
     scfg.cert_path = tf.cert_path;
@@ -401,7 +423,8 @@ static void test_managed_server_client_flow()
     /* --- Create managed client --- */
     client_state cs;
     moq_mvfst_managed_cfg_t ccfg;
-    moq_mvfst_managed_cfg_init(&ccfg);
+    moq_mvfst_managed_cfg_init_sized(&ccfg, sizeof(ccfg));
+    configure_version(ccfg);
     ccfg.perspective = MOQ_PERSPECTIVE_CLIENT;
     ccfg.host = "127.0.0.1";
     ccfg.port = port;
@@ -424,6 +447,8 @@ static void test_managed_server_client_flow()
     MVFST_CHECK(ss.setup_complete.load());
     MVFST_CHECK(!ss.error.load());
     MVFST_CHECK(!cs.error.load());
+    MVFST_CHECK(moq_mvfst_managed_negotiated_version(cli) == g_version);
+    MVFST_CHECK(moq_mvfst_managed_negotiated_version(srv) == g_version);
 
     /* --- Phase 2: subscribe --- */
     MVFST_CHECK(wait_for(srv, cli, ss, cs, [&]() {
@@ -503,8 +528,9 @@ static void test_managed_server_client_flow()
     moq_mvfst_managed_destroy(srv);
 }
 
-int main()
+int main(int argc, char **argv)
 {
+    if (argc > 1) g_version = (moq_version_t)std::atoi(argv[1]);
     test_managed_server_client_flow();
     std::printf("%s: %d failures\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;

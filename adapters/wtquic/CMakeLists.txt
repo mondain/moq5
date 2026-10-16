@@ -433,6 +433,8 @@ int main(void) { return p == 0; }
             target_include_directories(test_wtquic_origin_gate PRIVATE tests)
             target_link_libraries(test_wtquic_origin_gate PRIVATE
                 moq::adapter-wtquic-msquic-managed wtq::msquic Threads::Threads)
+            target_include_directories(test_wtquic_origin_gate PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/support)
             if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
                 target_compile_options(test_wtquic_origin_gate PRIVATE
                     -Wall -Wextra -Wpedantic
@@ -516,7 +518,7 @@ int main(void) { return p == 0; }
         # duplicate symbols; the testing seam never enters the shipped library.
         add_executable(test_wtquic_msquic_managed_internal
             tests/test_wtquic_msquic_managed_internal.c
-            ${CMAKE_CURRENT_SOURCE_DIR}/wtquic_msquic_managed.c)
+            tests/wtquic_msquic_managed_internal_tu.c)
         target_compile_definitions(test_wtquic_msquic_managed_internal PRIVATE
             MOQ_WTQ_MM_TESTING MOQ_BUILDING)
         target_include_directories(test_wtquic_msquic_managed_internal PRIVATE
@@ -533,7 +535,7 @@ int main(void) { return p == 0; }
     endif()
 
     # Export policy: the adapter's moq_wtquic_* surface is the installed public
-    # API plus exactly ONE private lockstep SPI; nothing else (in particular no
+    # API plus the explicitly listed private lockstep SPI; nothing else (in particular no
     # white-box test seam) may be exported.
     add_test(NAME wtquic_adapter_symbol_policy
         COMMAND ${CMAKE_COMMAND}
@@ -625,6 +627,76 @@ int main(void) { return p == 0; }
     add_test(NAME wtquic_keys COMMAND test_wtquic_keys)
     set_tests_properties(wtquic_keys PROPERTIES LABELS "wtquic")
 
+    # Public startup through the real adapter/bridge, with a fake WT provider.
+    add_executable(test_wtquic_open_close tests/test_wtquic_open_close.c)
+    target_link_libraries(test_wtquic_open_close PRIVATE moq::core)
+    target_include_directories(test_wtquic_open_close PRIVATE
+        ${PROJECT_SOURCE_DIR}/core/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        $<TARGET_PROPERTY:wtq::wtquic,INTERFACE_INCLUDE_DIRECTORIES>)
+    target_compile_definitions(test_wtquic_open_close PRIVATE MOQ_BUILDING WTQ_STATIC)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(test_wtquic_open_close PRIVATE
+            -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME wtquic_open_close COMMAND test_wtquic_open_close)
+    set_tests_properties(wtquic_open_close PROPERTIES
+        LABELS "wtquic;lifecycle" TIMEOUT 15)
+
+    # Real adapter/core dispatch with a bounded fake WT provider. Native peer
+    # ACK semantics are qualified separately against the selected WT backend.
+    add_executable(test_wtquic_commit tests/test_wtquic_commit.c)
+    target_link_libraries(test_wtquic_commit PRIVATE moq::core)
+    target_include_directories(test_wtquic_commit PRIVATE
+        ${PROJECT_SOURCE_DIR}/core/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        $<TARGET_PROPERTY:wtq::wtquic,INTERFACE_INCLUDE_DIRECTORIES>)
+    target_compile_definitions(test_wtquic_commit PRIVATE MOQ_BUILDING WTQ_STATIC)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(test_wtquic_commit PRIVATE
+            -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME wtquic_commit COMMAND test_wtquic_commit)
+    set_tests_properties(wtquic_commit PROPERTIES
+        LABELS "wtquic;lifecycle" TIMEOUT 30)
+
+    # Includes the actual managed and attach TUs with typed WT fakes. Use only
+    # provider headers; backend completion is covered by a separate native test.
+    # The managed TU is the MsQuic backend's, so this needs that backend's
+    # headers and is absent from a Network-only build.
+    if(TARGET wtq::msquic AND TARGET msquic::msquic)
+        add_executable(test_wtquic_flush tests/test_wtquic_flush.c)
+        target_link_libraries(test_wtquic_flush PRIVATE moq::core Threads::Threads)
+        target_include_directories(test_wtquic_flush PRIVATE
+            ${PROJECT_SOURCE_DIR}/core/include ${PROJECT_SOURCE_DIR}/core/src
+            ${PROJECT_SOURCE_DIR}/core/src/session
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            $<TARGET_PROPERTY:wtq::wtquic,INTERFACE_INCLUDE_DIRECTORIES>)
+        # The managed TU includes the MsQuic facade, whose header includes
+        # <msquic.h>: MsQuic's headers, without linking it (the WT calls are
+        # faked). SYSTEM, as the imported target would supply them.
+        target_include_directories(test_wtquic_flush SYSTEM PRIVATE
+            $<TARGET_PROPERTY:msquic::msquic,INTERFACE_INCLUDE_DIRECTORIES>)
+        target_compile_definitions(test_wtquic_flush PRIVATE MOQ_BUILDING WTQ_STATIC)
+        set_target_properties(test_wtquic_flush PROPERTIES
+            C_STANDARD 11 C_STANDARD_REQUIRED YES C_EXTENSIONS NO)
+        if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(test_wtquic_flush PRIVATE
+                -Wall -Wextra -Wpedantic -ffunction-sections -fdata-sections
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        if(APPLE)
+            target_link_options(test_wtquic_flush PRIVATE -Wl,-dead_strip)
+        elseif(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+            target_link_options(test_wtquic_flush PRIVATE -Wl,--gc-sections)
+        endif()
+        add_test(NAME wtquic_flush COMMAND test_wtquic_flush)
+        set_tests_properties(wtquic_flush PROPERTIES
+            LABELS "wtquic;lifecycle" TIMEOUT 30)
+    endif()
+
     # Prospective receive-admission ownership, with a fake provider only.
     add_executable(test_wtquic_hold_input tests/test_wtquic_hold_input.c)
     add_executable(test_wtquic_qualification tests/test_wtquic_qualification.c)
@@ -671,13 +743,14 @@ int main(void) { return p == 0; }
         endforeach()
     endforeach()
 
-    # Network-managed cfg initializer + whole-block read-gate ABI test.
-    # No network: it drives create()'s config-import and aborts on a bogus
-    # offer list before dialing. The whole-block gate is proven causally
-    # (an over-read of app_deadline_ctx is a heap-buffer-overflow under the
-    # canonical ASan build). Links only the managed lib (transitively
-    # wtq::network); no MsQuic server, no certs. Gated on the optional
-    # managed target so a tests-on build without it still configures.
+    # Network-managed cfg initializer ABI + short-config rejection test.
+    # No network: create() rejects the bogus offer list (MOQ_ERR_INVAL)
+    # during validation, before allocation. The optional-tail import,
+    # including the app_deadline whole-block gate, lies below an
+    # unconditional capability rejection and is unreachable here.
+    # Links only the managed lib (transitively wtq::network); no MsQuic
+    # server, no certs. Gated on the optional managed target so a
+    # tests-on build without it still configures.
     if(TARGET moq-adapter-wtquic-network-managed)
         add_executable(test_wtquic_network_managed_cfg_abi
             tests/test_wtquic_network_managed_cfg_abi.c)
@@ -701,7 +774,7 @@ int main(void) { return p == 0; }
         # the testing seam never enters the shipped library.
         add_executable(test_wtquic_network_managed_internal
             tests/test_wtquic_network_managed_internal.c
-            ${CMAKE_CURRENT_SOURCE_DIR}/wtquic_network_managed.c)
+            tests/wtquic_network_managed_internal_tu.c)
         target_compile_definitions(test_wtquic_network_managed_internal PRIVATE
             MOQ_WTQ_MM_TESTING MOQ_BUILDING)
         target_include_directories(test_wtquic_network_managed_internal PRIVATE
@@ -743,6 +816,8 @@ int main(void) { return p == 0; }
     add_executable(test_wtquic_loopback tests/test_wtquic_loopback.c)
     target_link_libraries(test_wtquic_loopback PRIVATE
         moq::adapter-wtquic wtq::msquic Threads::Threads)
+    target_include_directories(test_wtquic_loopback PRIVATE
+        ${PROJECT_SOURCE_DIR}/tests/support)
 
     # Production-contract conformance over real MsQuic loopback: every
     # MoQ session call runs inside the adapter hook on the transport
@@ -754,6 +829,8 @@ int main(void) { return p == 0; }
         tests/wtquic_contract_pair.c)
     target_link_libraries(test_wtquic_conformance PRIVATE
         moq::adapter-wtquic wtq::msquic Threads::Threads)
+    target_include_directories(test_wtquic_conformance PRIVATE
+        ${PROJECT_SOURCE_DIR}/tests/support)
     if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
         target_compile_options(test_wtquic_conformance PRIVATE
             -Wall -Wextra -Wpedantic
@@ -773,8 +850,25 @@ int main(void) { return p == 0; }
         tests/wtquic_contract_pair.c)
     target_link_libraries(test_wtquic_stress PRIVATE
         moq::adapter-wtquic wtq::msquic Threads::Threads)
+    target_include_directories(test_wtquic_stress PRIVATE
+        ${PROJECT_SOURCE_DIR}/tests/support)
     if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
         target_compile_options(test_wtquic_stress PRIVATE
+            -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+
+    # A pair's listener stays reachable over IPv4 loopback while IPv4-only
+    # sockets hold much of the ephemeral port range.
+    add_executable(test_wtquic_port_shadow
+        tests/test_wtquic_port_shadow.c
+        tests/wtquic_contract_pair.c)
+    target_link_libraries(test_wtquic_port_shadow PRIVATE
+        moq::adapter-wtquic wtq::msquic Threads::Threads)
+    target_include_directories(test_wtquic_port_shadow PRIVATE
+        ${PROJECT_SOURCE_DIR}/tests/support)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(test_wtquic_port_shadow PRIVATE
             -Wall -Wextra -Wpedantic
             $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
     endif()
@@ -803,6 +897,34 @@ int main(void) { return p == 0; }
         # negotiation + establishment. Registered here so it shares the cert
         # fixture; guarded on the facade target.
         if(TARGET moq::adapter-wtquic-msquic-managed)
+            # The fixture includes the real adapter TU for private mapping
+            # observations; the managed TU and WT provider are unchanged.
+            add_executable(test_wtquic_commit_loopback
+                tests/test_wtquic_commit_loopback.c
+                wtquic_msquic_managed.c)
+            target_compile_features(test_wtquic_commit_loopback PRIVATE c_std_11)
+            target_compile_definitions(test_wtquic_commit_loopback PRIVATE MOQ_BUILDING)
+            target_include_directories(test_wtquic_commit_loopback PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/include
+                ${CMAKE_CURRENT_SOURCE_DIR}
+                ${CMAKE_CURRENT_SOURCE_DIR}/..
+                ${PROJECT_SOURCE_DIR}/tests/support)
+            target_link_libraries(test_wtquic_commit_loopback PRIVATE
+                moq::core wtq::wtquic wtq::msquic Threads::Threads)
+            if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+                target_compile_options(test_wtquic_commit_loopback PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME wtquic_commit_loopback
+                COMMAND test_wtquic_commit_loopback
+                    ${CMAKE_CURRENT_BINARY_DIR}/cert.pem
+                    ${CMAKE_CURRENT_BINARY_DIR}/key.pem)
+            set_tests_properties(wtquic_commit_loopback PROPERTIES
+                FIXTURES_REQUIRED wtquic_certs
+                LABELS "network;wtquic"
+                TIMEOUT 240)
+
             # White-box loopback: recompile the facade with MOQ_WTQ_MM_TESTING so
             # the SERVER case can observe an established child under its lane
             # guard (proving establishment, not just admission). Links the DEPS
@@ -817,6 +939,8 @@ int main(void) { return p == 0; }
                 ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/..)
             target_link_libraries(test_wtquic_msquic_managed_loopback PRIVATE
                 moq::adapter-wtquic wtq::msquic Threads::Threads)
+            target_include_directories(test_wtquic_msquic_managed_loopback PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/support)
             if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
                 target_compile_options(test_wtquic_msquic_managed_loopback PRIVATE
                     -Wall -Wextra -Wpedantic
@@ -830,6 +954,53 @@ int main(void) { return p == 0; }
                 FIXTURES_REQUIRED wtquic_certs
                 LABELS "network;wtquic"
                 TIMEOUT 120)
+            # The same run while IPv4-only sockets hold much of the ephemeral
+            # range (tests/support/port_shadow.c): the raw wtquic listeners take
+            # their ports from the IPv4 allocator (tests/wtq_loopback_port.h);
+            # the managed server picks its port 0 that way itself.
+            if(NOT WIN32)
+                add_test(NAME wtquic_msquic_managed_loopback_port_shadow
+                    COMMAND $<TARGET_FILE:moq_port_shadow> --
+                        $<TARGET_FILE:test_wtquic_msquic_managed_loopback>
+                        ${CMAKE_CURRENT_BINARY_DIR}/cert.pem
+                        ${CMAKE_CURRENT_BINARY_DIR}/key.pem)
+                # Every port-shadow test holds thousands of IPv4 ports for its run; two at
+                # once can exhaust the ephemeral range, so they share one resource lock.
+                set_tests_properties(wtquic_msquic_managed_loopback_port_shadow
+                    PROPERTIES
+                    FIXTURES_REQUIRED wtquic_certs
+                    LABELS "network;wtquic"
+                    TIMEOUT 180
+                    RESOURCE_LOCK ipv4_port_shadow)
+
+                # A server created with port 0 is reachable over IPv4
+                # loopback under the same shadowing: the facade, not the
+                # test, chooses the port. Public managed API only.
+                add_executable(test_wtquic_msquic_managed_ephemeral_port
+                    tests/test_wtquic_msquic_managed_ephemeral_port.c)
+                target_link_libraries(test_wtquic_msquic_managed_ephemeral_port
+                    PRIVATE moq::adapter-wtquic-msquic-managed wtq::msquic
+                    Threads::Threads)
+                if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+                    target_compile_options(
+                        test_wtquic_msquic_managed_ephemeral_port PRIVATE
+                        -Wall -Wextra -Wpedantic
+                        $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+                endif()
+                add_test(NAME wtquic_msquic_managed_ephemeral_port_shadow
+                    COMMAND $<TARGET_FILE:moq_port_shadow> --
+                        $<TARGET_FILE:test_wtquic_msquic_managed_ephemeral_port>
+                        ${CMAKE_CURRENT_BINARY_DIR}/cert.pem
+                        ${CMAKE_CURRENT_BINARY_DIR}/key.pem)
+                # Every port-shadow test holds thousands of IPv4 ports for its run; two at
+                # once can exhaust the ephemeral range, so they share one resource lock.
+                set_tests_properties(wtquic_msquic_managed_ephemeral_port_shadow
+                    PROPERTIES
+                    FIXTURES_REQUIRED wtquic_certs
+                    LABELS "network;wtquic"
+                    TIMEOUT 180
+                    RESOURCE_LOCK ipv4_port_shadow)
+            endif()
 
             # Autonomous bounded-poll delivery: a MANAGED subscriber must deliver
             # a whole track to a bounded-poll app with no explicit receiver wake
@@ -843,6 +1014,8 @@ int main(void) { return p == 0; }
             target_link_libraries(test_wtquic_msquic_managed_autodrain PRIVATE
                 moq::adapter-wtquic-msquic-managed moq::adapter-wtquic
                 wtq::msquic Threads::Threads)
+            target_include_directories(test_wtquic_msquic_managed_autodrain PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/support)
             if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
                 target_compile_options(test_wtquic_msquic_managed_autodrain PRIVATE
                     -Wall -Wextra -Wpedantic
@@ -873,6 +1046,17 @@ int main(void) { return p == 0; }
             FIXTURES_REQUIRED wtquic_certs
             LABELS "network;wtquic"
             TIMEOUT 600)
+        add_test(NAME wtquic_port_shadow
+            COMMAND test_wtquic_port_shadow
+                ${CMAKE_CURRENT_BINARY_DIR}/cert.pem
+                ${CMAKE_CURRENT_BINARY_DIR}/key.pem)
+        # Every port-shadow test holds thousands of IPv4 ports for its run; two at
+        # once can exhaust the ephemeral range, so they share one resource lock.
+        set_tests_properties(wtquic_port_shadow PROPERTIES
+            FIXTURES_REQUIRED wtquic_certs
+            LABELS "network;wtquic"
+            TIMEOUT 120
+            RESOURCE_LOCK ipv4_port_shadow)
 
     endif()
     endif() # TARGET wtq::msquic

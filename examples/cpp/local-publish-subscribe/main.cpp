@@ -110,7 +110,7 @@ int main()
                         (unsigned long long)obj.object_id,
                         (int)obj.payload_data.size(),
                         (const char *)obj.payload_data.data());
-            received = (obj.payload_data.size() == 9 &&
+            received = (obj.sub == sub && obj.payload_data.size() == 9 &&
                         std::memcmp(obj.payload_data.data(),
                                     "hello moq", 9) == 0);
         },

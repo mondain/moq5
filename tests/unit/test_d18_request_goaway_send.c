@@ -277,7 +277,7 @@ static bool subscriber_goaway_teardown(moq_simpair_t *sp, bool reset)
         return false;
     int slot = sub_resolve_handle(client, csub);
     if (slot < 0) return false;
-    moq_stream_ref_t ref = client->subs[slot].request_stream_ref;
+    moq_stream_ref_t ref = client->subs[slot].rs.ref;
     (void)count_events(client);
     drain_actions(client);
     moq_result_t rc = reset
@@ -720,10 +720,21 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT(count_events(s), 0);
         moq_session_destroy(s);
     }
-    {   /* a second (inbound) GOAWAY on the migrated stream ⇒ 0x3 */
+    {   /* the peer's GOAWAY on the stream we migrated is the first it sent
+         * there: it migrates the request; a second one received ⇒ 0x3 */
         moq_stream_ref_t ref; moq_session_t *s = sub_after_goaway(&ref, NULL);
         uint8_t g[64]; moq_buf_writer_t gw; moq_buf_writer_init(&gw, g, sizeof(g));
         moq_d18_encode_goaway_request(&gw, NULL, 0, 0);
+        (void)moq_session_on_bidi_stream_bytes(s, ref, g,
+            moq_buf_writer_offset(&gw), false, 1);
+        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
+        bool migrated = false;
+        moq_event_t ev;
+        while (moq_session_poll_events(s, &ev, 1) > 0) {
+            if (ev.kind == MOQ_EVENT_REQUEST_GOAWAY) migrated = true;
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK(migrated);
         (void)moq_session_on_bidi_stream_bytes(s, ref, g,
             moq_buf_writer_offset(&gw), false, 1);
         MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_CLOSED);
@@ -747,10 +758,14 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
         moq_session_destroy(s);
     }
-    {   /* publisher-side: a duplicate inbound GOAWAY ⇒ 0x3 */
+    {   /* publisher-side: the subscriber's GOAWAY after ours migrates the
+         * request; a second one received ⇒ 0x3 */
         moq_stream_ref_t ref; moq_session_t *s = ns_pub_after_goaway(&ref);
         uint8_t g[64]; moq_buf_writer_t gw; moq_buf_writer_init(&gw, g, sizeof(g));
         moq_d18_encode_goaway_request(&gw, NULL, 0, 0);
+        (void)moq_session_on_bidi_stream_bytes(s, ref, g,
+            moq_buf_writer_offset(&gw), false, 1);
+        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
         (void)moq_session_on_bidi_stream_bytes(s, ref, g,
             moq_buf_writer_offset(&gw), false, 1);
         MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_CLOSED);
@@ -763,10 +778,14 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
         moq_session_destroy(s);
     }
-    {   /* subscriber-side: a duplicate inbound GOAWAY ⇒ 0x3 */
+    {   /* subscriber-side: the publisher's GOAWAY after ours migrates the
+         * request; a second one received ⇒ 0x3 */
         moq_stream_ref_t ref; moq_session_t *s = ns_subscriber_after_goaway(&ref);
         uint8_t g[64]; moq_buf_writer_t gw; moq_buf_writer_init(&gw, g, sizeof(g));
         moq_d18_encode_goaway_request(&gw, NULL, 0, 0);
+        (void)moq_session_on_bidi_stream_bytes(s, ref, g,
+            moq_buf_writer_offset(&gw), false, 1);
+        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
         (void)moq_session_on_bidi_stream_bytes(s, ref, g,
             moq_buf_writer_offset(&gw), false, 1);
         MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_CLOSED);
@@ -887,7 +906,7 @@ int main(void)
      *  A real client→server (empty URI) and server→client (server URI) send,
      *  each delivered over the transport pair. The receiver surfaces
      *  MOQ_EVENT_REQUEST_GOAWAY and, per §10.4, closes the old request stream
-     *  (FIN). The sender retires its request on send (strict drain), so that
+     *  (FIN). The sender retires its request on send (drain), so that
      *  returning FIN is absorbed: BOTH endpoints stay ESTABLISHED. */
 
     /* Client requester role: empty URI succeeds, non-empty ⇒ INVAL. */

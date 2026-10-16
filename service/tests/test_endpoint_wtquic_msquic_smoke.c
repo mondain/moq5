@@ -8,7 +8,8 @@
  * A managed wtquic-MsQuic SERVER (the same facade in server mode -- the endpoint
  * is client-only) loops back one real MoQ flow: SETUP both sides, the endpoint
  * SUBSCRIBEs, the server publishes one object, the endpoint receives it
- * byte-exact, then closes cleanly. The endpoint's session is driven on its own
+ * byte-exact, then closes cleanly. moq_endpoint_drain is a proven flush on
+ * this backend: once established, it reports the client's output settled. The endpoint's session is driven on its own
  * network thread through a post() task (the only place moq_session_* is legal).
  *
  * Unlike the MsQuic raw-QUIC backend (exact-version, single ALPN), this facade
@@ -29,6 +30,7 @@
 #include <moq/wtquic_msquic_managed.h>
 #include <moq/rcbuf.h>
 #include "test_support.h"
+#include "wtq_loopback_port.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -222,17 +224,17 @@ static moq_wtquic_msquic_managed_t *start_server(const char *cert,
                                                  uint16_t *out_port,
                                                  uint32_t wt_profile)
 {
-    static const char *const server_protos[] = { "moqt-18", "moqt-16" };
+    static const char *const server_protos[] = { "moqt-22", "moqt-18",
+                                                 "moqt-16" };
     moq_wtquic_msquic_managed_cfg_t cfg;
     moq_wtquic_msquic_managed_cfg_init_sized(&cfg, sizeof(cfg));
     cfg.alloc = moq_alloc_default();
     cfg.perspective = MOQ_PERSPECTIVE_SERVER;
     cfg.host = "127.0.0.1";
-    cfg.port = 0;                 /* ephemeral */
     cfg.cert_path = cert;
     cfg.key_path = key;
     cfg.wt_protocols = server_protos;
-    cfg.wt_protocol_count = 2;
+    cfg.wt_protocol_count = 3;
     cfg.on_lane_pump = server_pump;
     cfg.on_lane_pump_user = sv;
     cfg.send_request_capacity = true;
@@ -242,7 +244,7 @@ static moq_wtquic_msquic_managed_t *start_server(const char *cert,
     cfg.lane_count = 1;
     cfg.webtransport_profile = wt_profile; /* matched to the client's below */
     moq_wtquic_msquic_managed_t *m = NULL;
-    if (moq_wtquic_msquic_managed_create(&cfg, &m) != MOQ_OK)
+    if (wtqt_managed_server_create(&cfg, &m) != MOQ_OK)
         return NULL;
     *out_port = moq_wtquic_msquic_managed_port(m);
     return m;
@@ -277,8 +279,10 @@ static void run_case(const char *cert, const char *key, moq_version_t version,
     if (!srv_m) goto cleanup;
     MOQ_TEST_CHECK(port != 0);
 
+    /* The CONNECT dereferences exactly the URI's path: the server above is
+     * registered at the facade's default "/moq", so the URL names it. */
     char url[64];
-    snprintf(url, sizeof(url), "https://127.0.0.1:%u", (unsigned)port);
+    snprintf(url, sizeof(url), "https://127.0.0.1:%u/moq", (unsigned)port);
     moq_endpoint_cfg_t c;
     /* Sized init: wt_profile is a struct_size-gated tail field. */
     moq_endpoint_cfg_init_sized(&c, sizeof(c));
@@ -309,11 +313,13 @@ static void run_case(const char *cert, const char *key, moq_version_t version,
                           (int)version);
     MOQ_TEST_CHECK(!moq_endpoint_is_fatal(ep));
 
-    /* Drain has no truthful outbound-flush probe on this backend, so even a
-     * live established client reports UNSUPPORTED rather than a false DONE that
-     * would truncate the flush. */
-    MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_drain(ep, 1000000),
-                          (int)MOQ_ERR_UNSUPPORTED);
+    /* Drain is proven by the facade's flush probe
+     * (moq_wtquic_msquic_managed_poll_flush): an established client whose
+     * SETUP has been handed off and settled reports a complete local flush,
+     * not UNSUPPORTED. The bound is a hang guard; loopback settles well
+     * inside it. */
+    MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_drain(ep, 5000000),
+                          (int)MOQ_OK);
 
     struct client_drive cd;
     memset(&cd, 0, sizeof(cd));
@@ -422,8 +428,10 @@ int main(int argc, char **argv)
      * d13-14/d13-14 loopbacks (the two dialects are mutually exclusive). */
     run_case(cert, key, MOQ_VERSION_DRAFT_16, MOQ_WT_PROFILE_CURRENT);
     run_case(cert, key, MOQ_VERSION_DRAFT_18, MOQ_WT_PROFILE_CURRENT);
+    run_case(cert, key, MOQ_VERSION_DRAFT_22, MOQ_WT_PROFILE_CURRENT);
     run_case(cert, key, MOQ_VERSION_DRAFT_16, MOQ_WT_PROFILE_D13_14_COMPAT);
     run_case(cert, key, MOQ_VERSION_DRAFT_18, MOQ_WT_PROFILE_D13_14_COMPAT);
+    run_case(cert, key, MOQ_VERSION_DRAFT_22, MOQ_WT_PROFILE_D13_14_COMPAT);
 
     MOQ_TEST_PASS("endpoint_wtquic_msquic_smoke");
     return failures != 0;

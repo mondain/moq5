@@ -1,8 +1,10 @@
 /*
  * Managed MsQuic multi-ALPN server:
  *
- * - one managed server offers draft-18 and draft-16 on one listener;
- * - exact-version clients for both drafts complete a real subscribe/object flow;
+ * - one managed server offers draft-22, draft-18 and draft-16 on one listener;
+ * - exact-version clients for all three drafts complete a real
+ *   subscribe/object flow (the draft-22 one only once the facade has bound
+ *   its session to the connection);
  * - the accepted child reports the negotiated draft immutably from the
  *   per-connection pump window;
  * - unsupported/no-overlap still fails at TLS ALPN negotiation;
@@ -26,6 +28,8 @@
 #include <moq/msquic_managed.h>
 #include <moq/rcbuf.h>
 
+#include "msq_loopback_port.h"
+
 static int failures;
 static const QUIC_API_TABLE *g_msquic_api;
 
@@ -42,6 +46,17 @@ static void payload_fill(uint8_t *dst, size_t size, uint8_t salt)
 {
     for (size_t i = 0; i < size; i++)
         dst[i] = (uint8_t)(salt + i * 37u);
+}
+
+/* One payload salt per draft, so a flow delivered on the wrong version is
+ * caught byte for byte. */
+static uint8_t version_salt(moq_version_t version)
+{
+    switch (version) {
+    case MOQ_VERSION_DRAFT_18: return 0x18u;
+    case MOQ_VERSION_DRAFT_22: return 0x22u;
+    default:                   return 0x16u;
+    }
 }
 
 struct client_side {
@@ -74,6 +89,7 @@ struct server_side {
     int next_slot;
     int version16;
     int version18;
+    int version22;
     int published;
     int closed;
     int version_errors;
@@ -96,6 +112,7 @@ struct client_snapshot {
 struct server_snapshot {
     int version16;
     int version18;
+    int version22;
     int published;
     int closed;
     int version_errors;
@@ -158,20 +175,29 @@ static bool client_done(struct client_side *c)
 static bool server_seen_versions(struct server_side *s)
 {
     pthread_mutex_lock(&s->mu);
-    bool ok = s->version16 == 1 && s->version18 == 1 && s->published == 2 &&
-              s->version_errors == 0;
+    bool ok = s->version16 == 1 && s->version18 == 1 && s->version22 == 1 &&
+              s->published == 3 && s->version_errors == 0;
     pthread_mutex_unlock(&s->mu);
     return ok;
+}
+
+/* Exactly one accepted connection, at `version` and no other (s->mu held). */
+static bool server_only_version(const struct server_side *s,
+                                moq_version_t version)
+{
+    int want16 = version == MOQ_VERSION_DRAFT_16;
+    int want18 = version == MOQ_VERSION_DRAFT_18;
+    int want22 = version == MOQ_VERSION_DRAFT_22;
+
+    return (want16 || want18 || want22) && s->version16 == want16 &&
+           s->version18 == want18 && s->version22 == want22;
 }
 
 static bool server_seen_single(struct server_side *s, moq_version_t version)
 {
     pthread_mutex_lock(&s->mu);
     bool ok = s->published == 1 && s->version_errors == 0 &&
-              ((version == MOQ_VERSION_DRAFT_16 && s->version16 == 1 &&
-                s->version18 == 0) ||
-               (version == MOQ_VERSION_DRAFT_18 && s->version18 == 1 &&
-                s->version16 == 0));
+              server_only_version(s, version);
     pthread_mutex_unlock(&s->mu);
     return ok;
 }
@@ -193,6 +219,7 @@ static void server_snapshot(struct server_side *s, struct server_snapshot *out)
     pthread_mutex_lock(&s->mu);
     out->version16 = s->version16;
     out->version18 = s->version18;
+    out->version22 = s->version22;
     out->published = s->published;
     out->closed = s->closed;
     out->version_errors = s->version_errors;
@@ -203,18 +230,15 @@ static bool server_seen_raw_conn(struct server_side *s, moq_version_t version)
 {
     pthread_mutex_lock(&s->mu);
     bool ok = s->next_slot == 1 && s->published == 0 &&
-              s->version_errors == 0 &&
-              ((version == MOQ_VERSION_DRAFT_16 && s->version16 == 1 &&
-                s->version18 == 0) ||
-               (version == MOQ_VERSION_DRAFT_18 && s->version18 == 1 &&
-                s->version16 == 0));
+              s->version_errors == 0 && server_only_version(s, version);
     pthread_mutex_unlock(&s->mu);
     return ok;
 }
 
 static bool wait_for_probe_conn(struct server_side *srv,
                                 struct client_side *c16,
-                                struct client_side *c18, int max_ms)
+                                struct client_side *c18,
+                                struct client_side *c22, int max_ms)
 {
     for (int i = 0; i < max_ms / 10; i++) {
         if (atomic_load(&srv->probe_conn) != NULL)
@@ -223,6 +247,8 @@ static bool wait_for_probe_conn(struct server_side *srv,
             (void)moq_msquic_managed_wait(c16->m, 10 * 1000);
         if (c18->m != NULL)
             (void)moq_msquic_managed_wait(c18->m, 0);
+        if (c22->m != NULL)
+            (void)moq_msquic_managed_wait(c22->m, 0);
         (void)moq_msquic_managed_wait(srv->m, 0);
     }
     return atomic_load(&srv->probe_conn) != NULL;
@@ -230,17 +256,20 @@ static bool wait_for_probe_conn(struct server_side *srv,
 
 static bool wait_for_multi_flow(struct server_side *srv,
                                 struct client_side *c16,
-                                struct client_side *c18, int max_ms)
+                                struct client_side *c18,
+                                struct client_side *c22, int max_ms)
 {
     for (int i = 0; i < max_ms / 10; i++) {
-        if (client_done(c16) && client_done(c18) &&
+        if (client_done(c16) && client_done(c18) && client_done(c22) &&
             server_seen_versions(srv))
             return true;
         (void)moq_msquic_managed_wait(c16->m, 10 * 1000);
         (void)moq_msquic_managed_wait(c18->m, 10 * 1000);
+        (void)moq_msquic_managed_wait(c22->m, 10 * 1000);
         (void)moq_msquic_managed_wait(srv->m, 0);
     }
-    return client_done(c16) && client_done(c18) && server_seen_versions(srv);
+    return client_done(c16) && client_done(c18) && client_done(c22) &&
+           server_seen_versions(srv);
 }
 
 static bool wait_for_single_flow(struct server_side *srv,
@@ -289,7 +318,7 @@ static void observe_object(struct client_side *c, const moq_event_t *ev)
     }
     size_t len = moq_rcbuf_len(payload);
     const uint8_t *data = moq_rcbuf_data(payload);
-    uint8_t salt = c->want_version == MOQ_VERSION_DRAFT_18 ? 0x18u : 0x16u;
+    uint8_t salt = version_salt(c->want_version);
 
     c->bytes += len;
     if (len != PAYLOAD_SIZE) {
@@ -310,6 +339,8 @@ static const char *version_alpn(moq_version_t version)
         return MOQ_MSQUIC_ALPN_DRAFT16;
     case MOQ_VERSION_DRAFT_18:
         return MOQ_MSQUIC_ALPN_DRAFT18;
+    case MOQ_VERSION_DRAFT_22:
+        return MOQ_MSQUIC_ALPN_DRAFT22;
     default:
         return NULL;
     }
@@ -318,15 +349,17 @@ static const char *version_alpn(moq_version_t version)
 static bool alpn_to_version(const uint8_t *alpn, uint8_t len,
                             moq_version_t *out)
 {
-    if (len == strlen(MOQ_MSQUIC_ALPN_DRAFT16) &&
-        memcmp(alpn, MOQ_MSQUIC_ALPN_DRAFT16, len) == 0) {
-        *out = MOQ_VERSION_DRAFT_16;
-        return true;
-    }
-    if (len == strlen(MOQ_MSQUIC_ALPN_DRAFT18) &&
-        memcmp(alpn, MOQ_MSQUIC_ALPN_DRAFT18, len) == 0) {
-        *out = MOQ_VERSION_DRAFT_18;
-        return true;
+    static const moq_version_t known[] = {
+        MOQ_VERSION_DRAFT_16, MOQ_VERSION_DRAFT_18, MOQ_VERSION_DRAFT_22,
+    };
+
+    for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); i++) {
+        const char *want = version_alpn(known[i]);
+
+        if (len == strlen(want) && memcmp(alpn, want, len) == 0) {
+            *out = known[i];
+            return true;
+        }
     }
     return false;
 }
@@ -598,7 +631,8 @@ static int server_pump(moq_msquic_managed_t *m,
         moq_version_t v = moq_msquic_managed_conn_negotiated_version(conn);
         int slot = (int)(intptr_t)moq_msquic_managed_conn_user(conn) - 1;
 
-        if (v != MOQ_VERSION_DRAFT_16 && v != MOQ_VERSION_DRAFT_18)
+        if (v != MOQ_VERSION_DRAFT_16 && v != MOQ_VERSION_DRAFT_18 &&
+            v != MOQ_VERSION_DRAFT_22)
             srv->version_errors++;
         if (atomic_load(&srv->hold_publish_for_probe) &&
             atomic_load(&srv->probe_conn) == NULL)
@@ -617,6 +651,8 @@ static int server_pump(moq_msquic_managed_t *m,
                 srv->version16++;
             else if (v == MOQ_VERSION_DRAFT_18)
                 srv->version18++;
+            else if (v == MOQ_VERSION_DRAFT_22)
+                srv->version22++;
         } else if (srv->slots[slot].version != v) {
             srv->version_errors++;
         }
@@ -666,7 +702,7 @@ static int server_pump(moq_msquic_managed_t *m,
 
             uint8_t *bytes = malloc(PAYLOAD_SIZE);
             moq_rcbuf_t *buf = NULL;
-            uint8_t salt = v == MOQ_VERSION_DRAFT_18 ? 0x18u : 0x16u;
+            uint8_t salt = version_salt(v);
 
             if (bytes != NULL)
                 payload_fill(bytes, PAYLOAD_SIZE, salt);
@@ -712,7 +748,6 @@ static moq_msquic_managed_t *make_server(struct server_side *srv,
     cfg.alloc = moq_alloc_default();
     cfg.perspective = MOQ_PERSPECTIVE_SERVER;
     cfg.host = "127.0.0.1";
-    cfg.port = 0;
     cfg.cert_path = cert;
     cfg.key_path = key;
     cfg.on_lane_pump = server_pump;
@@ -725,7 +760,7 @@ static moq_msquic_managed_t *make_server(struct server_side *srv,
     cfg.max_connections = 4;
     cfg.versions = versions;
     cfg.version_count = version_count;
-    if (moq_msquic_managed_create(&cfg, &srv->m) != MOQ_OK)
+    if (msqt_server_create(&cfg, &srv->m) != MOQ_OK)
         return NULL;
     return srv->m;
 }
@@ -742,7 +777,6 @@ static moq_msquic_managed_t *make_exact_server(struct server_side *srv,
     cfg.alloc = moq_alloc_default();
     cfg.perspective = MOQ_PERSPECTIVE_SERVER;
     cfg.host = "127.0.0.1";
-    cfg.port = 0;
     cfg.cert_path = cert;
     cfg.key_path = key;
     cfg.on_lane_pump = server_pump;
@@ -754,7 +788,7 @@ static moq_msquic_managed_t *make_exact_server(struct server_side *srv,
     cfg.max_events = 64;
     cfg.max_connections = 4;
     cfg.version = version;
-    if (moq_msquic_managed_create(&cfg, &srv->m) != MOQ_OK)
+    if (msqt_server_create(&cfg, &srv->m) != MOQ_OK)
         return NULL;
     return srv->m;
 }
@@ -802,19 +836,20 @@ static void stop_destroy_client(struct client_side *c)
     client_destroy(c);
 }
 
-static void t_multi_alpn_two_drafts(const char *cert, const char *key)
+static void t_multi_alpn_three_drafts(const char *cert, const char *key)
 {
     int before = failures;
     struct server_side srv;
-    struct client_side c16, c18;
-    struct client_snapshot s16, s18;
+    struct client_side c16, c18, c22;
+    struct client_snapshot s16, s18, s22;
     struct server_snapshot ss;
     moq_version_t offered[] = {
+        MOQ_VERSION_DRAFT_22,
         MOQ_VERSION_DRAFT_18,
         MOQ_VERSION_DRAFT_16,
     };
 
-    CHECK(make_server(&srv, cert, key, offered, 2) != NULL);
+    CHECK(make_server(&srv, cert, key, offered, 3) != NULL);
     if (srv.m == NULL)
         return;
     CHECK(moq_msquic_managed_negotiated_version(srv.m) == 0);
@@ -827,13 +862,15 @@ static void t_multi_alpn_two_drafts(const char *cert, const char *key)
      * must not affect later accepted children. */
     offered[0] = (moq_version_t)77;
     offered[1] = (moq_version_t)78;
+    offered[2] = (moq_version_t)79;
 
     CHECK(make_client(&c16, port, MOQ_VERSION_DRAFT_16) != NULL);
     CHECK(make_client(&c18, port, MOQ_VERSION_DRAFT_18) != NULL);
-    if (c16.m == NULL || c18.m == NULL)
+    CHECK(make_client(&c22, port, MOQ_VERSION_DRAFT_22) != NULL);
+    if (c16.m == NULL || c18.m == NULL || c22.m == NULL)
         goto out;
 
-    CHECK(wait_for_probe_conn(&srv, &c16, &c18, 30000));
+    CHECK(wait_for_probe_conn(&srv, &c16, &c18, &c22, 30000));
     moq_msquic_managed_conn_t *probe = atomic_load(&srv.probe_conn);
     CHECK(probe != NULL);
     if (probe != NULL)
@@ -841,41 +878,41 @@ static void t_multi_alpn_two_drafts(const char *cert, const char *key)
     atomic_store(&srv.external_probe_done, true);
     CHECK(moq_msquic_managed_wake(srv.m) == MOQ_OK);
 
-    CHECK(wait_for_multi_flow(&srv, &c16, &c18, 30000));
+    CHECK(wait_for_multi_flow(&srv, &c16, &c18, &c22, 30000));
     client_snapshot(&c16, &s16);
     client_snapshot(&c18, &s18);
+    client_snapshot(&c22, &s22);
     server_snapshot(&srv, &ss);
-    CHECK(s16.setup == 1);
-    CHECK(s18.setup == 1);
-    CHECK(s16.sub_ok == 1);
-    CHECK(s18.sub_ok == 1);
-    CHECK(s16.objects == 1);
-    CHECK(s18.objects == 1);
-    CHECK(s16.bytes == PAYLOAD_SIZE);
-    CHECK(s18.bytes == PAYLOAD_SIZE);
-    CHECK(s16.object_errors == 0);
-    CHECK(s18.object_errors == 0);
-    CHECK(s16.negotiated_ok);
-    CHECK(s18.negotiated_ok);
+    const struct client_snapshot *snaps[] = { &s16, &s18, &s22 };
+    for (size_t i = 0; i < 3; i++) {
+        CHECK(snaps[i]->setup == 1);
+        CHECK(snaps[i]->sub_ok == 1);
+        CHECK(snaps[i]->objects == 1);
+        CHECK(snaps[i]->bytes == PAYLOAD_SIZE);
+        CHECK(snaps[i]->object_errors == 0);
+        CHECK(snaps[i]->negotiated_ok);
+    }
     CHECK(ss.version16 == 1);
     CHECK(ss.version18 == 1);
+    CHECK(ss.version22 == 1);
     CHECK(ss.version_errors == 0);
     CHECK(atomic_load(&srv.activity_checked) > 0);
     CHECK(atomic_load(&srv.activity_nonzero) == 0);
 
-    CHECK(wait_terminal(c16.m, 30000));
-    CHECK(wait_terminal(c18.m, 30000));
-    CHECK(moq_msquic_managed_is_closed(c16.m));
-    CHECK(!moq_msquic_managed_is_fatal(c16.m));
-    CHECK(moq_msquic_managed_is_closed(c18.m));
-    CHECK(!moq_msquic_managed_is_fatal(c18.m));
+    struct client_side *clients[] = { &c16, &c18, &c22 };
+    for (size_t i = 0; i < 3; i++) {
+        CHECK(wait_terminal(clients[i]->m, 30000));
+        CHECK(moq_msquic_managed_is_closed(clients[i]->m));
+        CHECK(!moq_msquic_managed_is_fatal(clients[i]->m));
+    }
 
 out:
     stop_destroy_client(&c16);
     stop_destroy_client(&c18);
+    stop_destroy_client(&c22);
     stop_destroy_server(&srv);
     if (failures == before)
-        printf("PASS: multi_alpn_two_drafts\n");
+        printf("PASS: multi_alpn_three_drafts\n");
 }
 
 static void t_exact_server_control(const char *cert, const char *key,
@@ -911,13 +948,9 @@ static void t_exact_server_control(const char *cert, const char *key,
     CHECK(cs.negotiated_ok);
     CHECK(ss.published == 1);
     CHECK(ss.version_errors == 0);
-    if (version == MOQ_VERSION_DRAFT_16) {
-        CHECK(ss.version16 == 1);
-        CHECK(ss.version18 == 0);
-    } else {
-        CHECK(ss.version18 == 1);
-        CHECK(ss.version16 == 0);
-    }
+    CHECK(ss.version16 == (version == MOQ_VERSION_DRAFT_16));
+    CHECK(ss.version18 == (version == MOQ_VERSION_DRAFT_18));
+    CHECK(ss.version22 == (version == MOQ_VERSION_DRAFT_22));
 
     CHECK(wait_terminal(c.m, 30000));
     CHECK(moq_msquic_managed_is_closed(c.m));
@@ -1150,7 +1183,8 @@ int main(int argc, char **argv)
     t_config_validation(argv[1], argv[2]);
     t_exact_server_control(argv[1], argv[2], MOQ_VERSION_DRAFT_16);
     t_exact_server_control(argv[1], argv[2], MOQ_VERSION_DRAFT_18);
-    t_multi_alpn_two_drafts(argv[1], argv[2]);
+    t_exact_server_control(argv[1], argv[2], MOQ_VERSION_DRAFT_22);
+    t_multi_alpn_three_drafts(argv[1], argv[2]);
     t_raw_multi_offer_preference(argv[1], argv[2]);
     t_no_overlap_alert(argv[1], argv[2]);
 

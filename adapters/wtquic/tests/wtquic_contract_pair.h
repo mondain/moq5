@@ -123,6 +123,8 @@ typedef struct wtqc_pair_cfg {
     const char *key;
     const char *client_offer;   /* WT subprotocol offered (required) */
     const char *server_serve;   /* WT subprotocol served (required) */
+    uint16_t listen_port;       /* 0: a port from the IPv4 allocator
+                                   (wtq_loopback_port.h) */
 } wtqc_pair_cfg_t;
 
 /* Bring the pair up (scripts must already be loaded into the sides).

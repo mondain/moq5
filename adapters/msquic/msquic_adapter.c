@@ -10,7 +10,9 @@
  *
  * Send ownership: with SendBufferingEnabled=FALSE MsQuic borrows the
  * QUIC_BUFFER array and every buffer's bytes until SEND_COMPLETE
- * (which then means full acknowledgment). Writes staged within one
+ * (which then means acknowledgment of those bytes, not their FIN).
+ * Graceful SEND_SHUTDOWN_COMPLETE alone reports ACK through FIN.
+ * Writes staged within one
  * service pass batch into a single multi-buffer StreamSend per stream:
  * the bridge emits a header write plus a payload write per object and
  * a burst of objects per pass, so per-send transport costs would
@@ -49,10 +51,20 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 
+/* Reliable reset negotiation (QUIC_SETTINGS.ReliableResetEnabled and the
+ * RELIABLE_RESET_NEGOTIATED connection event) is a preview API in MsQuic 2.5. Enabling it here changes no layout the
+ * adapter shares with callers: its QUIC_SETTINGS bits occupy reserved bits of
+ * the same words. */
+#ifndef QUIC_API_ENABLE_PREVIEW_FEATURES
+#define QUIC_API_ENABLE_PREVIEW_FEATURES 1
+#endif
+
 #include <string.h>
 #include <time.h>
 
 #include "msquic_internal.h"
+#include "../common/moq_adapter_binding.h"
+#include "../../core/src/bridge/transport_bridge_internal.h"
 
 #ifdef MOQ_MSQUIC_TESTING
 uint64_t (*moq_msq_test_now_us)(void);
@@ -112,6 +124,19 @@ static void stream_free(moq_msquic_conn_t *c, struct moq_msq_stream *ms)
     c->alloc.free(ms, sizeof(*ms), c->alloc.ctx);
 }
 
+static void stream_capture_control(moq_msquic_conn_t *c, struct moq_msq_stream *ms)
+{
+    ms->flush_control |= bridge_stream_is_session_control(c->bridge, ms->id);
+}
+
+static void stream_record_output_loss(moq_msquic_conn_t *c,
+                                      const struct moq_msq_stream *ms)
+{
+    if (!ms->flush_withdrawn &&
+        (ms->acked_total < ms->sent_total || (ms->fin_sent && !ms->fin_acked)))
+        c->flush_output_lost = true;
+}
+
 /* --- batched send records ----------------------------------------------------- */
 
 static struct moq_msq_batch_rec *batch_get(moq_msquic_conn_t *c)
@@ -148,38 +173,69 @@ static void batch_release_entries(moq_msquic_conn_t *c,
 }
 
 /*
+ * MsQuic refuses StreamOpen, StreamStart and StreamSend with
+ * QUIC_STATUS_ABORTED exactly when the peer has already closed the
+ * connection (it is ClosedRemotely). That close reaches this connection as
+ * SHUTDOWN_INITIATED_BY_PEER or _BY_TRANSPORT once its callback is free --
+ * an endpoint op running in the same window sees the refusal first -- and
+ * SHUTDOWN_COMPLETE always follows. The refusal is a consequence of that
+ * terminal, not a failure of its own: once the peer's CONNECTION_CLOSE has
+ * arrived the connection only drains (RFC 9000 10.2.2), and its error code is
+ * the cause the session must see. Reported as a failure, the refusal would
+ * latch INTERNAL_ERROR as the bridge's first cause ahead of it. So the op
+ * parks instead (WOULD_BLOCK, nothing consumed), a refused flush latches
+ * nothing, and the terminal that follows clears whatever was parked.
+ */
+static bool refused_by_peer_close(moq_msquic_conn_t *c, QUIC_STATUS status)
+{
+    if (status != QUIC_STATUS_ABORTED)
+        return false;
+    c->peer_closed = true;
+    return true;
+}
+
+/*
  * Flush the staged batch as one StreamSend. Runs both from endpoint
  * ops (stream switch, batch full, FIN) and from conn_service after
  * each bridge pass; when it runs inside an op it must not call into
  * the bridge, so a synchronous StreamSend failure only latches
  * flush_failed — conn_service feeds the transport error exactly once.
+ * A send refused for the peer's close latches peer_closed instead.
  */
 static void batch_flush(moq_msquic_conn_t *c)
 {
     struct moq_msq_batch_rec *rec = c->building;
     struct moq_msq_stream *ms = c->building_ms;
     bool fin = c->building_fin;
+    QUIC_STATUS status = QUIC_STATUS_INVALID_STATE;
 
     if (rec == NULL)
         return;
+    stream_capture_control(c, ms);
     c->building = NULL;
     c->building_ms = NULL;
     c->building_fin = false;
 
-    if (ms->stream == NULL ||
-        QUIC_FAILED(c->api->StreamSend(
+    if (ms->stream != NULL)
+        status = c->api->StreamSend(
             ms->stream, rec->bufs, (uint32_t)rec->count,
-            fin ? QUIC_SEND_FLAG_FIN : QUIC_SEND_FLAG_NONE, rec))) {
+            fin ? QUIC_SEND_FLAG_FIN : QUIC_SEND_FLAG_NONE, rec);
+    if (QUIC_FAILED(status)) {
         /* not accepted: no completion will fire — release ownership
          * here, exactly once, and let the next service pass report
-         * the dead transport */
+         * the dead transport (or, refused for the peer's close, let
+         * its shutdown event end the connection) */
         batch_release_entries(c, rec);
         batch_put(c, rec);
-        c->flush_failed = true;
+        if (!refused_by_peer_close(c, status))
+            c->flush_failed = true;
         return;
     }
     rec->ms = ms;
+    if (fin)
+        ms->fin_sent = true;
     ms->inflight_bytes += rec->bytes;
+    ms->sent_total += rec->bytes;
     c->pending_sends++;
     c->flush_sends++;            /* ACCEPTED batches only (failure returned) */
     c->flush_bytes += rec->bytes;
@@ -193,7 +249,9 @@ static void batch_flush(moq_msquic_conn_t *c)
  * staging, or the FIN/full flush after — stops the op immediately
  * with an error, so the bridge halts instead of piling actions onto
  * a transport that already discarded accepted bytes; flush_failed
- * stays latched for conn_service's exactly-once fatal feed. */
+ * stays latched for conn_service's exactly-once fatal feed. Once the
+ * peer has closed the connection every write parks (WOULD_BLOCK, this
+ * write unconsumed) until its shutdown event ends the connection. */
 static moq_transport_result_t batch_append(moq_msquic_conn_t *c,
                                            struct moq_msq_stream *ms,
                                            moq_rcbuf_t *rcbuf,
@@ -201,10 +259,14 @@ static moq_transport_result_t batch_append(moq_msquic_conn_t *c,
                                            const uint8_t *data,
                                            size_t len, bool fin)
 {
+    if (c->peer_closed)
+        goto park;
     if (c->building != NULL && c->building_ms != ms) {
         batch_flush(c);
         if (c->flush_failed)
             goto refuse; /* transport dead; this write never staged */
+        if (c->peer_closed)
+            goto park;
     }
     if (c->building == NULL) {
         c->building = batch_get(c);
@@ -233,13 +295,20 @@ static moq_transport_result_t batch_append(moq_msquic_conn_t *c,
         c->building_fin = true;
     if (fin || rec->count == MOQ_MSQ_BATCH_MAX) {
         batch_flush(c);
+        /* a failed flush already released every staged entry — this
+         * one included (its copy/rcbuf ownership is gone, exactly
+         * once) */
         if (c->flush_failed)
-            /* the failed flush already released every staged entry —
-             * this one included (its copy/rcbuf ownership is gone,
-             * exactly once) */
             return MOQ_TRANSPORT_ERROR;
+        if (c->peer_closed)
+            return MOQ_TRANSPORT_WOULD_BLOCK;
     }
     return MOQ_TRANSPORT_OK;
+
+park:
+    if (copy != NULL)
+        c->alloc.free(copy, copy_size, c->alloc.ctx);
+    return MOQ_TRANSPORT_WOULD_BLOCK;
 
 refuse:
     if (copy != NULL)
@@ -427,6 +496,7 @@ static moq_transport_result_t ep_open(void *ctx, bool bidi,
 {
     moq_msquic_conn_t *c = ctx;
     HQUIC h = NULL;
+    QUIC_STATUS status;
 
     if (c->conn == NULL)
         return MOQ_TRANSPORT_ERROR;
@@ -448,24 +518,28 @@ static moq_transport_result_t ep_open(void *ctx, bool bidi,
     if (ms == NULL)
         return MOQ_TRANSPORT_ERROR;
 
-    if (QUIC_FAILED(c->api->StreamOpen(
-            c->conn,
-            bidi ? QUIC_STREAM_OPEN_FLAG_NONE
-                 : QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL,
-            stream_event_cb, ms, &h))) {
+    status = c->api->StreamOpen(
+        c->conn,
+        bidi ? QUIC_STREAM_OPEN_FLAG_NONE
+             : QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL,
+        stream_event_cb, ms, &h);
+    if (QUIC_FAILED(status)) {
         stream_free(c, ms);
-        return MOQ_TRANSPORT_ERROR;
+        return refused_by_peer_close(c, status) ? MOQ_TRANSPORT_WOULD_BLOCK
+                                                : MOQ_TRANSPORT_ERROR;
     }
     ms->stream = h;
     /* FAIL_BLOCKED backs the credit gate: with the gate working the
      * start never exceeds peer limits; if it somehow does, the failure
      * surfaces in START_COMPLETE instead of queueing invisibly */
-    if (QUIC_FAILED(c->api->StreamStart(
-            h, QUIC_STREAM_START_FLAG_FAIL_BLOCKED |
-                   QUIC_STREAM_START_FLAG_SHUTDOWN_ON_FAIL))) {
+    status = c->api->StreamStart(
+        h, QUIC_STREAM_START_FLAG_FAIL_BLOCKED |
+               QUIC_STREAM_START_FLAG_SHUTDOWN_ON_FAIL);
+    if (QUIC_FAILED(status)) {
         c->api->StreamClose(h);
         stream_free(c, ms);
-        return MOQ_TRANSPORT_ERROR;
+        return refused_by_peer_close(c, status) ? MOQ_TRANSPORT_WOULD_BLOCK
+                                                : MOQ_TRANSPORT_ERROR;
     }
     if (bidi) {
         c->local_bidi_count++;
@@ -515,12 +589,16 @@ static moq_transport_result_t ep_write(void *ctx, uint64_t stream_id,
         if (c->building != NULL && c->building_ms == ms) {
             c->building_fin = true;
             batch_flush(c);
-            return c->flush_failed ? MOQ_TRANSPORT_ERROR
-                                   : MOQ_TRANSPORT_OK;
+            if (c->flush_failed)
+                return MOQ_TRANSPORT_ERROR;
+            return c->peer_closed ? MOQ_TRANSPORT_WOULD_BLOCK
+                                  : MOQ_TRANSPORT_OK;
         }
+        stream_capture_control(c, ms);
         if (QUIC_FAILED(c->api->StreamShutdown(
                 ms->stream, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0)))
             return MOQ_TRANSPORT_ERROR;
+        ms->fin_sent = true;
         return MOQ_TRANSPORT_OK;
     }
     /* one QUIC_BUFFER per entry, and the copy sizing must not wrap:
@@ -572,10 +650,79 @@ static moq_transport_result_t ep_reset_stream(void *ctx,
         return MOQ_TRANSPORT_ERROR; /* dead transport; stop the pass */
     if (ms == NULL || ms->stream == NULL)
         return MOQ_TRANSPORT_OK; /* already gone: idempotent */
+    if (ms->commit_reported || ms->reset_sent)
+        return MOQ_TRANSPORT_OK;
+    stream_capture_control(c, ms);
     if (QUIC_FAILED(c->api->StreamShutdown(
             ms->stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT_SEND,
             error_code)))
         return MOQ_TRANSPORT_ERROR;
+    ms->reset_sent = true;
+    ms->flush_withdrawn |= !ms->flush_control;
+    return MOQ_TRANSPORT_OK;
+}
+
+/*
+ * Reliable reset: the peer must receive the first `reliable_size` bytes (the
+ * stream's header, so it can tell which request the reset ends) and then see
+ * the reset, never a clean end.
+ *
+ * MsQuic's own RESET_STREAM_AT cannot be relied on for that:
+ *   - a receiving MsQuic that processes the frame before it has handed the
+ *     reliable bytes to its application delivers them with FIN and a
+ *     graceful PEER_SEND_SHUTDOWN, dropping the reset, so the peer reads the
+ *     stream as ended cleanly (for a fill, a complete fill). That happens
+ *     whenever the frame travels with the data;
+ *   - a sending stream whose RESET_STREAM_AT is still unacknowledged when
+ *     the connection ends refuses the immediate shutdown MsQuic tears the
+ *     connection down with ("pending reliable reset"), never completes, and
+ *     keeps its connection, and with it MsQuic's registration close, from
+ *     ever finishing.
+ *
+ * So the adapter provides the guarantee itself: it waits until the peer has
+ * acknowledged the reliable prefix, then resets plainly. Send buffering is
+ * off and MsQuic completes a stream's sends in queue order, so the bytes of
+ * uncanceled completions (acked_total) are exactly the acknowledged prefix.
+ * The receiver indicated those bytes before acknowledging them, so a reset
+ * sent after the acknowledgment reaches it as a reset after the header. The
+ * completion that acknowledges the prefix services the bridge on the worker,
+ * which retries the reset. Bytes past the prefix do not hold the reset back,
+ * and a plain StreamShutdown never blocks on the worker, so it is issued from
+ * any thread.
+ *
+ * Not negotiated, a size past what was sent, a canceled send or a closing
+ * connection (the prefix will never be acknowledged) all return DROPPED: the
+ * bridge resets plainly at once. A prefix not yet acknowledged, with sends
+ * still in flight, returns WOULD_BLOCK.
+ */
+static moq_transport_result_t ep_reset_stream_at(void *ctx,
+                                                 uint64_t stream_id,
+                                                 uint64_t error_code,
+                                                 uint64_t reliable_size)
+{
+    moq_msquic_conn_t *c = ctx;
+    struct moq_msq_stream *ms = stream_find(c, stream_id);
+
+    batch_flush(c); /* staged data must not reorder past the reset */
+    if (c->flush_failed)
+        return MOQ_TRANSPORT_ERROR;
+    if (ms == NULL || ms->stream == NULL)
+        return MOQ_TRANSPORT_OK; /* already gone: idempotent */
+    if (ms->commit_reported || ms->reset_sent)
+        return MOQ_TRANSPORT_OK;
+    if (!c->reliable_reset || reliable_size > ms->sent_total ||
+        c->close_pending || ms->send_canceled)
+        return MOQ_TRANSPORT_DROPPED;
+    if (ms->acked_total < reliable_size)
+        return ms->inflight_bytes > 0 ? MOQ_TRANSPORT_WOULD_BLOCK
+                                      : MOQ_TRANSPORT_DROPPED;
+    stream_capture_control(c, ms);
+    if (QUIC_FAILED(c->api->StreamShutdown(
+            ms->stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT_SEND, error_code)))
+        return MOQ_TRANSPORT_ERROR;
+    ms->reset_sent = true;
+    ms->flush_withdrawn |= !ms->flush_control;
+    c->reliable_resets++;
     return MOQ_TRANSPORT_OK;
 }
 
@@ -904,6 +1051,10 @@ static QUIC_STATUS stream_event_locked(HQUIC stream, void *ctx,
         break;
 
     case QUIC_STREAM_EVENT_PEER_RECEIVE_ABORTED:
+        stream_capture_control(c, ms);
+        if ((ms->is_local || ms->is_bidi) && !ms->flush_control)
+            ms->flush_withdrawn = true;
+        ms->send_shutdown_aborted = true;
         (void)moq_transport_bridge_on_peer_stop_sending(
             c->bridge, ms->id, ev->PEER_RECEIVE_ABORTED.ErrorCode,
             now_us());
@@ -916,6 +1067,13 @@ static QUIC_STATUS stream_event_locked(HQUIC stream, void *ctx,
 
         if (rec != NULL) {
             rec->ms->inflight_bytes -= rec->bytes;
+            if (ev->SEND_COMPLETE.Canceled) {
+                rec->ms->send_canceled = true;
+                /* A reset accepted by conn_service below is too late to
+                 * explain this loss. Never clear an earlier connection loss. */
+                stream_record_output_loss(c, rec->ms);
+            } else
+                rec->ms->acked_total += rec->bytes;
             c->pending_sends--;
             batch_release_entries(c, rec);
             batch_put(c, rec);
@@ -925,6 +1083,38 @@ static QUIC_STATUS stream_event_locked(HQUIC stream, void *ctx,
         conn_service(c);
         break;
     }
+
+    case QUIC_STREAM_EVENT_SEND_SHUTDOWN_COMPLETE:
+        if (stream != ms->stream)
+            break;
+        /* FIN ACK may win after canceled buffers return. Either kind settles
+         * send ownership, but cannot authorize withdrawal or undo prior loss. */
+        ms->send_shutdown_complete = true;
+        if (!ev->SEND_SHUTDOWN_COMPLETE.Graceful) {
+            ms->send_shutdown_aborted = true;
+            stream_record_output_loss(c, ms);
+            break;
+        }
+        if (!ms->fin_sent || ms->reset_sent || ms->send_canceled ||
+            ms->send_shutdown_aborted || c->close_pending || c->peer_closed ||
+            c->teardown_sent || c->flush_failed ||
+            moq_transport_bridge_is_fatal(c->bridge))
+            break;
+        ms->fin_acked = true;
+        if (!ms->is_local || ms->is_bidi || ms->commit_reported)
+            break;
+        /* Native MsQuic requires contiguous byte ACK plus FinAcked here.
+         * Publish the winner before bridge service can reenter via the hook;
+         * the stream/handle still belong to SHUTDOWN_COMPLETE, not this event. */
+        ms->commit_reported = true;
+#ifdef MOQ_MSQUIC_TESTING
+        c->test_stream_commit_reports++;
+        c->test_last_committed_stream = ms->id;
+#endif
+        (void)moq_transport_bridge_on_local_stream_committed(
+            c->bridge, ms->id, now_us());
+        conn_service(c);
+        break;
 
     case QUIC_STREAM_EVENT_IDEAL_SEND_BUFFER_SIZE: {
         uint64_t ideal = ev->IDEAL_SEND_BUFFER_SIZE.ByteCount;
@@ -942,6 +1132,9 @@ static QUIC_STATUS stream_event_locked(HQUIC stream, void *ctx,
     }
 
     case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE:
+        /* Final retirement also settles cancellation ownership. It is never
+         * byte/FIN ACK evidence and cannot repair a previously recorded loss. */
+        stream_record_output_loss(c, ms);
         /* all this stream's events (completions included) precede
          * this one; the handle dies here, the bookkeeping with it */
         if (ms->stream != NULL &&
@@ -966,9 +1159,78 @@ static QUIC_STATUS stream_event_cb(HQUIC stream, void *ctx,
     QUIC_STATUS rc;
 
     guard_enter(c);
+    c->on_worker++;
     rc = stream_event_locked(stream, ctx, ev);
+    c->on_worker--;
     guard_leave(c);
     return rc;
+}
+
+/* --- transport binding (CONNECTED -> session) --------------------------------- */
+
+/* One MsQuic connection parameter read as a transport fact: a readable
+ * BOOLEAN answers the fact bits (known, and supported when TRUE); a
+ * parameter the library cannot report leaves them unknown. */
+static void conn_fact_param(moq_msquic_conn_t *c, uint32_t param,
+                            uint32_t bits, uint32_t *known,
+                            uint32_t *supported)
+{
+    uint8_t enabled = 0;
+    uint32_t len = sizeof(enabled);
+
+    if (QUIC_FAILED(c->api->GetParam(c->conn, param, &len, &enabled)) ||
+        len != sizeof(enabled))
+        return;
+    *known |= bits;
+    if (enabled)
+        *supported |= bits;
+}
+
+/*
+ * Bind the session to this connection (moq_adapter_bind_session: always when
+ * the profile requires facts, otherwise when there is a target or policy to
+ * give it). The facts are the connection's: the handshake
+ * has completed (this runs inside CONNECTED), local DATAGRAM receive
+ * support is QUIC_PARAM_CONN_DATAGRAM_RECEIVE_ENABLED and the peer's
+ * DATAGRAM support -- which is what lets this side send -- is
+ * QUIC_PARAM_CONN_DATAGRAM_SEND_ENABLED. Natively over QUIC there is no
+ * further datagram layer, so sendability is the peer's support and
+ * receivability this side's. A server without a policy serves every
+ * authority and path. A refusal fails the connection: the bridge is told
+ * the transport failed (INTERNAL_ERROR for a local defect, PROTOCOL_VIOLATION
+ * when the peer's negotiation lacks what the profile requires) and the
+ * service pass shuts the connection down.
+ */
+static bool conn_bind_transport(moq_msquic_conn_t *c)
+{
+    uint32_t known = MOQ_BINDING_HANDSHAKE_COMPLETE;
+    uint32_t supported = MOQ_BINDING_HANDSHAKE_COMPLETE;
+
+    conn_fact_param(c, QUIC_PARAM_CONN_DATAGRAM_RECEIVE_ENABLED,
+                    MOQ_BINDING_LOCAL_QUIC_DATAGRAM |
+                        MOQ_BINDING_DATAGRAM_RECEIVE,
+                    &known, &supported);
+    conn_fact_param(c, QUIC_PARAM_CONN_DATAGRAM_SEND_ENABLED,
+                    MOQ_BINDING_PEER_QUIC_DATAGRAM | MOQ_BINDING_DATAGRAM_SEND,
+                    &known, &supported);
+
+    const moq_connection_target_t *target = c->target;
+    moq_connection_target_t any_uri;
+
+    if (!c->is_client && (target == NULL || target->accept_uri == NULL)) {
+        memset(&any_uri, 0, sizeof(any_uri));
+        any_uri.struct_size = (uint32_t)sizeof(any_uri);
+        any_uri.accept_uri = moq_adapter_accept_any_uri;
+        target = &any_uri;
+    }
+
+    moq_result_t rc = moq_adapter_bind_session(
+        c->session, MOQ_BINDING_RAW_QUIC, known, supported, target);
+    if (rc == MOQ_OK)
+        return true;
+    (void)moq_transport_bridge_on_transport_error(
+        c->bridge, rc == MOQ_ERR_UNSUPPORTED ? 0x3 : 0x1, now_us());
+    return false;
 }
 
 /* --- connection events (MsQuic -> bridge) ------------------------------------- */
@@ -982,6 +1244,13 @@ static QUIC_STATUS conn_event_locked(HQUIC conn, void *ctx,
     case QUIC_CONNECTION_EVENT_CONNECTED:
         if (!c->started) {
             c->started = true;
+            /* a profile that must be told how it is carried is bound
+             * here, before its first byte in either direction; a refusal
+             * is a connection failure, so the session never runs unbound */
+            if (!conn_bind_transport(c)) {
+                conn_service(c);
+                break;
+            }
             /* symmetric-start profiles start both sides; bidi-control
              * starts the client only (the server is reactive) */
             if (c->is_client ||
@@ -989,6 +1258,10 @@ static QUIC_STATUS conn_event_locked(HQUIC conn, void *ctx,
                 (void)moq_session_start(c->session, now_us());
         }
         conn_service(c);
+        break;
+
+    case QUIC_CONNECTION_EVENT_RELIABLE_RESET_NEGOTIATED:
+        c->reliable_reset = ev->RELIABLE_RESET_NEGOTIATED.IsNegotiated != 0;
         break;
 
     case QUIC_CONNECTION_EVENT_STREAMS_AVAILABLE:
@@ -1098,7 +1371,9 @@ static QUIC_STATUS conn_event_cb(HQUIC conn, void *ctx,
     QUIC_STATUS rc;
 
     guard_enter(c);
+    c->on_worker++;
     rc = conn_event_locked(conn, ctx, ev);
+    c->on_worker--;
     guard_leave(c);
     return rc;
 }
@@ -1113,11 +1388,18 @@ QUIC_CONNECTION_CALLBACK_HANDLER moq_msquic_conn_callback(void)
 void moq_msquic_conn_cfg_init_sized(moq_msquic_conn_cfg_t *cfg,
                                     size_t size)
 {
-    if (cfg == NULL || size < sizeof(*cfg))
+    if (cfg == NULL || size < MOQ_MSQUIC_CONN_CFG_V0_SIZE)
         return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = (uint32_t)sizeof(*cfg);
+    if (size > sizeof(*cfg))
+        size = sizeof(*cfg);
+    memset(cfg, 0, size);
+    cfg->struct_size = (uint32_t)size;
 }
+
+/* True when the caller's struct_size covers all of `field`. */
+#define MSQ_CFG_HAS(cfg, field)                                          \
+    ((cfg)->struct_size >=                                               \
+     offsetof(moq_msquic_conn_cfg_t, field) + sizeof((cfg)->field))
 
 moq_result_t moq_msquic_conn_create(const moq_msquic_conn_cfg_t *cfg,
                                     moq_msquic_conn_t **out)
@@ -1125,9 +1407,10 @@ moq_result_t moq_msquic_conn_create(const moq_msquic_conn_cfg_t *cfg,
     if (out == NULL)
         return MOQ_ERR_INVAL;
     *out = NULL;
-    /* the size guard comes first: a too-small struct_size means the
-     * caller's struct may not even contain the fields read below */
-    if (cfg == NULL || cfg->struct_size < sizeof(*cfg))
+    /* the size guard comes first: a struct_size below the frozen prefix
+     * means the caller's struct may not even contain the fields read
+     * below; appended fields are read only when covered */
+    if (cfg == NULL || cfg->struct_size < MOQ_MSQUIC_CONN_CFG_V0_SIZE)
         return MOQ_ERR_INVAL;
     if (cfg->alloc == NULL || cfg->session == NULL || cfg->api == NULL)
         return MOQ_ERR_INVAL;
@@ -1150,6 +1433,7 @@ moq_result_t moq_msquic_conn_create(const moq_msquic_conn_cfg_t *cfg,
     c->guard_enter = cfg->guard_enter;
     c->guard_leave = cfg->guard_leave;
     c->guard_user = cfg->guard_user;
+    c->target = MSQ_CFG_HAS(cfg, target) ? cfg->target : NULL;
     c->is_client = moq_session_perspective(cfg->session) ==
                    MOQ_PERSPECTIVE_CLIENT;
     c->ctrl_id = UINT64_MAX;
@@ -1158,12 +1442,15 @@ moq_result_t moq_msquic_conn_create(const moq_msquic_conn_cfg_t *cfg,
         .struct_size = sizeof(moq_transport_endpoint_ops_t),
         .capabilities = MOQ_TRANSPORT_CAP_WRITE_PAYLOAD |
                         MOQ_TRANSPORT_CAP_DATAGRAM |
-                        MOQ_TRANSPORT_CAP_HOLD_INPUT,
+                        MOQ_TRANSPORT_CAP_HOLD_INPUT |
+                        MOQ_TRANSPORT_CAP_COMMIT_REPORT |
+                        MOQ_TRANSPORT_CAP_RELIABLE_RESET,
         .open_uni = ep_open_uni,
         .open_bidi = ep_open_bidi,
         .write = ep_write,
         .write_payload = ep_write_payload,
         .reset_stream = ep_reset_stream,
+        .reset_stream_at = ep_reset_stream_at,
         .stop_sending = ep_stop_sending,
         .send_datagram = ep_send_datagram,
         .max_datagram_size = ep_max_datagram_size,
@@ -1352,6 +1639,11 @@ void moq_msquic_settings_init(QUIC_SETTINGS *settings)
 #endif
     settings->DatagramReceiveEnabled = TRUE;
     settings->IsSet.DatagramReceiveEnabled = TRUE;
+    /* Offer reset_stream_at: where the peer agrees, a data stream reset keeps
+     * its stream header (RESET_STREAM_AT) so the receiver can still tell
+     * which subscription, fetch or fill ended. */
+    settings->ReliableResetEnabled = TRUE;
+    settings->IsSet.ReliableResetEnabled = TRUE;
     /* MoQ-scale stream counts and media-scale flow control windows */
     settings->PeerBidiStreamCount = 129;
     settings->IsSet.PeerBidiStreamCount = TRUE;

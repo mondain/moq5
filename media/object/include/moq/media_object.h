@@ -5,8 +5,8 @@
  * Stateless MoQ media object normalizer.
  *
  * Parses one MoQ media object into timing, keyframe, and payload
- * metadata. Handles RAW (LOC-01 properties), CMAF (fragment
- * parsing) and, in a build with moq::mpeg2ts, MPEG-2 TS packaging. No state, no heap allocation, no retained
+ * metadata. Handles RAW (LOC properties), CMAF (fragment parsing) and, in a
+ * build with moq::mpeg2ts, MPEG-2 TS packaging. No state, no heap allocation, no retained
  * refs — output spans borrow from input rcbufs.
  *
  * Usable standalone by downstream integrations without requiring
@@ -20,6 +20,7 @@
 #include <moq/session.h>
 #include <moq/rcbuf.h>
 #include <moq/cmaf.h>
+#include <moq/loc.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -57,13 +58,49 @@ typedef enum moq_media_type {
     MOQ_MEDIA_TYPE_AUDIO = 2,
 } moq_media_type_t;
 
+/* Fixed-width shared types. LEGACY_MSF01_LOC01 pairs with drafts 16/18 and
+ * D22_MSF01_LOC04_PUBLIC with draft 22. AUTO is for the service sender and
+ * receiver configs (their default): it resolves to whichever of the two
+ * matches the session's negotiated draft. The object parser takes a resolved
+ * companion and refuses AUTO. Values are never renumbered. */
+typedef uint32_t moq_media_companion_profile_t;
+#define MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01     UINT32_C(0)
+#define MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC UINT32_C(1)
+#define MOQ_MEDIA_COMPANION_AUTO                   UINT32_C(2)
+
+typedef uint32_t moq_media_time_domain_t;
+#define MOQ_MEDIA_TIME_DOMAIN_NONE              UINT32_C(0)
+#define MOQ_MEDIA_TIME_DOMAIN_UNIX_US           UINT32_C(1)
+#define MOQ_MEDIA_TIME_DOMAIN_APPLICATION_MEDIA UINT32_C(2)
+
+/* Sized, value-only metadata. LOC is the effective snapshot: object presence
+ * overrides track presence for timescale/video/audio config, including empty
+ * config. Object spans borrow object properties; inherited config spans borrow
+ * the caller's distinct track-properties backing. Neither is retained here.
+ * time_us is available only when has_time_us; raw zero/overflow survives in loc.
+ * Independence describes normalized LOC marking, not a guessed opaque form. */
+typedef struct moq_media_metadata {
+    uint32_t struct_size;
+    moq_media_time_domain_t time_domain;
+    uint64_t time_us;
+    moq_loc_metadata_t loc;
+    uint8_t has_time_us;
+    uint8_t independence_known;
+    uint8_t independent;
+    uint8_t reserved[5];
+} moq_media_metadata_t;
+
+#define MOQ_MEDIA_METADATA_V0_SIZE \
+    (offsetof(moq_media_metadata_t, reserved) + \
+     sizeof(((moq_media_metadata_t *)0)->reserved))
+
 /* -- Track info (caller-supplied context) ----------------------------- */
 
 /*
  * The FROZEN v0 PREFIX runs from struct_size through `timescale`. Those
- * four fields and their order will not change; anything appended after
- * `timescale` is a tail field that only a caller whose struct_size
- * covers it may be assumed to own.
+ * four fields and their order will not change. The existing transport-version
+ * tail is read only when covered. This complete type is embedded in service
+ * descriptors and must not grow; new parser context uses a separate config.
  *
  * `transport_version` is the first such tail field. It names the
  * negotiated MoQ transport draft, which selects the integer codec the
@@ -78,9 +115,6 @@ typedef struct moq_media_track_info {
     /* -- appended after v0 ------------------------------------------ */
     moq_version_t        transport_version;
 } moq_media_track_info_t;
-
-/* This complete type is embedded by value in service descriptors and must
- * not grow. Additional parser context belongs in the separate sized config. */
 
 /* Size of the frozen v0 prefix: struct_size .. timescale inclusive. A
  * struct_size equal to this is an OLD caller that does not own
@@ -144,7 +178,7 @@ typedef struct moq_media_parsed_object {
     bool                  datagram;
 
     bool                  has_capture_time;
-    uint64_t              capture_time_us;
+    uint64_t              capture_time_us;   /* UNIX microseconds only */
 
     uint64_t              decode_time_us;
     int64_t               composition_offset_us;
@@ -188,11 +222,15 @@ typedef struct moq_media_parsed_object {
      * of source packets (saturating). sap_type is UNKNOWN:
      * random_access_indicator does not give a SAP type. Continuity counters
      * and the es-packets PID rules are not judged here; see <moq/mpeg2ts.h>. */
+
+    /* Starts after the complete baseline parsed-object sizeof. Read only
+     * when the outer struct_size covers this entire field. */
+    moq_media_metadata_t         metadata;    /* borrowed spans, no owned refs */
 } moq_media_parsed_object_t;
 
-MOQ_API void moq_media_parsed_object_init(moq_media_parsed_object_t *out);
-
-/* Original padded sizeof through track_id, independent of future tails. */
+/* Original padded sizeof through track_id, independent of future tails: the
+ * complete frozen baseline record, including its tail padding. metadata
+ * starts exactly here. */
 #ifdef __cplusplus
 #define MOQ_MEDIA_PARSED_OBJECT_V0_ALIGNMENT \
     (alignof(void *) > alignof(uint64_t) ? alignof(void *) : alignof(uint64_t))
@@ -206,6 +244,26 @@ MOQ_API void moq_media_parsed_object_init(moq_media_parsed_object_t *out);
       MOQ_MEDIA_PARSED_OBJECT_V0_ALIGNMENT - 1) & \
      ~(size_t)(MOQ_MEDIA_PARSED_OBJECT_V0_ALIGNMENT - 1))
 
+/* D22 requires the whole metadata field, not a partial tail. */
+#define MOQ_MEDIA_PARSED_OBJECT_METADATA_SIZE \
+    (offsetof(moq_media_parsed_object_t, metadata) + sizeof(moq_media_metadata_t))
+
+/* Pointer-only initializer clears/stamps ONLY the complete baseline record,
+ * including its tail padding, and sets sap_type to MOQ_SAP_UNKNOWN. Metadata
+ * and any later bytes are untouched, including through a function pointer.
+ * NULL writes nothing. */
+MOQ_API void moq_media_parsed_object_init(moq_media_parsed_object_t *out);
+
+/* Clears min(out_size, library size) bytes and stamps struct_size with that
+ * count, without reading its previous value. NULL or fewer than four bytes
+ * writes nothing. A wholly covered sap_type is set to MOQ_SAP_UNKNOWN.
+ * A wholly covered metadata field receives its own and its LOC struct_size
+ * stamps; all other metadata bytes stay zero. Partial metadata is only cleared
+ * within the supplied prefix. Bytes beyond the written count are untouched.
+ * No allocation, retained refs, or cleanup is needed. */
+MOQ_API void moq_media_parsed_object_init_sized(moq_media_parsed_object_t *out,
+                                              size_t out_size);
+
 /* -- Parse ----------------------------------------------------------- */
 
 /*
@@ -213,8 +271,10 @@ MOQ_API void moq_media_parsed_object_init(moq_media_parsed_object_t *out);
  *
  * Stateless, allocation-free, no retained refs.
  *
- * The LOC property codec is selected by track->transport_version, and
- * ONLY when track->struct_size FULLY COVERS that field.
+ * Legacy LOC01+D16/18 only. Stores only the complete frozen output prefix;
+ * D22 requires parse_sized below.
+ * The LOC integer codec is selected by track->transport_version, and ONLY
+ * when track->struct_size FULLY COVERS that field.
  *
  * Any valid struct_size that stops short of covering the whole field --
  * the frozen v0 prefix itself, or any partial prefix in between -- comes
@@ -241,8 +301,8 @@ MOQ_API void moq_media_parsed_object_init(moq_media_parsed_object_t *out);
  * Terminal statuses (END_OF_GROUP, END_OF_TRACK) return MOQ_OK with
  * status set and no timing/payload required.
  *
- * Capture timestamp is OPTIONAL (draft-ietf-moq-loc-01): a RAW/LOC object with
- * no LOC capture timestamp is NOT a parse failure -- it returns MOQ_OK with
+ * Capture timestamp is OPTIONAL (draft-ietf-moq-loc-01): a RAW/LOC
+ * object with no LOC timestamp is NOT a parse failure -- it returns MOQ_OK with
  * has_capture_time=false and the timing fields (decode/composition/presentation)
  * left at 0. (It is therefore never dropped with MOQ_MEDIA_DROP_MISSING_TIMESTAMP
  * at this layer; a consumer that requires a presentation time enforces that
@@ -257,11 +317,12 @@ MOQ_API moq_result_t moq_media_object_parse(
     moq_media_parsed_object_t *out,
     moq_media_drop_reason_t *drop_reason);
 
-typedef uint32_t moq_media_companion_profile_t;
-#define MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01     UINT32_C(0)
-#define MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC UINT32_C(1)
-typedef struct moq_loc_metadata moq_loc_metadata_t;
-
+/* Separate from the frozen embedded track record. NULL cfg selects legacy with
+ * no track context; it never opts into draft-22. The frozen input floor covers
+ * companion_profile. Each tail (track_loc_metadata, mpeg2ts_packet_size) is
+ * read only when its whole field is covered. Config/metadata records are
+ * borrowed for the call; inherited byte spans borrow their original backing
+ * for the output's lifetime. No ownership transfer or cleanup. */
 typedef struct moq_media_object_parse_cfg {
     uint32_t struct_size;
     uint32_t companion_profile;
@@ -276,21 +337,38 @@ typedef struct moq_media_object_parse_cfg {
     { (uint32_t)sizeof(moq_media_object_parse_cfg_t), \
       MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01, NULL, 0 }
 
-/* NULL cfg selects legacy draft-16/18 without track context. Unknown profile
- * or version and undersized cfg are INVAL. D22 and a covered non-NULL LOC
- * metadata pointer are UNSUPPORTED in this build; the pointer is not read
- * through. Each tail is read only when wholly covered. MPEG2TS requires a
- * covered packet size of 188 or 192 (otherwise INVAL); other packaging ignores
- * it. The unsized parser cannot supply TS context and returns INVAL for TS.
- * Valid TS context in a build without moq::mpeg2ts returns UNSUPPORTED.
- * Empty, partial or invalid-sync TS packets return PROTO with drop reason
- * MOQ_MEDIA_DROP_MALFORMED_MPEG2TS.
+/* Explicit LEGACY_MSF01_LOC01+D16/18 or D22_MSF01_LOC04_PUBLIC+D22.
+ * Unknown companion/version (AUTO included) or malformed sized config is
+ * INVAL; a known but
+ * mismatched pair is UNSUPPORTED. D22 requires METADATA_SIZE bytes; shorter output returns
+ * UNSUPPORTED before any output/drop-reason store. Legacy pairs require the
+ * old V0_SIZE floor. No caller input output-stamp is required.
+ * Success copies/stamps min(out_size, library size). Other failures leave out
+ * untouched, except BUFFER publishes the required sample_count as on the old
+ * parser. Caller sample storage is scratch during CMAF parsing, even on error.
+ * PROTO sets MALFORMED_LOC/CMAF; duplicate known LOC is UNSUPPORTED, not a drop.
+ * No refs are taken or transferred on any result. Payload/fragment/samples and
+ * object config borrow in/sample backing. These must outlive use of out;
+ * no cleanup is needed. Only absent timescale/video/audio configuration inherits
+ * from track_loc_metadata. Present object fields, including empty config, win.
+ * Track timestamp/marking/audio-level fields do not become object metadata.
+ * A supplied track record needs its complete v0 floor, known presence bits,
+ * zero reserved bytes, and coherent selected config spans; otherwise INVAL.
+ * Track timescale/audio configuration on the legacy companion is UNSUPPORTED.
+ * Timestamp without effective LOC timescale is UNIX/capture time; with any
+ * scale it is application time, never capture. Zero scale/overflow keeps raw
+ * metadata with has_time_us=false. RAW timing uses available time_us; CMAF
+ * tfdt/trun timing stays authoritative. Catalog timescale is not a LOC default.
+ * LOC04 marking1..3 uses the first payload byte's I bit; marking4 is opaque.
+ * Well-formed unknown properties are skipped; original property bytes stay
+ * unchanged and separate. No automatic companion or service eligibility.
  *
- * out_size must cover MOQ_MEDIA_PARSED_OBJECT_V0_SIZE. Validation of config
- * and output size precedes output/drop-reason stores. Success copies/stamps
- * min(out_size, library size). BUFFER also publishes the required sample_count;
- * other failures leave out untouched. Samples remain caller-owned scratch,
- * and all returned byte spans borrow input backing. No refs or ownership move. */
+ * MPEG2TS requires a covered packet size of 188 or 192 (otherwise INVAL);
+ * other packaging ignores it. The unsized parser cannot supply TS context and
+ * returns INVAL for TS. Valid TS context in a build without moq::mpeg2ts
+ * returns UNSUPPORTED. Empty, partial or invalid-sync TS packets return PROTO
+ * with drop reason MOQ_MEDIA_DROP_MALFORMED_MPEG2TS. An MPEG2TS object's
+ * properties are not parsed as LOC, so its metadata stays empty. */
 MOQ_API moq_result_t moq_media_object_parse_sized(
     const moq_media_track_info_t *track,
     const moq_media_object_input_t *in,

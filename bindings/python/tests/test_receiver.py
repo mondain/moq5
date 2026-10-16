@@ -476,9 +476,9 @@ class ReceiverShellTests(unittest.TestCase):
 
     def test_stats_copies_every_field_and_gates_appended_fields_by_stamp(self):
         with self.connect() as endpoint, self.attach(endpoint) as receiver:
-            _native._test_stats(1, 2, 3, 4, 5, 6, 7, 8, 9, True, 10, True)
+            _native._test_stats(1, 2, 3, 4, 5, 6, 7, 8, 9, True, 10, True, 11)
             stats = receiver.stats()
-            self.assertEqual(stats, moq5.ReceiverStats(1, 2, 3, 4, 5, 6, 7, 8, 9, True, 10, True))
+            self.assertEqual(stats, moq5.ReceiverStats(1, 2, 3, 4, 5, 6, 7, 8, 9, True, 10, True, 11))
             _native._test_stats(2**64 - 1, 0, 0, 0, 0, 0, 0, 0, 0, False, 2**64 - 1, False)
             stats = receiver.stats()
             self.assertEqual((stats.objects_received, stats.catalog_drops), (2**64 - 1, 2**64 - 1))
@@ -494,6 +494,12 @@ class ReceiverShellTests(unittest.TestCase):
             stats = receiver.stats()
             self.assertEqual(stats.catalog_drops, 2**64 - 1)
             self.assertIsNone(stats.catalog_complete)
+            self.assertIsNone(stats.tracks_malformed)
+            # a stamp covering catalog_complete but not tracks_malformed
+            _native._test_stats_size(104)
+            stats = receiver.stats()
+            self.assertFalse(stats.catalog_complete)
+            self.assertIsNone(stats.tracks_malformed)
             # OK with a malformed stamp is a BINDING fault, never a native code
             for size, detail in ((80, "below"), (200, "exceeds")):
                 _native._test_stats_size(size)

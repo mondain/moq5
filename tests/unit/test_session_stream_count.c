@@ -158,7 +158,7 @@ static void test_done_reset_ordering(moq_version_t ver, bool done_first)
         if (ver == MOQ_VERSION_DRAFT_18) {
             MOQ_TEST_CHECK(moq_d18_encode_publish_done(&w, 0x2, 1,
                 (moq_bytes_t){0}) == MOQ_OK);
-            moq_stream_ref_t ref = cl->publishes[slot].request_stream_ref;
+            moq_stream_ref_t ref = cl->publishes[slot].rs.ref;
             MOQ_TEST_CHECK(ref._v != 0);
             MOQ_TEST_CHECK(moq_session_on_bidi_stream_bytes(cl, ref, buf,
                 moq_buf_writer_offset(&w), false, now) == MOQ_OK);
@@ -489,7 +489,7 @@ static moq_result_t sub_feed_done_raw(moq_simpair_t *sp, moq_version_t ver,
         int slot = sub_resolve_handle(cl, cl_sub);
         MOQ_TEST_CHECK(slot >= 0);
         if (slot < 0) return MOQ_ERR_STALE_HANDLE;
-        moq_stream_ref_t ref = cl->subs[slot].request_stream_ref;
+        moq_stream_ref_t ref = cl->subs[slot].rs.ref;
         MOQ_TEST_CHECK(ref._v != 0);
         rc = moq_session_on_bidi_stream_bytes(cl, ref, buf, len, fin, now);
         moq_action_t acts[4]; size_t na;
@@ -601,7 +601,7 @@ static void test_sub_done_before_termination(moq_version_t ver, bool use_reset)
         int slot = sub_resolve_handle(cl, cl_sub);
         MOQ_TEST_CHECK(slot >= 0 &&
                        cl->subs[slot].state == MOQ_SUB_TERMINATED);
-        moq_stream_ref_t ref = cl->subs[slot].request_stream_ref;
+        moq_stream_ref_t ref = cl->subs[slot].rs.ref;
         MOQ_TEST_CHECK(moq_session_on_bidi_stream_bytes(cl, ref, NULL, 0,
             true, now) == MOQ_OK);
         assert_no_close_actions(cl);   /* the accept's close was the only one */
@@ -879,7 +879,7 @@ static void test_sub_destroy_while_deferred(moq_version_t ver)
         if (ver == MOQ_VERSION_DRAFT_18) {
             MOQ_TEST_CHECK(moq_d18_encode_publish_done(&w, 0x2, 3,
                 MOQ_BYTES_LITERAL("orphaned")) == MOQ_OK);
-            moq_stream_ref_t ref = cl->publishes[slot].request_stream_ref;
+            moq_stream_ref_t ref = cl->publishes[slot].rs.ref;
             MOQ_TEST_CHECK(ref._v != 0);
             MOQ_TEST_CHECK(moq_session_on_bidi_stream_bytes(cl, ref, buf,
                 moq_buf_writer_offset(&w), false, now) == MOQ_OK);
@@ -932,7 +932,7 @@ static void test_sub_oom_reason(moq_version_t ver)
         moq_result_t rrc;
         if (ver == MOQ_VERSION_DRAFT_18) {
             int slot = sub_resolve_handle(cl, cl_sub);
-            moq_stream_ref_t ref = cl->subs[slot].request_stream_ref;
+            moq_stream_ref_t ref = cl->subs[slot].rs.ref;
             rrc = moq_session_on_bidi_stream_bytes(cl, ref, NULL, 0, false,
                                                    moq_simpair_now_us(sp));
             /* Steal the queued half-close, as in sub_feed_done. */
@@ -1014,7 +1014,7 @@ static void test_sub_d18_fin_variants(void)
         MOQ_TEST_CHECK(cl_sub_done_pending(cl, cl_sub));
         int slot = sub_resolve_handle(cl, cl_sub);
         MOQ_TEST_CHECK(slot >= 0);
-        moq_stream_ref_t ref = cl->subs[slot].request_stream_ref;
+        moq_stream_ref_t ref = cl->subs[slot].rs.ref;
         /* Bare FIN while pending: accepted, recorded, no event, no close. */
         MOQ_TEST_CHECK(moq_session_on_bidi_stream_bytes(cl, ref, NULL, 0,
             true, now) == MOQ_OK);
@@ -1057,7 +1057,7 @@ static void test_sub_d18_extra_bytes_after_terminal(void)
     MOQ_TEST_CHECK(cl_sub_done_pending(cl, cl_sub));
     int slot = sub_resolve_handle(cl, cl_sub);
     MOQ_TEST_CHECK(slot >= 0);
-    moq_stream_ref_t ref = cl->subs[slot].request_stream_ref;
+    moq_stream_ref_t ref = cl->subs[slot].rs.ref;
     uint8_t junk = 0x00;
     (void)moq_session_on_bidi_stream_bytes(cl, ref, &junk, 1, false, now);
     MOQ_TEST_CHECK(moq_session_state(cl) == MOQ_SESS_CLOSED);
@@ -1423,7 +1423,7 @@ static moq_result_t pub_feed_done(moq_simpair_t *sp, moq_version_t ver,
         moq_bytes_t rb = { (const uint8_t *)reason, rlen };
         MOQ_TEST_CHECK(moq_d18_encode_publish_done(&w, status, count, rb)
                        == MOQ_OK);
-        moq_stream_ref_t ref = cl->publishes[slot].request_stream_ref;
+        moq_stream_ref_t ref = cl->publishes[slot].rs.ref;
         MOQ_TEST_CHECK(ref._v != 0);
         rc = moq_session_on_bidi_stream_bytes(cl, ref, buf,
             moq_buf_writer_offset(&w), fin, now);
@@ -1580,7 +1580,7 @@ static void test_pub_pending_f0(moq_version_t ver, bool done_first)
             /* Immediate path drains the bidi: absorb the FIN to free. */
             int slot = pub_resolve_handle(cl, cl_pub);
             if (slot >= 0) {
-                moq_stream_ref_t ref = cl->publishes[slot].request_stream_ref;
+                moq_stream_ref_t ref = cl->publishes[slot].rs.ref;
                 MOQ_TEST_CHECK(moq_session_on_bidi_stream_bytes(cl, ref,
                     NULL, 0, true, now) == MOQ_OK);
             }
@@ -1623,7 +1623,7 @@ static void test_sub_pending_done_rejected(moq_version_t ver)
     if (ver == MOQ_VERSION_DRAFT_18) {
         int slot = sub_resolve_handle(cl, cl_sub);
         MOQ_TEST_CHECK(slot >= 0);
-        moq_stream_ref_t ref = cl->subs[slot].request_stream_ref;
+        moq_stream_ref_t ref = cl->subs[slot].rs.ref;
         (void)moq_session_on_bidi_stream_bytes(cl, ref, buf, len, false, now);
     } else {
         (void)moq_session_on_control_bytes(cl, buf, len, now);
@@ -1920,7 +1920,7 @@ static void test_sub_d18_defer_action_backpressure(void)
                                  0x2, 1, "gate", buf, sizeof(buf));
     int slot = sub_resolve_handle(cl, cl_sub);
     MOQ_TEST_CHECK(slot >= 0);
-    moq_stream_ref_t ref = cl->subs[slot].request_stream_ref;
+    moq_stream_ref_t ref = cl->subs[slot].rs.ref;
     MOQ_TEST_CHECK(moq_session_on_bidi_stream_bytes(cl, ref, buf, len,
         false, now) == MOQ_ERR_WOULD_BLOCK);
     MOQ_TEST_CHECK(!cl_sub_done_pending(cl, cl_sub));
@@ -2247,7 +2247,7 @@ static void test_fwd0_stream_suppressed(moq_version_t ver, bool established,
     if (ver == MOQ_VERSION_DRAFT_18) {
         int slot = pub_resolve_handle(cl, cl_pub);
         if (slot >= 0) {
-            moq_stream_ref_t ref = cl->publishes[slot].request_stream_ref;
+            moq_stream_ref_t ref = cl->publishes[slot].rs.ref;
             MOQ_TEST_CHECK(moq_session_on_bidi_stream_bytes(cl, ref, NULL,
                 0, true, now) == MOQ_OK);
         }
@@ -2773,14 +2773,14 @@ static void test_pub_fwd0_datagram_no_staging(moq_version_t ver)
 /* Build a property/extension blob with one or two even entries (ascending
  * types) and optionally an IMMUTABLE_PROPERTIES (0x0B) block wrapping
  * `imm`/`imm_len` (d18 only; 0x0B > 0x06 keeps ascent). Draft-16 Track
- * Extensions are QUIC-varint KVPs (the kvp codec); draft-18 Track
+ * Extensions are QUIC-varint KVPs (the kvp codec); draft-18/22 Track
  * Properties are vi64 Type-Delta KVPs -- crafted manually here. */
 static size_t dt_blob_v(moq_version_t ver, uint8_t *buf, size_t cap,
                         bool with_obj, uint64_t obj_ms,
                         bool with_sub, uint64_t sub_ms,
                         const uint8_t *imm, size_t imm_len)
 {
-    if (ver == MOQ_VERSION_DRAFT_18) {
+    if (ver == MOQ_VERSION_DRAFT_18 || ver == MOQ_VERSION_DRAFT_22) {
         moq_buf_writer_t w;
         moq_buf_writer_init(&w, buf, cap);
         uint64_t prev = 0;
@@ -3070,6 +3070,47 @@ static void test_dt_update_latch(moq_version_t ver, bool reject)
     MOQ_TEST_CHECK(as.balance == 0);
 }
 
+/* Drain only this timer probe's header, FIN or reset; retain the actual
+ * encoded header extent for the later reliable reset assertion. */
+static uint8_t dt_timer_actions(moq_session_t *s, moq_stream_ref_t ref,
+                                uint8_t header_len, unsigned want_fin,
+                                unsigned want_reset)
+{
+    unsigned headers = 0, fins = 0, resets = 0;
+    const unsigned want_header = header_len == 0 ? 1 : 0;
+    moq_action_t a;
+    while (moq_session_poll_actions(s, &a, 1) == 1) {
+        if (a.kind == MOQ_ACTION_SEND_DATA) {
+            MOQ_TEST_CHECK_EQ_U64(a.u.send_data.stream_ref._v, ref._v);
+            MOQ_TEST_CHECK(a.u.send_data.payload == NULL);
+            if (a.u.send_data.fin) {
+                MOQ_TEST_CHECK(a.u.send_data.header_len == 0);
+                fins++;
+            } else {
+                MOQ_TEST_CHECK(a.u.send_data.header_len > 0);
+                header_len = a.u.send_data.header_len;
+                headers++;
+            }
+        } else if (a.kind == MOQ_ACTION_RESET_DATA) {
+            MOQ_TEST_CHECK(a.detail_size >=
+                offsetof(moq_reset_data_action_t, reliable_size) +
+                sizeof(a.u.reset_data.reliable_size));
+            MOQ_TEST_CHECK_EQ_U64(a.u.reset_data.stream_ref._v, ref._v);
+            MOQ_TEST_CHECK_EQ_U64(a.u.reset_data.error_code, MOQ_RESET_DELIVERY_TIMEOUT);
+            MOQ_TEST_CHECK(header_len > 0);
+            MOQ_TEST_CHECK_EQ_U64(a.u.reset_data.reliable_size, header_len);
+            resets++;
+        } else {
+            MOQ_TEST_CHECK(false);
+        }
+        moq_action_cleanup(&a);
+    }
+    MOQ_TEST_CHECK_EQ_U64(headers, want_header);
+    MOQ_TEST_CHECK_EQ_U64(fins, want_fin);
+    MOQ_TEST_CHECK_EQ_U64(resets, want_reset);
+    return header_len;
+}
+
 /* -- the subgroup timer uses the exact NEGOTIATED SUBGROUP timeout ----- */
 static void test_dt_subgroup_consumer(moq_version_t ver)
 {
@@ -3085,7 +3126,7 @@ static void test_dt_subgroup_consumer(moq_version_t ver)
     MOQ_TEST_CHECK(dt_subscribe_pending(sp, "t", &cl_sub, &sv_sub));
 
     uint8_t props[64]; size_t plen;
-    if (ver == MOQ_VERSION_DRAFT_18)
+    if (ver == MOQ_VERSION_DRAFT_18 || ver == MOQ_VERSION_DRAFT_22)
         /* object=1000 SMALLER than subgroup=8000: the subgroup timer must
          * use 8000, never the min_nonzero legacy projection (1000). */
         plen = dt_blob_v(ver, props, sizeof(props), true, 1000, true, 8000,
@@ -3093,6 +3134,7 @@ static void test_dt_subgroup_consumer(moq_version_t ver)
     else
         plen = dt_blob_v(ver, props, sizeof(props), true, 8000, false, 0,
                          NULL, 0);
+    MOQ_TEST_CHECK(plen > 0);
     MOQ_TEST_CHECK(dt_accept_with_props(sp, sv_sub, props, plen) == MOQ_OK);
     moq_simpair_run_until_quiescent(sp, 16, NULL);
     drain_events(cl); drain_events(sv);
@@ -3103,16 +3145,59 @@ static void test_dt_subgroup_consumer(moq_version_t ver)
     moq_subgroup_handle_t sg;
     MOQ_TEST_CHECK(moq_session_open_subgroup(sv, sv_sub, &sgc, now, &sg)
                    == MOQ_OK);
-    {
-        bool found = false;
-        for (size_t i = 0; i < sv->sg_cap; i++) {
-            if (sv->subgroups[i].state == MOQ_SG_FREE) continue;
-            MOQ_TEST_CHECK_EQ_U64(sv->subgroups[i].delivery_deadline_us,
-                                  now + 8000ull * 1000ull);
-            found = true;
-        }
-        MOQ_TEST_CHECK(found);
+    int slot = -1;
+    for (size_t i = 0; i < sv->sg_cap; i++) {
+        if (sv->subgroups[i].state != MOQ_SG_OPEN ||
+            !moq_subscription_eq(sv->subgroups[i].sub, sv_sub) ||
+            sv->subgroups[i].group_id != sgc.group_id ||
+            sv->subgroups[i].subgroup_id != sgc.subgroup_id) continue;
+        MOQ_TEST_CHECK(slot < 0);
+        slot = (int)i;
     }
+    MOQ_TEST_CHECK(slot >= 0);
+    if (slot < 0) goto out;
+    moq_stream_ref_t ref = sv->subgroups[slot].stream_ref;
+    uint8_t header_len = dt_timer_actions(sv, ref, 0, 0, 0);
+    uint64_t deadline;
+    if (ver == MOQ_VERSION_DRAFT_16) {
+        /* Preserved D16 behavior: expiry runs from open without a FIN. */
+        deadline = now + 8000ull * 1000ull;
+        MOQ_TEST_CHECK(sv->subgroups[slot].state == MOQ_SG_OPEN);
+        MOQ_TEST_CHECK_EQ_U64(sv->subgroups[slot].delivery_deadline_us, deadline);
+    } else {
+        MOQ_TEST_CHECK_EQ_U64(sv->subgroups[slot].delivery_deadline_us, UINT64_MAX);
+        MOQ_TEST_CHECK_EQ_U64(sv->subgroup_deadline_us, UINT64_MAX);
+        MOQ_TEST_CHECK(moq_session_tick(sv, now + 9000000) == MOQ_OK);
+        (void)dt_timer_actions(sv, ref, header_len, 0, 0);
+        MOQ_TEST_CHECK(sv->subgroups[slot].state == MOQ_SG_OPEN);
+        MOQ_TEST_CHECK_EQ_U64(sv->subgroups[slot].delivery_deadline_us, UINT64_MAX);
+        MOQ_TEST_CHECK_EQ_U64(sv->subgroup_deadline_us, UINT64_MAX);
+
+        const uint64_t fin_us = now + 11000000;
+        deadline = fin_us + 8000ull * 1000ull;
+        MOQ_TEST_CHECK(moq_session_close_subgroup(sv, sg, fin_us) == MOQ_OK);
+        (void)dt_timer_actions(sv, ref, header_len, 1, 0);
+        MOQ_TEST_CHECK(sv->subgroups[slot].state == MOQ_SG_CLOSING);
+        MOQ_TEST_CHECK_EQ_U64(sv->subgroups[slot].delivery_deadline_us, deadline);
+        MOQ_TEST_CHECK_EQ_U64(sv->subgroup_deadline_us, deadline);
+        /* No expiry at the smaller OBJECT / legacy-minimum delay. */
+        MOQ_TEST_CHECK(moq_session_tick(sv, fin_us + 1000000) == MOQ_OK);
+        (void)dt_timer_actions(sv, ref, header_len, 0, 0);
+    }
+    MOQ_TEST_CHECK_EQ_U64(sv->subgroup_deadline_us, deadline);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(sv), deadline);
+    MOQ_TEST_CHECK(moq_session_tick(sv, deadline - 1) == MOQ_OK);
+    (void)dt_timer_actions(sv, ref, header_len, 0, 0);
+    MOQ_TEST_CHECK_EQ_U64(sv->subgroups[slot].delivery_deadline_us, deadline);
+    MOQ_TEST_CHECK(moq_session_tick(sv, deadline) == MOQ_OK);
+    (void)dt_timer_actions(sv, ref, header_len, 0, 1);
+    MOQ_TEST_CHECK_EQ_U64(sv->subgroup_deadline_us, UINT64_MAX);
+    MOQ_TEST_CHECK(moq_session_tick(sv, deadline) == MOQ_OK);
+    (void)dt_timer_actions(sv, ref, header_len, 0, 0);
+    MOQ_TEST_CHECK(moq_session_tick(sv, deadline + 1) == MOQ_OK);
+    (void)dt_timer_actions(sv, ref, header_len, 0, 0);
+    MOQ_TEST_CHECK(moq_session_state(sv) == MOQ_SESS_ESTABLISHED);
+out:
     moq_simpair_destroy(sp);
     MOQ_TEST_CHECK(as.balance == 0);
 }
@@ -3132,7 +3217,7 @@ static void test_dt_event_vs_retained_d18(void)
     MOQ_TEST_CHECK(sc_sub_establish(sp, &cl_sub, &sv_sub));
     int svslot = sub_resolve_handle(sv, sv_sub);
     MOQ_TEST_CHECK(svslot >= 0);
-    moq_stream_ref_t ref = sv->subs[svslot].request_stream_ref;
+    moq_stream_ref_t ref = sv->subs[svslot].rs.ref;
     MOQ_TEST_CHECK(ref._v != 0);
 
     /* Update #1: DIFFERING object/subgroup values in one message --
@@ -3206,11 +3291,11 @@ static void test_dt_event_vs_retained_d18(void)
 }
 
 /* -- vi64-max saturation: exact ms retained; deadline never sentinel -- */
-static void test_dt_saturation_d18(void)
+static void test_dt_saturation(moq_version_t ver)
 {
     sc_alloc_state_t as = {0};
     moq_alloc_t alloc = sc_allocator(&as);
-    moq_simpair_t *sp = sc_pair(&alloc, MOQ_VERSION_DRAFT_18, false, 0);
+    moq_simpair_t *sp = sc_pair(&alloc, ver, false, 0);
     MOQ_TEST_CHECK(sp != NULL);
     if (!sp) return;
     moq_session_t *sv = moq_simpair_server(sp);
@@ -3218,7 +3303,7 @@ static void test_dt_saturation_d18(void)
     moq_subscription_t cl_sub, sv_sub;
     MOQ_TEST_CHECK(dt_subscribe_pending(sp, "t", &cl_sub, &sv_sub));
     uint8_t props[64];
-    size_t plen = dt_blob_v(MOQ_VERSION_DRAFT_18, props, sizeof(props),
+    size_t plen = dt_blob_v(ver, props, sizeof(props),
                             false, 0, true, MOQ_QUIC_VARINT_MAX, NULL, 0);
     MOQ_TEST_CHECK(plen > 0);
     MOQ_TEST_CHECK(dt_accept_with_props(sp, sv_sub, props, plen) == MOQ_OK);
@@ -3228,19 +3313,51 @@ static void test_dt_saturation_d18(void)
                        sv->subs[slot].dt_pub_subgroup_ms
                            == MOQ_QUIC_VARINT_MAX);   /* exact raw ms */
     }
+    moq_simpair_run_until_quiescent(sp, 16, NULL);
+    drain_events(moq_simpair_client(sp)); drain_events(sv);
     now = moq_simpair_now_us(sp);
     moq_subgroup_cfg_t sgc; moq_subgroup_cfg_init(&sgc);
     sgc.group_id = 0; sgc.subgroup_id = 0; sgc.publisher_priority = 128;
     moq_subgroup_handle_t sg;
     MOQ_TEST_CHECK(moq_session_open_subgroup(sv, sv_sub, &sgc, now, &sg)
                    == MOQ_OK);
+    int slot = -1;
     for (size_t i = 0; i < sv->sg_cap; i++) {
-        if (sv->subgroups[i].state == MOQ_SG_FREE) continue;
-        /* Saturated duration -> finite deadline via deadline_add: never
-         * the UINT64_MAX no-deadline sentinel. */
-        MOQ_TEST_CHECK_EQ_U64(sv->subgroups[i].delivery_deadline_us,
-                              UINT64_MAX - 1);
+        if (sv->subgroups[i].state != MOQ_SG_OPEN ||
+            !moq_subscription_eq(sv->subgroups[i].sub, sv_sub) ||
+            sv->subgroups[i].group_id != sgc.group_id ||
+            sv->subgroups[i].subgroup_id != sgc.subgroup_id) continue;
+        MOQ_TEST_CHECK(slot < 0);
+        slot = (int)i;
     }
+    MOQ_TEST_CHECK(slot >= 0);
+    if (slot < 0) goto out;
+    moq_stream_ref_t ref = sv->subgroups[slot].stream_ref;
+    uint8_t header_len = dt_timer_actions(sv, ref, 0, 0, 0);
+    MOQ_TEST_CHECK_EQ_U64(sv->subgroups[slot].delivery_deadline_us, UINT64_MAX);
+    MOQ_TEST_CHECK_EQ_U64(sv->subgroup_deadline_us, UINT64_MAX);
+    MOQ_TEST_CHECK(moq_session_tick(sv, now + 8000000) == MOQ_OK);
+    (void)dt_timer_actions(sv, ref, header_len, 0, 0);
+    MOQ_TEST_CHECK_EQ_U64(sv->subgroups[slot].delivery_deadline_us, UINT64_MAX);
+    MOQ_TEST_CHECK(moq_session_close_subgroup(sv, sg, now + 9000000) == MOQ_OK);
+    (void)dt_timer_actions(sv, ref, header_len, 1, 0);
+    /* The post-FIN saturated deadline is finite, not the no-timer sentinel. */
+    MOQ_TEST_CHECK(sv->subgroups[slot].state == MOQ_SG_CLOSING);
+    MOQ_TEST_CHECK_EQ_U64(sv->subgroups[slot].delivery_deadline_us, UINT64_MAX - 1);
+    MOQ_TEST_CHECK_EQ_U64(sv->subgroup_deadline_us, UINT64_MAX - 1);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(sv), UINT64_MAX - 1);
+    MOQ_TEST_CHECK(moq_session_tick(sv, UINT64_MAX - 2) == MOQ_OK);
+    (void)dt_timer_actions(sv, ref, header_len, 0, 0);
+    MOQ_TEST_CHECK_EQ_U64(sv->subgroups[slot].delivery_deadline_us, UINT64_MAX - 1);
+    MOQ_TEST_CHECK(moq_session_tick(sv, UINT64_MAX - 1) == MOQ_OK);
+    (void)dt_timer_actions(sv, ref, header_len, 0, 1);
+    MOQ_TEST_CHECK_EQ_U64(sv->subgroup_deadline_us, UINT64_MAX);
+    MOQ_TEST_CHECK(moq_session_tick(sv, UINT64_MAX - 1) == MOQ_OK);
+    (void)dt_timer_actions(sv, ref, header_len, 0, 0);
+    MOQ_TEST_CHECK(moq_session_tick(sv, UINT64_MAX) == MOQ_OK);
+    (void)dt_timer_actions(sv, ref, header_len, 0, 0);
+    MOQ_TEST_CHECK(moq_session_state(sv) == MOQ_SESS_ESTABLISHED);
+out:
     moq_simpair_destroy(sp);
     MOQ_TEST_CHECK(as.balance == 0);
 }
@@ -3725,7 +3842,7 @@ static void test_dt_pub_matrix(moq_version_t ver)
             pms.has_subgroup_delivery_timeout = true;
             pms.subgroup_delivery_timeout_ms = 9000;
             MOQ_TEST_CHECK(moq_d18_encode_publish_ok(&w, &pms) == MOQ_OK);
-            moq_stream_ref_t ref = sv->publishes[slot].request_stream_ref;
+            moq_stream_ref_t ref = sv->publishes[slot].rs.ref;
             MOQ_TEST_CHECK(ref._v != 0);
             MOQ_TEST_CHECK(moq_session_on_bidi_stream_bytes(sv, ref, okb,
                 moq_buf_writer_offset(&w), false, now) == MOQ_OK);
@@ -4086,7 +4203,7 @@ static void test_dt_d18_update_reject(bool publication)
         { moq_action_t a;                        /* never delivered */
           while (moq_session_poll_actions(cl, &a, 1) > 0)
               moq_action_cleanup(&a); }
-        ref = cl->publishes[slot].request_stream_ref;
+        ref = cl->publishes[slot].rs.ref;
         uint8_t buf[64]; moq_buf_writer_t w;
         moq_buf_writer_init(&w, buf, sizeof(buf));
         MOQ_TEST_CHECK(moq_d18_encode_request_error(&w, 0x0, 0,
@@ -4124,7 +4241,7 @@ static void test_dt_d18_update_reject(bool publication)
         { moq_action_t a;
           while (moq_session_poll_actions(cl, &a, 1) > 0)
               moq_action_cleanup(&a); }
-        ref = cl->subs[slot].request_stream_ref;
+        ref = cl->subs[slot].rs.ref;
         uint8_t buf[64]; moq_buf_writer_t w;
         moq_buf_writer_init(&w, buf, sizeof(buf));
         MOQ_TEST_CHECK(moq_d18_encode_request_error(&w, 0x0, 0,
@@ -4293,7 +4410,7 @@ static void test_dt_subscribe_ok_malformed(moq_version_t ver,
         MOQ_TEST_CHECK(moq_buf_write_raw(&w, bad, blen) == MOQ_OK);
         MOQ_TEST_CHECK(moq_buf_patch_uint16(&w, len_off,
             (uint16_t)(moq_buf_writer_offset(&w) - (len_off + 2))) == MOQ_OK);
-        moq_stream_ref_t ref = cl->subs[slot].request_stream_ref;
+        moq_stream_ref_t ref = cl->subs[slot].rs.ref;
         (void)moq_session_on_bidi_stream_bytes(cl, ref, ok,
             moq_buf_writer_offset(&w), false, now);
     }
@@ -4461,8 +4578,10 @@ int main(void)
                                                 * clear covered via retire */
         test_dt_subgroup_consumer(ver);
     }
+    test_dt_subgroup_consumer(MOQ_VERSION_DRAFT_22);
     test_dt_event_vs_retained_d18();
-    test_dt_saturation_d18();
+    test_dt_saturation(MOQ_VERSION_DRAFT_18);
+    test_dt_saturation(MOQ_VERSION_DRAFT_22);
 
     test_ex_cfg();
     for (int v = 0; v < 2; v++) {

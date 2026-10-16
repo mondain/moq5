@@ -22,6 +22,7 @@
 #endif
 
 #include "conn_reap.h"
+#include "lanedeadline.h"
 #ifdef MOQR_DUAL_LISTENER
 #include "wtcfg.h"
 #endif
@@ -95,6 +96,8 @@ _Static_assert(ATOMIC_INT_LOCK_FREE == 2,
  * here, the one TU that sees both headers. */
 _Static_assert(MOQR_CLI_MAX_LANES == MOQR_SHARDS_MAX,
                "listener.lanes cap must equal the shard runtime cap");
+_Static_assert(MOQR_CLI_LANE_DEADLINE_SLOTS == MOQR_CLI_MAX_LANES,
+               "one fill-deadline slot per shard");
 
 static atomic_int g_stop;
 
@@ -1042,7 +1045,19 @@ typedef struct serve_ctx {
     /* The lane's relay-core deadline (see deadline.h). */
     _Atomic uint64_t          deadline[1];
     moqr_cli_deadline_range_t deadlines;
+    /* The binding's next fill deadline, published by the lane pump and read
+     * by the facade's per-lane deadline query (one slot). */
+    moqr_cli_lane_deadlines_t fill_deadlines;
 } serve_ctx_t;
+
+/* The facade's per-lane deadline query for the single-lane composition: its
+ * one lane drives the one binding. */
+static uint64_t
+relay_lane_deadline(void *vctx, uint32_t lane_index)
+{
+    serve_ctx_t *ctx = vctx;
+    return moqr_cli_lane_deadlines_at(&ctx->fill_deadlines, lane_index);
+}
 
 /* Render `fn` into a heap buffer, growing once on truncation (the serializers
  * report the size they need), then write it to stderr under a banner. Network
@@ -1157,6 +1172,11 @@ relay_lane_pump(moq_msquic_managed_t *m, moq_msquic_managed_lane_t *lane,
         fprintf(stderr, "MOQ5 Relay: connection retirement failed — stopping\n");
         return 1;
     }
+    /* A fill held at a gap ends at its deadline, not at the next pump this
+     * lane happens to earn: the facade folds this into the lane's wait. */
+    moqr_cli_lane_deadlines_publish(&ctx->fill_deadlines, 0,
+                                    moqr_bind_next_deadline_us(ctx->bind),
+                                    now_us);
 
     unsigned re = atomic_load(&g_route_dump_epoch);
     if (ctx->seen_route_epoch != re) {
@@ -1361,6 +1381,11 @@ cmd_serve(const moqr_cli_config_t *cfg)
     tcfg.on_lane_pump_user = &ctx;
     tcfg.app_deadline_us = moqr_cli_deadline_query;
     tcfg.app_deadline_ctx = &ctx.deadlines;
+    /* Before create: the lane may pump, and the callback run, before it
+     * returns. */
+    moqr_cli_lane_deadlines_init(&ctx.fill_deadlines, 1u);
+    tcfg.app_lane_deadline_us = relay_lane_deadline;
+    tcfg.app_lane_deadline_ctx = &ctx;
 
     moq_msquic_managed_t *t = NULL;
     if (moq_msquic_managed_create(&tcfg, &t) != MOQ_OK) {
@@ -1591,7 +1616,35 @@ typedef struct serve_lanes_ctx {
     _Atomic uint64_t          deadline[MOQR_CLI_MAX_LANES];
     moqr_cli_deadline_range_t raw_deadlines;
     moqr_cli_deadline_range_t wt_deadlines;
+    /* Each shard's next fill deadline, indexed by global shard and written
+     * only by the lane that owns it. Each facade's per-lane deadline query
+     * answers the slot of the shard the asking lane drives, and nothing
+     * else. */
+    moqr_cli_lane_deadlines_t fill_deadlines;
 } serve_lanes_ctx_t;
+
+/* The raw facade's per-lane deadline query: the asking lane's own shard,
+ * mapped exactly as relay_lanes_pump maps it. A lane the plan gives no shard
+ * has no deadline. */
+static uint64_t
+relay_raw_lane_deadline(void *vctx, uint32_t lane_index)
+{
+    serve_lanes_ctx_t *ctx = vctx;
+    return moqr_cli_lane_deadlines_at(
+        &ctx->fill_deadlines, moqr_cli_shard_of_raw_lane(&ctx->plan, lane_index));
+}
+
+#ifdef MOQR_DUAL_LISTENER
+/* The WebTransport facade's per-lane deadline query, mapped as
+ * relay_wt_lanes_pump maps its lanes: into the WebTransport shard range. */
+static uint64_t
+relay_wt_lane_deadline(void *vctx, uint32_t lane_index)
+{
+    serve_lanes_ctx_t *ctx = vctx;
+    return moqr_cli_lane_deadlines_at(
+        &ctx->fill_deadlines, moqr_cli_shard_of_wt_lane(&ctx->plan, lane_index));
+}
+#endif
 
 /* Lane i drives shard i: attach/reap this lane's connections against shard i's
  * binding, step the shard, then wake exactly the destination lanes whose
@@ -1792,6 +1845,11 @@ relay_pump_shard(serve_lanes_ctx_t *ctx, moq_msquic_managed_t *raw,
                         "— stopping\n", shard);
         return 1;
     }
+    /* A fill held at a gap ends at its deadline, not at the next pump this
+     * lane happens to earn: the lane's facade folds this shard's deadline,
+     * and only this one, into the lane's wait. */
+    moqr_cli_lane_deadlines_publish(&ctx->fill_deadlines, shard,
+                                    moqr_bind_next_deadline_us(bind), now_us);
 
     /* Operator dumps: THIS lane renders its own route + journal dumps once
      * per new epoch (safe here — its core/mgr/trace are read only inside
@@ -2314,6 +2372,11 @@ cmd_serve_lanes(const moqr_cli_config_t *cfg)
     tcfg.on_lane_pump_user = ctx;
     tcfg.app_deadline_us = moqr_cli_deadline_query;
     tcfg.app_deadline_ctx = &ctx->raw_deadlines;
+    /* Before either facade exists: their lanes may pump, and the callback
+     * run, before create returns. */
+    moqr_cli_lane_deadlines_init(&ctx->fill_deadlines, plan.total_shards);
+    tcfg.app_lane_deadline_us = relay_raw_lane_deadline;
+    tcfg.app_lane_deadline_ctx = ctx;
 #ifdef MOQR_VERIFY_SEAM
     /* Blocked-scenario seam: constrain every relay-side session's outgoing
      * subgroup pool (SESSION_SG induction; the bind override rode the shard
@@ -2352,6 +2415,7 @@ cmd_serve_lanes(const moqr_cli_config_t *cfg)
                                         relay_wt_lanes_pump, ctx,
                                         moqr_cli_deadline_query,
                                         &ctx->wt_deadlines,
+                                        relay_wt_lane_deadline, ctx,
                                         &ctx->wt) != MOQ_OK) {
             fprintf(stderr,
                     "webtransport transport create failed (port %d)\n",
@@ -2814,6 +2878,7 @@ void moqr_test_lanes_ctx_plan_dual(void *vctx, uint32_t raw_lanes,
     ctx->plan.wt_count = wt_lanes;
     ctx->plan.total_shards = raw_lanes + wt_lanes;
     ctx->lanes = raw_lanes + wt_lanes;
+    moqr_cli_lane_deadlines_init(&ctx->fill_deadlines, raw_lanes + wt_lanes);
 }
 
 /* The raw facade handle, so a WebTransport lane's cross-shard push can wake a
@@ -2865,6 +2930,7 @@ void *moqr_test_mk_serve_ctx(moqr_bind_t *bind, moqr_core_t *core,
         ctx->bind = bind;
         ctx->core = core;
         ctx->trace = trace;
+        moqr_cli_lane_deadlines_init(&ctx->fill_deadlines, 1u);
     }
     return ctx;
 }
@@ -2883,6 +2949,7 @@ void *moqr_test_mk_lanes_ctx(moqr_shards_t *shards, uint32_t lanes)
         ctx->plan.wt_first = lanes;
         ctx->plan.wt_count = 0;
         ctx->plan.total_shards = lanes;
+        moqr_cli_lane_deadlines_init(&ctx->fill_deadlines, lanes);
     }
     return ctx;
 }
@@ -2959,7 +3026,7 @@ moqr_test_admin_owner_probe(const moqr_cli_config_t *cfg, char *out,
     admin_owner_t o;
     moqr_cli_snapshot_t snap;
     moqr_obs_labels_t labels = { .shard = 0, .transport = "msquic",
-                                 .version = "moqt-18" };
+                                 .version = cfg->alpn_set };
     moqr_result_t rc;
 
     if (out_len != NULL) {

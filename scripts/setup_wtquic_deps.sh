@@ -99,7 +99,7 @@ WTQUIC_REPO="${WTQUIC_REPO:-https://github.com/rwl4/wtquic.git}"
 # This revision includes the relay's Origin/D02 API, upstream typed callback
 # registration for GCC pedantic WAE, and the accounted receive/bounded stream
 # admission APIs required by the adapter. No downstream WTQuic patches apply.
-WTQUIC_REF="${WTQUIC_REF:-c4973f427226834d1bac08dcb92aeb125cd7c7c2}"
+WTQUIC_REF="${WTQUIC_REF:-644644727ed7ba853c3f14450dd42a9e8a40d7e4}"
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
 repo_root=$(cd "$script_dir/.." && pwd)

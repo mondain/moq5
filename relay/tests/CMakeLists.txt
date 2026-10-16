@@ -168,19 +168,77 @@ if(TARGET moq::sim)
         moq::relay-core)
     moqr_test_warnings(moq-relay-bind-test-internals)
 
-    add_executable(test_relay_session_binding test_relay_session_binding.c
-        $<TARGET_OBJECTS:moq-relay-bind-test-internals>)
-    target_compile_definitions(test_relay_session_binding PRIVATE
+    # The session-binding suites share one test-only rig (allocator, SimPair
+    # rig, peer drain, shared fixtures), compiled once and linked into each
+    # suite executable; it is never part of a library.
+    add_library(moq-relay-session-binding-harness OBJECT
+        relay_session_binding_harness.c)
+    target_compile_definitions(moq-relay-session-binding-harness PRIVATE
         MOQR_BIND_TESTING)
-    target_link_libraries(test_relay_session_binding PRIVATE
+    target_link_libraries(moq-relay-session-binding-harness PRIVATE
         moq::sim moq-relay-policy)
-    moqr_test_warnings(test_relay_session_binding)
-    add_test(NAME relay_session_binding COMMAND test_relay_session_binding)
+    moqr_test_warnings(moq-relay-session-binding-harness)
+
+    # One executable per suite, so one failing suite never hides the others.
+    # The core suite keeps the relay_session_binding test name; the others
+    # register as relay_session_binding_<suite>.
+    set(MOQR_SESSION_BINDING_SUITES
+        core auth delivery ingress fetch namespace d22 metadata)
+    foreach(suite IN LISTS MOQR_SESSION_BINDING_SUITES)
+        set(_exe test_relay_session_binding_${suite})
+        add_executable(${_exe} ${_exe}.c
+            $<TARGET_OBJECTS:moq-relay-session-binding-harness>
+            $<TARGET_OBJECTS:moq-relay-bind-test-internals>)
+        target_compile_definitions(${_exe} PRIVATE MOQR_BIND_TESTING)
+        target_link_libraries(${_exe} PRIVATE moq::sim moq-relay-policy)
+        moqr_test_warnings(${_exe})
+        if(suite STREQUAL "core")
+            set(_test relay_session_binding)
+        else()
+            set(_test relay_session_binding_${suite})
+        endif()
+        add_test(NAME ${_test} COMMAND ${_exe})
+        set_tests_properties(${_test} PROPERTIES TIMEOUT 120)
+    endforeach()
+    add_test(NAME relay_metadata_lifetime
+        COMMAND test_relay_session_binding_metadata --metadata-lifetime)
+    add_test(NAME relay_direct_core_publisher
+        COMMAND test_relay_session_binding_metadata --direct-core-publisher)
+    set_tests_properties(relay_metadata_lifetime relay_direct_core_publisher
+        PROPERTIES TIMEOUT 120 LABELS "relay")
     # Core contract (fetcher-side late response stream after cancel): its
     # own entry so its result is reported apart from the ordinary suite.
     add_test(NAME relay_core_cancel_after_stop
-        COMMAND test_relay_session_binding --core-cancel-after-stop)
-    set_tests_properties(relay_session_binding PROPERTIES TIMEOUT 120)
+        COMMAND test_relay_session_binding_fetch --core-cancel-after-stop)
+
+    add_executable(test_relay_standalone_fetch test_relay_standalone_fetch.c
+        $<TARGET_OBJECTS:moq-relay-bind-test-internals>)
+    target_compile_definitions(test_relay_standalone_fetch PRIVATE
+        MOQR_BIND_TESTING)
+    target_link_libraries(test_relay_standalone_fetch PRIVATE
+        moq::sim moq-relay-policy)
+    moqr_test_warnings(test_relay_standalone_fetch)
+    foreach(row IN ITEMS publish-gap pull-gap cached-only timeout-zero
+            absent-source source-error source-reset total-deadline
+            cancel-reuse capacity-recovery descending cancel-cached
+            coalesce-oom coalesce-control legacy descending-groups
+            evicted-range abort-blocked d18-origin source-lost expired-zero
+            expired-budget)
+        string(REPLACE "-" "_" _row "${row}")
+        add_test(NAME relay_standalone_fetch_${_row}
+            COMMAND test_relay_standalone_fetch ${row})
+        set_tests_properties(relay_standalone_fetch_${_row} PROPERTIES
+            TIMEOUT 60 LABELS "relay;sansio;d22")
+    endforeach()
+
+    add_executable(test_relay_unfiltered test_relay_unfiltered.c
+        $<TARGET_OBJECTS:moq-relay-bind-test-internals>)
+    target_compile_definitions(test_relay_unfiltered PRIVATE MOQR_BIND_TESTING)
+    target_link_libraries(test_relay_unfiltered PRIVATE
+        moq::sim moq-relay-policy)
+    moqr_test_warnings(test_relay_unfiltered)
+    add_test(NAME relay_unfiltered COMMAND test_relay_unfiltered)
+    set_tests_properties(relay_unfiltered PROPERTIES TIMEOUT 120)
 
     add_executable(test_relay_lifecycle test_relay_lifecycle.c)
     target_link_libraries(test_relay_lifecycle PRIVATE
@@ -195,6 +253,47 @@ if(TARGET moq::sim)
     moqr_test_warnings(test_relay_ns_propagation)
     add_test(NAME relay_ns_propagation COMMAND test_relay_ns_propagation)
     set_tests_properties(relay_ns_propagation PROPERTIES TIMEOUT 30)
+
+    add_executable(test_relay_namespace_baseline
+        test_relay_namespace_baseline.c)
+    target_link_libraries(test_relay_namespace_baseline PRIVATE
+        moq::relay moq::sim)
+    moqr_test_warnings(test_relay_namespace_baseline)
+    add_test(NAME relay_namespace_controls
+        COMMAND test_relay_namespace_baseline --controls)
+    add_test(NAME relay_namespace_features
+        COMMAND test_relay_namespace_baseline --features)
+    set_tests_properties(relay_namespace_controls relay_namespace_features
+        PROPERTIES TIMEOUT 30)
+
+    add_executable(test_relay_namespace_d22 test_relay_namespace_d22.c)
+    target_link_libraries(test_relay_namespace_d22 PRIVATE
+        moq::relay moq::sim)
+    moqr_test_warnings(test_relay_namespace_d22)
+    add_test(NAME relay_namespace_d22 COMMAND test_relay_namespace_d22)
+    set_tests_properties(relay_namespace_d22 PROPERTIES TIMEOUT 60)
+
+    add_executable(test_relay_standalone_fetch_shard
+        test_relay_standalone_fetch_shard.c)
+    target_link_libraries(test_relay_standalone_fetch_shard PRIVATE
+        moq::relay moq::sim)
+    moqr_test_warnings(test_relay_standalone_fetch_shard)
+    foreach(row IN ITEMS cross-gap cross-cache cross-cancel cross-absent
+            cross-descending cross-capacity)
+        string(REPLACE "-" "_" _row "${row}")
+        add_test(NAME relay_standalone_fetch_shard_${_row}
+            COMMAND test_relay_standalone_fetch_shard ${row})
+        set_tests_properties(relay_standalone_fetch_shard_${_row} PROPERTIES
+            TIMEOUT 60 LABELS "relay;sansio;d22")
+    endforeach()
+
+    add_executable(test_relay_shard_fill test_relay_shard_fill.c)
+    target_link_libraries(test_relay_shard_fill PRIVATE
+        moq::relay moq::sim)
+    moqr_test_warnings(test_relay_shard_fill)
+    add_test(NAME relay_shard_fill COMMAND test_relay_shard_fill)
+    set_tests_properties(relay_shard_fill PROPERTIES TIMEOUT 60)
+
 endif()
 
 endif() # runtime tests
@@ -249,7 +348,13 @@ set(MOQR_LIBRARY_TESTS_SANSIO
     relay_log relay_control relay_scenario relay_fetch relay_forcewithdraw
     relay_upstreamcancel relay_capacity relay_track_reclaim relay_obs
     relay_route_dump
-    relay_shards relay_session_binding relay_lifecycle relay_ns_propagation
+    relay_shards relay_session_binding relay_session_binding_auth
+    relay_session_binding_delivery relay_session_binding_ingress
+    relay_session_binding_fetch relay_session_binding_namespace
+    relay_session_binding_d22 relay_session_binding_metadata
+    relay_lifecycle relay_ns_propagation
+    relay_shard_fill relay_namespace_controls relay_namespace_features
+    relay_namespace_d22
     relay_sched_vectors relay_seedx_units relay_migration_codes
     relay_metrics_const relay_wake_self_bit)
 foreach(t IN LISTS MOQR_LIBRARY_TESTS_SANSIO)
@@ -291,13 +396,14 @@ if(Python3_Interpreter_FOUND AND UNIX AND MOQR_SDK_CXX)
     moq_write_consumer_context("${_sdk_consumer_context}")
     add_test(NAME relay_sdk_package COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/check_sdk_package.py
-        --build ${CMAKE_BINARY_DIR} --source ${CMAKE_CURRENT_SOURCE_DIR}/..
+        --build ${PROJECT_BINARY_DIR} --source ${CMAKE_CURRENT_SOURCE_DIR}/..
         --context "${_sdk_consumer_context}"
         --libdir ${CMAKE_INSTALL_LIBDIR} --includedir ${CMAKE_INSTALL_INCLUDEDIR}
         --cmake ${CMAKE_COMMAND} --cc ${CMAKE_C_COMPILER} --cxx ${MOQR_SDK_CXX}
         --runtime $<BOOL:${MOQ_BUILD_RELAY_RUNTIME}>
         --shared $<BOOL:${BUILD_SHARED_LIBS}>
         --managed $<TARGET_EXISTS:moq::adapter-msquic-managed>
+        --sim $<TARGET_EXISTS:moq-sim>
         --msquic-dir "${msquic_DIR}")
     set_tests_properties(relay_sdk_package PROPERTIES TIMEOUT 180 LABELS "relay;boundary")
 endif()

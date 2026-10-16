@@ -50,6 +50,8 @@
 #include <moq/msquic_managed.h>
 #include <moq/rcbuf.h>
 
+#include "msq_loopback_port.h"
+
 static int failures = 0;
 
 #define CHECK(expr) do { \
@@ -404,7 +406,7 @@ static void t_stalled_receiver_recovers(const char *cert, const char *key)
     cfg_side(&scfg, MOQ_PERSPECTIVE_SERVER, 0, cert, key, server_pump, &sv,
              0);
     scfg.max_events = 4; /* small receive queue: the receiver pauses early */
-    CHECK(moq_msquic_managed_create(&scfg, &sv.m) == MOQ_OK);
+    CHECK(msqt_server_create(&scfg, &sv.m) == MOQ_OK);
     if (sv.m == NULL)
         return;
     uint16_t port = moq_msquic_managed_port(sv.m);
@@ -742,7 +744,7 @@ static void t_over_window_continuous_drain(const char *cert, const char *key)
     moq_msquic_managed_cfg_t scfg;
     cfg_side(&scfg, MOQ_PERSPECTIVE_SERVER, 0, cert, key, big_server_pump, &sv, 0);
     scfg.max_events = 4;   /* small receive queue -> repeated pause/resume */
-    CHECK(moq_msquic_managed_create(&scfg, &sv.m) == MOQ_OK);
+    CHECK(msqt_server_create(&scfg, &sv.m) == MOQ_OK);
     if (sv.m == NULL) { free(sv.seen); free(sv.want); return; }
     uint16_t port = moq_msquic_managed_port(sv.m);
     CHECK(port != 0);

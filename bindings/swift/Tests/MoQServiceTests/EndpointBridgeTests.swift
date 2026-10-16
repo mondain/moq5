@@ -16,6 +16,13 @@ private func string(_ bytes: moq_bytes_t) -> String {
                   as: UTF8.self)
 }
 
+/* MOQ_ENDPOINT_URI_STANDARD / MOQ_ENDPOINT_URI_LEGACY are UINT32_C()
+ * macros, which Swift does not import; these are their header values.
+ * "The SDK reads each URI mode as that mode" below proves the installed
+ * library reads them the same way. */
+private let uriStandard: UInt32 = 1
+private let uriLegacy: UInt32 = 0
+
 @Suite("Endpoint configuration mapping")
 struct EndpointConfigurationMappingTests {
 
@@ -28,6 +35,7 @@ struct EndpointConfigurationMappingTests {
         configuration.backend = .picoquic
         configuration.serverName = "relay.example.com"
         configuration.insecureSkipVerify = true
+        configuration.uriMode = .legacy
         configuration.webTransportPath = "/moq"
 
         withEndpointCFG(configuration) { cfg in
@@ -37,9 +45,47 @@ struct EndpointConfigurationMappingTests {
             #expect(string(cfg.sni) == "relay.example.com")
             #expect(cfg.insecure_skip_verify == true)
             #expect(string(cfg.wt_path) == "/moq")
+            #expect(cfg.uri_mode == uriLegacy)
             #expect(cfg.ca_file.len == 0)
             /* AUTO version offer: zero-init policy. */
             #expect(cfg.versions.policy == MOQ_VERSION_POLICY_AUTO)
+        }
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("The cfg is sized to cover every tail field; defaults are LEGACY with no preference")
+    func sizedDefaults() {
+        let configuration = MoQEndpoint.Configuration(
+            url: URL(string: "https://relay.example.com/session")!)
+        withEndpointCFG(configuration) { cfg in
+            #expect(Int(cfg.struct_size) == MemoryLayout<moq_endpoint_cfg_t>.size)
+            #expect(cfg.uri_mode == uriLegacy)
+            #expect(cfg.preferred_version == moq_version_t(rawValue: 0))
+            #expect(cfg.wt_path.len == 0)
+            #expect(cfg.versions.policy == MOQ_VERSION_POLICY_AUTO)
+        }
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("URI mode and preferred version reach the C cfg")
+    func uriModeAndPreferredVersion() {
+        var configuration = MoQEndpoint.Configuration(
+            url: URL(string: "moqt://relay.example.com")!)
+        configuration.uriMode = .standard
+        withEndpointCFG(configuration) { cfg in
+            #expect(cfg.uri_mode == uriStandard)
+        }
+        configuration.uriMode = .legacy
+        withEndpointCFG(configuration) { cfg in
+            #expect(cfg.uri_mode == uriLegacy)
+            #expect(cfg.preferred_version == moq_version_t(rawValue: 0))
+        }
+        for version in MoQVersion.allCases {
+            configuration.preferredVersion = version
+            withEndpointCFG(configuration) { cfg in
+                #expect(cfg.preferred_version == cVersion(version))
+                #expect(cfg.versions.policy == MOQ_VERSION_POLICY_AUTO)
+            }
         }
     }
 
@@ -67,9 +113,16 @@ struct EndpointConfigurationMappingTests {
     func versionOffers() throws {
         var configuration = MoQEndpoint.Configuration(
             url: URL(string: "moqt://h:1")!)
+        /* The offer's own struct_size: 0 means AUTO to the SDK, whatever
+         * the policy field says. */
+        let offerSize = MemoryLayout<moq_version_offer_t>.size
 
+        withEndpointCFG(configuration) { cfg in
+            #expect(cfg.versions.struct_size == 0)
+        }
         configuration.versions = .list([.draft18, .draft16])
         withEndpointCFG(configuration) { cfg in
+            #expect(Int(cfg.versions.struct_size) == offerSize)
             #expect(cfg.versions.policy == MOQ_VERSION_POLICY_LIST)
             #expect(cfg.versions.version_count == 2)
             #expect(cfg.versions.versions?[0] == MOQ_VERSION_DRAFT_18)
@@ -77,6 +130,7 @@ struct EndpointConfigurationMappingTests {
         }
         configuration.versions = .exactly(.draft16)
         withEndpointCFG(configuration) { cfg in
+            #expect(Int(cfg.versions.struct_size) == offerSize)
             #expect(cfg.versions.policy == MOQ_VERSION_POLICY_EXACT)
             #expect(cfg.versions.version_count == 1)
             #expect(cfg.versions.versions?[0] == MOQ_VERSION_DRAFT_16)
@@ -90,7 +144,37 @@ struct EndpointConfigurationMappingTests {
         #expect(cVersion(.draft18) == MOQ_VERSION_DRAFT_18)
         #expect(swiftVersion(MOQ_VERSION_DRAFT_16) == .draft16)
         #expect(swiftVersion(MOQ_VERSION_DRAFT_18) == .draft18)
+        #expect(WireVersion.draft22.rawValue == MOQ_VERSION_DRAFT_22.rawValue)
+        #expect(swiftVersion(MOQ_VERSION_DRAFT_22) == nil)
         #expect(swiftVersion(moq_version_t(rawValue: 0)) == nil)
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("Extended wire offers are explicit and preserve native values")
+    func extendedWireOffers() throws {
+        var cfg = MoQEndpoint.Configuration(
+            url: URL(string: "moqt://h:1")!, wireVersion: .draft22)
+        try cfg.validate()
+        withEndpointCFG(cfg) { native in
+            #expect(native.versions.policy == MOQ_VERSION_POLICY_EXACT)
+            #expect(native.versions.version_count == 1)
+            #expect(native.versions.versions?[0] == MOQ_VERSION_DRAFT_22)
+        }
+        cfg.wireVersions = .list([.draft22, .draft18, .draft16])
+        try cfg.validate()
+        withEndpointCFG(cfg) { native in
+            #expect(native.versions.policy == MOQ_VERSION_POLICY_LIST)
+            #expect(native.versions.version_count == 3)
+            #expect(native.versions.versions?[0] == MOQ_VERSION_DRAFT_22)
+        }
+        cfg.preferredWireVersion = .draft22
+        #expect(throws: MoQServiceError.self) { try cfg.validate() }
+        cfg.wireVersions = .automatic
+        try cfg.validate()
+        withEndpointCFG(cfg) { native in
+            #expect(native.versions.struct_size == 0)
+            #expect(native.preferred_version == MOQ_VERSION_DRAFT_22)
+        }
     }
 }
 
@@ -107,6 +191,103 @@ struct EndpointBridgePreflightTests {
         #expect(throws: MoQServiceError.self) {
             _ = try MoQEndpoint.connect(to: URL(string: "moqt://")!)
         }
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("connect() refuses a standard-mode WebTransport path with its own error")
+    func standardModePathRefused() {
+        var configuration = MoQEndpoint.Configuration(
+            url: URL(string: "https://relay.example.com/session")!)
+        configuration.uriMode = .standard
+        configuration.webTransportPath = "/moq"
+        #expect(throws: MoQServiceError.invalidArgument(
+            "webTransportPath is a URIMode.legacy override; under "
+            + "URIMode.standard the URL carries the WebTransport path")) {
+            _ = try MoQEndpoint.connect(configuration: configuration)
+        }
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("connect() refuses a preferred version beside an explicit offer with its own error")
+    func preferenceBesideExplicitOfferRefused() {
+        var configuration = MoQEndpoint.Configuration(
+            url: URL(string: "moqt://relay.example.com")!)
+        configuration.versions = .list([.draft18])
+        configuration.preferredWireVersion = .draft22
+        #expect(throws: MoQServiceError.invalidArgument(
+            "preferredVersion applies only to an automatic version offer; "
+            + "a list or exact offer already gives the order")) {
+            _ = try MoQEndpoint.connect(configuration: configuration)
+        }
+    }
+
+    /* The two Swift refusals above mirror rules the C resolver also
+     * enforces. These pin that contract on the installed SDK: both cfgs
+     * are refused during resolution, before any backend is chosen, so no
+     * endpoint is created and nothing is dialed. */
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("The SDK resolver refuses the same two configurations with INVAL")
+    func resolverContract() {
+        var standardPath = MoQEndpoint.Configuration(
+            url: URL(string: "https://relay.example.com/session")!)
+        standardPath.uriMode = .standard
+        standardPath.webTransportPath = "/moq"
+        var preferenceWithList = MoQEndpoint.Configuration(
+            url: URL(string: "moqt://relay.example.com")!)
+        preferenceWithList.versions = .list([.draft18])
+        preferenceWithList.preferredVersion = .draft18
+        for configuration in [standardPath, preferenceWithList] {
+            var endpoint: OpaquePointer?
+            let rc = withEndpointCFG(configuration) { cfg in
+                withUnsafePointer(to: cfg) { moq_endpoint_connect($0, &endpoint) }
+            }
+            #expect(rc == moq_result_t(MOQ_ERR_INVAL))
+            #expect(endpoint == nil)
+        }
+    }
+
+    /* The same cfg under each mode: STANDARD refuses the path during URL
+     * resolution (INVAL); LEGACY accepts it and resolution goes on to the
+     * backend check, where mvfst cannot serve WebTransport (UNSUPPORTED,
+     * whatever backends the SDK has). Nothing is dialed either way. */
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("The SDK reads each URI mode as that mode")
+    func sdkReadsURIModes() {
+        var configuration = MoQEndpoint.Configuration(
+            url: URL(string: "https://relay.example.com/session")!)
+        configuration.transportProtocol = .webTransport
+        configuration.backend = .mvfst
+        configuration.webTransportPath = "/moq"
+        let expected: [(MoQEndpoint.URIMode, Int32)] = [
+            (.standard, MOQ_ERR_INVAL),
+            (.legacy, MOQ_ERR_UNSUPPORTED),
+        ]
+        for (mode, code) in expected {
+            configuration.uriMode = mode
+            var endpoint: OpaquePointer?
+            let rc = withEndpointCFG(configuration) { cfg in
+                withUnsafePointer(to: cfg) { moq_endpoint_connect($0, &endpoint) }
+            }
+            #expect(rc == moq_result_t(code))
+            #expect(endpoint == nil)
+        }
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("An unchanged default client path passes the SDK URI checks without I/O")
+    func defaultClientPathOverride() {
+        var configuration = MoQEndpoint.Configuration(
+            url: URL(string: "https://relay.example.com")!)
+        configuration.transportProtocol = .webTransport
+        configuration.backend = .mvfst
+        configuration.webTransportPath = "/moq"
+        #expect(throws: Never.self) { try configuration.validate() }
+        var endpoint: OpaquePointer?
+        let rc = withEndpointCFG(configuration) { cfg in
+            withUnsafePointer(to: cfg) { moq_endpoint_connect($0, &endpoint) }
+        }
+        #expect(rc == moq_result_t(MOQ_ERR_UNSUPPORTED))
+        #expect(endpoint == nil)
     }
 
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)

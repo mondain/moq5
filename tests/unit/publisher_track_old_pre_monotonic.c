@@ -1,0 +1,4 @@
+#define OLD_TRACK_CFG test_pub_track_pre_monotonic_t
+#define OLD_TRACK_ENTRY publisher_track_old_pre_monotonic
+#define OLD_TRACK_GENERATION 1
+#include "publisher_track_old_caller_impl.h"

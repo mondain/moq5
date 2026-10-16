@@ -117,7 +117,21 @@ wtq_result_t wtq_stream_pause_receive(wtq_stream_t *st)
 { if (st) st->pauses++; return g_pause_rc; }
 wtq_result_t wtq_stream_resume_receive(wtq_stream_t *st)
 { if (st) st->resumes++; return g_resume_rc; }
-void wtq_session_events_init(wtq_session_events_t *e) { if (e) memset(e, 0, sizeof(*e)); }
+void wtq_session_events_init_ex(wtq_session_events_t *e, size_t size)
+{
+    if (!e || size < sizeof(e->struct_size)) return;
+    size_t n = size < sizeof(*e) ? size : sizeof(*e);
+    memset(e, 0, n);
+    e->struct_size = (uint32_t)n;
+}
+wtq_send_commit_mode_t wtq_session_send_commit_mode(const wtq_session_t *s)
+{ (void)s; return WTQ_SEND_COMMIT_UNSUPPORTED; }
+wtq_local_flush_mode_t wtq_session_local_flush_mode(const wtq_session_t *s)
+{ (void)s; return WTQ_LOCAL_FLUSH_UNSUPPORTED; }
+wtq_result_t wtq_session_local_flush(const wtq_session_t *s)
+{ return s ? WTQ_ERR_UNSUPPORTED : WTQ_ERR_INVALID_ARG; }
+wtq_result_t wtq_stream_enable_send_commit(wtq_stream_t *st)
+{ (void)st; return WTQ_ERR_UNSUPPORTED; }
 static int g_session_closes;
 wtq_result_t wtq_session_close(wtq_session_t *s, uint32_t c, const uint8_t *r,
                                size_t rl)
@@ -450,7 +464,7 @@ int main(void)
         cc->streams[0].in_use = true;
         cc->streams[0].st = (wtq_stream_t *)st;
         cc->streams[0].id = 1;
-        cc->term_count = MOQ_WTQ_MAX_STREAMS; /* queue already full */
+        cc->term_count = sizeof(cc->term_events) / sizeof(cc->term_events[0]);
 
         g_session_closes = 0;
         cc->in_service = true; /* hold the drain to observe the latch */

@@ -123,6 +123,53 @@ if(MOQ_BUILD_TESTS)
     target_link_libraries(test_cpp_subscriber PRIVATE moq::cpp)
     add_test(NAME cpp_subscriber COMMAND test_cpp_subscriber)
 
+    add_executable(test_cpp_subscriber_status_legacy
+        ../../tests/unit/test_subscriber_status_legacy_cpp.cpp)
+    target_link_libraries(test_cpp_subscriber_status_legacy PRIVATE moq::cpp)
+    add_test(NAME cpp_subscriber_status_legacy COMMAND test_cpp_subscriber_status_legacy)
+    set_tests_properties(cpp_subscriber_status_legacy PROPERTIES TIMEOUT 30)
+
+    add_executable(test_cpp_facade_terminal_observations
+        tests/test_facade_terminal_observations.cpp)
+    target_link_libraries(test_cpp_facade_terminal_observations PRIVATE moq::cpp)
+    add_test(NAME cpp_facade_terminal_observations COMMAND test_cpp_facade_terminal_observations)
+    set_tests_properties(cpp_facade_terminal_observations PROPERTIES TIMEOUT 30)
+
+    add_executable(test_cpp_subscriber_track_result tests/test_subscriber_track_result.cpp)
+    target_link_libraries(test_cpp_subscriber_track_result PRIVATE moq::cpp)
+    add_test(NAME cpp_subscriber_track_result COMMAND test_cpp_subscriber_track_result)
+
+    add_executable(test_cpp_subscriber_local_failure tests/test_subscriber_local_failure.cpp)
+    target_link_libraries(test_cpp_subscriber_local_failure PRIVATE moq::cpp)
+    add_test(NAME cpp_subscriber_local_failure COMMAND test_cpp_subscriber_local_failure)
+    set_tests_properties(cpp_subscriber_local_failure PROPERTIES TIMEOUT 30)
+
+    add_executable(test_cpp_fill tests/test_fill.cpp)
+    target_link_libraries(test_cpp_fill PRIVATE moq::cpp)
+    add_test(NAME cpp_fill COMMAND test_cpp_fill)
+
+    add_executable(test_cpp_d22_surface tests/test_d22_surface.cpp)
+    target_link_libraries(test_cpp_d22_surface PRIVATE moq::cpp)
+    add_test(NAME cpp_d22_surface COMMAND test_cpp_d22_surface)
+
+    add_executable(test_cpp_session_control tests/test_session_control.cpp)
+    target_link_libraries(test_cpp_session_control PRIVATE moq::cpp)
+    add_test(NAME cpp_session_control COMMAND test_cpp_session_control)
+
+    add_executable(test_cpp_namespace_updates tests/test_namespace_updates.cpp)
+    target_link_libraries(test_cpp_namespace_updates PRIVATE moq::cpp)
+    add_test(NAME cpp_namespace_updates COMMAND test_cpp_namespace_updates)
+
+    add_executable(test_cpp_legacy_surface tests/test_legacy_surface.cpp
+        ../compatibility/reset_decomposition.cpp
+        ../compatibility/action_visitor.cpp)
+    target_link_libraries(test_cpp_legacy_surface PRIVATE moq::cpp)
+    add_test(NAME cpp_legacy_surface COMMAND test_cpp_legacy_surface)
+
+    add_executable(test_cpp_extended_views tests/test_extended_views.cpp)
+    target_link_libraries(test_cpp_extended_views PRIVATE moq::cpp)
+    add_test(NAME cpp_extended_views COMMAND test_cpp_extended_views)
+
     if(TARGET moq::loc)
         add_executable(test_cpp_loc tests/test_loc.cpp)
         target_link_libraries(test_cpp_loc PRIVATE moq::cpp)

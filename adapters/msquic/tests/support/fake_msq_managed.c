@@ -114,6 +114,37 @@ static void QUIC_API g_connection_close(HQUIC h)
     }
 }
 
+static QUIC_STATUS QUIC_API g_connection_open(HQUIC reg,
+    QUIC_CONNECTION_CALLBACK_HANDLER cb, void *ctx, HQUIC *out)
+{
+    (void)reg;
+    FAKE_MGD_REQUIRE(g_live != NULL);
+    for (int i = 0; i < FAKE_MGD_MAX_CONNS; ++i) {
+        fake_mgd_conn_t *c = &g_live->conns[i];
+        if (c->in_use) continue;
+        memset(c, 0, sizeof(*c));
+        fake_msq_init(&c->fake, true);
+        c->in_use = true;
+        c->cb = cb;
+        c->ctx = ctx;
+        ++g_live->conn_count;
+        if (g_live->conn_hwm < i + 1) g_live->conn_hwm = i + 1;
+        *out = (HQUIC)&c->fake;
+        return QUIC_STATUS_SUCCESS;
+    }
+    return QUIC_STATUS_OUT_OF_MEMORY;
+}
+
+static QUIC_STATUS QUIC_API g_connection_start(HQUIC h, HQUIC cfg,
+    QUIC_ADDRESS_FAMILY family, const char *host, uint16_t port)
+{
+    (void)cfg; (void)family; (void)host; (void)port;
+    fake_mgd_conn_t *c = g_live != NULL ? conn_of(g_live, h) : NULL;
+    FAKE_MGD_REQUIRE(c != NULL && c->cb != NULL);
+    c->configured = true;
+    return QUIC_STATUS_SUCCESS;
+}
+
 static void QUIC_API g_connection_shutdown(
     HQUIC h, QUIC_CONNECTION_SHUTDOWN_FLAGS flags, QUIC_UINT62 code)
 {
@@ -174,6 +205,15 @@ static QUIC_STATUS QUIC_API g_set_param(HQUIC h, uint32_t param, uint32_t len,
 static QUIC_STATUS QUIC_API g_get_param(HQUIC h, uint32_t param,
                                         uint32_t *len, void *buf)
 {
+    /* a connection with QUIC DATAGRAM negotiated both ways, as the real
+     * library reports it once the handshake has completed */
+    if ((param == QUIC_PARAM_CONN_DATAGRAM_RECEIVE_ENABLED ||
+         param == QUIC_PARAM_CONN_DATAGRAM_SEND_ENABLED) &&
+        *len >= sizeof(uint8_t)) {
+        *(uint8_t *)buf = 1;
+        *len = sizeof(uint8_t);
+        return QUIC_STATUS_SUCCESS;
+    }
     if (param == QUIC_PARAM_STREAM_ID && *len >= sizeof(uint64_t)) {
         *(uint64_t *)buf = ((fake_msq_stream_t *)h)->id;
         *len = sizeof(uint64_t);
@@ -201,6 +241,8 @@ void fake_mgd_init(fake_mgd_t *g)
     g->api.ListenerStart = g_listener_start;
     g->api.ListenerClose = g_listener_close;
     g->api.ConnectionClose = g_connection_close;
+    g->api.ConnectionOpen = g_connection_open;
+    g->api.ConnectionStart = g_connection_start;
     g->api.ConnectionShutdown = g_connection_shutdown;
     g->api.ConnectionSetConfiguration = g_connection_set_configuration;
     g->api.SetCallbackHandler = g_set_callback_handler;

@@ -15,6 +15,11 @@
  * orderly peer application close. The bridge's first fatal cause must win in
  * both cases.
  *
+ * An op MsQuic refuses because the PEER has already closed the connection
+ * (QUIC_STATUS_ABORTED; its shutdown event is still on the way) is not such a
+ * failure: it is a consequence of the terminal that follows, so it latches
+ * nothing and the peer's own close reaches the session with its code.
+ *
  * Deterministic and socket-free: one thread, the production connection
  * callback and service entries over the fake QUIC_API_TABLE. No sleeps, no
  * elapsed time, no repetition; every ordering is forced by the call sequence.
@@ -174,10 +179,9 @@ static void check_no_second_terminal(struct rig *r)
 
 /*
  * The bridge latches its own fatal when an endpoint op fails hard mid-dispatch
- * -- here a StreamStart the transport refuses, exactly as one racing a closing
- * connection does. That latch is not a session terminal: the session is still
- * open with nothing queued. The transport terminal that follows is its last
- * notice and must be delivered.
+ * -- here a StreamStart the transport refuses outright. That latch is not a
+ * session terminal: the session is still open with nothing queued. The
+ * transport terminal that follows is its last notice and must be delivered.
  */
 static void arm_internal_fatal(struct rig *r)
 {
@@ -1157,6 +1161,147 @@ static void t_ctl_transport_then_peer(void)
     ctl_order("CTL-TRANSPORT-THEN-PEER", "ctl_transport_first", false);
 }
 
+/* --- 4. a refusal caused by the peer's close is not a cause of its own ---- */
+
+/*
+ * The peer closes the connection while this side is mid-pass: MsQuic marks it
+ * ClosedRemotely at once and refuses StreamOpen, StreamStart and StreamSend
+ * with QUIC_STATUS_ABORTED, but delivers SHUTDOWN_INITIATED_BY_PEER only when
+ * the connection's callback is next free. The refused op parks
+ * (WOULD_BLOCK): no fatal is latched, the connection is not shut down from
+ * this side, and the peer's close, when it arrives, is the session's one
+ * terminal with the peer's code.
+ */
+static void t_peer_closed_refusal_then_peer_close(void)
+{
+    int before = failures;
+    struct rig r;
+    QUIC_CONNECTION_EVENT ev;
+
+    CHECK(rig_up(&r, NULL, NULL) == 0);
+    printf("PEER-CLOSED-REFUSAL-THEN-PEER-CLOSE:\n");
+
+    /* the client's SETUP wants its control bidi: refused, the peer is gone */
+    r.fake.closed_remotely = true;
+    deliver_conn_event(&r, QUIC_CONNECTION_EVENT_CONNECTED);
+    print_state("after-connected", &r);
+    CHECK(!moq_msquic_conn_is_fatal(r.conn));
+    CHECK(r.fake.conn_shutdowns == 0);
+    CHECK(drain_events(&r).total == 0);
+
+    memset(&ev, 0, sizeof(ev));
+    ev.Type = QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_PEER;
+    ev.SHUTDOWN_INITIATED_BY_PEER.ErrorCode = PEER_CLOSE_CODE;
+    moq_msquic_conn_callback()(fake_msq_conn_handle(&r.fake), r.conn, &ev);
+    print_state("after-peer-close", &r);
+
+    struct drained d = drain_events(&r);
+
+    check_told_once(&r, d, PEER_CLOSE_CODE);
+    CHECK(moq_transport_bridge_is_closed(r.conn->bridge));
+    CHECK(!moq_msquic_conn_is_fatal(r.conn));
+    deliver_conn_event(&r, QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE);
+    check_no_second_terminal(&r);
+
+    rig_down(&r);
+    if (failures == before)
+        printf("PASS: peer_closed_refusal_then_peer_close\n");
+}
+
+/* The same race, closed by a peer TRANSPORT error: the transport's code is
+ * the cause, not an internal error of this side's making. */
+static void t_peer_closed_refusal_then_transport_close(void)
+{
+    int before = failures;
+    struct rig r;
+
+    CHECK(rig_up(&r, NULL, NULL) == 0);
+    printf("PEER-CLOSED-REFUSAL-THEN-TRANSPORT-CLOSE:\n");
+
+    r.fake.closed_remotely = true;
+    deliver_conn_event(&r, QUIC_CONNECTION_EVENT_CONNECTED);
+    CHECK(!moq_msquic_conn_is_fatal(r.conn));
+    CHECK(r.fake.conn_shutdowns == 0);
+
+    deliver_transport_error(&r, TRANSPORT_CLOSE_CODE);
+    deliver_conn_event(&r, QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE);
+    print_state("after-terminal", &r);
+
+    struct drained d = drain_events(&r);
+
+    check_told_once(&r, d, TRANSPORT_CLOSE_CODE);
+    CHECK(moq_msquic_conn_is_fatal(r.conn));
+    CHECK(moq_transport_bridge_fatal_code(r.conn->bridge) ==
+          TRANSPORT_CLOSE_CODE);
+    check_no_second_terminal(&r);
+
+    rig_down(&r);
+    if (failures == before)
+        printf("PASS: peer_closed_refusal_then_transport_close\n");
+}
+
+/*
+ * Every endpoint op MsQuic refuses for the peer's close parks without
+ * consuming the write, and a flush it refuses latches nothing: a staged write
+ * whose flush is refused, then opens of both kinds and a further write. The
+ * peer's close then ends the session with its code.
+ */
+static void t_peer_closed_refusal_ops(void)
+{
+    int before = failures;
+    struct rig r;
+    QUIC_CONNECTION_EVENT ev;
+    const moq_transport_endpoint_ops_t *ops;
+    uint64_t uni = 0, id = 0;
+    static const uint8_t bytes[32] = { 0x5a };
+
+    CHECK(rig_up(&r, NULL, NULL) == 0);
+    printf("PEER-CLOSED-REFUSAL-OPS:\n");
+    ops = moq_msquic_test_ops(r.conn);
+    deliver_conn_event(&r, QUIC_CONNECTION_EVENT_CONNECTED);
+    (void)drain_events(&r);
+    CHECK(ops->open_uni(r.conn, &uni) == MOQ_TRANSPORT_OK);
+
+    /* staged while the connection was live; the peer closes before the
+     * flush, which MsQuic refuses */
+    CHECK(ops->write(r.conn, uni, bytes, sizeof(bytes), false) ==
+          MOQ_TRANSPORT_OK);
+    r.fake.closed_remotely = true;
+    int sends = r.fake.send_count;
+    moq_msquic_test_flush(r.conn);
+    CHECK(r.fake.send_count == sends);
+    moq_msquic_conn_service(r.conn);
+    CHECK(!moq_msquic_conn_is_fatal(r.conn));
+
+    CHECK(ops->open_uni(r.conn, &id) == MOQ_TRANSPORT_WOULD_BLOCK);
+    CHECK(ops->open_bidi(r.conn, &id) == MOQ_TRANSPORT_WOULD_BLOCK);
+    CHECK(ops->write(r.conn, uni, bytes, sizeof(bytes), true) ==
+          MOQ_TRANSPORT_WOULD_BLOCK);
+    /* a bare FIN with nothing staged is a stream shutdown, which MsQuic
+     * accepts on a closing connection */
+    CHECK(ops->write(r.conn, uni, NULL, 0, true) == MOQ_TRANSPORT_OK);
+    moq_msquic_conn_service(r.conn);
+    CHECK(!moq_msquic_conn_is_fatal(r.conn));
+    CHECK(r.fake.conn_shutdowns == 0);
+    CHECK(r.fake.send_count == sends);
+
+    memset(&ev, 0, sizeof(ev));
+    ev.Type = QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_PEER;
+    ev.SHUTDOWN_INITIATED_BY_PEER.ErrorCode = PEER_CLOSE_CODE;
+    moq_msquic_conn_callback()(fake_msq_conn_handle(&r.fake), r.conn, &ev);
+    deliver_conn_event(&r, QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE);
+
+    struct drained d = drain_events(&r);
+
+    check_told_once(&r, d, PEER_CLOSE_CODE);
+    CHECK(moq_transport_bridge_is_closed(r.conn->bridge));
+    CHECK(!moq_msquic_conn_is_fatal(r.conn));
+
+    rig_down(&r);
+    if (failures == before)
+        printf("PASS: peer_closed_refusal_ops\n");
+}
+
 int main(void)
 {
     t_internal_fatal_then_transport_error();
@@ -1180,6 +1325,10 @@ int main(void)
     t_local_close_wins_injected_completion();
     t_local_close_wins_injected_all();
     t_local_close_reason_not_retained();
+
+    t_peer_closed_refusal_then_peer_close();
+    t_peer_closed_refusal_then_transport_close();
+    t_peer_closed_refusal_ops();
 
     if (failures == 0)
         printf("PASS: msquic_close_feed\n");

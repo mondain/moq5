@@ -49,9 +49,12 @@ endif()
 
 # Instrument the in-tree libraries linked by the fuzz harnesses so coverage-
 # guided mutation and ASan/UBSan checks reach into the core, media, and relay
-# parsers rather than stopping at the harness translation units.
+# parsers rather than stopping at the harness translation units. A harness
+# that needs internal symbols links moq-core-test-internals, which compiles
+# the core sources again, so that copy is instrumented the same way.
 foreach(_fuzz_lib
         moq-core
+        moq-core-test-internals
         moq-loc
         moq-cmaf
         moq-mpeg2ts
@@ -91,6 +94,11 @@ target_link_libraries(fuzz_control_d18 PRIVATE moq::core)
 target_compile_options(fuzz_control_d18 PRIVATE ${FUZZ_FLAGS})
 target_link_options(fuzz_control_d18 PRIVATE ${FUZZ_FLAGS})
 
+add_executable(fuzz_control_d22 fuzz_control_d22.c)
+target_link_libraries(fuzz_control_d22 PRIVATE moq-core-test-internals)
+target_compile_options(fuzz_control_d22 PRIVATE ${FUZZ_FLAGS})
+target_link_options(fuzz_control_d22 PRIVATE ${FUZZ_FLAGS})
+
 add_executable(fuzz_session_control fuzz_session_control.c)
 target_link_libraries(fuzz_session_control PRIVATE moq::core)
 target_compile_options(fuzz_session_control PRIVATE ${FUZZ_FLAGS})
@@ -106,8 +114,8 @@ target_link_libraries(fuzz_session_d18 PRIVATE moq::core)
 target_compile_options(fuzz_session_d18 PRIVATE ${FUZZ_FLAGS})
 target_link_options(fuzz_session_d18 PRIVATE ${FUZZ_FLAGS})
 
-set(_fuzz_target_count 7)
-set(_fuzz_test_count 11)
+set(_fuzz_target_count 8)
+set(_fuzz_test_count 13)
 
 # The relay admin parser, built only when the relay tier is in this tree.
 if(TARGET moqr-admin)
@@ -204,6 +212,8 @@ add_test(NAME fuzz_control_d16_smoke
          COMMAND fuzz_control_d16 -runs=1 -max_len=0)
 add_test(NAME fuzz_control_d18_smoke
          COMMAND fuzz_control_d18 -runs=1 -max_len=0)
+add_test(NAME fuzz_control_d22_smoke
+         COMMAND fuzz_control_d22 -runs=1 -max_len=0)
 add_test(NAME fuzz_session_control_smoke
          COMMAND fuzz_session_control -runs=1 -max_len=0)
 add_test(NAME fuzz_session_data_smoke
@@ -215,6 +225,9 @@ add_test(NAME fuzz_session_d18_smoke
 add_test(NAME fuzz_control_d18_corpus
          COMMAND fuzz_control_d18
          ${CMAKE_CURRENT_SOURCE_DIR}/corpus/control_d18 -runs=0)
+add_test(NAME fuzz_control_d22_corpus
+         COMMAND fuzz_control_d22
+         ${CMAKE_CURRENT_SOURCE_DIR}/corpus/control_d22 -runs=0)
 add_test(NAME fuzz_session_control_corpus
          COMMAND fuzz_session_control
          ${CMAKE_CURRENT_SOURCE_DIR}/corpus/session_control -runs=0)

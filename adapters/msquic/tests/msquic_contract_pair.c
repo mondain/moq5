@@ -15,6 +15,8 @@
 
 #include "msquic_contract_pair.h"
 
+#include "msq_loopback_port.h"
+
 #include <moq/rcbuf.h>
 
 #define MSQC_WAIT_SECS 30
@@ -410,7 +412,6 @@ int msqc_pair_setup(msqc_pair_t *p, const msqc_pair_cfg_t *cfg)
     scfg.alloc = moq_alloc_default();
     scfg.perspective = MOQ_PERSPECTIVE_SERVER;
     scfg.host = "127.0.0.1";
-    scfg.port = 0; /* ephemeral */
     scfg.cert_path = cfg->cert;
     scfg.key_path = cfg->key;
     scfg.on_lane_pump = msqc_pump;
@@ -419,7 +420,7 @@ int msqc_pair_setup(msqc_pair_t *p, const msqc_pair_cfg_t *cfg)
     scfg.initial_request_capacity = 16;
     scfg.max_events = 256;
     scfg.version = cfg->server_version;
-    if (moq_msquic_managed_create(&scfg, &p->server.m) != MOQ_OK)
+    if (msqt_server_create(&scfg, &p->server.m) != MOQ_OK)
         return -1;
     uint16_t port = moq_msquic_managed_port(p->server.m);
     if (port == 0)

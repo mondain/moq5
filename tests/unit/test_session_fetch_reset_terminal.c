@@ -38,7 +38,8 @@ static const char *vlbl(moq_version_t v) { return v == MOQ_VERSION_DRAFT_16 ? "v
 static int layout_row(void)
 {
     int failures = 0;
-    MOQ_TEST_CHECK_EQ_SIZE(sizeof(moq_fetch_reset_event_t), 24);
+    MOQ_TEST_CHECK_EQ_SIZE(sizeof(moq_fetch_reset_event_t), 32);
+    MOQ_TEST_CHECK_EQ_SIZE(offsetof(moq_fetch_reset_event_t, cause), 24);
     MOQ_TEST_CHECK_EQ_SIZE(offsetof(moq_fetch_reset_event_t, fetch), 0);
     MOQ_TEST_CHECK_EQ_SIZE(offsetof(moq_fetch_reset_event_t, error_code), 8);
     MOQ_TEST_CHECK_EQ_SIZE(offsetof(moq_fetch_reset_event_t, data_stream), 16);
@@ -425,7 +426,7 @@ static int request_terminal_row(bool stop)
     int a_slot = fetch_resolve_handle(r.fet, fa);
     MOQ_TEST_CHECK(a_slot >= 0);
     MOQ_TEST_CHECK(!r.fet->fetches[a_slot].data_stream_started);
-    moq_stream_ref_t req_ref = r.fet->fetches[a_slot].request_stream_ref;
+    moq_stream_ref_t req_ref = r.fet->fetches[a_slot].rs.ref;
     MOQ_TEST_CHECK(req_ref._v != 0);
 
     /* the peer terminates the request stream (no identifying data header
@@ -539,7 +540,7 @@ static int already_error_row(moq_version_t v)
     uint64_t id_a = fet_request_id(r.fet, fa);
     int a_slot = fetch_resolve_handle(r.fet, fa);
     MOQ_TEST_CHECK(a_slot >= 0);
-    moq_stream_ref_t req_ref = a_slot >= 0 ? r.fet->fetches[a_slot].request_stream_ref : moq_stream_ref_from_u64(0);
+    moq_stream_ref_t req_ref = a_slot >= 0 ? r.fet->fetches[a_slot].rs.ref : moq_stream_ref_from_u64(0);
 
     /* scripted peer: the data stream binds first (FETCH_HEADER for A, objects
      * may precede the response), then a terminal REQUEST_ERROR */
@@ -615,7 +616,7 @@ static int already_terminal_request_row(ae_opts_t o)
     uint64_t id_a = fet_request_id(r.fet, fa);
     int a_slot = fetch_resolve_handle(r.fet, fa);
     MOQ_TEST_CHECK(a_slot >= 0);
-    moq_stream_ref_t req_ref = a_slot >= 0 ? r.fet->fetches[a_slot].request_stream_ref : moq_stream_ref_from_u64(0);
+    moq_stream_ref_t req_ref = a_slot >= 0 ? r.fet->fetches[a_slot].rs.ref : moq_stream_ref_from_u64(0);
     moq_stream_ref_t data_ref = moq_stream_ref_from_u64(0xD002);
     if (o.bind_data) {
         uint8_t hdr[16];

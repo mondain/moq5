@@ -826,6 +826,149 @@ static void test_early_stop_real_adapter(void)
     shell_free(m);
 }
 
+/* A stream complete at the transport, buffered by the facade, replayed into
+ * a session that cannot admit it, then cancelled at the hold age. Real
+ * transport delivery and the facade's real buffer and replay; the harness has
+ * already completed the CONNECT, and the facade shell recreates the state
+ * before the response (the session prefix names the facade), so this is not
+ * a pending CONNECT transaction.
+ *
+ * The client's receive pool has one entry, which an earlier buffered
+ * subgroup stream for an unknown alias takes (the session stops it, and the
+ * stopped stream keeps the entry until its peer terminal). The second
+ * stream's header and FIN were buffered early, so picoquic already retired
+ * it: replayed, it is refused at admission and held, recorded complete at
+ * the transport, and the replay of its buffered FIN then lands behind the
+ * held chunk. So at the hold age both the completion record and the later
+ * FIN show its receive half terminal -- this row does not single out either.
+ * With held-stream records (the bridge is rebuilt with
+ * MOQ_TRANSPORT_CAP_HOLD_BIDI_INPUT, which no shipped adapter declares), the
+ * hold age cancels it: the held bytes are discarded, no STOP_SENDING reaches
+ * picoquic for the retired stream, and nothing is fatal. */
+static void test_early_fin_held_cancel_real_adapter(void)
+{
+    pico_wt_harness_t h;
+    pico_wt_harness_cfg_t cfg = { .cid_byte = 0x9b, .request_capacity = 10,
+                                  .version = MOQ_VERSION_DRAFT_18 };
+    if (pico_wt_harness_setup(&h, &cfg) != 0) {
+        CHECK(0 && "harness setup");
+        pico_wt_harness_cleanup(&h);
+        return;
+    }
+    moq_pico_wt_conn_destroy(h.client_conn);
+    h.client_conn = NULL;
+    moq_pico_wt_managed_t *m = shell();
+    m->h3_ctx = h.client_h3_ctx;
+    m->ctrl_ctx = h.client_ctrl_ctx;
+    CHECK(h3zero_declare_stream_prefix(h.client_h3_ctx,
+              h.client_ctrl_ctx->stream_id, managed_client_wt_cb, m) == 0);
+
+    uint8_t hdr[32];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, hdr, sizeof(hdr));
+    moq_d18_subgroup_header_t sg;
+    memset(&sg, 0, sizeof(sg));
+    sg.type = 0x10;                          /* subgroup ID zero, priority present */
+    sg.track_alias = 99;                     /* no subscription has it */
+    sg.group_id = 0;
+    sg.publisher_priority = 0x80;
+    CHECK(moq_d18_encode_subgroup_header(&w, &sg) == MOQ_OK);
+    size_t hlen = moq_buf_writer_offset(&w);
+    static const uint8_t setup[] = { 0xaf, 0x00, 0x00, 0x00 };
+
+    picoquic_cnx_t *srv = h.test_ctx->cnx_server;
+    h3zero_stream_ctx_t *ctl = picowt_create_local_stream(
+        srv, 0, h.server_wt.h3_ctx, h.server_wt.ctrl_ctx->stream_id);
+    h3zero_stream_ctx_t *a = picowt_create_local_stream(
+        srv, 0, h.server_wt.h3_ctx, h.server_wt.ctrl_ctx->stream_id);
+    h3zero_stream_ctx_t *b = picowt_create_local_stream(
+        srv, 0, h.server_wt.h3_ctx, h.server_wt.ctrl_ctx->stream_id);
+    CHECK(ctl != NULL && a != NULL && b != NULL);
+    if (ctl == NULL || a == NULL || b == NULL) {
+        pico_wt_harness_cleanup(&h);
+        shell_free(m);
+        return;
+    }
+    uint64_t csid = ctl->stream_id, asid = a->stream_id, bsid = b->stream_id;
+    CHECK(picoquic_add_to_stream(srv, csid, setup, sizeof(setup), 0) == 0);
+    CHECK(pico_wt_harness_pump(&h, 200) == 0);
+    CHECK(picoquic_add_to_stream(srv, asid, hdr, hlen, 0) == 0);
+    CHECK(pico_wt_harness_pump(&h, 200) == 0);
+    CHECK(picoquic_add_to_stream(srv, bsid, hdr, hlen, 1) == 0);
+    CHECK(pico_wt_harness_pump(&h, 300) == 0);
+    /* picoquic retired the complete stream once its data and FIN were in */
+    CHECK(picoquic_find_stream(h.test_ctx->cnx_client, bsid) == NULL);
+
+    moq_session_t *s = NULL;
+    moq_session_cfg_t scfg;
+    moq_session_cfg_init_sized(&scfg, sizeof(scfg), moq_alloc_default(),
+                               MOQ_PERSPECTIVE_CLIENT);
+    scfg.version = MOQ_VERSION_DRAFT_18;
+    scfg.send_request_capacity = true;
+    scfg.initial_request_capacity = 10;
+    scfg.max_data_streams = 1;
+    CHECK(moq_session_create(&scfg, h.now, &s) == MOQ_OK);
+    moq_pico_wt_conn_cfg_t wc;
+    moq_pico_wt_conn_cfg_init_sized(&wc, sizeof(wc));
+    wc.session = s;
+    wc.cnx = h.test_ctx->cnx_client;
+    wc.h3_ctx = h.client_h3_ctx;
+    wc.ctrl_ctx = h.client_ctrl_ctx;
+    wc.alloc = moq_alloc_default();
+    moq_pico_wt_conn_t *conn = NULL;
+    CHECK(moq_pico_wt_conn_create(&wc, &conn) == 0);
+    if (conn) {
+        /* Held-stream records: rebuild the bridge over the same endpoint
+         * with the capability declared. */
+        moq_transport_bridge_destroy(conn->bridge);
+        conn->bridge = NULL;
+        conn->endpoint_ops.capabilities |= MOQ_TRANSPORT_CAP_HOLD_BIDI_INPUT;
+        moq_transport_bridge_cfg_t bcfg;
+        moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
+        CHECK(moq_transport_bridge_create(&bcfg, s, &conn->endpoint_ops,
+                                          &conn->endpoint_ctx,
+                                          &conn->bridge) == MOQ_OK);
+    }
+    if (conn && conn->bridge) {
+        h.client_conn = conn;
+        moq_session_destroy(h.client_session);
+        h.client_session = s;
+        CHECK(moq_session_start(s, h.now) == MOQ_OK);
+        const uint64_t held_at = h.now;
+        pwm_early_replay(m, h.test_ctx->cnx_client, conn);
+        CHECK(m->early_head == NULL && m->early_ended);
+        CHECK(!conn->rx_replay_complete);
+        CHECK(moq_session_state(s) == MOQ_SESS_ESTABLISHED);
+        CHECK(!moq_session_can_admit_data_stream(s));
+
+        const pw_rx_stream_t *rb = rx_of(conn, bsid);
+        CHECK(rb != NULL && rb->held_input && rb->rx_complete);
+        CHECK(rb != NULL && rb->buf_fin);   /* the replayed FIN, behind the chunk */
+        CHECK(moq_transport_bridge_stream_has_pending(conn->bridge, bsid));
+        CHECK(!moq_pico_wt_conn_is_fatal(conn));
+
+        /* The hold age passes. */
+        (void)moq_pico_wt_service(conn, held_at + 5000000);
+        uint64_t code = moq_transport_bridge_fatal_code(conn->bridge);
+        if (moq_pico_wt_conn_is_fatal(conn))
+            fprintf(stderr, "  held complete stream cancel was fatal (code 0x%llx)\n",
+                    (unsigned long long)code);
+        CHECK(!moq_pico_wt_conn_is_fatal(conn));
+        CHECK(rx_of(conn, bsid) == NULL);
+        CHECK(!moq_transport_bridge_stream_has_pending(conn->bridge, bsid));
+        CHECK(moq_session_state(s) == MOQ_SESS_ESTABLISHED);
+    } else if (!conn) {
+        moq_session_destroy(s);
+    } else {
+        h.client_conn = conn;
+        moq_session_destroy(h.client_session);
+        h.client_session = s;
+    }
+    CHECK(g_live == 0);
+    pico_wt_harness_cleanup(&h);
+    shell_free(m);
+}
+
 int main(void)
 {
     moq_pico_wt_managed_test_abort_stream = rec_abort;
@@ -839,6 +982,7 @@ int main(void)
     test_early_stop_real_adapter();
     test_early_fin_interleaved_real_adapter();
     test_replay_marker_cleared_on_failure();
+    test_early_fin_held_cancel_real_adapter();
     if (failures == 0)
         printf("test_pico_wt_managed_early_streams: PASS\n");
     return failures ? 1 : 0;

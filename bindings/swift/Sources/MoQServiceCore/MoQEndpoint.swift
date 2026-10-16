@@ -56,35 +56,87 @@ public final class MoQEndpoint: @unchecked Sendable {
              wtquicMsquic
     }
 
+    /// How the endpoint reads ``Configuration/url``.
+    ///
+    /// - `.standard` is opt-in and reads the URL as the MOQT URI scheme
+    ///   defines it: `moqt` and `https` matched case-insensitively, port 443
+    ///   when the URL has none, the authority and path/query kept exactly as
+    ///   written, and a WebTransport path of `/` when the URL path is empty.
+    ///   The URL is the only source of the WebTransport path, so
+    ///   ``Configuration/webTransportPath`` must be left `nil` or empty.
+    ///   The legacy `moq` scheme is refused with `.unsupported` at connect.
+    /// - `.legacy` (the default) selects the original reading: exact lowercase `moqt`,
+    ///   `moq` and `https` schemes, port 4433 for a `moqt`/`moq` URL with no
+    ///   port, ``Configuration/webTransportPath`` as an override, and `/moq`
+    ///   when neither it nor the URL gives a WebTransport path.
+    public enum URIMode: Sendable, Hashable {
+        case standard, legacy
+    }
+
     public struct Configuration: Sendable {
         /// Relay URL: `moqt://host:port[/path]` or `https://host:port[/path]`.
         public var url: URL
         public var transportProtocol: TransportProtocol
         public var backend: TransportBackend
         public var versions: VersionOffer
+        public var wireVersions: WireVersionOffer?
         /// TLS SNI + certificate-verification name; `nil` uses the URL host.
         public var serverName: String?
         /// CA bundle; `nil` uses the system roots.
         public var caFileURL: URL?
         /// Disables certificate verification. Local/self-signed testing ONLY.
         public var insecureSkipVerify: Bool
-        /// WebTransport CONNECT path; `nil` uses the URL path or "/moq".
+        /// WebTransport CONNECT path override, honored only under
+        /// ``URIMode/legacy`` (where `nil` uses the URL path, or "/moq").
+        /// Under ``URIMode/standard`` the URL carries the path and a
+        /// non-empty value is refused before connecting.
         public var webTransportPath: String?
+        /// How the URL is read; `.legacy` by default. See ``URIMode``.
+        public var uriMode: URIMode
+        /// The version offered first in an ``VersionOffer/automatic`` offer;
+        /// `nil` keeps the library default (draft-18 first). The rest of the
+        /// offer stays newest first behind it. A `.list` or `.exactly` offer
+        /// already gives its order, so setting this beside one is refused
+        /// before connecting.
+        public var preferredVersion: MoQVersion?
+        public var preferredWireVersion: WireVersion?
+        /// AUTHORIZATION TOKEN parameters carried in this endpoint's SETUP
+        /// message, in order. Empty by default. Only the picoquic-based
+        /// backends forward them; another backend refuses a non-empty list
+        /// at connect rather than dropping it.
+        public var setupAuthorizationTokens: [SetupAuthorizationToken]
 
         public init(url: URL) {
             self.url = url
             self.transportProtocol = .automatic
             self.backend = .automatic
             self.versions = .automatic
+            self.wireVersions = nil
             self.serverName = nil
             self.caFileURL = nil
             self.insecureSkipVerify = false
             self.webTransportPath = nil
+            self.uriMode = .legacy
+            self.preferredVersion = nil
+            self.preferredWireVersion = nil
+            self.setupAuthorizationTokens = []
+        }
+
+        public init(url: URL, wireVersions: WireVersionOffer) {
+            self.init(url: url)
+            self.wireVersions = wireVersions
+        }
+
+        public init(url: URL, wireVersion: WireVersion) {
+            self.init(url: url, wireVersions: .exactly(wireVersion))
         }
 
         /// Synchronous preflight: the checks that must reject a
-        /// configuration BEFORE any I/O. Scheme and host shape only — full
-        /// URL semantics remain the C tier's job at connect.
+        /// configuration BEFORE any I/O. Scheme and host shape, then the
+        /// two combinations the C tier also refuses (a WebTransport path
+        /// under `.standard`, a preferred version beside an explicit
+        /// offer), reported here with their own message. Full URL
+        /// semantics remain the C tier's job at connect.
         package func validate() throws {
             guard let scheme = url.scheme?.lowercased(),
                   ["moqt", "moq", "https"].contains(scheme) else {
@@ -94,6 +146,35 @@ public final class MoQEndpoint: @unchecked Sendable {
             guard let host = url.host, !host.isEmpty else {
                 throw MoQServiceError.invalidArgument("URL must include a host")
             }
+            if uriMode == .standard, let path = webTransportPath, !path.isEmpty {
+                throw MoQServiceError.invalidArgument(
+                    "webTransportPath is a URIMode.legacy override; under "
+                    + "URIMode.standard the URL carries the WebTransport path")
+            }
+            if wireVersions != nil, versions != .automatic {
+                throw MoQServiceError.invalidArgument("Choose versions or wireVersions")
+            }
+            if preferredVersion != nil, preferredWireVersion != nil {
+                throw MoQServiceError.invalidArgument("Choose one preferred version")
+            }
+            if preferredVersion != nil || preferredWireVersion != nil,
+               versions != .automatic || (wireVersions != nil && wireVersions != .automatic) {
+                throw MoQServiceError.invalidArgument(
+                    "preferredVersion applies only to an automatic version "
+                    + "offer; a list or exact offer already gives the order")
+            }
+        }
+    }
+
+    /// One SETUP AUTHORIZATION TOKEN: the application-defined token type and
+    /// its opaque value, sent by value (no alias registration).
+    public struct SetupAuthorizationToken: Sendable, Hashable {
+        public var tokenType: UInt64
+        public var value: Data
+
+        public init(tokenType: UInt64, value: Data) {
+            self.tokenType = tokenType
+            self.value = value
         }
     }
 
@@ -124,6 +205,11 @@ public final class MoQEndpoint: @unchecked Sendable {
     public var state: State { engine.state }
     /// The negotiated version; retains its last value across close.
     public var negotiatedVersion: MoQVersion? { engine.negotiatedVersion }
+    public var negotiatedWireVersion: WireVersion? { engine.negotiatedWireVersion }
+    /// The New Session URI from the peer's session-wide GOAWAY, once one has
+    /// arrived; `nil` before that. Empty data means "reconnect to the current
+    /// URI". Retains its value across close.
+    public var goawayNewSessionURI: Data? { engine.goawayNewSessionURI }
 
     // MARK: Interrupt latch
 

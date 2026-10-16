@@ -16,7 +16,9 @@ final class ScriptedSenderBackend: SenderBackend, @unchecked Sendable {
     struct Snapshot: @unchecked Sendable {
         var addTrackNames: [String] = []
         var writeCalls: [UInt64] = []           /* handleID per attempt */
+        var writtenObjects: [OutgoingObject] = []
         var acceptedPayloads: [Data] = []       /* transferred on .ok only */
+        var acceptedMetadata: [MediaLOCMetadata?] = []
         var endTrackCalls: [UInt64] = []
         var waitCalls: [UInt64] = []            /* requested slice args */
         var detachCalls = 0
@@ -39,8 +41,11 @@ final class ScriptedSenderBackend: SenderBackend, @unchecked Sendable {
     private var waitGate = false
     private var r = Snapshot()
     private let latch: @Sendable () -> Bool
+    private let writeGate: TestGate?
 
-    init(latch: @escaping @Sendable () -> Bool = { false }) {
+    init(writeGate: TestGate? = nil,
+         latch: @escaping @Sendable () -> Bool = { false }) {
+        self.writeGate = writeGate
         self.latch = latch
     }
 
@@ -82,11 +87,13 @@ final class ScriptedSenderBackend: SenderBackend, @unchecked Sendable {
     }
 
     func write(handleID: UInt64, object: OutgoingObject) -> SenderOperationResult {
+        writeGate?.pass()
         cond.lock()
         defer { cond.unlock() }
         tripwireLocked("write")
         noteServiceThreadLocked("write")
         r.writeCalls.append(handleID)
+        r.writtenObjects.append(object)
         cond.broadcast()
         /* C order: the latch refuses the write before anything else. */
         if latch() { return .interrupted }
@@ -100,6 +107,7 @@ final class ScriptedSenderBackend: SenderBackend, @unchecked Sendable {
         }
         if case .ok = result {
             r.acceptedPayloads.append(object.payload)  /* transfer on OK only */
+            r.acceptedMetadata.append(object.locMetadata)
         }
         return result
     }
@@ -152,7 +160,22 @@ final class ScriptedSenderBackend: SenderBackend, @unchecked Sendable {
     /// teardown-ordering assertions.
     var onDetach: (@Sendable () -> Void)?
 
+    /// Pending new-group requests by handle, taken once.
+    private var newGroupRequests: [UInt64: UInt64] = [:]
+
+    func takeNewGroupRequest(handleID: UInt64) -> UInt64? {
+        cond.lock(); defer { cond.unlock() }
+        tripwireLocked("takeNewGroupRequest")
+        return newGroupRequests.removeValue(forKey: handleID)
+    }
+
     // MARK: Test control
+
+    func scriptNewGroupRequest(handleID: UInt64, value: UInt64) {
+        cond.lock()
+        newGroupRequests[handleID] = value
+        cond.unlock()
+    }
 
     func setReady(_ ready: Bool) {
         cond.lock()

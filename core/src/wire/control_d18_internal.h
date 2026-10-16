@@ -25,6 +25,56 @@ moq_result_t moq_d18_scan_delivery_timeouts(const uint8_t *props, size_t len,
                                             bool *out_has_subgroup,
                                             uint64_t *out_subgroup_ms);
 
+/* Track priority extraction shared by D18 and D22. Unknown properties pass
+ * through; absence resolves to 128, and values above 255 are invalid. */
+/* Strict check of a Track Property set this side sends: structure, no
+ * unknown Mandatory Property, DYNAMIC_GROUPS 0 or 1 (also inside Immutable
+ * Properties), a readable default publisher priority. MOQ_ERR_PROTO when it
+ * fails. */
+moq_result_t moq_d18_validate_track_properties(const uint8_t *data, size_t len);
+moq_result_t moq_d18_scan_default_publisher_priority(const uint8_t *props,
+                                                     size_t len,
+                                                     uint8_t *out);
+
+/*
+ * Object Property violations that make the Track malformed rather than the
+ * session (draft-22 §12.1). The session-level failures stay MOQ_ERR_PROTO:
+ * a Delta Type past 2^64-1 and a value Length above 2^16-1 (§8.3), and a
+ * DYNAMIC_GROUPS value above 1 (§10.6).
+ */
+#define MOQ_OBJ_PROPS_OK                   0u
+#define MOQ_OBJ_PROPS_UNPARSEABLE          1u  /* a pair overruns the block (§10.7) */
+#define MOQ_OBJ_PROPS_NESTED_IMMUTABLE     2u  /* 0x0B inside 0x0B (§10.7) */
+#define MOQ_OBJ_PROPS_DUPLICATE_IMMUTABLE  3u  /* two 0x0B on one object (§10.7) */
+#define MOQ_OBJ_PROPS_MANDATORY            4u  /* 0x4000-0x7FFF on an object (§3.7) */
+#define MOQ_OBJ_PROPS_DUPLICATE_GAP        5u  /* two 0x3C or two 0x3E (§10.8, §10.9) */
+
+typedef struct moq_obj_props_scan {
+    uint8_t  malformed;               /* MOQ_OBJ_PROPS_*; the first one found */
+    bool     has_prior_group_gap;     /* Prior Group ID Gap (0x3C) */
+    bool     has_prior_object_gap;    /* Prior Object ID Gap (0x3E) */
+    uint64_t prior_group_gap;
+    uint64_t prior_object_gap;
+} moq_obj_props_scan_t;
+
+/* Scan an Object Property block, searching the mutable list and the contents
+ * of Immutable Properties (§10.7: "processors MUST search both"). Returns
+ * MOQ_ERR_PROTO only for the session-level failures named above; every
+ * Track-level violation is reported in out->malformed with MOQ_OK. The gap
+ * values are reported only when the block is not malformed. */
+moq_result_t moq_d18_scan_object_properties(const uint8_t *props, size_t len,
+                                            moq_obj_props_scan_t *out);
+
+/* moq_d18_decode_object_datagram with the Object Property outcome split as
+ * above: with `track_scoped` set, a Track-level property violation returns
+ * MOQ_OK and is reported in *scan; without it the block is validated as the
+ * public decoder does (any violation is MOQ_ERR_PROTO) and *scan carries only
+ * the gap values. */
+moq_result_t moq_d18_decode_object_datagram_scan(const uint8_t *data, size_t len,
+                                                 bool track_scoped,
+                                                 moq_d18_object_datagram_t *out,
+                                                 moq_obj_props_scan_t *scan);
+
 /*
  * REQUEST_UPDATE_OK codec (§10.5): the REQUEST_OK form that carries
  * LARGEST_OBJECT / EXPIRES response parameters with empty Track Properties.

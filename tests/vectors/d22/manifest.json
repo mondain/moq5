@@ -1,0 +1,785 @@
+{
+  "spec": "draft-ietf-moq-transport-22",
+  "spec_date": "2026-10-01",
+  "vectors": [
+    {
+      "file": "setup_empty.bin",
+      "type": "SETUP",
+      "section": "\u00a79.1",
+      "type_code": "0x2F00",
+      "description": "SETUP with no Setup Options",
+      "wire_length": 4,
+      "wire_hex": "af000000",
+      "expected": {
+        "options_count": 0
+      }
+    },
+    {
+      "file": "setup_max_request_updates.bin",
+      "type": "SETUP",
+      "section": "\u00a79.1 / \u00a79.1.7",
+      "type_code": "0x2F00",
+      "description": "SETUP with MAX_REQUEST_UPDATES (0x08) = 1",
+      "wire_length": 6,
+      "wire_hex": "af0000020801",
+      "expected": {
+        "options_count": 1,
+        "max_request_updates": 1
+      }
+    },
+    {
+      "file": "setup_max_filter_ranges_zero.bin",
+      "type": "SETUP",
+      "section": "\u00a79.1 / \u00a79.1.6",
+      "type_code": "0x2F00",
+      "description": "SETUP with MAX_FILTER_RANGES (0x06) = 0",
+      "wire_length": 6,
+      "wire_hex": "af0000020600",
+      "expected": {
+        "options_count": 1,
+        "max_filter_ranges": 0
+      }
+    },
+    {
+      "file": "setup_path_authority.bin",
+      "type": "SETUP",
+      "section": "\u00a79.1 / \u00a79.1.2 / \u00a79.1.1",
+      "type_code": "0x2F00",
+      "description": "SETUP (client, native QUIC) with PATH (0x01) = \"/moq\" and AUTHORITY (0x05) = \"ex.net\"",
+      "wire_length": 18,
+      "wire_hex": "af00000e01042f6d6f71040665782e6e6574",
+      "expected": {
+        "options_count": 2,
+        "path": "/moq",
+        "authority": "ex.net"
+      }
+    },
+    {
+      "file": "setup_server_options.bin",
+      "type": "SETUP",
+      "section": "\u00a79.1 / \u00a79.1.3 / \u00a79.1.5 / \u00a79.1.7",
+      "type_code": "0x2F00",
+      "description": "SETUP (server-style) with MAX_AUTH_TOKEN_CACHE_SIZE (0x04) = 1024, MOQT_IMPLEMENTATION (0x07) = \"lib\", MAX_REQUEST_UPDATES (0x08) = 1",
+      "wire_length": 14,
+      "wire_hex": "af00000a04840003036c69620101",
+      "expected": {
+        "options_count": 3,
+        "max_auth_token_cache_size": 1024,
+        "moqt_implementation": "lib",
+        "max_request_updates": 1
+      }
+    },
+    {
+      "file": "goaway_empty_uri.bin",
+      "type": "GOAWAY",
+      "section": "\u00a79.2",
+      "type_code": "0x10",
+      "description": "GOAWAY with zero-length New Session URI and Timeout 0",
+      "wire_length": 5,
+      "wire_hex": "1000020000",
+      "expected": {
+        "uri": "",
+        "timeout_ms": 0
+      }
+    },
+    {
+      "file": "goaway_uri_timeout.bin",
+      "type": "GOAWAY",
+      "section": "\u00a79.2",
+      "type_code": "0x10",
+      "description": "GOAWAY with 5-byte New Session URI \"x://y\" and Timeout 5000 ms",
+      "wire_length": 11,
+      "wire_hex": "10000805783a2f2f799388",
+      "expected": {
+        "uri": "x://y",
+        "timeout_ms": 5000
+      }
+    },
+    {
+      "file": "request_ok_empty.bin",
+      "type": "REQUEST_OK",
+      "section": "\u00a79.3",
+      "type_code": "0x7",
+      "description": "REQUEST_OK with no Parameters and empty Track Properties",
+      "wire_length": 4,
+      "wire_hex": "07000100",
+      "expected": {
+        "params_count": 0,
+        "track_properties_len": 0
+      }
+    },
+    {
+      "file": "request_ok_expires.bin",
+      "type": "REQUEST_OK",
+      "section": "\u00a79.3 / \u00a79.20.16",
+      "type_code": "0x7",
+      "description": "REQUEST_OK with EXPIRES (0x08) = 30000 ms",
+      "wire_length": 8,
+      "wire_hex": "0700050108c07530",
+      "expected": {
+        "params_count": 1,
+        "expires_ms": 30000,
+        "track_properties_len": 0
+      }
+    },
+    {
+      "file": "request_error_invalid_filter.bin",
+      "type": "REQUEST_ERROR",
+      "section": "\u00a79.4 / \u00a712.3 / \u00a716.11.2",
+      "type_code": "0x5",
+      "description": "REQUEST_ERROR with Error Code INVALID_FILTER (0x36), Retry Interval 0, Reason \"bad\"",
+      "wire_length": 9,
+      "wire_hex": "050006360003626164",
+      "expected": {
+        "error_code": 54,
+        "retry_interval": 0,
+        "reason": "bad"
+      }
+    },
+    {
+      "file": "request_error_redirect.bin",
+      "type": "REQUEST_ERROR",
+      "section": "\u00a79.4 / \u00a79.4.1",
+      "type_code": "0x5",
+      "description": "REQUEST_ERROR with Error Code REDIRECT (0x34), Retry Interval 1, empty Reason, Redirect to [\"live\"] / \"video\" at the current URI",
+      "wire_length": 19,
+      "wire_hex": "0500103401000001046c69766505766964656f",
+      "expected": {
+        "error_code": 52,
+        "retry_interval": 1,
+        "reason": "",
+        "redirect": {
+          "connect_uri": "",
+          "namespace": [
+            "live"
+          ],
+          "track_name": "video"
+        }
+      }
+    },
+    {
+      "file": "request_update_forward_zero.bin",
+      "type": "REQUEST_UPDATE",
+      "section": "\u00a79.5 / \u00a79.20.18",
+      "type_code": "0x2",
+      "description": "REQUEST_UPDATE for Request ID 4 with FORWARD (0x10) = 0 (pause)",
+      "wire_length": 7,
+      "wire_hex": "02000404011000",
+      "expected": {
+        "request_id": 4,
+        "params_count": 1,
+        "forward": 0
+      }
+    },
+    {
+      "file": "subscribe_minimal.bin",
+      "type": "SUBSCRIBE",
+      "section": "\u00a79.6",
+      "type_code": "0x3",
+      "description": "SUBSCRIBE Request ID 4, namespace [\"live\",\"a\"], track \"video\", no Parameters",
+      "wire_length": 19,
+      "wire_hex": "0300100402046c697665016105766964656f00",
+      "expected": {
+        "request_id": 4,
+        "namespace": [
+          "live",
+          "a"
+        ],
+        "track_name": "video",
+        "params_count": 0
+      }
+    },
+    {
+      "file": "subscribe_filter_type_00.bin",
+      "type": "SUBSCRIBE",
+      "section": "\u00a79.6 / \u00a79.20.9",
+      "type_code": "0x3",
+      "description": "SUBSCRIBE Request ID 4 with FORWARD=1, SUBSCRIBER_PRIORITY=128, LOCATION_FILTER type 0x00 (None)",
+      "wire_length": 25,
+      "wire_hex": "0300160402046c697665016105766964656f03100110800100",
+      "expected": {
+        "request_id": 4,
+        "namespace": [
+          "live",
+          "a"
+        ],
+        "track_name": "video",
+        "params_count": 3,
+        "forward": 1,
+        "subscriber_priority": 128,
+        "location_filter_type": 0
+      }
+    },
+    {
+      "file": "subscribe_filter_type_01.bin",
+      "type": "SUBSCRIBE",
+      "section": "\u00a79.6 / \u00a79.20.9",
+      "type_code": "0x3",
+      "description": "SUBSCRIBE Request ID 4 with FORWARD=1, SUBSCRIBER_PRIORITY=128, LOCATION_FILTER type 0x01 (Relative Start)",
+      "wire_length": 26,
+      "wire_hex": "0300170402046c697665016105766964656f0310011080010101",
+      "expected": {
+        "request_id": 4,
+        "namespace": [
+          "live",
+          "a"
+        ],
+        "track_name": "video",
+        "params_count": 3,
+        "forward": 1,
+        "subscriber_priority": 128,
+        "location_filter_type": 1,
+        "startgroup": 1
+      }
+    },
+    {
+      "file": "subscribe_filter_type_02.bin",
+      "type": "SUBSCRIBE",
+      "section": "\u00a79.6 / \u00a79.20.9",
+      "type_code": "0x3",
+      "description": "SUBSCRIBE Request ID 4 with FORWARD=1, SUBSCRIBER_PRIORITY=128, LOCATION_FILTER type 0x02 (Absolute Start)",
+      "wire_length": 27,
+      "wire_hex": "0300180402046c697665016105766964656f031001108001020304",
+      "expected": {
+        "request_id": 4,
+        "namespace": [
+          "live",
+          "a"
+        ],
+        "track_name": "video",
+        "params_count": 3,
+        "forward": 1,
+        "subscriber_priority": 128,
+        "location_filter_type": 2,
+        "startgroup": 3,
+        "startobject": 4
+      }
+    },
+    {
+      "file": "subscribe_filter_type_03.bin",
+      "type": "SUBSCRIBE",
+      "section": "\u00a79.6 / \u00a79.20.9",
+      "type_code": "0x3",
+      "description": "SUBSCRIBE Request ID 4 with FORWARD=1, SUBSCRIBER_PRIORITY=128, LOCATION_FILTER type 0x03 (Absolute Start, Group End)",
+      "wire_length": 28,
+      "wire_hex": "0300190402046c697665016105766964656f03100110800103030402",
+      "expected": {
+        "request_id": 4,
+        "namespace": [
+          "live",
+          "a"
+        ],
+        "track_name": "video",
+        "params_count": 3,
+        "forward": 1,
+        "subscriber_priority": 128,
+        "location_filter_type": 3,
+        "startgroup": 3,
+        "startobject": 4,
+        "endgroupdelta": 2
+      }
+    },
+    {
+      "file": "subscribe_filter_type_04.bin",
+      "type": "SUBSCRIBE",
+      "section": "\u00a79.6 / \u00a79.20.9",
+      "type_code": "0x3",
+      "description": "SUBSCRIBE Request ID 4 with FORWARD=1, SUBSCRIBER_PRIORITY=128, LOCATION_FILTER type 0x04 (Absolute Range)",
+      "wire_length": 29,
+      "wire_hex": "03001a0402046c697665016105766964656f0310011080010403040209",
+      "expected": {
+        "request_id": 4,
+        "namespace": [
+          "live",
+          "a"
+        ],
+        "track_name": "video",
+        "params_count": 3,
+        "forward": 1,
+        "subscriber_priority": 128,
+        "location_filter_type": 4,
+        "startgroup": 3,
+        "startobject": 4,
+        "endgroupdelta": 2,
+        "endobject": 9
+      }
+    },
+    {
+      "file": "subscribe_filter_type_05.bin",
+      "type": "SUBSCRIBE",
+      "section": "\u00a79.6 / \u00a79.20.9",
+      "type_code": "0x3",
+      "description": "SUBSCRIBE Request ID 4 with FORWARD=1, SUBSCRIBER_PRIORITY=128, LOCATION_FILTER type 0x05 (Next Object)",
+      "wire_length": 25,
+      "wire_hex": "0300160402046c697665016105766964656f03100110800105",
+      "expected": {
+        "request_id": 4,
+        "namespace": [
+          "live",
+          "a"
+        ],
+        "track_name": "video",
+        "params_count": 3,
+        "forward": 1,
+        "subscriber_priority": 128,
+        "location_filter_type": 5
+      }
+    },
+    {
+      "file": "subscribe_fill_parameters.bin",
+      "type": "SUBSCRIBE",
+      "section": "\u00a79.6 / \u00a79.20.15",
+      "type_code": "0x3",
+      "description": "SUBSCRIBE Request ID 4 with LOCATION_FILTER (Next Object) and FILL_PARAMETERS carrying Number of Parameters 2: FILL_TIMEOUT=250 and LOCATION_FILTER type 0x01 StartGroup=1",
+      "wire_length": 30,
+      "wire_hex": "03001b0402046c697665016105766964656f0221050207020a80fa170101",
+      "expected": {
+        "request_id": 4,
+        "namespace": [
+          "live",
+          "a"
+        ],
+        "track_name": "video",
+        "params_count": 2,
+        "location_filter_type": 5,
+        "fill_parameters": {
+          "inner_count": 2,
+          "fill_timeout_ms": 250,
+          "location_filter_type": 1,
+          "startgroup": 1
+        }
+      }
+    },
+    {
+      "file": "subscribe_fill_parameters_empty.bin",
+      "type": "SUBSCRIBE",
+      "section": "\u00a79.6 / \u00a79.20.15",
+      "type_code": "0x3",
+      "description": "SUBSCRIBE Request ID 4 with LOCATION_FILTER (Next Object) and FILL_PARAMETERS with no settings of its own: Number of Parameters 0",
+      "wire_length": 24,
+      "wire_hex": "0300150402046c697665016105766964656f022105020100",
+      "expected": {
+        "request_id": 4,
+        "namespace": [
+          "live",
+          "a"
+        ],
+        "track_name": "video",
+        "params_count": 2,
+        "location_filter_type": 5,
+        "fill_parameters": {
+          "inner_count": 0
+        }
+      }
+    },
+    {
+      "file": "subscribe_fill_parameters_alt_uncounted.bin",
+      "type": "SUBSCRIBE",
+      "section": "\u00a79.6 / \u00a79.20.15",
+      "type_code": "0x3",
+      "description": "SUBSCRIBE Request ID 4 with LOCATION_FILTER (Next Object) and FILL_PARAMETERS containing FILL_TIMEOUT=250 and LOCATION_FILTER type 0x01 StartGroup=1 - REFUSED alternate reading: nested value without a parameter count",
+      "wire_length": 29,
+      "wire_hex": "03001a0402046c697665016105766964656f02210502060a80fa170101",
+      "expected": {
+        "request_id": 4,
+        "namespace": [
+          "live",
+          "a"
+        ],
+        "track_name": "video",
+        "params_count": 2,
+        "location_filter_type": 5,
+        "fill_parameters": {
+          "inner_count_field_present": false,
+          "fill_timeout_ms": 250,
+          "location_filter_type": 1,
+          "startgroup": 1
+        }
+      },
+      "alternate_reading_of": "subscribe_fill_parameters.bin"
+    },
+    {
+      "file": "subscribe_ok_largest_object.bin",
+      "type": "SUBSCRIBE_OK",
+      "section": "\u00a79.7 / \u00a79.20.17",
+      "type_code": "0x4",
+      "description": "SUBSCRIBE_OK Track Alias 7 with LARGEST_OBJECT (0x09) = {2, 5}, empty Track Properties",
+      "wire_length": 8,
+      "wire_hex": "0400050701090205",
+      "expected": {
+        "track_alias": 7,
+        "params_count": 1,
+        "largest_group": 2,
+        "largest_object": 5,
+        "track_properties_len": 0
+      }
+    },
+    {
+      "file": "publish_minimal.bin",
+      "type": "PUBLISH",
+      "section": "\u00a79.8",
+      "type_code": "0x1D",
+      "description": "PUBLISH Request ID 1, namespace [\"live\",\"a\"], track \"video\", Track Alias 7, no Parameters, empty Track Properties",
+      "wire_length": 20,
+      "wire_hex": "1d00110102046c697665016105766964656f0700",
+      "expected": {
+        "request_id": 1,
+        "namespace": [
+          "live",
+          "a"
+        ],
+        "track_name": "video",
+        "track_alias": 7,
+        "params_count": 0,
+        "track_properties_len": 0
+      }
+    },
+    {
+      "file": "publish_largest_object_props.bin",
+      "type": "PUBLISH",
+      "section": "\u00a79.8 / \u00a79.20.17 / \u00a78.4",
+      "type_code": "0x1D",
+      "description": "PUBLISH Request ID 1, Track Alias 7, LARGEST_OBJECT {2,5}, FORWARD 1, Track Properties DEFAULT_PUBLISHER_PRIORITY=3 and DYNAMIC_GROUPS=1",
+      "wire_length": 29,
+      "wire_hex": "1d001a0102046c697665016105766964656f070209020507010e032201",
+      "expected": {
+        "request_id": 1,
+        "namespace": [
+          "live",
+          "a"
+        ],
+        "track_name": "video",
+        "track_alias": 7,
+        "params_count": 2,
+        "largest_group": 2,
+        "largest_object": 5,
+        "forward": 1,
+        "track_properties": {
+          "default_publisher_priority": 3,
+          "dynamic_groups": 1
+        }
+      }
+    },
+    {
+      "file": "publish_done_stream_count_max.bin",
+      "type": "PUBLISH_DONE",
+      "section": "\u00a79.9 / \u00a712.4",
+      "type_code": "0xB",
+      "description": "PUBLISH_DONE Status TRACK_ENDED (0x2), Stream Count 2^64-1, Reason \"ended\"",
+      "wire_length": 19,
+      "wire_hex": "0b001002ffffffffffffffffff05656e646564",
+      "expected": {
+        "status_code": 2,
+        "stream_count": "18446744073709551615",
+        "reason": "ended"
+      }
+    },
+    {
+      "file": "publish_state_notify_largest_object.bin",
+      "type": "PUBLISH_STATE_NOTIFY",
+      "section": "\u00a79.10 / \u00a79.20.17",
+      "type_code": "0x22",
+      "description": "PUBLISH_STATE_NOTIFY with LARGEST_OBJECT (0x09) = {10, 20}",
+      "wire_length": 7,
+      "wire_hex": "22000401090a14",
+      "expected": {
+        "params_count": 1,
+        "largest_group": 10,
+        "largest_object": 20
+      }
+    },
+    {
+      "file": "publish_state_notify_paused.bin",
+      "type": "PUBLISH_STATE_NOTIFY",
+      "section": "\u00a79.10 / \u00a79.20.18",
+      "type_code": "0x22",
+      "description": "PUBLISH_STATE_NOTIFY with LARGEST_OBJECT {10, 20} and FORWARD 0 (subscription paused at the publisher)",
+      "wire_length": 9,
+      "wire_hex": "22000602090a140700",
+      "expected": {
+        "params_count": 2,
+        "largest_group": 10,
+        "largest_object": 20,
+        "forward": 0
+      }
+    },
+    {
+      "file": "fetch_filter_type_04.bin",
+      "type": "FETCH",
+      "section": "\u00a79.11 / \u00a79.20.9",
+      "type_code": "0x16",
+      "description": "FETCH Request ID 6, namespace [\"live\",\"a\"], track \"video\", LOCATION_FILTER type 0x04 {StartGroup 3, StartObject 4, EndGroupDelta 2, EndObject 9}",
+      "wire_length": 25,
+      "wire_hex": "1600160602046c697665016105766964656f01210403040209",
+      "expected": {
+        "request_id": 6,
+        "namespace": [
+          "live",
+          "a"
+        ],
+        "track_name": "video",
+        "params_count": 1,
+        "location_filter_type": 4,
+        "startgroup": 3,
+        "startobject": 4,
+        "endgroupdelta": 2,
+        "endobject": 9
+      }
+    },
+    {
+      "file": "fetch_ok_end_location.bin",
+      "type": "FETCH_OK",
+      "section": "\u00a79.12",
+      "type_code": "0x18",
+      "description": "FETCH_OK End Of Track 0, End Location {5, 9}, no Parameters, empty Track Properties",
+      "wire_length": 7,
+      "wire_hex": "18000400050900",
+      "expected": {
+        "end_of_track": 0,
+        "end_group": 5,
+        "end_object": 9,
+        "params_count": 0,
+        "track_properties_len": 0
+      }
+    },
+    {
+      "file": "fetch_ok_end_of_track_props.bin",
+      "type": "FETCH_OK",
+      "section": "\u00a79.12 / \u00a78.4 / \u00a710.3",
+      "type_code": "0x18",
+      "description": "FETCH_OK End Of Track 1, End Location {5, 9}, no Parameters, Track Properties MAX_CACHE_DURATION (0x04) = 60000",
+      "wire_length": 11,
+      "wire_hex": "1800080105090004c0ea60",
+      "expected": {
+        "end_of_track": 1,
+        "end_group": 5,
+        "end_object": 9,
+        "params_count": 0,
+        "track_properties": {
+          "max_cache_duration_ms": 60000
+        }
+      }
+    },
+    {
+      "file": "track_status.bin",
+      "type": "TRACK_STATUS",
+      "section": "\u00a79.13",
+      "type_code": "0xD",
+      "description": "TRACK_STATUS Request ID 8, namespace [\"live\",\"a\"], track \"video\", INCLUDE_PROPERTIES (0x35) = 1",
+      "wire_length": 21,
+      "wire_hex": "0d00120802046c697665016105766964656f013501",
+      "expected": {
+        "request_id": 8,
+        "namespace": [
+          "live",
+          "a"
+        ],
+        "track_name": "video",
+        "params_count": 1,
+        "include_properties": 1
+      }
+    },
+    {
+      "file": "track_status_ok.bin",
+      "type": "REQUEST_OK (TRACK_STATUS_OK)",
+      "section": "\u00a79.3 / \u00a79.13 / \u00a79.20.17 / \u00a78.4",
+      "type_code": "0x7",
+      "description": "REQUEST_OK answering TRACK_STATUS: LARGEST_OBJECT {10, 20} and Track Properties DEFAULT_PUBLISHER_PRIORITY (0x0E) = 100",
+      "wire_length": 9,
+      "wire_hex": "07000601090a140e64",
+      "expected": {
+        "params_count": 1,
+        "largest_group": 10,
+        "largest_object": 20,
+        "track_properties": {
+          "default_publisher_priority": 100
+        }
+      }
+    },
+    {
+      "file": "publish_skipped.bin",
+      "type": "PUBLISH_SKIPPED",
+      "section": "\u00a79.19",
+      "type_code": "0xF",
+      "description": "PUBLISH_SKIPPED with one-field Track Namespace Suffix [\"a\"] and Track Name \"x\"",
+      "wire_length": 8,
+      "wire_hex": "0f00050101610178",
+      "expected": {
+        "namespace_suffix": [
+          "a"
+        ],
+        "track_name": "x"
+      }
+    },
+    {
+      "file": "object_datagram_flags_00.bin",
+      "type": "OBJECT_DATAGRAM",
+      "section": "\u00a711.2.1",
+      "description": "OBJECT_DATAGRAM Type Flags 0x00: Track Alias 7, Group 2, Object 5, Priority 3, payload \"hi\"",
+      "wire_length": 7,
+      "wire_hex": "00070205036869",
+      "expected": {
+        "type_flags": 0,
+        "track_alias": 7,
+        "group_id": 2,
+        "object_id": 5,
+        "priority": 3,
+        "payload_hex": "6869"
+      }
+    },
+    {
+      "file": "object_datagram_properties.bin",
+      "type": "OBJECT_DATAGRAM",
+      "section": "\u00a711.2.1 / \u00a711.1.2",
+      "description": "OBJECT_DATAGRAM Type Flags 0x01 (PROPERTIES): Track Alias 7, Group 2, Object 5, Priority 3, Object Property PRIOR_OBJECT_ID_GAP (0x3E) = 2, payload \"hi\"",
+      "wire_length": 10,
+      "wire_hex": "0107020503023e026869",
+      "expected": {
+        "type_flags": 1,
+        "track_alias": 7,
+        "group_id": 2,
+        "object_id": 5,
+        "priority": 3,
+        "properties": {
+          "prior_object_id_gap": 2
+        },
+        "payload_hex": "6869"
+      }
+    },
+    {
+      "file": "subgroup_header_flags_14.bin",
+      "type": "SUBGROUP_HEADER",
+      "section": "\u00a711.3.1",
+      "description": "SUBGROUP_HEADER Type Flags 0x14: Track Alias 7, Group 2, Subgroup ID 1 (explicit), Priority 3",
+      "wire_length": 5,
+      "wire_hex": "1407020103",
+      "expected": {
+        "type_flags": 20,
+        "track_alias": 7,
+        "group_id": 2,
+        "subgroup_id": 1,
+        "priority": 3
+      }
+    },
+    {
+      "file": "subgroup_header_flags_54.bin",
+      "type": "SUBGROUP_HEADER",
+      "section": "\u00a711.3.1 / \u00a72.2",
+      "description": "SUBGROUP_HEADER Type Flags 0x54: FIRST_OBJECT set, Track Alias 7, Group 2, Subgroup ID 1 (explicit), Priority 3",
+      "wire_length": 5,
+      "wire_hex": "5407020103",
+      "expected": {
+        "type_flags": 84,
+        "first_object": true,
+        "track_alias": 7,
+        "group_id": 2,
+        "subgroup_id": 1,
+        "priority": 3
+      }
+    },
+    {
+      "file": "subgroup_object_first.bin",
+      "type": "Subgroup Object (Fig. 27)",
+      "section": "\u00a711.3.1",
+      "description": "First Object on a Subgroup stream (header without PROPERTIES bit): Object ID Delta 5 -> Object ID 5, payload \"hi\"",
+      "wire_length": 4,
+      "wire_hex": "05026869",
+      "expected": {
+        "object_id_delta": 5,
+        "object_id": 5,
+        "payload_len": 2,
+        "payload_hex": "6869"
+      }
+    },
+    {
+      "file": "subgroup_object_status_eog.bin",
+      "type": "Subgroup Object (Fig. 27)",
+      "section": "\u00a711.3.1 / \u00a711.1.1",
+      "description": "Subgroup Object with zero-length payload and Object Status End of Group (0x3), Object ID Delta 0",
+      "wire_length": 3,
+      "wire_hex": "000003",
+      "expected": {
+        "object_id_delta": 0,
+        "payload_len": 0,
+        "object_status": 3
+      }
+    },
+    {
+      "file": "subgroup_object_prior_gaps.bin",
+      "type": "Subgroup Object (Fig. 27)",
+      "section": "\u00a711.3.1 / \u00a711.1.2 / \u00a710.8 / \u00a710.9",
+      "description": "Subgroup Object on a PROPERTIES subgroup following Object 5: Object ID Delta 4 (Object 10), Prior Group ID Gap (0x3C) = 3, Prior Object ID Gap (0x3E) = 2, payload \"hi\"",
+      "wire_length": 9,
+      "wire_hex": "04043c030202026869",
+      "expected": {
+        "object_id_delta": 4,
+        "object_id": 10,
+        "properties": {
+          "prior_group_id_gap": 3,
+          "prior_object_id_gap": 2
+        },
+        "payload_len": 2
+      }
+    },
+    {
+      "file": "fetch_header.bin",
+      "type": "FETCH_HEADER",
+      "section": "\u00a711.4.1",
+      "description": "FETCH_HEADER Type 0x5, Request ID 6",
+      "wire_length": 2,
+      "wire_hex": "0506",
+      "expected": {
+        "type": 5,
+        "request_id": 6
+      }
+    },
+    {
+      "file": "fetch_object_first.bin",
+      "type": "Fetch Object (Fig. 29)",
+      "section": "\u00a711.4.1 / \u00a711.4.1.1",
+      "description": "First Fetch Object, Serialization Flags 0x1F: Group 3, Subgroup 1 (explicit), Object 4, Priority 3, no Properties, payload \"hi\"",
+      "wire_length": 8,
+      "wire_hex": "1f03010403026869",
+      "expected": {
+        "serialization_flags": 31,
+        "group_id": 3,
+        "subgroup_id": 1,
+        "object_id": 4,
+        "priority": 3,
+        "payload_hex": "6869"
+      }
+    },
+    {
+      "file": "fetch_object_eor_timed_out.bin",
+      "type": "Fetch End of Range (0x20C)",
+      "section": "\u00a711.4.1 / \u00a711.4.1.2",
+      "description": "End of Timed-Out Range indicator: Serialization Flags 0x20C, Group ID 5, Object ID 9 - PRIMARY reading: no Object Payload Length",
+      "wire_length": 4,
+      "wire_hex": "820c0509",
+      "expected": {
+        "serialization_flags": 524,
+        "range_kind": "end_of_timed_out_range",
+        "group_id": 5,
+        "object_id": 9,
+        "payload_length_field_present": false
+      }
+    },
+    {
+      "file": "fetch_object_eor_timed_out_alt_payload_length.bin",
+      "type": "Fetch End of Range (0x20C)",
+      "section": "\u00a711.4.1 / \u00a711.4.1.2",
+      "description": "End of Timed-Out Range indicator: Serialization Flags 0x20C, Group ID 5, Object ID 9 - ALTERNATE reading: Fig. 29's Object Payload Length (0) is present",
+      "wire_length": 5,
+      "wire_hex": "820c050900",
+      "expected": {
+        "serialization_flags": 524,
+        "range_kind": "end_of_timed_out_range",
+        "group_id": 5,
+        "object_id": 9,
+        "payload_length_field_present": true,
+        "payload_len": 0
+      },
+      "alternate_reading_of": "fetch_object_eor_timed_out.bin"
+    }
+  ]
+}

@@ -93,8 +93,20 @@ RC=0
 if [ "$RC" -ne 1 ]; then
     fail "--draft 16junk exit code $RC, expected 1"
 fi
-if ! grep -q 'must be exactly 16 or 18' "$TMPERR"; then
+if ! grep -q 'must be exactly 16, 18 or 22' "$TMPERR"; then
     fail "--draft 16junk missing validation error"
+fi
+
+# -- 5b: --draft 22 is accepted and named in the request line --
+
+RC=0
+"$BIN" --relay moqt://127.0.0.1:9 --test setup-only --draft 22 \
+    --tls-disable-verify >"$TMPOUT" 2>"$TMPERR" || RC=$?
+if grep -q 'must be exactly' "$TMPERR"; then
+    fail "--draft 22 rejected by validation"
+fi
+if ! grep -q '^# request: .* draft=22$' "$TMPOUT"; then
+    fail "--draft 22 missing from the request line"
 fi
 
 # -- 6: invalid MOQT_DRAFT (non-numeric) → exit 1, validation error --
@@ -105,7 +117,7 @@ MOQT_DRAFT=abc "$BIN" --relay moqt://127.0.0.1:9 --test setup-only \
 if [ "$RC" -ne 1 ]; then
     fail "MOQT_DRAFT=abc exit code $RC, expected 1"
 fi
-if ! grep -q 'must be exactly 16 or 18' "$TMPERR"; then
+if ! grep -q 'must be exactly 16, 18 or 22' "$TMPERR"; then
     fail "MOQT_DRAFT=abc missing validation error"
 fi
 

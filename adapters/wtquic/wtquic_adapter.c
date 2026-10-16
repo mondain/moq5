@@ -32,6 +32,7 @@
 #include <moq/wtquic.h>
 
 #include "wtquic_adapter_internal.h"
+#include "../../core/src/session/session_outbound_internal.h"
 
 #define MOQ_WTQ_MAX_STREAMS 16 /* mirrors wtquic's session handle pool */
 #define MOQ_WTQ_RECEIVE_QUANTUM 65535u
@@ -58,15 +59,36 @@ struct moq_wtq_stream {
     bool held;
     bool held_fin;
     bool receive_reset;
+    bool commit_enabled;
+    bool fin_submitting;
+    bool fin_sent;
+    bool committed;
+    bool send_cancelled;
+    bool stop_seen;
+    unsigned pending_events;
     unsigned borrowed;
     uint64_t replay_epoch;
     size_t held_len;
     uint8_t held_bytes[MOQ_WTQ_RECEIVE_QUANTUM];
 };
 
+typedef enum {
+    STREAM_EVENT_CLOSED,
+    STREAM_EVENT_COMMITTED,
+    STREAM_EVENT_STOP,
+} stream_event_kind_t;
+
+struct moq_wtq_stream_event {
+    uint64_t key;
+    uint32_t code;
+    stream_event_kind_t kind;
+};
+
 /* One in-flight send: either a copied cold write or a retained rcbuf
  * whose bytes wtquic borrows until the completion. */
 struct moq_wtq_send_rec {
+    struct moq_wtq_send_rec *next;
+    struct moq_wtq_send_rec **prev_next;
     bool is_rcbuf;
     size_t alloc_size;
     moq_rcbuf_t *buf;   /* retained (rcbuf sends only) */
@@ -78,6 +100,7 @@ struct moq_wtquic_conn {
     moq_session_t *session;       /* not owned */
     moq_transport_bridge_t *bridge;
     wtq_session_t *ws;            /* immutable qualified creation binding */
+    struct moq_wtq_send_rec *sends; /* actual retained adapter send ownership */
     moq_wtquic_hook_fn hook;
     void *hook_user;
     struct moq_wtq_stream streams[MOQ_WTQ_MAX_STREAMS];
@@ -93,20 +116,16 @@ struct moq_wtquic_conn {
     bool teardown_sent;           /* fatal-bridge teardown issued once */
     bool in_service;              /* conn_service is on the stack */
     bool service_pending;         /* re-run requested while in service */
+    bool stream_close_context;    /* observed close in this/deferred service */
     bool close_pending;           /* deferred transport-close feed */
     bool close_fed;
     bool close_clean;
     uint64_t close_code;
-    /*
-     * Deferred stream-terminal feed. A synchronous on_stream_closed can
-     * fire from INSIDE an endpoint op (e.g. wtq_stream_abort -> immediate
-     * terminal), and the bridge forbids inbound handlers being called
-     * from an endpoint op. So ev_stream_closed only ENQUEUES the opaque
-     * key here; conn_service drains it outside the endpoint-op/bridge-
-     * service frame. Sized one per adapter stream slot -- the maximum
-     * that can terminate before a drain -- plus headroom; overflow is
-     * fatal, never a silent drop. */
-    uint64_t term_keys[MOQ_WTQ_MAX_STREAMS];
+    /* A slot remains retained until its queued callbacks drain. Each slot
+     * contributes at most one send outcome (commit or STOP) and one close;
+     * duplicate outcomes are latched before enqueue. Endpoint operations may
+     * produce these callbacks synchronously, so bridge feeds are deferred. */
+    struct moq_wtq_stream_event term_events[2 * MOQ_WTQ_MAX_STREAMS];
     size_t   term_count;
     bool     term_overflow;
     moq_transport_endpoint_ops_t ops;
@@ -202,11 +221,28 @@ static moq_transport_result_t ep_open(void *ctx, bool bidi,
                            : wtq_session_open_uni(c->ws, &st);
     if (rc != WTQ_OK) {
         memset(ms, 0, sizeof(*ms));
+        /* WT closes streams before reporting the session outcome. A retry
+         * caused by that close must leave the verdict to the session callback.
+         * CLOSED outside observed terminal work is still an error. */
+        if (rc == WTQ_ERR_CLOSED && !c->close_fed &&
+            (c->close_pending || c->stream_close_context))
+            return MOQ_TRANSPORT_WOULD_BLOCK;
         return map_open_rc(rc);
     }
     ms->st = ms->lease = st;
     ms->bidi = bidi;
     wtq_stream_add_ref(st);
+    if (!bidi && (c->ops.capabilities & MOQ_TRANSPORT_CAP_COMMIT_REPORT)) {
+        c->feed_depth++;
+        rc = wtq_stream_enable_send_commit(st);
+        if (rc == WTQ_OK)
+            ms->commit_enabled = true;
+        else
+            (void)wtq_stream_abort(st, 0);
+        c->feed_depth--;
+        if (rc != WTQ_OK)
+            return MOQ_TRANSPORT_ERROR;
+    }
     *out_id = ms->id;
     /* bidi-control profiles: the first locally opened bidi carries the
      * MoQ control channel */
@@ -238,6 +274,40 @@ static moq_transport_result_t map_send_rc(wtq_result_t rc)
     return MOQ_TRANSPORT_ERROR;
 }
 
+/* Publish before the provider call: completion may return the borrow
+ * synchronously. On refusal the caller withdraws the same record. */
+static void send_rec_link(moq_wtquic_conn_t *c, struct moq_wtq_send_rec *rec)
+{
+    rec->next = c->sends;
+    rec->prev_next = &c->sends;
+    if (rec->next) rec->next->prev_next = &rec->next;
+    c->sends = rec;
+}
+
+static void send_rec_unlink(struct moq_wtq_send_rec *rec)
+{
+    *rec->prev_next = rec->next;
+    if (rec->next) rec->next->prev_next = rec->prev_next;
+}
+
+static wtq_result_t stream_send(moq_wtquic_conn_t *c,
+                                struct moq_wtq_stream *ms,
+                                const wtq_span_t *spans, size_t count,
+                                bool fin, void *send_ctx)
+{
+    if (!ms->st) return WTQ_ERR_CLOSED;
+    c->feed_depth++;
+    ms->borrowed++;
+    ms->fin_submitting = fin;
+    wtq_result_t rc = wtq_stream_send(ms->st, spans, count,
+                                     fin ? WTQ_SEND_FIN : 0, send_ctx);
+    if (rc == WTQ_OK && fin) ms->fin_sent = true;
+    ms->fin_submitting = false;
+    ms->borrowed--;
+    c->feed_depth--;
+    return rc;
+}
+
 static moq_transport_result_t ep_write(void *ctx, uint64_t stream_id,
                                        const uint8_t *data, size_t len,
                                        bool fin)
@@ -248,9 +318,7 @@ static moq_transport_result_t ep_write(void *ctx, uint64_t stream_id,
     if (ms == NULL)
         return MOQ_TRANSPORT_ERROR;
     if (len == 0)
-        return map_send_rc(
-            wtq_stream_send(ms->st, NULL, 0, fin ? WTQ_SEND_FIN : 0,
-                            NULL));
+        return map_send_rc(stream_send(c, ms, NULL, 0, fin, NULL));
 
     /* wtquic borrows the bytes until the completion; the bridge's
      * write contract releases them at return — copy into a record */
@@ -264,11 +332,13 @@ static moq_transport_result_t ep_write(void *ctx, uint64_t stream_id,
     rec->buf = NULL;
     memcpy(rec + 1, data, len);
 
-    wtq_span_t span = { .data = (const uint8_t *)(rec + 1), .len = len };
-    wtq_result_t rc =
-        wtq_stream_send(ms->st, &span, 1, fin ? WTQ_SEND_FIN : 0, rec);
-    if (rc != WTQ_OK)
+    wtq_span_t span = {.data = (const uint8_t *)(rec + 1), .len = len};
+    send_rec_link(c, rec);
+    wtq_result_t rc = stream_send(c, ms, &span, 1, fin, rec);
+    if (rc != WTQ_OK) {
+        send_rec_unlink(rec);
         c->alloc.free(rec, rec_size, c->alloc.ctx);
+    }
     return map_send_rc(rc);
 }
 
@@ -291,10 +361,11 @@ static moq_transport_result_t ep_write_payload(void *ctx,
     rec->buf = buf;
     moq_rcbuf_incref(buf); /* held until the send completion */
 
-    wtq_span_t span = { .data = moq_rcbuf_data(buf), .len = moq_rcbuf_len(buf) };
-    wtq_result_t rc =
-        wtq_stream_send(ms->st, &span, 1, fin ? WTQ_SEND_FIN : 0, rec);
+    wtq_span_t span = {.data = moq_rcbuf_data(buf), .len = moq_rcbuf_len(buf)};
+    send_rec_link(c, rec);
+    wtq_result_t rc = stream_send(c, ms, &span, 1, fin, rec);
     if (rc != WTQ_OK) {
+        send_rec_unlink(rec);
         moq_rcbuf_decref(buf);
         c->alloc.free(rec, sizeof(*rec), c->alloc.ctx);
     }
@@ -308,12 +379,17 @@ static moq_transport_result_t ep_reset_stream(void *ctx,
     moq_wtquic_conn_t *c = ctx;
     struct moq_wtq_stream *ms = stream_find(c, stream_id);
 
-    if (ms == NULL)
-        return MOQ_TRANSPORT_OK; /* already gone: idempotent */
+    if (ms == NULL || ms->st == NULL || ms->committed)
+        return MOQ_TRANSPORT_OK; /* observed terminal: idempotent, not a reset */
+    if (ms->stop_seen && ms->commit_enabled)
+        return MOQ_TRANSPORT_WOULD_BLOCK; /* await the causal closed callback */
+    c->feed_depth++;
+    ms->borrowed++;
     wtq_result_t rc = wtq_stream_reset(ms->st, (uint32_t)error_code);
-    if (rc == WTQ_OK || rc == WTQ_ERR_STATE || rc == WTQ_ERR_CLOSED)
-        return MOQ_TRANSPORT_OK;
-    return MOQ_TRANSPORT_ERROR;
+    if (rc == WTQ_OK) ms->send_cancelled = true;
+    ms->borrowed--;
+    c->feed_depth--;
+    return map_send_rc(rc);
 }
 
 static moq_transport_result_t ep_abort_stream(void *ctx,
@@ -323,12 +399,17 @@ static moq_transport_result_t ep_abort_stream(void *ctx,
     moq_wtquic_conn_t *c = ctx;
     struct moq_wtq_stream *ms = stream_find(c, stream_id);
 
-    if (ms == NULL)
-        return MOQ_TRANSPORT_OK; /* already gone: idempotent */
+    if (ms == NULL || ms->st == NULL)
+        return MOQ_TRANSPORT_OK; /* an actual closed callback retired it */
+    if (ms->stop_seen && ms->commit_enabled)
+        return MOQ_TRANSPORT_WOULD_BLOCK;
+    c->feed_depth++;
+    ms->borrowed++;
     wtq_result_t rc = wtq_stream_abort(ms->st, (uint32_t)error_code);
-    if (rc == WTQ_OK || rc == WTQ_ERR_STATE || rc == WTQ_ERR_CLOSED)
-        return MOQ_TRANSPORT_OK;
-    return MOQ_TRANSPORT_ERROR;
+    if (rc == WTQ_OK) ms->send_cancelled = true;
+    ms->borrowed--;
+    c->feed_depth--;
+    return map_send_rc(rc);
 }
 
 static moq_transport_result_t ep_stop_sending(void *ctx,
@@ -414,7 +495,22 @@ static moq_transport_result_t ep_close_transport(void *ctx, uint64_t code,
  * re-run; the transport-close feed itself is deferred the same way and
  * fed exactly once, outside any endpoint op.
  */
-/* Drain queued stream terminals into the bridge. Called ONLY from
+static void stream_retire_if_idle(struct moq_wtq_stream *ms);
+
+static void stream_enqueue(moq_wtquic_conn_t *c, struct moq_wtq_stream *ms,
+                            stream_event_kind_t kind, uint32_t code)
+{
+    if (c->term_count == sizeof(c->term_events) / sizeof(c->term_events[0])) {
+        c->term_overflow = true;
+        return;
+    }
+    c->term_events[c->term_count++] = (struct moq_wtq_stream_event){
+        .key = ms->id, .code = code, .kind = kind,
+    };
+    ms->pending_events++;
+}
+
+/* Drain queued stream outcomes into the bridge. Called ONLY from
  * conn_service, outside any endpoint-op/bridge-service frame. */
 static void conn_feed_terminals(moq_wtquic_conn_t *c)
 {
@@ -427,16 +523,37 @@ static void conn_feed_terminals(moq_wtquic_conn_t *c)
         return;
     }
     while (c->term_count > 0) {
-        /* FIFO; take a snapshot count so terminals enqueued by a
-         * reentrant callback during the bridge call are handled on the
-         * next pass, never lost */
+        /* Remove before feeding: a callback caused by the feed can append
+         * another event without overwriting this one. */
         size_t n = c->term_count;
-        uint64_t key = c->term_keys[0];
+        struct moq_wtq_stream_event event = c->term_events[0];
         for (size_t i = 1; i < n; i++)
-            c->term_keys[i - 1] = c->term_keys[i];
+            c->term_events[i - 1] = c->term_events[i];
         c->term_count = n - 1;
-        (void)moq_transport_bridge_on_peer_stream_terminal(c->bridge, key,
-                                                           now_us());
+        struct moq_wtq_stream *ms = stream_find(c, event.key);
+        if (ms == NULL || ms->pending_events == 0) {
+            (void)moq_transport_bridge_on_transport_error(c->bridge, 0x1,
+                                                          now_us());
+            continue;
+        }
+        if (event.kind == STREAM_EVENT_COMMITTED) {
+            /* A synchronous callback is retained until send has returned;
+             * rejected FIN cannot become a successful commitment. */
+            if (!ms->fin_sent)
+                (void)moq_transport_bridge_on_transport_error(c->bridge, 0x1,
+                                                              now_us());
+            else
+                (void)moq_transport_bridge_on_local_stream_committed(
+                    c->bridge, event.key, now_us());
+        } else if (event.kind == STREAM_EVENT_STOP) {
+            (void)moq_transport_bridge_on_peer_stop_sending(
+                c->bridge, event.key, event.code, now_us());
+        } else {
+            (void)moq_transport_bridge_on_peer_stream_terminal(
+                c->bridge, event.key, now_us());
+        }
+        ms->pending_events--;
+        stream_retire_if_idle(ms);
     }
 }
 
@@ -521,7 +638,8 @@ static void resume_paused_streams(moq_wtquic_conn_t *c)
 
 static void stream_retire_if_idle(struct moq_wtq_stream *ms)
 {
-    if (ms->st == NULL && !ms->held && ms->borrowed == 0) {
+    if (ms->st == NULL && !ms->held && ms->borrowed == 0 &&
+        ms->pending_events == 0) {
         wtq_stream_t *lease = ms->lease;
         memset(ms, 0, sizeof(*ms));
         if (lease) wtq_stream_release(lease);
@@ -580,9 +698,13 @@ static void conn_service(moq_wtquic_conn_t *c)
             c->misrouted = false;
             (void)moq_transport_bridge_on_transport_error(c->bridge, 0x2, now_us());
         }
-        conn_feed_close(c);
         conn_feed_terminals(c);
+        conn_feed_close(c);
         (void)moq_transport_bridge_service(c->bridge, now_us());
+        /* Endpoint operations may synchronously retain terminal callbacks.
+         * Feed them before invoking hooks or issuing further transport work. */
+        conn_feed_terminals(c);
+        conn_feed_close(c);
         if (c->hook != NULL) {
             c->hook(c, c->hook_user);
             /* the hook may have closed the WebTransport session (a
@@ -590,9 +712,11 @@ static void conn_service(moq_wtquic_conn_t *c)
              * bridge must learn of the terminal before it services
              * anything the hook queued, or those sends would hit the
              * closed session and read as fatal */
-            conn_feed_close(c);
             conn_feed_terminals(c);
+            conn_feed_close(c);
             (void)moq_transport_bridge_service(c->bridge, now_us());
+            conn_feed_terminals(c);
+            conn_feed_close(c);
         }
         /* After servicing (which retires cleared bridge input), resume any
          * stream whose pending has drained — otherwise a pause that clears on
@@ -622,6 +746,7 @@ static void conn_service(moq_wtquic_conn_t *c)
         }
     } while (c->service_pending || (c->close_pending && !c->close_fed) ||
              c->term_count > 0 || c->term_overflow);
+    c->stream_close_context = false;
     c->in_service = false;
 }
 
@@ -825,8 +950,11 @@ static void ev_stream_stop(wtq_session_t *s, wtq_stream_t *st,
     if (!callback_matches(c, s)) return;
     if (ms == NULL)
         return;
-    (void)moq_transport_bridge_on_peer_stop_sending(c->bridge, ms->id,
-                                                    code, now_us());
+    if (!ms->stop_seen && !ms->committed && !ms->send_cancelled) {
+        ms->stop_seen = true;
+        ms->send_cancelled = true;
+        stream_enqueue(c, ms, STREAM_EVENT_STOP, code);
+    }
     conn_service(c);
 }
 
@@ -838,21 +966,35 @@ static void ev_stream_closed(wtq_session_t *s, wtq_stream_t *st,
 
     if (!callback_matches(c, s)) return;
     if (ms != NULL) {
+        /* Retain through a deferred/reentrant service pass, not merely the
+         * callback frame: WT may defer session close until its caller unwinds. */
+        c->stream_close_context = true;
         /* ENQUEUE the backend-neutral terminal; NEVER feed the bridge
          * here -- this may run synchronously from inside an endpoint op
          * (wtq_stream_abort -> immediate on_stream_closed), and inbound
          * handlers must not be called from an endpoint op. conn_service
          * drains it later, outside that frame. */
-        if (c->term_count < MOQ_WTQ_MAX_STREAMS)
-            c->term_keys[c->term_count++] = ms->id;
-        else
-            c->term_overflow = true; /* fatal on drain; never dropped */
+        stream_enqueue(c, ms, STREAM_EVENT_CLOSED, 0);
         ms->st = NULL;
         ms->paused = false;
         stream_retire_if_idle(ms);
     }
     /* a freed stream slot may unblock a pending open (re-entrant-safe:
      * conn_service latches in_service and defers) */
+    conn_service(c);
+}
+
+static void ev_stream_committed(wtq_session_t *s, wtq_stream_t *st,
+                                void *user)
+{
+    moq_wtquic_conn_t *c = user;
+    if (!callback_matches(c, s)) return;
+    struct moq_wtq_stream *ms = stream_find_by_handle(c, st);
+    if (!ms || !ms->commit_enabled || ms->bidi || ms->committed ||
+        ms->send_cancelled || c->close_pending ||
+        (!ms->fin_sent && !ms->fin_submitting)) return;
+    ms->committed = true;
+    stream_enqueue(c, ms, STREAM_EVENT_COMMITTED, 0);
     conn_service(c);
 }
 
@@ -865,6 +1007,7 @@ static void ev_send_complete(wtq_session_t *s, void *send_ctx,
     if (!callback_matches(c, s)) return;
     (void)canceled;
     if (rec != NULL) {
+        send_rec_unlink(rec);
         if (rec->is_rcbuf)
             moq_rcbuf_decref(rec->buf);
         c->alloc.free(rec, rec->alloc_size, c->alloc.ctx);
@@ -919,6 +1062,7 @@ static const wtq_session_events_t adapter_event_table = {
     .on_send_complete = ev_send_complete,
     .on_datagram = ev_datagram,
     .on_stream_writable = ev_stream_writable,
+    .on_stream_send_committed = ev_stream_committed,
 };
 
 const wtq_session_events_t *moq_wtquic_conn_events(void)
@@ -992,6 +1136,9 @@ moq_result_t moq_wtquic_conn_create(const moq_wtquic_conn_cfg_t *cfg,
         .max_datagram_size = ep_max_datagram_size,
         .close_transport = ep_close_transport,
     };
+    if (wtq_session_send_commit_mode(c->ws) ==
+        WTQ_SEND_COMMIT_LOCAL_UNI_ACK_FIN_RESETTABLE)
+        c->ops.capabilities |= MOQ_TRANSPORT_CAP_COMMIT_REPORT;
 
     moq_transport_bridge_cfg_t bcfg;
     moq_transport_bridge_cfg_init(&bcfg, &c->alloc);
@@ -1038,6 +1185,38 @@ bool moq_wtquic_conn_is_fatal(const moq_wtquic_conn_t *c)
 bool moq_wtquic_conn_is_closed(const moq_wtquic_conn_t *c)
 {
     return c != NULL && moq_transport_bridge_is_closed(c->bridge);
+}
+
+moq_result_t moq_wtquic_conn_poll_flush(const moq_wtquic_conn_t *c)
+{
+    if (c == NULL) return MOQ_ERR_INVAL;
+    if (c->close_pending || c->teardown_sent ||
+        moq_transport_bridge_is_terminal(c->bridge))
+        return MOQ_ERR_CLOSED;
+    if (c->misrouted || c->term_overflow) return MOQ_ERR_INTERNAL;
+    if (c->ws == NULL || c->session == NULL) return MOQ_DONE;
+
+    /* Observe errors even when an upper layer retains output. Otherwise sticky
+     * loss could be hidden forever behind a pending action or send borrow. */
+    wtq_result_t rc = wtq_session_local_flush(c->ws);
+    switch (rc) {
+    case WTQ_OK:
+    case WTQ_ERR_WOULD_BLOCK: break;
+    case WTQ_ERR_STATE:       return MOQ_DONE;
+    case WTQ_ERR_CLOSED:      return MOQ_ERR_CLOSED;
+    case WTQ_ERR_UNSUPPORTED: return MOQ_ERR_UNSUPPORTED;
+    default:                 return MOQ_ERR_INTERNAL;
+    }
+    wtq_local_flush_mode_t mode = wtq_session_local_flush_mode(c->ws);
+    if (mode != WTQ_LOCAL_FLUSH_TRANSPORT && mode != WTQ_LOCAL_FLUSH_ACKNOWLEDGED)
+        return MOQ_ERR_UNSUPPORTED;
+    if (rc == WTQ_ERR_WOULD_BLOCK || c->sends != NULL ||
+        session_has_reliable_outbound_obligation(c->session) ||
+        moq_transport_bridge_has_outbound_pending(c->bridge))
+        return MOQ_DONE;
+    for (size_t i = 0; i < MOQ_WTQ_MAX_STREAMS; ++i)
+        if (c->streams[i].fin_submitting) return MOQ_DONE;
+    return MOQ_OK;
 }
 
 uint64_t moq_wtquic_conn_event_progress(const moq_wtquic_conn_t *c,

@@ -12,10 +12,11 @@
  * Current status: tracks, catalog, readiness, and the media write path are
  * live -- objects written from the app thread are enqueued in decode order
  * into a bounded, per-track sync-anchored queue and drained to the session
- * on the network thread, generating standard LOC-01 properties from the
+ * on the network thread, generating the standard LOC properties from the
  * typed fields and abandoning open subgroups wire-correctly under
- * backpressure. LOC-02 (the draft-18 KVP profile) is a coordinated
- * stack-wide future item; today everything is LOC-01.
+ * backpressure. The media companion defaults to AUTO, which follows the
+ * negotiated draft (legacy LOC-01 on drafts 16/18, LOC-04 on draft 22); an
+ * explicit companion pins one and refuses the other drafts.
  */
 
 #include <moq/types.h>
@@ -203,6 +204,71 @@ typedef struct moq_media_sender_cfg {
      * A real mutation generation always takes precedence and resets the
      * refresh cadence; no demand means no refresh. */
     uint64_t                             catalog_refresh_interval_us;
+    /* Media companion. AUTO is the default: an absent or partially covered
+     * field, and every initializer that covers it (the _sized forms), select
+     * it. A zeroed field is LEGACY_MSF01_LOC01, not AUTO.
+     *
+     * Explicit companions are fixed at creation: LEGACY_MSF01_LOC01 requires
+     * negotiated D16/18 and D22_MSF01_LOC04_PUBLIC negotiated D22. A known
+     * mismatch reports UNSUPPORTED through write/wait and stats.last_error,
+     * never endpoint/session termination.
+     *
+     * AUTO resolves once, when the sender first observes a draft-16/18/22
+     * session, to the matching companion, and then behaves exactly as that
+     * companion (any other draft is UNSUPPORTED). Nothing is published before
+     * then, so the catalog and every object follow the resolved companion.
+     * Until it resolves, AUTO differs from an explicit companion in these
+     * ways only:
+     *   - Creation reads the wallclock Group-ID base described below, and
+     *     fails as D22_MSF01_LOC04_PUBLIC does when it cannot. Objects written
+     *     before resolution are numbered from it; resolving to legacy renumbers
+     *     them from 0, before any is sent.
+     *   - add_track accepts a CMAF track without init_data. If the sender then
+     *     resolves to draft 22 with such a track still registered, it reports
+     *     UNSUPPORTED (write/wait, stats.last_error) and publishes nothing
+     *     until those tracks are removed.
+     *   - write() accepts RAW objects (explicit D22 refuses writes before
+     *     D22 is observed). A RAW object's metadata tail, when present, is
+     *     validated and kept for draft 22 (an invalid one is INVAL); its
+     *     legacy timestamp must fit the narrowest draft (see
+     *     presentation_time_us).
+     * On draft 22, an AUTO sender's RAW object written without the metadata
+     * tail is not refused: it carries LOC-04 metadata generated from the typed
+     * fields. With has_capture_time, capture_time_us is an unscaled Timestamp
+     * (Unix-epoch microseconds, LOC-04 2.3.1.1). Otherwise
+     * presentation_time_us is media time: the Timestamp goes with a Timescale
+     * of 1000000 (2.3.1.2), so a receiver reads it as application media time,
+     * not a capture clock. On video a one-byte frame marking whose I bit is
+     * is_sync is added. A track whose track_properties carry a LOC-04
+     * Timescale (or do not parse as LOC-04 metadata) would make a receiver
+     * read every object's Timestamp at that scale, so on such a track a
+     * write with has_capture_time and no metadata tail is MOQ_ERR_INVAL
+     * whenever the object may go out as draft 22: once resolved to it, or
+     * before resolution when the endpoint offers draft 22. Explicit
+     * D22_MSF01_LOC04_PUBLIC still requires the tail. On drafts 16/18 the
+     * tail is ignored, as with LEGACY.
+     *
+     * D22_MSF01_LOC04_PUBLIC also selects its MSF-01 catalog: version
+     * "draft-01"; every track's init_data in the root initDataList,
+     * referenced by initRef (no per-track initData); a CMAF track without
+     * init_data refused by add_track (CMSF-01 3.1); an added track with
+     * init_data published as a full catalog, not a delta; and each track's
+     * Group IDs (media, generated timeline and catalog) starting at the
+     * wallclock milliseconds read when the sender is created, the
+     * best-effort approach MSF-01 6.1 suggests. It keeps a restarted
+     * publisher's IDs above its predecessor's only while the clock moves
+     * forward and no instance numbers groups faster than the clock; restart
+     * identity otherwise remains the application's responsibility. Creation
+     * fails with MOQ_ERR_INTERNAL when the clock cannot be read and with
+     * MOQ_ERR_LIMIT when the reading is above the largest Group ID the
+     * library writes (2^62 - 1, its object write-path bound on every
+     * profile). Group IDs never wrap: a write that would open a group past
+     * that ID, and an add_track / remove_track / convert_to_vod / complete
+     * whose catalog change would need one, return MOQ_ERR_LIMIT without
+     * taking ownership or changing state. The legacy companion keeps its
+     * catalog and Group IDs from 0. Unknown values fail creation with
+     * MOQ_ERR_INVAL. */
+    moq_media_companion_profile_t         companion_profile;
 } moq_media_sender_cfg_t;
 
 /* Plain init leaves backpressure UNSET on purpose -- the choice is forced,
@@ -231,7 +297,8 @@ MOQ_API void moq_media_sender_cfg_init_lossless(moq_media_sender_cfg_t *cfg);
  *     cfg.publish_tracks = true;
  *
  * Each clears and stamps min(cfg_size, this library's struct size) and applies
- * its preset defaults only to fields that lie within that prefix; the nested
+ * its preset defaults (companion_profile = AUTO among them) only to fields
+ * that lie within that prefix; the nested
  * callbacks struct is initialized to the portion the caller's storage covers.
  * Safe for a caller compiled against an older, smaller header too. */
 MOQ_API void moq_media_sender_cfg_init_sized(moq_media_sender_cfg_t *cfg,
@@ -441,6 +508,27 @@ typedef struct moq_media_track_cfg {
     uint32_t    mpeg2ts_object_packets;
     uint32_t    mpeg2ts_min_group_ms;
     bool        mpeg2ts_forward_before_random_access;
+
+    /* The track's Track Properties (draft-22 §10), stated on every answer
+     * the sender gives for the track (SUBSCRIBE_OK, TRACK_STATUS_OK, the
+     * PUBLISH of a publish_tracks sender). Opaque and in the negotiated
+     * draft's encoding; a property whose type and value are both below 64
+     * encodes identically on drafts 16, 18 and 22. Copied by add_track; the
+     * session checks them when the track reaches it, and a set it refuses
+     * makes the sender fatal with MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED. Empty
+     * states none. Aligned past the MPEG2TS block on every target, so a
+     * caller's struct_size that ends at or before that block never covers
+     * it. */
+#ifdef __cplusplus
+    alignas(uint64_t)
+#else
+    _Alignas(uint64_t)
+#endif
+    moq_bytes_t track_properties;
+    /* Advertise DYNAMIC_GROUPS = 1 (draft-22 §10.6), added to
+     * track_properties: subscribers may then ask the sender to start a new
+     * group, which moq_media_sender_take_new_group_request() reports. */
+    bool        dynamic_groups;
 } moq_media_track_cfg_t;
 
 #define MOQ_MEDIA_TRACK_CFG_V0_SIZE \
@@ -541,20 +629,32 @@ typedef struct moq_media_send_object {
     bool starts_group;           /* opens a new group (closing any open one) */
     bool ends_group;             /* closes the group after this object */
     uint64_t decode_time_us;     /* advisory in v0 (order conveys decode seq) */
-    /* RAW/LOC timing. The LOC Capture Timestamp (LOC-01 2.3.1.1, wall-clock
-     * microseconds since the Unix epoch) is taken from capture_time_us when
-     * has_capture_time is true (emitted verbatim, no clamp/scale); otherwise it
-     * falls back to presentation_time_us. presentation_time_us also drives the
-     * generated SAP/media timelines. These fields are RAW/LOC-only -- for CMAF
-     * the object's timing and properties live in the passed-through `properties`
-     * block and these are ignored. For a RAW/LOC track the emitted timestamp
-     * (capture_time_us, or presentation_time_us when has_capture_time is false)
-     * MUST fit the QUIC varint / LOC encoding range (<= MOQ_QUIC_VARINT_MAX);
-     * moq_media_sender_write() rejects an out-of-range value with MOQ_ERR_INVAL
-     * (synchronously, without taking payload ownership). */
+    /* Legacy RAW/LOC timing. Every legacy RAW/LOC object carries one timestamp:
+     *   drafts 16 and 18: the LOC-01 Capture Timestamp (ID 0x02, LOC-01
+     *     2.3.1.1), wall-clock microseconds since the Unix epoch;
+     * The value is capture_time_us when has_capture_time is true (emitted
+     * verbatim, no clamp/scale); otherwise it falls back to
+     * presentation_time_us. presentation_time_us also drives the generated
+     * SAP/media timelines. These fields are RAW/LOC-only -- for CMAF the
+     * object's timing and properties live in the passed-through `properties`
+     * block and these are ignored. moq_media_sender_write() rejects, with
+     * MOQ_ERR_INVAL (synchronously, without taking payload ownership), a
+     * RAW/LOC timestamp above what the session's draft can encode
+     * (moq_loc_value_max_for_version): MOQ_QUIC_VARINT_MAX on draft 16 and
+     * before the draft is known; none on draft 18 (vi64 carries uint64).
+     * Explicit D22 RAW uses the metadata tail instead, not a capture/PTS
+     * fallback; an AUTO sender on draft 22 generates LOC-04 from these fields
+     * when the tail is absent (capture time as Unix microseconds, else
+     * presentation time with Timescale 1000000; see
+     * moq_media_sender_cfg_t.companion_profile). presentation_time_us still
+     * drives generated timelines. */
     uint64_t presentation_time_us;
-    bool has_capture_time;       /* true: emit capture_time_us as the LOC ts */
-    uint64_t capture_time_us;    /* wall-clock us since epoch (LOC Capture Timestamp) */
+    bool has_capture_time;       /* true: emit capture_time_us as the LOC
+                                    timestamp property (an AUTO sender that
+                                    may send draft 22 refuses it on a track
+                                    with a Track Properties Timescale; see
+                                    companion_profile) */
+    uint64_t capture_time_us;    /* legacy wall-clock us since epoch */
     /* OPTIONAL app-declared CMAF SAP type for this object (CMSF §3.6.1). The
      * exact SAP type 1/2/3 cannot be derived from CMAF sample flags alone
      * (it needs codec-bitstream knowledge), so the encoder declares it here.
@@ -565,7 +665,27 @@ typedef struct moq_media_send_object {
      * be SAP type 1 or 2 (§3.4). With no declaration, behavior is unchanged. */
     bool has_sap_type;
     moq_sap_type_t sap_type;
+    /* Beyond the COMPLETE old extent, including short-enum/ARM padding.
+     * D22 RAW requires a borrowed, full-sized metadata record. loc is the
+     * authoritative wire input; derived time/independence observations are
+     * not serialized. Timestamp is required; zero scale or conversion overflow
+     * is INVAL. Scale presence means application time, including scale1e6;
+     * absence means UNIX microseconds. Config spans/marking are copied into
+     * owned generated properties before transfer and charged to the queue.
+     * No caller metadata span is retained. Legacy RAW and CMAF ignore this
+     * tail. Before negotiated D22 is observed, explicit D22 writes are
+     * UNSUPPORTED; an AUTO sender's handling is described at
+     * moq_media_sender_cfg_t.companion_profile. */
+#ifdef __cplusplus
+    alignas(uint64_t)
+#else
+    _Alignas(uint64_t)
+#endif
+    const moq_media_metadata_t *metadata;
 } moq_media_send_object_t;
+
+/* Complete frozen pre-metadata input extent; old-sized writes remain legal. */
+#define MOQ_MEDIA_SEND_OBJECT_V0_SIZE offsetof(moq_media_send_object_t, metadata)
 
 /* Submit one media object in decode order. On an MPEG2TS track this is the
  * app-Object mode (mpeg2ts_app_objects): the payload must be whole source
@@ -573,7 +693,6 @@ typedef struct moq_media_send_object {
  * starts_group Object must hold a random access point; a failing Object is
  * MOQ_ERR_PROTO with no ownership taken. On a byte-stream MPEG2TS track it
  * returns MOQ_ERR_WRONG_STATE.
- *
  *
  * Objects are enqueued in decode order into one bounded queue (the
  * pre-ready bound applies before ready, the send-queue bound after) and
@@ -600,7 +719,17 @@ typedef struct moq_media_send_object {
  * MOQ_ERR_INTERRUPTED while the endpoint interrupt latch is set; the
  * caller retains ownership in both cases. MOQ_ERR_INVAL for NULL/foreign
  * track or for non-NULL `properties` on a RAW track (§7.4 -- the service
- * owns the RAW/LOC property block in v0). */
+ * owns the RAW/LOC property block in v0). Explicit D22 RAW also requires valid
+ * complete metadata (AUTO generates it from the typed fields when absent,
+ * and refuses with INVAL a capture time it cannot send as Unix time because
+ * the track's properties carry a Timescale; see companion_profile);
+ * unusable timing or invalid LOC input is INVAL, generated-property
+ * allocation failure is NOMEM. A companion/negotiated-version mismatch, or an
+ * AUTO sender blocked on draft 22 by a CMAF track without init_data, is
+ * UNSUPPORTED without transfer or endpoint/session termination. An object
+ * that would open a group after Group ID 2^62 - 1 (the library's write-path
+ * bound) is MOQ_ERR_LIMIT, without transfer; the track's open group still
+ * accepts objects. */
 MOQ_API moq_result_t moq_media_sender_write(
     moq_media_sender_t *s, moq_media_track_t *track,
     const moq_media_send_object_t *obj);
@@ -676,7 +805,16 @@ typedef struct moq_media_send_mpeg2ts {
  *                         them in *consumed, and the Object that could not
  *                         be queued stays held, as above, for the next call
  *                         once the latch clears.
- *   MOQ_ERR_UNSUPPORTED   a build without moq::mpeg2ts.
+ *   MOQ_ERR_UNSUPPORTED   a build without moq::mpeg2ts, or the companion
+ *                         refusal write() applies (a companion/negotiated-
+ *                         version mismatch, an explicit D22 companion before
+ *                         draft 22 is observed, or an AUTO sender blocked on
+ *                         draft 22; also stats.last_error). Checked before
+ *                         any byte is taken: *consumed is 0 and no kept,
+ *                         held or queued state changes. Should the session
+ *                         latch such a draft while the call has released the
+ *                         sender between Objects, the call stops there and
+ *                         *consumed reports the bytes already taken.
  *
  * Under a drop policy, when an open Group has lost queued media, the
  * packetizer's later Objects of that Group are discarded and counted
@@ -923,7 +1061,9 @@ MOQ_API bool moq_media_sender_is_ready(const moq_media_sender_t *s);
  *
  * Returns MOQ_OK (level holds / endpoint woke), MOQ_DONE (timeout with the
  * level not holding), MOQ_ERR_INTERRUPTED (endpoint latch set),
- * MOQ_ERR_CLOSED (sender or endpoint terminal), MOQ_ERR_INVAL (NULL).
+ * MOQ_ERR_CLOSED (sender or endpoint terminal), MOQ_ERR_INVAL (NULL),
+ * MOQ_ERR_UNSUPPORTED (known companion/negotiated-version mismatch, or an
+ * AUTO sender blocked on draft 22; see companion_profile).
  * PRIORITY: the latch, then terminal state, WIN over the level -- while
  * latched wait() returns MOQ_ERR_INTERRUPTED (§5.3) and once terminal it
  * returns MOQ_ERR_CLOSED, even when ready+space still holds, because
@@ -948,6 +1088,20 @@ MOQ_API size_t moq_media_sender_track_subscriptions(
 MOQ_API bool moq_media_sender_track_has_subscriber(
     const moq_media_sender_t *s, const moq_media_track_t *track);
 
+/* Take the new-group request pending on a track added with dynamic_groups:
+ * a subscriber asked for a new group (NEW_GROUP_REQUEST, draft-22 §9.20.19)
+ * with a value that warrants one -- 0, or larger than the track's current
+ * group. The Original Publisher "SHOULD end the current Group and begin a new
+ * Group as soon as practical", so write the next object as the start of a
+ * group (a sync/keyframe object with starts_group). MOQ_OK clears the request
+ * and stores its value (the largest group the subscriber knows, plus one; 0
+ * when it knows none) in *requested_group when that is non-NULL; requests
+ * that arrive before it is taken coalesce into the latest. MOQ_DONE when none
+ * is pending; MOQ_ERR_INVAL for a NULL sender or a NULL/foreign track. Safe
+ * from any thread, like the queries above. */
+MOQ_API moq_result_t moq_media_sender_take_new_group_request(
+    moq_media_sender_t *s, moq_media_track_t *track, uint64_t *requested_group);
+
 /* True if ANY app-visible media track has a subscriber -- the "should I encode
  * media?" helper. Counts user media tracks only: the internal catalog track and
  * generated SAP/media-timeline tracks are excluded, as are removed tracks. So a
@@ -957,7 +1111,7 @@ MOQ_API bool moq_media_sender_has_media_subscriber(const moq_media_sender_t *s);
 
 /* is_closed: clean close / drained. is_fatal: connect, certificate,
  * protocol, transport, or sender failure (catalog encode, setup, namespace
- * rejected or cancelled, PUBLISH rejected). fatal_code: the sender's own code
+ * rejected, cancelled or terminated, PUBLISH rejected). fatal_code: the sender's own code
  * when sender-fatal, otherwise the endpoint's. */
 MOQ_API bool     moq_media_sender_is_closed(const moq_media_sender_t *s);
 MOQ_API bool     moq_media_sender_is_fatal(const moq_media_sender_t *s);
@@ -975,6 +1129,9 @@ MOQ_API uint64_t moq_media_sender_fatal_code(const moq_media_sender_t *s);
 #define MOQ_MEDIA_SENDER_FATAL_PUBLISH_REJECTED   0x5u /* peer rejected a
                                                         catalog or media-track
                                                         PUBLISH */
+/* D22 namespace operation ended without a peer rejection/cancellation.
+ * Sender-local: does not close its shared endpoint or another sender. */
+#define MOQ_MEDIA_SENDER_FATAL_NAMESPACE_TERMINATED 0x6u
 
 #ifdef __cplusplus
 }

@@ -7,6 +7,10 @@
 #include <moq/result.hpp>
 #include <moq/session.hpp>
 
+#include <cstring>
+#include <optional>
+#include <span>
+
 namespace moq {
 
 enum class pub_accept_mode {
@@ -34,6 +38,99 @@ struct publisher_config {
     uint8_t            default_publisher_priority  = 128;
 };
 
+struct publisher_options {
+    /* Fill requests the facade can hold in flight at once; 0 selects 16.
+     * Never fewer than the session's fill pool. */
+    uint32_t           max_fills                   = 0;
+};
+
+enum class pub_namespace_terminal_kind : uint32_t {
+    rejected = MOQ_PUB_NAMESPACE_REJECTED,
+    cancelled = MOQ_PUB_NAMESPACE_CANCELLED,
+    terminated = MOQ_PUB_NAMESPACE_TERMINATED,
+};
+
+/* Namespace parts and reason are borrowed only for the native callback.
+ * The physical extent and producer stamp must cover every observed scalar. */
+struct pub_namespace_terminal_view {
+    pub_namespace_terminal_kind kind{};
+    std::span<const moq_bytes_t> namespace_parts{};
+    request_error error_code{};
+    bool can_retry = false;
+    uint64_t retry_after_ms = 0;
+    bytes_view reason{};
+    std::optional<namespace_terminal_cause> cause{};
+    std::optional<request_role> local_role{};
+    uint64_t stream_error_code = 0;
+
+    static result<pub_namespace_terminal_view> from_native(const void *data, size_t size)
+    {
+        if (!data || size < sizeof(uint32_t)) return errc::abi_mismatch;
+        uint32_t stamped = 0;
+        std::memcpy(&stamped, data, sizeof(stamped));
+        size_t n = size < stamped ? size : stamped;
+        if (n < MOQ_PUB_NAMESPACE_TERMINAL_INFO_V0_SIZE) return errc::abi_mismatch;
+        moq_pub_namespace_terminal_info_t c{};
+        std::memcpy(&c, data, n < sizeof(c) ? n : sizeof(c));
+        if (c.kind == MOQ_PUB_NAMESPACE_TERMINATED &&
+            n < offsetof(moq_pub_namespace_terminal_info_t, stream_error_code) + sizeof(c.stream_error_code))
+            return errc::abi_mismatch;
+        pub_namespace_terminal_view v;
+        v.kind = static_cast<pub_namespace_terminal_kind>(c.kind);
+        v.namespace_parts = {c.namespace_.parts, c.namespace_.count};
+        if (c.kind == MOQ_PUB_NAMESPACE_TERMINATED) {
+            v.cause = static_cast<namespace_terminal_cause>(c.cause);
+            v.local_role = static_cast<request_role>(c.local_role);
+            v.stream_error_code = c.stream_error_code;
+        } else {
+            v.error_code = request_error_from_c(c.error_code);
+            v.can_retry = c.can_retry;
+            v.retry_after_ms = c.retry_after_ms;
+            v.reason = bytes_view(c.reason);
+        }
+        return v;
+    }
+};
+
+/* A stable, caller-owned observer. It and ctx must outlive the publisher;
+ * do not move it or mutate it during a callback. Callbacks must not reenter
+ * libmoq. Moving the publisher itself does not move this context. */
+/* A subscriber asked for a new group on a track that advertises
+ * DYNAMIC_GROUPS, with a value that warrants one (draft-22 §9.20.19): the
+ * value it sent (0: it knows no group) and the track's current group, when
+ * the track has published one. */
+struct pub_new_group_request_view {
+    uint64_t                requested_group = 0;
+    std::optional<uint64_t> current_group   = {};
+
+    static result<pub_new_group_request_view> from_native(const void *data, size_t size)
+    {
+        if (!data || size < sizeof(uint32_t)) return errc::abi_mismatch;
+        uint32_t stamped = 0;
+        std::memcpy(&stamped, data, sizeof(stamped));
+        size_t n = size < stamped ? size : stamped;
+        if (n < offsetof(moq_pub_new_group_request_info_t, current_group) +
+                sizeof(uint64_t))
+            return errc::abi_mismatch;
+        moq_pub_new_group_request_info_t c{};
+        std::memcpy(&c, data, n < sizeof(c) ? n : sizeof(c));
+        pub_new_group_request_view v;
+        v.requested_group = c.requested_group;
+        if (c.has_current_group) v.current_group = c.current_group;
+        return v;
+    }
+};
+
+struct publisher_observer {
+    void *ctx = nullptr;
+    void (*on_namespace_terminal)(void *, result<pub_namespace_terminal_view>) noexcept = nullptr;
+    void (*on_new_group_request)(void *, publisher_track,
+                                 result<pub_new_group_request_view>) noexcept = nullptr;
+    /* The session-wide GOAWAY's New Session URI, borrowed for the call
+     * (empty: reconnect to the current URI). */
+    void (*on_goaway)(void *, std::span<const uint8_t>) noexcept = nullptr;
+};
+
 struct pub_track_config {
     namespace_name ns;
     bytes_view     track;
@@ -41,6 +138,10 @@ struct pub_track_config {
     bool           has_publisher_priority   = false;
     uint8_t        publisher_priority      = 128;
     uint64_t       max_retained_bytes      = 0;  // retained-group budget; 0 = 1 MiB
+    /* The track's Track Properties in the session's encoding, stated on
+     * every answer for it; dynamic_groups adds DYNAMIC_GROUPS = 1. */
+    bytes_view     track_properties        = {};
+    bool           dynamic_groups          = false;
 };
 
 // One object of a retained catalog group (origin-local Joining-FETCH cache).
@@ -77,6 +178,10 @@ public:
     publisher() noexcept : p_(nullptr) {}
 
     static result<publisher> create(session &s, publisher_config cfg = {});
+    static result<publisher> create(session &s, publisher_config cfg,
+                                     const publisher_options &options);
+    static result<publisher> create_observed(session &s, publisher_observer &observer,
+        publisher_config cfg = {}, const publisher_options &options = {});
 
     ~publisher()
     {
@@ -121,6 +226,8 @@ public:
         c.has_publisher_priority = cfg.has_publisher_priority;
         c.publisher_priority     = cfg.publisher_priority;
         c.max_retained_bytes     = cfg.max_retained_bytes;
+        c.track_properties       = cfg.track_properties.raw();
+        c.dynamic_groups         = cfg.dynamic_groups;
 
         moq_pub_track_t *t = nullptr;
         auto rc = moq_pub_add_track(p_, &c, now, &t);
@@ -266,6 +373,20 @@ public:
         return moq_pub_has_subscriber(p_, track.raw());
     }
 
+    /* Where the track's publication went when a REDIRECT or a GOAWAY on its
+     * request stream ended it; nullopt when it did not end by migration. */
+    result<std::optional<request_migration>> get_track_migration(
+        publisher_track track) const
+    {
+        moq_request_migration_t m;
+        auto rc = moq_pub_get_track_migration(p_, track.raw(), &m, sizeof(m));
+        if (rc == MOQ_DONE)
+            return std::optional<request_migration>{};
+        if (rc < 0)
+            return errc_from_result(rc);
+        return std::optional<request_migration>{migration_from_c(m)};
+    }
+
     bool is_draining() const noexcept
     {
         return moq_pub_is_draining(p_);
@@ -279,16 +400,57 @@ public:
 
 inline result<publisher> publisher::create(session &s, publisher_config cfg)
 {
+    return create(s, cfg, publisher_options{});
+}
+
+inline result<publisher> publisher::create(session &s, publisher_config cfg,
+                                            const publisher_options &options)
+{
     moq_pub_cfg_t c;
-    moq_pub_cfg_init(&c);
+    /* Sized init: max_fills is past the frozen prefix. */
+    moq_pub_cfg_init_sized(&c, sizeof(c));
     c.accept_mode                 = static_cast<moq_pub_accept_mode_t>(cfg.accept_mode);
     c.default_publisher_priority  = cfg.default_publisher_priority;
+    c.max_fills                   = options.max_fills;
 
     moq_publisher_t *p = nullptr;
     auto alloc = cfg.alloc ? cfg.alloc : moq_alloc_default();
     auto rc = moq_pub_create(s.raw(), alloc, &c, &p);
     if (rc < 0)
         return errc_from_result(rc);
+    return publisher(p);
+}
+
+inline result<publisher> publisher::create_observed(session &s, publisher_observer &observer,
+    publisher_config cfg, const publisher_options &options)
+{
+    moq_pub_cfg_t c;
+    moq_pub_cfg_init_sized(&c, sizeof(c));
+    c.accept_mode = static_cast<moq_pub_accept_mode_t>(cfg.accept_mode);
+    c.default_publisher_priority = cfg.default_publisher_priority;
+    c.max_fills = options.max_fills;
+    c.callbacks.ctx = &observer;
+    c.callbacks.on_namespace_terminal = [](void *ctx, const moq_pub_namespace_terminal_info_t *info) {
+        auto &o = *static_cast<publisher_observer *>(ctx);
+        if (o.on_namespace_terminal)
+            o.on_namespace_terminal(o.ctx, pub_namespace_terminal_view::from_native(info, info->struct_size));
+    };
+    c.on_new_group_request_ctx = &observer;
+    c.on_new_group_request = [](void *ctx, moq_pub_track_t *track,
+                                const moq_pub_new_group_request_info_t *info) {
+        auto &o = *static_cast<publisher_observer *>(ctx);
+        if (o.on_new_group_request)
+            o.on_new_group_request(o.ctx, publisher_track(track),
+                pub_new_group_request_view::from_native(info, info->struct_size));
+    };
+    c.on_goaway = [](void *ctx, moq_bytes_t uri) {
+        auto &o = *static_cast<publisher_observer *>(ctx);
+        if (o.on_goaway)
+            o.on_goaway(o.ctx, std::span<const uint8_t>(uri.data, uri.len));
+    };
+    moq_publisher_t *p = nullptr;
+    auto rc = moq_pub_create(s.raw(), cfg.alloc ? cfg.alloc : moq_alloc_default(), &c, &p);
+    if (rc < 0) return errc_from_result(rc);
     return publisher(p);
 }
 

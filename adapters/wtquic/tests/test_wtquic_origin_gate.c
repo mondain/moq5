@@ -47,6 +47,7 @@
 #include "moq/wtquic_msquic_managed.h"
 #include "wtquic/session.h"
 #include "wtquic/wtquic_msquic.h"
+#include "wtq_loopback_port.h"
 
 
 /* -- per-row client state -------------------------------------------------- */
@@ -490,7 +491,6 @@ native_server_create(void *ctx, const origin_row_t *row, void **out)
     cfg.alloc = moq_alloc_default();
     cfg.perspective = MOQ_PERSPECTIVE_SERVER;
     cfg.host = n->bind_address;
-    cfg.port = 0;                       /* ephemeral; _port() reports it */
     cfg.cert_path = n->cert;
     cfg.key_path = n->key;
     cfg.wt_path = "/moq";
@@ -506,7 +506,7 @@ native_server_create(void *ctx, const origin_row_t *row, void **out)
     cfg.max_connections = 4;
     cfg.on_lane_pump = server_pump;
     cfg.on_lane_pump_user = n;
-    if (moq_wtquic_msquic_managed_create(&cfg, &m) != MOQ_OK) {
+    if (wtqt_managed_server_create(&cfg, &m) != MOQ_OK) {
         return -1;
     }
     *out = m;

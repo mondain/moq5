@@ -626,11 +626,22 @@ int main(void)
                               (int)MOQ_OK);
         MOQ_TEST_CHECK(got_subscribe_request(s));
         MOQ_TEST_CHECK_EQ_SIZE(ctx.refused, 0);
-        (void)feed_subscribe(s, 5, 0xC065, "five");
+        /* The ledger's first range table cannot be allocated: the request is
+         * refused with NOMEM, nothing is recorded, the session stays up, and
+         * the request dispatches when it is fed again with memory available. */
+        MOQ_TEST_CHECK_EQ_INT((int)feed_subscribe(s, 5, 0xC065, "five"),
+                              (int)MOQ_ERR_NOMEM);
         MOQ_TEST_CHECK_EQ_SIZE(ctx.refused, 1);
-        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_CLOSED);
-        MOQ_TEST_CHECK_EQ_U64(poll_close_code(s), 0x1);
+        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
         MOQ_TEST_CHECK(!got_subscribe_request(s));
+        /* The refusal released the staging slot; the transport host keeps the
+         * refused bytes and feeds them again. */
+        MOQ_TEST_CHECK_EQ_INT(slot_state_for(s, moq_stream_ref_from_u64(0xC065)), -1);
+        ctx.fail_alloc_size = 0;
+        MOQ_TEST_CHECK_EQ_INT((int)feed_subscribe(s, 5, 0xC065, "five"),
+                              (int)MOQ_OK);
+        MOQ_TEST_CHECK(got_subscribe_request(s));
+        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
         moq_session_destroy(s);
     }
     {
@@ -646,11 +657,19 @@ int main(void)
             s->profile->commit_inbound_request(s, &ep);
         }
         ctx.fail_realloc_size = 16 * 2 * sizeof(uint64_t);
-        (void)s->profile->validate_inbound_request_stream(
-            s, moq_stream_ref_from_u64(0xE109), MOQ_D18_SUBSCRIBE, 36, &ep);
+        /* Growing the full range table fails: a retryable refusal that leaves
+         * the ledger and the session untouched; the same request validates
+         * once the growth succeeds. */
+        MOQ_TEST_CHECK_EQ_INT((int)s->profile->validate_inbound_request_stream(
+            s, moq_stream_ref_from_u64(0xE109), MOQ_D18_SUBSCRIBE, 36, &ep),
+            (int)MOQ_ERR_NOMEM);
         MOQ_TEST_CHECK_EQ_SIZE(ctx.refused, 1);
-        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_CLOSED);
-        MOQ_TEST_CHECK_EQ_U64(poll_close_code(s), 0x1);
+        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
+        ctx.fail_realloc_size = 0;
+        MOQ_TEST_CHECK_EQ_INT((int)s->profile->validate_inbound_request_stream(
+            s, moq_stream_ref_from_u64(0xE109), MOQ_D18_SUBSCRIBE, 36, &ep),
+            (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_SIZE(ctx.refused, 1);
         moq_session_destroy(s);
     }
     {

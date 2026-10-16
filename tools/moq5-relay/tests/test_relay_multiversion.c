@@ -11,9 +11,12 @@
  * draft; peers on the other draft are refused at the TLS handshake with the
  * no_application_protocol alert (RFC 9001 Section 8.1, QUIC error 0x178).
  *
- * This pins the capability: ONE listener endpoint accepts both a draft-18 and
- * a draft-16 client, and each connection is bound to the exact draft that was
- * negotiated for it -- never a permissive cross-draft decode.
+ * This pins the capability: ONE listener endpoint accepts a draft-18, a
+ * draft-16 and a draft-22 client, and each connection is bound to the exact
+ * draft that was negotiated for it -- never a permissive cross-draft decode.
+ * The draft-22 connection additionally proves the facade bound its session
+ * to the transport before starting it: unbound, that profile never reaches
+ * ESTABLISHED.
  */
 
 #include <stdatomic.h>
@@ -22,6 +25,7 @@
 #include <string.h>
 
 #include <moq/msquic_managed.h>
+#include "msq_loopback_port.h"
 
 #include "config.h"
 #include "conn_reap.h"
@@ -191,17 +195,16 @@ run_endpoint(const char *cert, const char *key, uint32_t lanes)
     moqr_cli_config_t rcfg;
     char cerr[256];
     const char *json =
-        "{\"listener\":{\"port\":4433,\"versions\":[18,16]}}";
+        "{\"listener\":{\"port\":4433,\"versions\":[18,16,22]}}";
     MV_CHECK(moqr_cli_config_parse(json, strlen(json), &rcfg, cerr,
                                    sizeof(cerr)) == MOQR_OK);
-    MV_CHECK(rcfg.version_count == 2);
+    MV_CHECK(rcfg.version_count == 3);
 
     moq_msquic_managed_cfg_t scfg;
     moq_msquic_managed_cfg_init_sized(&scfg, sizeof(scfg));
     scfg.alloc = moq_alloc_default();
     scfg.perspective = MOQ_PERSPECTIVE_SERVER;
     scfg.host = "127.0.0.1";
-    scfg.port = 0;   /* ephemeral: the listener port is not what is under test */
     scfg.cert_path = cert;
     scfg.key_path = key;
     /* The same request-capacity grant both production serve paths set; without
@@ -211,11 +214,12 @@ run_endpoint(const char *cert, const char *key, uint32_t lanes)
     scfg.streaming_objects = true;
     moqr_cli_apply_versions(&rcfg, &scfg);   /* the production mapping */
     MV_CHECK(scfg.version == 0);
-    MV_CHECK(scfg.version_count == 2);
+    MV_CHECK(scfg.version_count == 3);
     MV_CHECK(scfg.versions != NULL);
-    if (scfg.versions != NULL && scfg.version_count == 2) {
+    if (scfg.versions != NULL && scfg.version_count == 3) {
         MV_CHECK(scfg.versions[0] == MOQ_VERSION_DRAFT_18);
         MV_CHECK(scfg.versions[1] == MOQ_VERSION_DRAFT_16);
+        MV_CHECK(scfg.versions[2] == MOQ_VERSION_DRAFT_22);
     }
     scfg.lane_count = lanes;
     scfg.max_connections = 4;
@@ -235,7 +239,7 @@ run_endpoint(const char *cert, const char *key, uint32_t lanes)
     scfg.on_lane_pump_user = &rctx;
 
     moq_msquic_managed_t *server = NULL;
-    MV_CHECK(moq_msquic_managed_create(&scfg, &server) == MOQ_OK);
+    MV_CHECK(msqt_server_create(&scfg, &server) == MOQ_OK);
     if (server == NULL) {
         /* A listener that cannot start is a NAMED failure, and it must not
          * strand the shards this function already created. */
@@ -247,18 +251,21 @@ run_endpoint(const char *cert, const char *key, uint32_t lanes)
 
     mv_client_ctx_t k18 = { "mv18", "cam", 0, 0, 0, 0, 0 };
     mv_client_ctx_t k16 = { "mv16", "cam", 0, 0, 0, 0, 0 };
+    mv_client_ctx_t k22 = { "mv22", "cam", 0, 0, 0, 0, 0 };
     moq_msquic_managed_t *c18 = mk_client_ctl(MOQ_VERSION_DRAFT_18, port, &k18);
     moq_msquic_managed_t *c16 = mk_client_ctl(MOQ_VERSION_DRAFT_16, port, &k16);
+    moq_msquic_managed_t *c22 = mk_client_ctl(MOQ_VERSION_DRAFT_22, port, &k22);
+    moq_msquic_managed_t *clients[3] = { c18, c16, c22 };
     MV_CHECK(c18 != NULL);
     MV_CHECK(c16 != NULL);
-    if (c18 == NULL || c16 == NULL) {
-        /* Report and unwind: every later step dereferences both clients, so a
+    MV_CHECK(c22 != NULL);
+    if (c18 == NULL || c16 == NULL || c22 == NULL) {
+        /* Report and unwind: every later step dereferences the clients, so a
          * failed creation must end this arm rather than crash in it. */
-        for (int i = 0; i < 2; i++) {
-            moq_msquic_managed_t *c = (i == 0) ? c18 : c16;
-            if (c != NULL) {
-                (void)moq_msquic_managed_stop(c);
-                moq_msquic_managed_destroy(c);
+        for (int i = 0; i < 3; i++) {
+            if (clients[i] != NULL) {
+                (void)moq_msquic_managed_stop(clients[i]);
+                moq_msquic_managed_destroy(clients[i]);
             }
         }
         (void)moq_msquic_managed_stop(server);
@@ -267,26 +274,30 @@ run_endpoint(const char *cert, const char *key, uint32_t lanes)
         return 1;
     }
 
-    /* Bounded wait for both connections to land AND for each client's
+    /* Bounded wait for every connection to land AND for each client's
      * PUBLISH_NAMESPACE to be answered by the relay. */
     for (int waited = 0; waited < 300; waited++) {   /* bounded, never a hang */
-        if (moq_msquic_managed_conn_count(server) >= 2 &&
-            atomic_load(&k18.accepted) >= 1 && atomic_load(&k16.accepted) >= 1) {
+        if (moq_msquic_managed_conn_count(server) >= 3 &&
+            atomic_load(&k18.accepted) >= 1 && atomic_load(&k16.accepted) >= 1 &&
+            atomic_load(&k22.accepted) >= 1) {
             break;
         }
         (void)moq_msquic_managed_wait(server, 50 * 1000);
     }
 
     size_t accepted = moq_msquic_managed_conn_count(server);
-    bool f18 = (c18 != NULL) && moq_msquic_managed_is_fatal(c18);
-    bool f16 = (c16 != NULL) && moq_msquic_managed_is_fatal(c16);
+    bool f18 = moq_msquic_managed_is_fatal(c18);
+    bool f16 = moq_msquic_managed_is_fatal(c16);
+    bool f22 = moq_msquic_managed_is_fatal(c22);
     fprintf(stderr,
             "endpoint(lanes=%u): accepted=%zu d18_fatal=%d(code=%llu) "
-            "d16_fatal=%d(code=%llu)\n",
+            "d16_fatal=%d(code=%llu) d22_fatal=%d(code=%llu)\n",
             lanes, accepted, (int)f18,
-            (unsigned long long)(c18 ? moq_msquic_managed_fatal_code(c18) : 0),
+            (unsigned long long)moq_msquic_managed_fatal_code(c18),
             (int)f16,
-            (unsigned long long)(c16 ? moq_msquic_managed_fatal_code(c16) : 0));
+            (unsigned long long)moq_msquic_managed_fatal_code(c16),
+            (int)f22,
+            (unsigned long long)moq_msquic_managed_fatal_code(c22));
 
     /* The draft-18 client is the side the current single-ALPN listener
      * already serves; it must keep working. */
@@ -295,39 +306,48 @@ run_endpoint(const char *cert, const char *key, uint32_t lanes)
      * that supports both drafts it must NOT be refused at the handshake
      * (RFC 9001 Section 8.1 would otherwise give 0x178). */
     MV_CHECK(!f16);
-    MV_CHECK(accepted == 2);
+    /* The draft-22 client's session cannot start unbound; a completed
+     * exchange proves the facade bound it at CONNECTED. */
+    MV_CHECK(!f22);
+    MV_CHECK(accepted == 3);
     /* Each accepted connection is pinned to the draft ALPN selected for it,
      * and that selection is immutable for the connection's life. */
     MV_CHECK(moq_msquic_managed_negotiated_version(c18) ==
              MOQ_VERSION_DRAFT_18);
     MV_CHECK(moq_msquic_managed_negotiated_version(c16) ==
              MOQ_VERSION_DRAFT_16);
+    MV_CHECK(moq_msquic_managed_negotiated_version(c22) ==
+             MOQ_VERSION_DRAFT_22);
 
     /* A real control exchange reached relay bind/core on BOTH exact profiles:
      * each client's PUBLISH_NAMESPACE was authorized and answered exactly once,
      * with no cancellation. */
     fprintf(stderr,
             "  control(lanes=%u): d18 est=%d req=%d acc=%d err=%d rc=%d | "
-            "d16 est=%d req=%d acc=%d err=%d rc=%d\n",
+            "d16 est=%d req=%d acc=%d err=%d rc=%d | "
+            "d22 est=%d req=%d acc=%d err=%d rc=%d\n",
             lanes, atomic_load(&k18.established), atomic_load(&k18.requested),
             atomic_load(&k18.accepted), atomic_load(&k18.errors),
             atomic_load(&k18.last_rc),
             atomic_load(&k16.established), atomic_load(&k16.requested),
             atomic_load(&k16.accepted), atomic_load(&k16.errors),
-            atomic_load(&k16.last_rc));
+            atomic_load(&k16.last_rc),
+            atomic_load(&k22.established), atomic_load(&k22.requested),
+            atomic_load(&k22.accepted), atomic_load(&k22.errors),
+            atomic_load(&k22.last_rc));
     MV_CHECK(atomic_load(&k18.established) == 1);
     MV_CHECK(atomic_load(&k16.established) == 1);
+    MV_CHECK(atomic_load(&k22.established) == 1);
     MV_CHECK(atomic_load(&k18.accepted) == 1);
     MV_CHECK(atomic_load(&k16.accepted) == 1);
+    MV_CHECK(atomic_load(&k22.accepted) == 1);
     MV_CHECK(atomic_load(&k18.errors) == 0);
     MV_CHECK(atomic_load(&k16.errors) == 0);
+    MV_CHECK(atomic_load(&k22.errors) == 0);
 
-    for (int i = 0; i < 2; i++) {
-        moq_msquic_managed_t *c = (i == 0) ? c18 : c16;
-        if (c != NULL) {
-            (void)moq_msquic_managed_stop(c);
-            moq_msquic_managed_destroy(c);
-        }
+    for (int i = 0; i < 3; i++) {
+        (void)moq_msquic_managed_stop(clients[i]);
+        moq_msquic_managed_destroy(clients[i]);
     }
     /* QUIESCENCE BEFORE DESTRUCTION. Destroying the shards would reclaim
      * anything still held, so the drain has to be asserted while the relay is
@@ -395,7 +415,8 @@ main(int argc, char **argv)
     (void)run_endpoint(argv[1], argv[2], 1);
     (void)run_endpoint(argv[1], argv[2], 2);
     if (g_failures == 0) {
-        printf("PASS: one endpoint served moqt-18 and moqt-16 (lanes 1 and 2)\n");
+        printf("PASS: one endpoint served moqt-18, moqt-16 and moqt-22 "
+               "(lanes 1 and 2)\n");
     }
     return g_failures;
 }

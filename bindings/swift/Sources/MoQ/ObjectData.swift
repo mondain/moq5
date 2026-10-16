@@ -59,11 +59,18 @@ public struct ObjectConfiguration {
     public var objectID: UInt64
     public var payload: Buffer
     public var properties: Buffer?
+    /// Prior Group ID Gap / Prior Object ID Gap (draft-22 §10.8, §10.9),
+    /// added to `properties`; the subgroup must carry object properties.
+    public var priorGroupGap: UInt64?
+    public var priorObjectGap: UInt64?
 
-    public init(objectID: UInt64, payload: Buffer, properties: Buffer? = nil) {
+    public init(objectID: UInt64, payload: Buffer, properties: Buffer? = nil,
+                priorGroupGap: UInt64? = nil, priorObjectGap: UInt64? = nil) {
         self.objectID = objectID
         self.payload = payload
         self.properties = properties
+        self.priorGroupGap = priorGroupGap
+        self.priorObjectGap = priorObjectGap
     }
 }
 
@@ -82,6 +89,16 @@ public struct ReceivedObject {
     public let isDatagram: Bool
     public let payload: Buffer?
     public let properties: Buffer?
+    /// The subgroup header set FIRST_OBJECT and this is the first object its
+    /// stream carried: the first object ever published in the subgroup.
+    /// False on later objects, datagrams, and drafts without the bit.
+    public let firstObject: Bool
+    /// The Prior Group ID Gap / Prior Object ID Gap Object Properties as
+    /// received (draft-22 §10.8, §10.9); nil when absent.
+    public let priorGroupGap: UInt64?
+    public let priorObjectGap: UInt64?
+    /// The subgroup header carried PROPERTIES (false for a datagram).
+    public let subgroupProperties: Bool
 }
 
 extension ReceivedObject: Equatable {
@@ -94,6 +111,10 @@ extension ReceivedObject: Equatable {
         lhs.status == rhs.status &&
         lhs.endOfGroup == rhs.endOfGroup &&
         lhs.isDatagram == rhs.isDatagram &&
+        lhs.firstObject == rhs.firstObject &&
+        lhs.priorGroupGap == rhs.priorGroupGap &&
+        lhs.priorObjectGap == rhs.priorObjectGap &&
+        lhs.subgroupProperties == rhs.subgroupProperties &&
         lhs.payload === rhs.payload &&
         lhs.properties === rhs.properties
     }

@@ -37,9 +37,9 @@ endif()
 if(MOQ_BUILD_TESTS)
     add_executable(test_cmaf
         tests/test_cmaf.c
-        ${CMAKE_SOURCE_DIR}/tests/support/media_builders.c)
+        ${PROJECT_SOURCE_DIR}/tests/support/media_builders.c)
     target_include_directories(test_cmaf PRIVATE
-        ${CMAKE_SOURCE_DIR}/tests/support)
+        ${PROJECT_SOURCE_DIR}/tests/support)
     target_link_libraries(test_cmaf PRIVATE moq::cmaf)
     add_test(NAME cmaf COMMAND test_cmaf)
 endif()

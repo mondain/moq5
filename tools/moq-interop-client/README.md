@@ -56,7 +56,7 @@ moq-interop-client --relay moqt://relay.example.com:4443 --test setup-only
 # Run the whole suite (no --test / TESTCASE): one TAP line per case.
 moq-interop-client --relay moqt://relay.example.com:4443
 
-# Pin the offered draft to 16 or 18 (default: auto-negotiate, offer all):
+# Pin the offered draft to 16, 18 or 22 (default: auto-negotiate, offer all):
 moq-interop-client --relay moqt://relay:4443 --draft 18
 
 # With TLS verification disabled (for test relays with self-signed certs):
@@ -68,8 +68,8 @@ RELAY_URL=moqt://relay:4443 TESTCASE=setup-only MOQT_DRAFT=16 TLS_DISABLE_VERIFY
 
 CLI flags override environment variables. With no test named (neither `--test`
 nor `TESTCASE`) the client runs every case and exits 0 as long as it ran;
-per-case pass/fail is in the TAP. `--draft` / `MOQT_DRAFT` must be exactly `16`
-or `18`.
+per-case pass/fail is in the TAP. `--draft` / `MOQT_DRAFT` must be exactly `16`,
+`18` or `22`.
 
 ## Backend selection (testing)
 
@@ -83,7 +83,7 @@ cross-checks the name against the URL scheme and rejects a mismatch up front:
 |---|---|---|
 | `auto` | raw QUIC + WebTransport | picoquic family (default) |
 | `picoquic` | raw QUIC + WebTransport | |
-| `msquic` | raw QUIC only | exact-version — pin `--draft 16`/`18` (a single ALPN) |
+| `msquic` | raw QUIC only | exact-version — pin `--draft 16`, `18` or `22` (a single ALPN) |
 | `mvfst` | raw QUIC only | exact-version; when compiled in |
 | `proxygen` | WebTransport only | when compiled in |
 | `wtquic-msquic` | WebTransport only | WebTransport over MsQuic (cross-platform) |
@@ -146,7 +146,7 @@ docker run --rm \
 
 ## URL format
 
-- `moqt://host:port` — raw QUIC (ALPN `moqt-16` / `moqt-18`, negotiated)
+- `moqt://host:port` — raw QUIC (ALPN `moqt-16` / `moqt-18` / `moqt-22`, negotiated)
 - `moqt://[::1]:port` — IPv6 literal
 - `https://host:port/path` — WebTransport with an explicit CONNECT path
 - `https://host:port` — WebTransport at `/`, for relays that mount the root
@@ -204,3 +204,60 @@ ok 1 - unknown-test # SKIP unknown test case
 | `subscribe-error` | Implemented |
 | `announce-subscribe` | Implemented |
 | `subscribe-before-announce` | Implemented |
+
+## Named-only case: `object-relay` (opaque object conformance)
+
+`object-relay` runs only when named (`--test object-relay`), never in the run-all
+suite, because it needs a relay that forwards Objects. It opens two
+connections to the relay:
+
+1. The publisher announces a namespace unique to the run
+   (`moq-test/object-relay/<pid>-<clock>`).
+2. The subscriber subscribes to `orl-track` in that namespace through the relay.
+3. The publisher accepts the forwarded SUBSCRIBE. Once the subscriber holds
+   SUBSCRIBE_OK, the publisher writes 3 groups of 4 Objects, each group a
+   subgroup that it closes with a FIN.
+4. The publisher ends the subscription with PUBLISH_DONE TRACK_ENDED.
+
+**What the subscriber checks:** every Object's group, subgroup and Object ID,
+its status, its length and every payload byte, against a sequence derived only
+from (group, object). Every payload length is distinct and nonzero. Also
+required:
+
+- each subgroup's FIN comes after that group's tail;
+- the PUBLISH_DONE comes after all of them;
+- no duplicate, extra, missing or reordered Object.
+
+Every wait is bounded, and a timeout is a failure. The TAP names the
+negotiated draft and transport for both connections.
+
+**Scope:** the payloads are opaque bytes. A pass says nothing about catalog
+discovery, codecs or playback.
+
+**Fault injection:** `MOQ_INTEROP_OBJECT_RELAY_FAULT=corrupt-byte|drop-object|extra-object`
+makes the publisher deviate from the sequence. The subscriber's unchanged
+verifier must then fail step 7. The verifier also has a hermetic unit test
+(`interop_object_relay_verify`).
+
+`MOQ_INTEROP_OBJECT_RELAY_DONE_DELAY_MS=N` is diagnostic. It holds the
+publisher's PUBLISH_DONE back by N ms after the last FIN, which separates a
+relay that ends its downstream before forwarding the tail from a tail that was
+never sent. A passing run never sets it.
+
+**Running it against an owned relay:**
+`scripts/run_object_relay.sh` starts one `moq5-relay` on loopback with:
+
+- a fresh CA and server certificate;
+- free ports;
+- both listeners offering drafts 22, 18 and 16.
+
+It runs the case for each requested draft over raw QUIC and WebTransport, and
+stops the relay. The client trusts only the run's CA, through `SSL_CERT_FILE`,
+with verification on.
+
+```
+tools/moq-interop-client/scripts/run_object_relay.sh \
+    --relay-bin build/tools/moq5-relay/moq5-relay \
+    --client-bin build/tools/moq-interop-client/moq-interop-client \
+    --out object-relay-run --drafts "22 18" --faults
+```

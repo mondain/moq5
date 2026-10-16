@@ -52,6 +52,7 @@
 #include "auth.h"
 #include "wire_codes.h"
 #include "log.h"
+#include <moq/location.h>
 #include "trace.h"
 #include "types.h"
 
@@ -83,10 +84,21 @@ typedef uint32_t moqr_filter_type_t;
 #define MOQR_FILTER_LARGEST_OBJECT   2u  /* wire 0x2 */
 #define MOQR_FILTER_ABSOLUTE_START   3u  /* wire 0x3 */
 #define MOQR_FILTER_ABSOLUTE_RANGE   4u  /* wire 0x4 */
+/* The current group from its first object: {Largest Object.Group, 0}, open-
+ * ended. No draft-16/18 wire form; it is the draft-22 relative Location
+ * Filter at StartGroup=1 (the relative form at 0 is NEXT_GROUP_START). */
+#define MOQR_FILTER_CURRENT_GROUP_START 5u
+/* A start `start_group` groups before the Next Group, open-ended:
+ * {Largest Object.Group + 1 - start_group, 0}, clamped at group 0 -- the
+ * draft-22 relative Location Filter at any StartGroup (0 is
+ * NEXT_GROUP_START's start, 1 CURRENT_GROUP_START's). start_object is
+ * ignored. */
+#define MOQR_FILTER_RELATIVE_START   6u
 
 typedef struct moqr_filter {
     moqr_filter_type_t type;
-    uint64_t           start_group;     /* ABSOLUTE_* only                */
+    uint64_t           start_group;     /* ABSOLUTE_*; RELATIVE_START: the
+                                         * relative StartGroup              */
     uint64_t           start_object;    /* ABSOLUTE_* only                */
     uint64_t           end_group_delta; /* ABSOLUTE_RANGE only            */
 } moqr_filter_t;
@@ -142,7 +154,8 @@ typedef struct moqr_intent {
     uint64_t           cookie;          /* caller correlation (request)    */
     uint64_t           binding_cookie;  /* which session this targets      */
     moqr_sub_t         sub;             /* ACCEPT_SUB / SUB_DONE           */
-    moqr_track_t       track;           /* UPSTREAM_* / ACCEPT_PUBLISH     */
+    moqr_track_t       track;           /* UPSTREAM_* / ACCEPT_PUBLISH /
+                                         * TRACK_STATUS_OK                 */
     uint64_t           track_gen;       /* upstream identity guard         */
     bool               has_largest;
     uint64_t           largest_group;
@@ -271,13 +284,13 @@ MOQR_CORE_API moqr_result_t moqr_core_create(const moqr_core_relay_cfg_t *cfg,
 MOQR_CORE_API void moqr_core_destroy(moqr_core_t *core);
 
 /* Advance virtual time: fires linger deadlines, ages logs, frees tracks past
- * the warm idle bound. */
+ * the warm idle bound, resumes or times out held rendezvous subscriptions. */
 MOQR_CORE_API moqr_result_t moqr_core_tick(moqr_core_t *core, uint64_t now_us);
 
 /*
- * The earliest now_us at which moqr_core_tick has time-driven work: a pull
- * track's upstream linger expiring, or a reclaimable track reaching
- * warm_idle_us (0 when a reclaimable track still needs the tick that arms
+ * The earliest now_us at which moqr_core_tick has time-driven work: a held
+ * rendezvous subscription's deadline, a pull track's upstream linger
+ * expiring, or a reclaimable track reaching warm_idle_us (0 when a reclaimable track still needs the tick that arms
  * its idle clock). UINT64_MAX = none. Pure; same clock domain as the now_us
  * the caller passes to tick. A runtime that sleeps while idle folds this into
  * its wake deadline so retention bounds hold without traffic.
@@ -317,6 +330,18 @@ MOQR_CORE_API void moqr_core_set_epochs(moqr_core_t *core, uint64_t node_epoch,
 MOQR_CORE_API moqr_result_t moqr_core_binding_open(moqr_core_t *core,
                                      uint64_t session_cookie,
                                      moqr_binding_t *out);
+
+/* Initialize min(options_size, sizeof current), stamp bytes initialized and
+ * default flags to zero. NULL or fewer than 4 bytes leaves storage untouched.
+ * The open call accepts a frozen 8-byte prefix, not sizeof a future layout.
+ * NULL/default options retain binding_open's property-less direct-source
+ * behavior. Unknown flags or a short prefix return INVAL before pool/trace
+ * mutation and leave output unchanged. No existing public layout grows. */
+MOQR_CORE_API void moqr_binding_options_init_sized(
+    moqr_binding_options_t *options, size_t options_size);
+MOQR_CORE_API moqr_result_t moqr_core_binding_open_with_options(
+    moqr_core_t *core, uint64_t session_cookie,
+    const moqr_binding_options_t *options, moqr_binding_t *out);
 
 /* Retires everything the binding owns: subscriptions (cursors),
  * announcements (with NS_GONE fan-out), namespace subscriptions, pending
@@ -361,6 +386,24 @@ typedef struct moqr_park_req {
     uint64_t                 sub_end_group_delta;
     uint8_t                  sub_priority;
     uint32_t                 sub_group_order;
+    /* Appended: the SUBSCRIBE asked for Forward State 0, so the subscription
+     * it resumes into must not forward until an update turns it on. False is
+     * the default (forwarding), so a request that never sets it keeps the
+     * behavior of the layout before it. The struct carries no struct_size, so
+     * the field is reached only through moqr_core_park_sized() and
+     * moqr_core_auth_begin_resolve_sized(), which take the caller's size;
+     * moqr_core_park() and moqr_core_auth_begin_resolve() read and write the
+     * layout through sub_group_order and never touch it. */
+    bool                     sub_forward_off;
+    /* Appended: the SUBSCRIBE asked to wait for a publisher (draft-22
+     * RENDEZVOUS_TIMEOUT). sub_rendezvous_deadline_us is the one absolute
+     * deadline the binding computed at the request's first receipt, so a
+     * resume after deferred authorization keeps it. Read and written only
+     * through the _sized calls when req_size covers sub_rendezvous; the
+     * deadline comes first so that neither sits in the tail padding of the
+     * layout through sub_forward_off. */
+    uint64_t                 sub_rendezvous_deadline_us;
+    bool                     sub_rendezvous;
 } moqr_park_req_t;
 
 /* Park a DEFERred request under external ticket `ext_ticket` (nonzero). Deep-
@@ -379,6 +422,15 @@ typedef struct moqr_park_req {
  * requests sharing a ticket. */
 MOQR_CORE_API moqr_result_t moqr_core_park(moqr_core_t *core, const moqr_park_req_t *req,
                              uint64_t ext_ticket, uint64_t now_us);
+/* Park with the size of the caller's moqr_park_req_t (sizeof, for a caller
+ * built against this header): fields past it read as their defaults.
+ * moqr_core_park() is this with the layout through sub_group_order.
+ * MOQR_ERR_INVAL, with no state change, for a req_size below that layout. */
+MOQR_CORE_API moqr_result_t moqr_core_park_sized(moqr_core_t *core,
+                                                 const moqr_park_req_t *req,
+                                                 size_t req_size,
+                                                 uint64_t ext_ticket,
+                                                 uint64_t now_us);
 
 /* Begin resolving a parked ticket. `result` is the async verifier's outcome
  * (decision + reason + wire error_code + lease). Validates the ticket (0 /
@@ -399,6 +451,15 @@ MOQR_CORE_API moqr_result_t moqr_core_auth_begin_resolve(moqr_core_t *core,
                                            uint64_t now_us,
                                            moqr_auth_verdict_t *verdict,
                                            moqr_park_req_t *view);
+/* Begin a resolve into a view of the caller's size (sizeof, for a caller
+ * built against this header): the library writes min(view_size, its own
+ * sizeof) bytes and nothing past them. moqr_core_auth_begin_resolve() is
+ * this with the layout through sub_group_order. MOQR_ERR_INVAL (verdict left
+ * DENY, nothing pinned) for a view_size below that layout. */
+MOQR_CORE_API moqr_result_t moqr_core_auth_begin_resolve_sized(
+    moqr_core_t *core, uint64_t ext_ticket, const moqr_auth_verdict_t *result,
+    uint64_t now_us, moqr_auth_verdict_t *verdict, moqr_park_req_t *view,
+    size_t view_size);
 
 /* Finish a resolve started by begin_resolve: unpin + free the entry. No-op if
  * the ticket is not currently pinned. After this the external ticket is no
@@ -451,6 +512,14 @@ MOQR_CORE_API moqr_result_t moqr_core_grant_commit(moqr_core_t *core, moqr_grant
 /* Abort a reservation whose op failed: frees the copied material. No-op if the
  * reservation is stale. */
 MOQR_CORE_API void moqr_core_grant_abort(moqr_core_t *core, moqr_grant_res_t res);
+
+/* Free the committed grant of the op (binding_cookie, session_cookie) -- an
+ * announce whose authorization an accepted update replaced -- so a later
+ * recheck cannot act on authorization that no longer applies. A grant already
+ * revoked and awaiting its cancel is kept. No-op when none matches. */
+MOQR_CORE_API void moqr_core_grant_release(moqr_core_t *core,
+                                           uint64_t binding_cookie,
+                                           uint64_t session_cookie);
 
 /* Retire every grant owned by `binding_cookie` (called from binding close):
  * frees copied bytes; a later scheduled recheck can no longer touch it. */
@@ -532,6 +601,205 @@ MOQR_CORE_API moqr_result_t moqr_core_ns_subscribe(moqr_core_t *core, moqr_bindi
 MOQR_CORE_API moqr_result_t moqr_core_ns_unsubscribe(moqr_core_t *core, moqr_binding_t b,
                                        uint64_t cookie);
 
+/*
+ * Replace a namespace subscription's prefix (a draft-22 update, §9.5.2), in
+ * two steps around the update's acceptance on the wire (the acceptance is
+ * the barrier at which the new prefix takes effect):
+ *  - prepare does everything that can fail -- MOQR_ERR_STALE_HANDLE for an
+ *    unknown (binding, cookie), MOQR_ERR_CAPACITY when the new prefix does not
+ *    fit the name-byte budget, MOQR_ERR_NOMEM, MOQR_ERR_WOULD_BLOCK when the
+ *    intent ring cannot take the NS_FOUND fan-out -- and on MOQR_OK holds the
+ *    new prefix and that intent room in *prep, changing nothing else;
+ *  - commit installs it and cannot fail for want of memory or intent room:
+ *    the new prefix governs every later NS_FOUND / NS_GONE; announces it
+ *    matches that the old prefix did not are reported with NS_FOUND; queued
+ *    NS_FOUND / NS_GONE intents for the subscription that have not been polled
+ *    are re-expressed against the new prefix (`value`), or withdrawn when
+ *    their namespace lies outside it. Namespaces both prefixes match are not
+ *    reported again; one only the old prefix matched is not reported as gone
+ *    (the subscriber drops it at the same barrier). MOQR_ERR_STALE_HANDLE
+ *    when the subscription ended since (the prep is released);
+ *  - abort releases a prepared update that will not be committed.
+ * A prepared update must be committed or aborted before any other core call
+ * on the binding.
+ */
+typedef struct moqr_ns_update_prep {
+    bool           staged;
+    moqr_binding_t binding;
+    uint64_t       cookie;
+    uint8_t       *prefix_buf;   /* owned until commit or abort */
+    uint32_t       prefix_len;
+    uint32_t       intents;      /* intent room held for the fan-out */
+} moqr_ns_update_prep_t;
+MOQR_CORE_API moqr_result_t moqr_core_ns_update_prepare(moqr_core_t *core,
+    moqr_binding_t b, uint64_t cookie, moqr_ns_t prefix,
+    moqr_ns_update_prep_t *prep);
+MOQR_CORE_API moqr_result_t moqr_core_ns_update_commit(moqr_core_t *core,
+    moqr_ns_update_prep_t *prep);
+MOQR_CORE_API void moqr_core_ns_update_abort(moqr_core_t *core,
+    moqr_ns_update_prep_t *prep);
+
+/* -- Track discovery (draft-22 SUBSCRIBE_TRACKS, §3.6, §7.6, §9.18) -------- *
+ * A binding's track subscription asks for a PUBLISH for every track the relay
+ * knows under a namespace prefix -- now and as tracks appear. The core keeps
+ * the interest and which (subscription, track source generation) pairs have
+ * been offered; the binding pulls the next unoffered match, authorizes it,
+ * sends the PUBLISH (or PUBLISH_SKIPPED) and reports the outcome. Bounded by
+ * max_ns_subs track subscriptions (an independent pool from the namespace
+ * subscriptions) and the name-byte budget for their prefixes. */
+
+typedef struct moqr_tracks_req {
+    uint32_t           struct_size;
+    moqr_ns_t          prefix;            /* borrowed for the call           */
+    uint64_t           cookie;            /* the binding's wire handle       */
+    bool               forward;           /* FORWARD of the PUBLISHes        */
+    bool               include_properties;
+    moqr_group_order_t group_order;       /* MOQR_GROUP_ORDER_*              */
+    /* Appended: nothing is offered until moqr_core_tracks_answered says the
+     * request's acceptance is on the wire (§3.6: a PUBLISH follows the
+     * REQUEST_OK). */
+    bool               held;
+} moqr_tracks_req_t;
+
+/* Clears and stamps min(req_size, sizeof current); defaults forward and
+ * include_properties to true. */
+MOQR_CORE_API void moqr_tracks_req_init_sized(moqr_tracks_req_t *req,
+                                              size_t req_size);
+
+/* MOQR_ERR_STALE_HANDLE (binding), MOQR_ERR_INVAL (malformed prefix or a
+ * duplicate cookie on the binding), MOQR_ERR_CAPACITY (pool or name bytes;
+ * counted as MOQR_REFUSE_NS_SUBS / _NAME_BYTES), MOQR_ERR_NOMEM. No intents. */
+MOQR_CORE_API moqr_result_t moqr_core_tracks_subscribe(moqr_core_t *core,
+                                         moqr_binding_t b,
+                                         const moqr_tracks_req_t *req);
+
+/* A held track subscription's acceptance is on the wire: its matches are
+ * offered from now on. MOQR_ERR_STALE_HANDLE for an unknown one. */
+MOQR_CORE_API moqr_result_t moqr_core_tracks_answered(moqr_core_t *core,
+    moqr_binding_t b, uint64_t cookie);
+
+/* Changes affect only future offers (§9.5.2, §9.20.18): PREFIX replaces the
+ * prefix; FORWARD replaces the FORWARD of later PUBLISHes; TOKENS says the
+ * authorization tokens changed, so every match whose authorization was
+ * decided, declined or still pending under the old tokens is decided again
+ * under the new ones (input_gen advances; a verdict for the old tokens is
+ * stale). Prepared and committed around the update's acceptance as
+ * moqr_core_ns_update_prepare / _commit / _abort: prepare holds the new
+ * prefix's bytes, commit cannot fail for want of memory. */
+#define MOQR_TRACKS_UPDATE_PREFIX  0x01u
+#define MOQR_TRACKS_UPDATE_FORWARD 0x02u
+#define MOQR_TRACKS_UPDATE_TOKENS  0x04u
+typedef struct moqr_tracks_update_prep {
+    bool           staged;
+    moqr_binding_t binding;
+    uint64_t       cookie;
+    uint32_t       flags;
+    bool           forward;
+    uint8_t       *prefix_buf;   /* owned until commit or abort (PREFIX) */
+    uint32_t       prefix_len;
+} moqr_tracks_update_prep_t;
+MOQR_CORE_API moqr_result_t moqr_core_tracks_update_prepare(moqr_core_t *core,
+    moqr_binding_t b, uint64_t cookie, uint32_t flags, moqr_ns_t prefix,
+    bool forward, moqr_tracks_update_prep_t *prep);
+MOQR_CORE_API moqr_result_t moqr_core_tracks_update_commit(moqr_core_t *core,
+    moqr_tracks_update_prep_t *prep);
+MOQR_CORE_API void moqr_core_tracks_update_abort(moqr_core_t *core,
+    moqr_tracks_update_prep_t *prep);
+
+/* Ends the interest only: PUBLISHes already sent are untouched (§3.6). */
+MOQR_CORE_API moqr_result_t moqr_core_tracks_unsubscribe(moqr_core_t *core,
+                                           moqr_binding_t b, uint64_t cookie);
+
+/* One unoffered match: a track with a live source whose namespace the
+ * subscription's prefix matches, excluding tracks the binding itself sources
+ * (§3.6). Views BORROW core storage until the next mutating core call. */
+typedef struct moqr_discovery {
+    uint32_t           struct_size;       /* written: the size filled in     */
+    uint64_t           cookie;            /* the track subscription          */
+    moqr_track_t       track;
+    uint64_t           track_gen;         /* the source generation offered   */
+    moqr_ns_t          ns;                /* views ns_parts                  */
+    moq_bytes_t        ns_parts[32];
+    moq_bytes_t        name;
+    uint32_t           prefix_count;      /* PUBLISH_SKIPPED suffix start    */
+    bool               forward;
+    bool               include_properties;
+    moqr_group_order_t group_order;
+    bool               has_largest;
+    uint64_t           largest_group;
+    uint64_t           largest_object;
+    /* Appended: the subscriber's authorization for this track was already
+     * decided (MOQR_DISCOVERY_ALLOWED after a deferral): offer it without
+     * asking again. Written only when out_size covers it. */
+    bool               authorized;
+    /* Appended: the generation of the track subscription's authorization
+     * inputs (its tokens) this match is decided under; reported back with
+     * the outcome. Written only when out_size covers it. */
+    uint32_t           input_gen;
+} moqr_discovery_t;
+
+/* The complete first layout; a later field is appended past it. */
+#define MOQR_DISCOVERY_V0_SIZE \
+    (offsetof(moqr_discovery_t, largest_object) + sizeof(uint64_t))
+
+/* MOQR_OK with *out filled, MOQR_DONE when nothing is unoffered, or
+ * MOQR_ERR_STALE_HANDLE. The same match is returned until it is reported.
+ * out_size is the caller's sizeof(moqr_discovery_t); fields past it are not
+ * written, and struct_size reports the size filled in. MOQR_ERR_INVAL for an
+ * out_size below MOQR_DISCOVERY_V0_SIZE. */
+MOQR_CORE_API moqr_result_t moqr_core_next_discovery(moqr_core_t *core,
+                                       moqr_binding_t b,
+                                       moqr_discovery_t *out,
+                                       size_t out_size);
+
+/* The outcome of an offered match, for that source generation only (a new
+ * PUBLISH from the source is a new generation, §3.6.3). OFFERED: a PUBLISH was
+ * sent. SKIPPED: PUBLISH_SKIPPED was sent, never followed by a PUBLISH for
+ * that generation. DECLINED: not authorized; nothing sent, offered again
+ * after a token update. SUPPRESSED (set by the core): a SUBSCRIBE this binding
+ * held for the track was resolved by its PUBLISH instead (§7.6). */
+#define MOQR_DISCOVERY_OFFERED    1u
+#define MOQR_DISCOVERY_SKIPPED    2u
+#define MOQR_DISCOVERY_DECLINED   3u
+#define MOQR_DISCOVERY_SUPPRESSED 4u
+/* PENDING: its authorization was deferred; it is not returned again until
+ * the verdict is reported -- ALLOWED (returned once more, `authorized` set)
+ * or DECLINED. An outcome reported for an older input_gen, or for a source
+ * generation that is no longer the track's, is MOQR_ERR_STALE_HANDLE and
+ * changes nothing. */
+#define MOQR_DISCOVERY_PENDING    5u
+#define MOQR_DISCOVERY_ALLOWED    6u
+MOQR_CORE_API moqr_result_t moqr_core_discovery_done(moqr_core_t *core,
+                                       moqr_binding_t b, uint64_t cookie,
+                                       moqr_track_t track, uint64_t track_gen,
+                                       uint32_t input_gen, uint32_t outcome);
+
+/* The prefix in effect of a binding's namespace subscription (tracks false)
+ * or track subscription (tracks true): views into core storage, written to
+ * `parts` (parts_cap entries) and valid until the next mutating core call.
+ * MOQR_ERR_STALE_HANDLE for an unknown (binding, cookie). Pure. */
+MOQR_CORE_API moqr_result_t moqr_core_subscription_prefix(moqr_core_t *core,
+    moqr_binding_t b, uint64_t cookie, bool tracks, moq_bytes_t *parts,
+    size_t parts_cap, moqr_ns_t *out);
+
+/* -- Request tokens ---------------------------------------------------------- *
+ * The authorization tokens a binding's long-lived request (an announce, a
+ * namespace or track subscription) currently carries, deep-copied, so an
+ * update without tokens is authorized against the ones in effect (§9.5: an
+ * omitted parameter keeps its value) and discovery authorizes each track with
+ * them. Keyed by (binding, cookie); retired with the binding. Bytes are
+ * charged to the name-byte budget; at most 2 * max_ns_subs + max_ns_nodes
+ * entries. */
+MOQR_CORE_API moqr_result_t moqr_core_request_tokens_set(moqr_core_t *core,
+    moqr_binding_t b, uint64_t cookie, const moqr_auth_token_t *tokens,
+    size_t token_count);
+/* Borrowed until the next mutating core call. MOQR_DONE when none. */
+MOQR_CORE_API moqr_result_t moqr_core_request_tokens_get(moqr_core_t *core,
+    moqr_binding_t b, uint64_t cookie, const moqr_auth_token_t **tokens,
+    size_t *token_count);
+MOQR_CORE_API void moqr_core_request_tokens_clear(moqr_core_t *core,
+    moqr_binding_t b, uint64_t cookie);
+
 /* -- Downstream subscribe ------------------------------------------------------ */
 
 typedef struct moqr_subscribe_req {
@@ -548,9 +816,60 @@ typedef struct moqr_subscribe_req {
      * the binding carries the request's forward bit here so a subscription
      * created paused is never scheduled (and so never retired for it). */
     bool               forward;
+    /* Reserved, never read: it fills the tail padding after `forward`, so
+     * range_end_holds starts at or past the sizeof of the layout that ends at
+     * `forward` -- a struct_size that caller passes never covers it. */
+    uint32_t           _reserved_range_end_holds;
+    /* Appended (prefix-safe; absent means false): what reaching the end of a
+     * bounded filter range does to the subscription. false retires it with
+     * PUBLISH_DONE SUBSCRIPTION_ENDED once every in-range record has been
+     * delivered (the draft-16/18 contract). true keeps it established and
+     * idle -- nothing further is scheduled for it, the track stays demanded,
+     * and only the subscriber or a track end finishes it -- which is what a
+     * draft-22 subscription requires: its publisher does not end it because
+     * Largest Object advanced past the end of its Location Filter. */
+    bool               range_end_holds;
+    /* Preserve the complete prior extent, including its uint64_t alignment
+     * padding on ILP32. This field is never read. */
+    uint32_t           _reserved_location;
+    /* Whole-pointer gated, borrowed for the call and copied on success.
+     * Non-NULL selects the semantic filter instead of `filter`, including
+     * NONE (unfiltered). NULL preserves the legacy admission behavior. */
+    const moq_location_filter_cfg_t *location;
+    /* Appended: wait for a publisher when none is known (draft-22
+     * RENDEZVOUS_TIMEOUT, §9.20.6). With rendezvous true and neither a track
+     * nor an announced publisher, the subscription is held -- no ACCEPT_SUB,
+     * no REJECT_SUB -- until an announce or a PUBLISH supplies a source (then
+     * ordinary admission resumes, never an early accept) or moqr_core_tick
+     * reaches rendezvous_deadline_us (REJECT_SUB with TIMEOUT). The one
+     * absolute deadline is the binding's: it is never renewed here. A held
+     * subscription takes a track slot and a subscription slot like any
+     * other. False keeps the immediate REJECT_SUB DOES_NOT_EXIST. The
+     * deadline comes first so that no part of the pair sits in the tail
+     * padding of the layout through location; both are read only when
+     * struct_size covers rendezvous. */
+    uint64_t                         rendezvous_deadline_us;
+    bool                             rendezvous;
+    /* Appended: take a subscription slot reserved earlier by the same-build
+     * binding (consumed when the request succeeds, held again when it
+     * fails). */
+    bool                             reserved;
 } moqr_subscribe_req_t;
 
+/*
+ * The symbol clears and stamps the layout through `forward` -- the struct as a
+ * caller built before range_end_holds was appended holds it -- and sets the
+ * defaults (Largest Object filter, subscriber priority 128, forward), so it
+ * never writes past such a caller's storage. A caller built against this
+ * header reaches the whole struct: the function-like macro below passes its
+ * sizeof to moqr_subscribe_req_init_sized(), which clears and stamps
+ * min(req_size, sizeof current) and sets the same defaults.
+ */
 MOQR_CORE_API void moqr_subscribe_req_init(moqr_subscribe_req_t *req);
+MOQR_CORE_API void moqr_subscribe_req_init_sized(moqr_subscribe_req_t *req,
+                                                 size_t req_size);
+#define moqr_subscribe_req_init(req) \
+    moqr_subscribe_req_init_sized((req), sizeof(*(req)))
 
 /*
  * Get-or-create + coalescing (REGISTRY semantics):
@@ -568,6 +887,14 @@ MOQR_CORE_API moqr_result_t moqr_core_subscribe(moqr_core_t *core, moqr_binding_
 
 MOQR_CORE_API moqr_result_t moqr_core_unsubscribe(moqr_core_t *core, moqr_sub_t sub,
                                     uint64_t now_us);
+
+/* The live subscription a binding made with `cookie` (moqr_subscribe_req_t),
+ * answered or not -- so a request withdrawn before its answer, such as a
+ * SUBSCRIBE held for a publisher, can be ended with moqr_core_unsubscribe.
+ * MOQR_ERR_STALE_HANDLE when there is none. Pure. */
+MOQR_CORE_API moqr_result_t moqr_core_sub_find(const moqr_core_t *core,
+                                               moqr_binding_t b, uint64_t cookie,
+                                               moqr_sub_t *out);
 
 /*
  * Set a live subscription's downstream Forward state (draft §10.2.12: a
@@ -591,6 +918,46 @@ MOQR_CORE_API moqr_result_t moqr_core_unsubscribe(moqr_core_t *core, moqr_sub_t 
  */
 MOQR_CORE_API moqr_result_t moqr_core_sub_set_forward(moqr_core_t *core, moqr_sub_t sub,
                                         bool forward, uint64_t now_us);
+
+/*
+ * Replace a live subscription's filter (a subscription update that carries a
+ * new Location Filter). The new filter is resolved exactly as the request's
+ * own would be: against the track's Largest Object when the subscription is
+ * active, or remembered and resolved at upstream acceptance while it is still
+ * parked. On an active subscription the window applies to what its cursor has
+ * not yet passed: a start at or above the current one narrows delivery from
+ * there on, the end is replaced freely (a subscription idle at the end of a
+ * bounded range resumes when the new window extends it, and a bounded window
+ * already passed completes as usual), and a start below the current one keeps
+ * the current one -- records the cursor passed, delivered or consumed below
+ * the former start, are never revisited (re-sending them would also break
+ * the ascending object order of an open downstream subgroup stream). A
+ * subscriber that lowers its start retrieves Objects at or below Largest
+ * Object through a fill or a FETCH, which this relay serves from the same
+ * retained log. Records already written outside the new window are not
+ * recalled. Same argument contract as moqr_core_subscribe for `filter`
+ * (MOQR_ERR_INVAL for an unknown type or an overflowing ABSOLUTE_RANGE);
+ * MOQR_ERR_STALE_HANDLE for a retired, unknown or foreign subscription.
+ */
+MOQR_CORE_API moqr_result_t moqr_core_sub_set_filter(moqr_core_t *core, moqr_sub_t sub,
+                                       const moqr_filter_t *filter,
+                                       uint64_t now_us);
+
+/* Replace the semantic Location Filter, copied before return (also while
+ * parked). Active relative/Next Object filters resolve against current Largest;
+ * parked filters resolve on upstream acceptance. NONE removes the constraint,
+ * not delivery history: delivered or previously excluded retained records are
+ * never replayed, but new arrivals can pass even below Largest. Begun objects
+ * retain their completion/reset obligation. An unbegun held delivery excluded
+ * by the replacement is released, as with Forward=0. Inclusive object ends and
+ * equal-group empty ranges are supported without end+1 arithmetic.
+ * NULL, a record shorter than the 48-byte v0 floor, an unknown kind or reversed
+ * group bounds return INVAL before effects; stale/foreign handles return
+ * STALE_HANDLE. NOMEM leaves the subscription untouched. This does not change
+ * moqr_core_sub_set_filter's legacy monotonic-start contract. */
+MOQR_CORE_API moqr_result_t moqr_core_sub_set_location_filter(
+    moqr_core_t *core, moqr_sub_t sub,
+    const moq_location_filter_cfg_t *location, uint64_t now_us);
 
 /*
  * Checkpoint the exact absolute chunk count the bind has emitted downstream for
@@ -623,6 +990,61 @@ MOQR_CORE_API moqr_result_t moqr_core_delivery_note_emitted(moqr_core_t *core,
  */
 MOQR_CORE_API moqr_result_t moqr_core_sub_track(moqr_core_t *core, moqr_sub_t sub,
                                   moqr_track_t *track, uint64_t *track_gen);
+
+/*
+ * Resolve a full retained-track handle in any live state (PENDING, ACTIVE or
+ * WARM) and return its current source generation. NULL core/output is INVAL;
+ * an invalid, retired or replaced handle is STALE_HANDLE. Failure leaves the
+ * output unchanged. Pure O(1) owner-lane observation: no allocation, time
+ * advance, mutation, intents, borrowed storage or lifetime pin. A changed
+ * source generation does not mean the retained identity was retired. Handles
+ * must belong to this core; numeric handle tags are not cross-core identity.
+ */
+MOQR_CORE_API moqr_result_t moqr_core_track_current_generation(
+    const moqr_core_t *core, moqr_track_t track, uint64_t *out_track_gen);
+
+/* Resolve retained SOURCE metadata provenance, not the downstream binding's
+ * flag. Managed remains true through detach, WARM, failover and rejoin; only
+ * a new retained identity/log initializes it again from its selected source.
+ * NULL core/output is INVAL; a dead/replaced full handle is STALE_HANDLE.
+ * Failure leaves output unchanged. Pure O(1) owner-lane query, no allocation,
+ * mutation, intents or pin. False alone is not proof of an available reply:
+ * source admission and any explicit metadata obligation still apply. */
+MOQR_CORE_API moqr_result_t moqr_core_track_metadata_managed(
+    const moqr_core_t *core, moqr_track_t track, bool *out_managed);
+
+/*
+ * A live track's full identity: its Track Namespace parts and Track Name,
+ * as BORROWED views into core-interned storage, valid until the next
+ * mutating core call. The parts are written into the caller's `parts`
+ * array (`parts_cap` entries) and `ns` is set to view them; MOQR_ERR_CAPACITY
+ * when the namespace has more parts than fit (nothing written). The
+ * generation guard matches moqr_core_sub_track: MOQR_ERR_STALE_HANDLE for a
+ * retired track or a stale `track_gen`. Pure -- no mutation, no intents --
+ * so a consumer holding only a subscription (through moqr_core_sub_track)
+ * can name the track to the retained-log fetch path.
+ */
+MOQR_CORE_API moqr_result_t moqr_core_track_key(const moqr_core_t *core, moqr_track_t track,
+                                  uint64_t track_gen, moq_bytes_t *parts,
+                                  size_t parts_cap, moqr_ns_t *ns,
+                                  moq_bytes_t *name);
+
+/*
+ * A live track's Largest Object as this core knows it: the larger of the
+ * Largest its upstream reported on acceptance and the greatest Location
+ * ingested on it. An Object counts from its first byte: an in-progress
+ * record (moqr_core_ingest with MOQR_OBJ_OPEN) is the Largest Object while
+ * it is the greatest, so the Largest can name an Object still arriving.
+ * *has_largest is false while there is neither. The generation
+ * guard matches moqr_core_track_key. Pure -- no mutation, no intents -- so
+ * a binding can state the relay's Largest to a session that answers for it.
+ */
+MOQR_CORE_API moqr_result_t moqr_core_track_largest(const moqr_core_t *core,
+                                                    moqr_track_t track,
+                                                    uint64_t track_gen,
+                                                    bool *has_largest,
+                                                    uint64_t *largest_group,
+                                                    uint64_t *largest_object);
 
 /* A live subscription's delivery state: PARKED (awaiting upstream
  * resolution) or ACTIVE (serving from a track log). */
@@ -700,9 +1122,10 @@ MOQR_CORE_API moqr_result_t moqr_core_ingest(moqr_core_t *core, moqr_track_t tra
                                const moqr_log_append_desc_t *desc);
 
 /* Chunk-through ingest: a NORMAL object may be admitted incrementally.
- * moqr_core_ingest with desc->obj_state == MOQR_OBJ_OPEN opens the record (does
- * NOT advance the track largest); then append its payload slices and either
- * complete it (advances largest) or abandon it. All address the OPEN record by
+ * moqr_core_ingest with desc->obj_state == MOQR_OBJ_OPEN opens the record, and
+ * the track's Largest Object advances to it then, on its first byte; then
+ * append its payload slices and either complete it or abandon it (neither
+ * moves the Largest back). All address the OPEN record by
  * (group, subgroup, object) -- the identity every OBJECT_CHUNK carries. Errors
  * mirror the log's OPEN-record APIs (STALE_HANDLE / WRONG_STATE / TOO_OLD /
  * INVAL / CAPACITY). The log increfs `chunk`; the caller keeps its ref. */
@@ -724,7 +1147,8 @@ MOQR_CORE_API moqr_result_t moqr_core_abandon_record(moqr_core_t *core, moqr_tra
 /* Relay-defined subgroup-reset codes for terminals that carry no peer reset
  * code (moq_session_reset_subgroup takes a u64 application code). A genuine
  * upstream RESET forwards the publisher's code instead of these. */
-#define MOQR_RESET_CODE_EVICTED  0x1001u  /* truncated by capacity eviction   */
+#define MOQR_RESET_CODE_EVICTED  0x1001u  /* truncated by capacity eviction or
+                                            * a refused ingest               */
 #define MOQR_RESET_CODE_STOPPED  0x1002u  /* upstream STOP terminal, no code   */
 
 /* Seal a subgroup on `track`: the upstream subgroup stream (group_id,
@@ -950,8 +1374,11 @@ MOQR_CORE_API moqr_result_t moqr_core_delivery_chunk(moqr_core_t *core, moqr_bin
  *
  * Scope: standalone only; ASCENDING only; NORMAL records only (status-only
  * records are skipped); FULLY-RETAINED ranges only (a start below the eviction
- * horizon is refused). No gap markers, no joining fetch, no chunk-through — those
- * are future work; the seams here don't change for them.
+ * horizon is refused). Gaps inside the range are passed over silently unless the
+ * request sets report_gaps (and report_unknown), which surfaces them as items
+ * for the caller to mark.
+ * No joining fetch, no chunk-through — those are future work; the seams here
+ * don't change for them.
  */
 typedef struct moqr_fetch { uint64_t _opaque; } moqr_fetch_t;
 
@@ -963,6 +1390,14 @@ typedef struct moqr_fetch { uint64_t _opaque; } moqr_fetch_t;
 
 MOQR_CORE_API bool moqr_fetch_is_valid(moqr_fetch_t h);
 MOQR_CORE_API bool moqr_fetch_eq(moqr_fetch_t a, moqr_fetch_t b);
+
+/* The parts of a fetch range stated relative to the track's Largest Object
+ * {lg, lo} (moqr_fetch_req_t.range_form), resolved by moqr_core_fetch_open
+ * against the core's own Largest in the same call that plans the range. */
+#define MOQR_FETCH_START_RELATIVE    0x1u  /* start {lg + 1 - relative_start, 0},
+                                            * clamped at group 0               */
+#define MOQR_FETCH_START_NEXT_OBJECT 0x2u  /* start {lg, lo + 1}                */
+#define MOQR_FETCH_END_AT_LARGEST    0x4u  /* end at {lg, lo}, inclusive        */
 
 /* Fetch request. start/end are RAW WIRE: [start .. end) with end_object == 0
  * meaning "the whole end_group" (draft-16/18 End Location encoding). */
@@ -977,9 +1412,61 @@ typedef struct moqr_fetch_req {
     moqr_group_order_t group_order;    /* ASCENDING only (DEFAULT == ASC)  */
     uint8_t            subscriber_priority;
     uint64_t           cookie;         /* caller correlation               */
+    /* Appended (prefix-safe; absent means false): report the Locations inside
+     * the range that the log does not hold but has evidence for as
+     * MOQR_FETCH_ITEM_GAP items instead of passing over them silently. A gap
+     * is a run of Locations within a retained group's extent (at or below the
+     * greatest id any record of the group carries) that no record accounts
+     * for -- a status object there is a known non-object and is skipped; an
+     * abandoned record counts as not held, and an Object still arriving is
+     * waited for, not reported (see report_pending). Locations
+     * past a group's extent, and groups the log never saw, carry no
+     * evidence either way and are not reported as gaps. */
+    bool               report_gaps;
+    /* Appended (prefix-safe; absent means false; read only with
+     * report_gaps): also report the Locations inside the range the log has
+     * no evidence about as MOQR_FETCH_ITEM_UNKNOWN items -- the Locations
+     * past the extent of a group whose final object is not known
+     * (moqr_log_group_final), every Location of a group the log never
+     * saw, and every Object retained past the source's MAX_CACHE_DURATION
+     * (expired from the cache: never served, and not known not to exist). A Location past a known group final does not exist and is never
+     * reported, so with both flags set every Location of the range is
+     * accounted for: served, reported, or known not to exist. It sits in the
+     * tail padding after report_gaps, so the sizeof is unchanged;
+     * moqr_fetch_req_init clears it. */
+    bool               report_unknown;
+    /* Appended (prefix-safe; absent means zero): with
+     * MOQR_FETCH_START_RELATIVE, the start's distance in groups before the
+     * group after the Largest Object (0 is that next group, 1 the Largest
+     * Object's own group). */
+    uint64_t           relative_start;
+    /* Appended (prefix-safe; absent means 0): MOQR_FETCH_* bits naming the
+     * parts of the range stated relative to the track's Largest Object; the
+     * start_* (end_*) fields are ignored for a part a bit names. The range
+     * resolves against the Largest Object when the fetch is opened, and is
+     * then checked against it exactly as an explicit one is: no Largest, or
+     * a start past it, is INVALID_RANGE, and the plan's End is the resolved
+     * end. */
+    uint32_t           range_form;
+    /* Appended (prefix-safe; absent means false): report an Object still
+     * arriving at the cursor as a MOQR_FETCH_ITEM_PENDING item instead of
+     * answering MOQR_ERR_WOULD_BLOCK until it is whole. */
+    bool               report_pending;
 } moqr_fetch_req_t;
 
+/*
+ * The symbol clears and stamps the layout through `cookie` -- the struct as a
+ * caller built before report_gaps was appended holds it -- so it never writes
+ * past such a caller's storage. A caller built against this header reaches
+ * the whole struct: the function-like macro below passes its sizeof to
+ * moqr_fetch_req_init_sized(), which clears and stamps
+ * min(req_size, sizeof current).
+ */
 MOQR_CORE_API void moqr_fetch_req_init(moqr_fetch_req_t *req);
+MOQR_CORE_API void moqr_fetch_req_init_sized(moqr_fetch_req_t *req,
+                                             size_t req_size);
+#define moqr_fetch_req_init(req) \
+    moqr_fetch_req_init_sized((req), sizeof(*(req)))
 
 /* fetch_open's decision, so the binding emits FETCH_OK / REQUEST_ERROR without
  * re-deriving. On ACCEPT, end_group/end_object are the FETCH_OK End Location
@@ -1000,6 +1487,11 @@ typedef uint32_t moqr_fetch_item_kind_t;
 #define MOQR_FETCH_ITEM_OBJECT 1u   /* a NORMAL object to write            */
 #define MOQR_FETCH_ITEM_END    2u   /* range exhausted; FIN the fetch      */
 #define MOQR_FETCH_ITEM_MARKER 3u   /* leading evicted-prefix gap marker   */
+#define MOQR_FETCH_ITEM_GAP    4u   /* report_gaps: Locations not held      */
+#define MOQR_FETCH_ITEM_UNKNOWN 5u  /* report_unknown: Locations without
+                                     * evidence either way                 */
+#define MOQR_FETCH_ITEM_PENDING 6u  /* report_pending: an Object still
+                                     * arriving                            */
 
 typedef struct moqr_fetch_item {
     moqr_fetch_item_kind_t kind;
@@ -1008,16 +1500,29 @@ typedef struct moqr_fetch_item {
                                         * COMPLETE record is coalesced into an owned
                                         * buffer, so rec.chunk_count
                                         * is presented as 0 — see fetch_peek.       */
-    /* MARKER: emit an UNKNOWN end-of-range marker IMMEDIATELY BEFORE this
-     * (first retained) group -- i.e. moq_session_write_fetch_range_before_group
-     * with MOQ_FETCH_RANGE_UNKNOWN. Covers the evicted prefix the fetch's Start
-     * fell into; the marker carries no payload (no pin). */
+    /* MARKER: emit an end-of-range marker IMMEDIATELY BEFORE this (first
+     * retained) group -- i.e. moq_session_write_fetch_range_before_group with
+     * MOQ_FETCH_RANGE_UNKNOWN (or Timed-Out where the request's wait budget
+     * is spent). Covers the evicted prefix the fetch's Start fell into; the
+     * marker carries no payload (no pin).
+     * GAP (report_gaps fetches only): rec.group_id / rec.object_id carry the
+     * INCLUSIVE end Location of a run of Locations the log does not hold,
+     * starting right after the last committed item (or at the range Start);
+     * every other rec field is zero and there is no pin.
+     * UNKNOWN (report_unknown fetches only): the same shape as GAP, for a run
+     * the log has no evidence about. An object id of UINT64_MAX ends the run
+     * with its group.
+     * PENDING (report_pending fetches only): rec.group_id / rec.object_id is
+     * the Location of an Object whose first bytes are in the log and whose
+     * last are not; every other rec field is zero and there is no pin. */
     uint64_t               marker_group;
 } moqr_fetch_item_t;
 
 /*
- * Open a fetch. Resolves the track, validates the range, and (on ACCEPT)
- * reserves a cursor slot. *out_plan carries the admission decision:
+ * Open a fetch. Resolves the track, resolves the parts of the range stated
+ * relative to its Largest Object (range_form) against the Largest this core
+ * holds at the call, validates the range, and (on ACCEPT) reserves a cursor
+ * slot. *out_plan carries the admission decision:
  *  - REJECT with DOES_NOT_EXIST: no such (servable) track.
  *  - REJECT with INVALID_RANGE: empty track, Start past the largest object, a
  *    range whose Start is below the retention horizon AND whose End does not
@@ -1045,9 +1550,31 @@ MOQR_CORE_API moqr_result_t moqr_core_fetch_open(moqr_core_t *core, moqr_binding
  *     rec.payload is one rcbuf: a whole-object record pins its retained payload
  *     (zero copy); a chunked COMPLETE record (streaming-ingest) is coalesced
  *     into one owned buffer here, charged as the pin.
+  *   - MOQR_FETCH_ITEM_GAP (report_gaps only): the Locations from the cursor up
+ *     to and including rec.{group_id,object_id} are not held (an abandoned
+ *     record is not held; an Object still arriving is not a gap). Nothing is
+ *     pinned and nothing is remembered: a re-peek recomputes the gap from the
+ *     log as it stands, so an object that arrives meanwhile shrinks or closes
+ *     it and is then served in order. Commit skips past the reported end.
+ *   - MOQR_FETCH_ITEM_UNKNOWN (report_unknown only): the Locations from the
+ *     cursor up to and including rec.{group_id,object_id} are ones the log
+ *     has no evidence about. It runs through to just before the next group
+ *     the log holds, or to the range end; a run of Objects expired from the
+ *     cache runs through the last of them. It is recomputed on every peek
+ *     and committed like a GAP.
+ *   - MOQR_FETCH_ITEM_PENDING (report_pending only): the next Location to
+ *     serve holds an Object still arriving (its first bytes are in, it is not
+ *     yet complete): the Largest Object can be such an Object, and a range
+ *     that includes it includes it in full. Reported once whatever precedes
+ *     it is served or reported; a re-peek serves the Object once it is whole,
+ *     or reports its Location as a GAP once its record is abandoned. A caller
+ *     that will not wait any longer commits it, which skips its one Location
+ *     like a GAP ending there.
  *   - MOQR_FETCH_ITEM_END: the range is exhausted; FIN the fetch.
  * Otherwise: MOQR_ERR_WOULD_BLOCK when the pin budget is momentarily full
- * (another fetch holds it — retry after it commits), MOQR_ERR_CAPACITY when a
+ * (another fetch holds it — retry after it commits), or, without
+ * report_pending, while the next Location holds an Object still arriving
+ * (retry once it completes or is abandoned), MOQR_ERR_CAPACITY when a
  * single object exceeds the whole pin budget (a terminal the caller resets the
  * fetch stream on — unreachable while fetch_pin_bytes is floored to the log
  * budget, kept as defense), MOQR_ERR_TOO_OLD when the range fell below the
@@ -1058,8 +1585,11 @@ MOQR_CORE_API moqr_result_t moqr_core_fetch_peek(moqr_core_t *core, moqr_fetch_t
 
 /* Advance past the peeked head item: an OBJECT advances the cursor and unpins it;
  * a MARKER is cleared without unpinning (it holds no pin, and the cursor already
- * starts at the first retained group). MOQR_ERR_WRONG_STATE without a prior peek
- * of a MARKER or OBJECT; MOQR_ERR_STALE_HANDLE on a dead fetch. */
+ * starts at the first retained group); a GAP, UNKNOWN or PENDING moves the cursor
+ * to the Location after its reported end (the range is exhausted when that end
+ * was the range end). MOQR_ERR_WRONG_STATE without a prior peek of a MARKER,
+ * GAP, UNKNOWN, PENDING or OBJECT;
+ * MOQR_ERR_STALE_HANDLE on a dead fetch. */
 MOQR_CORE_API moqr_result_t moqr_core_fetch_commit(moqr_core_t *core, moqr_fetch_t fetch);
 
 /* Retire the fetch: unpin, release the pin-byte budget, invalidate the handle. */
@@ -1152,6 +1682,26 @@ MOQR_CORE_API moqr_result_t moqr_core_upstream_lost(moqr_core_t *core, moqr_trac
 MOQR_CORE_API moqr_result_t moqr_core_source_done(moqr_core_t *core, moqr_track_t track,
                                     uint64_t track_gen, moqr_pd_desc_t status,
                                     uint64_t now_us);
+
+/*
+ * The track's SOURCE finished gracefully and no further objects will be
+ * admitted for it: an upstream subscription that got SUBSCRIBE_DONE, or a
+ * push publisher that finished (PUBLISH_FINISHED). Unlike
+ * moqr_core_source_done, which terminates every downstream subscriber at
+ * once (for failures such as a malformed track), each forwarding subscriber
+ * first receives what was already admitted -- records, seals and FINs in
+ * their usual order -- and is then terminated with a wire SUBSCRIBE_DONE
+ * carrying `status` from moqr_core_next_delivery, so the terminal follows the
+ * data it closes. A paused subscriber (Forward=0) asked for nothing further
+ * and is terminated by its binding's next delivery scan. The source is
+ * released as by moqr_core_source_done. Every terminal comes from the
+ * delivery scans, so this call queues no intent and never returns
+ * MOQR_ERR_WOULD_BLOCK: MOQR_OK, MOQR_ERR_INVAL, MOQR_ERR_STALE_HANDLE or
+ * MOQR_ERR_WRONG_STATE (the track is not ACTIVE).
+ */
+MOQR_CORE_API moqr_result_t moqr_core_source_finish(moqr_core_t *core, moqr_track_t track,
+                                      uint64_t track_gen, moqr_pd_desc_t status,
+                                      uint64_t now_us);
 
 /*
  * Admission-refusal reasons — the bounded label set for the refusals

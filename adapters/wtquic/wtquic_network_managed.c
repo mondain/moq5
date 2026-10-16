@@ -22,6 +22,8 @@
 #include <moq/wtquic_network_managed.h>
 
 #include "../common/moq_alpn.h"
+#include "../common/moq_adapter_binding.h"
+#include "wtquic_adapter_internal.h"
 
 #define NW_MAX_OFFERS 8
 
@@ -111,6 +113,12 @@ struct moq_wtquic_network_managed {
     uint64_t (*app_deadline_us)(void *ctx);
     void *app_deadline_ctx;
     uint64_t wake_deadline_us;
+
+    /* The connection target the session is bound with when its profile
+     * requires one (copied bytes). */
+    moq_connection_target_t target;
+    uint8_t *target_bytes;
+    size_t target_bytes_len;
 };
 
 static uint64_t nwm_now_us(void)
@@ -471,6 +479,25 @@ static void nwm_established(wtq_session_t *s, wtq_str_t sub, void *user)
         (void)wtq_session_close(s, 0, NULL, 0);
         return;
     }
+    /* The session is bound before the attach adapter starts it (a profile
+     * without requirements only when there is a target to give it). The
+     * Network.framework backend always advertises QUIC DATAGRAM support in
+     * its own transport parameters; the peer's support is known once the
+     * transport reports a nonzero datagram limit, and unknown (not refused)
+     * while its datagram flow is still coming up, which the core answers
+     * with WOULD_BLOCK. A refusal ends the session. */
+    {
+        uint32_t known, supported;
+        moq_wtquic_binding_facts(s, true, false, &known, &supported);
+        moq_result_t brc = moq_adapter_bind_session(
+            ms, MOQ_BINDING_WEBTRANSPORT_H3, known, supported, &m->target);
+        if (brc != MOQ_OK) {
+            moq_session_destroy(ms);
+            nwm_latch_fatal(m, brc == MOQ_ERR_UNSUPPORTED ? 0x3 : 0x1);
+            (void)wtq_session_close(s, 0, NULL, 0);
+            return;
+        }
+    }
     moq_wtquic_conn_cfg_t ccfg;
     moq_wtquic_conn_cfg_init_sized(&ccfg, sizeof(ccfg));
     ccfg.alloc = &m->alloc;
@@ -617,6 +644,31 @@ static void nwm_stream_writable(wtq_session_t *s, wtq_stream_t *st,
     NWM_FWD(on_stream_writable, s, st);
 }
 
+static void nwm_stream_committed(wtq_session_t *s, wtq_stream_t *st,
+                                void *user)
+{
+    NWM_FWD(on_stream_send_committed, s, st);
+}
+
+static void nwm_events_init(wtq_session_events_t *ev)
+{
+    wtq_session_events_init(ev);
+    ev->on_established = nwm_established;
+    ev->on_refused = nwm_refused;
+    ev->on_failed = nwm_failed;
+    ev->on_draining = nwm_draining;
+    ev->on_closed = nwm_closed;
+    ev->on_stream_opened = nwm_stream_opened;
+    ev->on_stream_data = nwm_stream_data;
+    ev->on_stream_reset = nwm_stream_reset;
+    ev->on_stream_stop = nwm_stream_stop;
+    ev->on_stream_closed = nwm_stream_closed;
+    ev->on_send_complete = nwm_send_complete;
+    ev->on_datagram = nwm_datagram;
+    ev->on_stream_writable = nwm_stream_writable;
+    ev->on_stream_send_committed = nwm_stream_committed;
+}
+
 /* --- final teardown (on-domain, the backend's LAST block) -------------------- */
 
 static void nwm_on_stopped(void *ctx)
@@ -652,12 +704,19 @@ static void nwm_on_stopped(void *ctx)
 
 /* --- public API --------------------------------------------------------------- */
 
-void moq_wtquic_network_managed_cfg_init(moq_wtquic_network_managed_cfg_t *cfg)
+/* The sizeof of the layout through app_deadline_ctx: what a caller built
+ * before `target` was appended allocates and passes. */
+#define NWM_CFG_SIZE_THROUGH_APP_DEADLINE_CTX \
+    ((offsetof(moq_wtquic_network_managed_cfg_t, app_deadline_ctx) + \
+      sizeof(((moq_wtquic_network_managed_cfg_t *)0)->app_deadline_ctx) + \
+      (_Alignof(moq_wtquic_network_managed_cfg_t) - 1)) & \
+     ~(_Alignof(moq_wtquic_network_managed_cfg_t) - 1))
+
+/* Parenthesized: defines the symbol, not the header's sized macro. */
+void (moq_wtquic_network_managed_cfg_init)(moq_wtquic_network_managed_cfg_t *cfg)
 {
-    if (cfg == NULL)
-        return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = (uint32_t)sizeof(*cfg);
+    moq_wtquic_network_managed_cfg_init_sized(cfg,
+        NWM_CFG_SIZE_THROUGH_APP_DEADLINE_CTX);
 }
 
 void moq_wtquic_network_managed_cfg_init_sized(
@@ -787,10 +846,61 @@ moq_result_t moq_wtquic_network_managed_create(
 
     m->host = nwm_strdup(m, cfg->host);
     m->path = nwm_strdup(m, cfg->path != NULL ? cfg->path : "/moq");
-    m->authority = nwm_strdup(
-        m, cfg->authority != NULL ? cfg->authority : cfg->host);
-    if (m->host == NULL || m->path == NULL || m->authority == NULL)
+    if (cfg->authority != NULL)
+        m->authority = nwm_strdup(m, cfg->authority);
+    if (m->host == NULL || m->path == NULL ||
+        (cfg->authority != NULL && m->authority == NULL))
         goto oom;
+    /* The connection target: configured, else the configured :authority
+     * (or "host:port") with the WebTransport path. */
+    {
+        const moq_connection_target_t *target =
+            (size_t)cfg->struct_size >=
+                    offsetof(moq_wtquic_network_managed_cfg_t, target) +
+                        sizeof(cfg->target)
+                ? cfg->target
+                : NULL;
+        moq_connection_target_t derived;
+        char derived_buf[1024];
+        if (target == NULL) {
+            bool ok;
+            if (cfg->authority != NULL) {
+                memset(&derived, 0, sizeof(derived));
+                derived.struct_size = (uint32_t)sizeof(derived);
+                derived.target_present = MOQ_BINDING_TARGET_COMPLETE;
+                derived.authority.data = (const uint8_t *)m->authority;
+                derived.authority.len = strlen(m->authority);
+                derived.path_query.data = (const uint8_t *)m->path;
+                derived.path_query.len = strlen(m->path);
+                ok = true;
+            } else {
+                ok = moq_adapter_target_from_dial(derived_buf,
+                                                  sizeof(derived_buf), m->host,
+                                                  cfg->port, m->path, &derived);
+            }
+            if (ok)
+                target = &derived;
+        }
+        moq_result_t trc = moq_adapter_target_copy(&m->alloc, target,
+                                                   &m->target, &m->target_bytes,
+                                                   &m->target_bytes_len);
+        if (trc == MOQ_ERR_NOMEM)
+            goto oom;
+        if (trc != MOQ_OK)
+            goto inval;
+    }
+    /* Without an explicit :authority the CONNECT names the target's
+     * authority (or host:port), never the bare TLS server name: see
+     * moq_adapter_connect_authority. */
+    if (m->authority == NULL) {
+        char authority[1024];
+        if (!moq_adapter_connect_authority(authority, sizeof(authority),
+                                           &m->target, m->host, cfg->port))
+            goto inval;
+        m->authority = nwm_strdup(m, authority);
+        if (m->authority == NULL)
+            goto oom;
+    }
 
     if (cfg->wt_protocols != NULL) {
         m->protos_buf = nwm_strdup(m, cfg->wt_protocols);
@@ -853,20 +963,7 @@ moq_result_t moq_wtquic_network_managed_create(
                                             establishment */
 
     wtq_session_events_t ev;
-    wtq_session_events_init(&ev);
-    ev.on_established = nwm_established;
-    ev.on_refused = nwm_refused;
-    ev.on_failed = nwm_failed;
-    ev.on_draining = nwm_draining;
-    ev.on_closed = nwm_closed;
-    ev.on_stream_opened = nwm_stream_opened;
-    ev.on_stream_data = nwm_stream_data;
-    ev.on_stream_reset = nwm_stream_reset;
-    ev.on_stream_stop = nwm_stream_stop;
-    ev.on_stream_closed = nwm_stream_closed;
-    ev.on_send_complete = nwm_send_complete;
-    ev.on_datagram = nwm_datagram;
-    ev.on_stream_writable = nwm_stream_writable;
+    nwm_events_init(&ev);
 
     wtq_nw_conn_cfg_t ncfg = WTQ_NW_CONN_CFG_INIT;
     ncfg.server_name = m->host;
@@ -973,6 +1070,8 @@ void moq_wtquic_network_managed_destroy(moq_wtquic_network_managed_t *m)
     nwm_free_str(m, m->host);
     nwm_free_str(m, m->path);
     nwm_free_str(m, m->authority);
+    if (m->target_bytes != NULL)
+        m->alloc.free(m->target_bytes, m->target_bytes_len, m->alloc.ctx);
     if (m->protos_buf != NULL)
         m->alloc.free(m->protos_buf, m->protos_buf_size, m->alloc.ctx);
     pthread_mutex_destroy(&m->mu);

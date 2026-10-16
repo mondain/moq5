@@ -32,6 +32,55 @@ private let kSwiftStagingCap = 64
 @Suite("Track-event backlog bound")
 struct TrackEventBacklogTests {
 
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("Mixed fill and legacy entries share the exact 64+1 poll ledger and terminal tail")
+    func mixedFillCapacity() {
+        for fatal in [false, true] {
+            let backend = ScriptedReceiverBackend()
+            let attachment = ReceiverAttachment(backend: backend)
+            let mixed: [ReceiverPolledEvent] = (0..<64).map {
+                $0.isMultiple(of: 2) ? .fill(7, requestID: UInt64($0)) : .catalogReady
+            }
+            backend.scriptEvents([.added(7, name: "video")] + mixed)
+            backend.scriptTerminal(fatal: fatal, code: .max)
+            #expect(attachment.drainTrackEvents())
+            #expect(attachment.stagedTrackEventCount == 64)
+            #expect(backend.snapshot().pollCalls == 64)
+            #expect(backend.snapshot().queuedEventsRemaining == 1)
+            #expect(!attachment.objectWaiterReady)
+            #expect(attachment.drainTrackEvents())
+            #expect(attachment.drainTrackEvents())
+            #expect(backend.snapshot().pollCalls == 64)
+            guard case .item(.legacy(.added(let track))) = attachment.takeStagedTrackEvent() else {
+                Issue.record("missing added track"); return
+            }
+            #expect(attachment.drainTrackEvents())
+            #expect(attachment.stagedTrackEventCount == 64)
+            #expect(backend.snapshot().pollCalls == 65)
+            #expect(backend.snapshot().queuedEventsRemaining == 0)
+            #expect(backend.snapshot().terminalPollsReturned == 0)
+            for index in 0..<64 {
+                switch attachment.takeStagedTrackEvent() {
+                case .item(.fillTerminal(let parent, let terminal)):
+                    #expect(index.isMultiple(of: 2))
+                    #expect(parent === track && terminal.initiatingRequestID == UInt64(index))
+                case .item(.legacy(.catalogReady)):
+                    #expect(!index.isMultiple(of: 2))
+                default: Issue.record("mixed entry lost at \(index)")
+                }
+            }
+            #expect(!attachment.drainTrackEvents())
+            #expect(backend.snapshot().pollCalls == 66 && backend.snapshot().terminalPollsReturned == 1)
+            switch attachment.takeStagedTrackEvent() {
+            case .terminalClean: #expect(!fatal)
+            case .terminalFatal(let code): #expect(fatal && code == .max)
+            default: Issue.record("terminal missing after mixed queue")
+            }
+            attachment.finalizeDetach()
+            #expect(backend.snapshot().violations.isEmpty)
+        }
+    }
+
     /// Build `total` track events: one `.added` (so the FIFO holds a real
     /// lifecycle event first) followed by mutable `.catalogReady` events -- a
     /// peer does not need distinct tracks to grow the FIFO.
@@ -121,7 +170,7 @@ struct TrackEventBacklogTests {
     /// disposition -- lets `#expect` assert order/identity in one comparison.
     private func addedName(
         _ taken: ReceiverAttachment.TakenTrackEvent) -> String? {
-        if case .item(.added(let track)) = taken { return track.description.name }
+        if case .item(.legacy(.added(let track))) = taken { return track.description.name }
         return nil
     }
 
@@ -414,7 +463,7 @@ struct TrackEventBacklogTests {
 
         loop: while true {
             switch attachment.takeStagedTrackEvent() {
-            case .item(.added(let track)):
+            case .item(.legacy(.added(let track))):
                 outcome.delivered.append(track.description.name)
             case .item:
                 Issue.record("unexpected non-added staged event")

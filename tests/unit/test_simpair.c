@@ -1067,9 +1067,135 @@ static int sp_directional_checks(void)
     return failures;
 }
 
+typedef struct {
+    inject_trace_t trace;
+    const uint8_t *wire;
+    size_t bad_wire;
+    size_t bad_code;
+} close_profile_trace_t;
+
+static void close_profile_trace(void *ctx, const moq_sim_trace_record_t *r)
+{
+    close_profile_trace_t *t = ctx;
+    inject_trace_fn(&t->trace, r);
+    if (r->kind == MOQ_SIM_TRACE_FAULT_INJECT &&
+        r->action_kind == MOQ_ACTION_CLOSE_SESSION) {
+        if (r->bytes.len != 4 || memcmp(r->bytes.data, t->wire, 4) != 0)
+            t->bad_wire++;
+        if (r->result != MOQ_OK || r->code != 0x3) t->bad_code++;
+    }
+    if (r->kind == MOQ_SIM_TRACE_ACTION &&
+        r->action_kind == MOQ_ACTION_CLOSE_SESSION &&
+        (r->code != 0x3 || r->error_code != 0x3))
+        t->bad_code++;
+}
+
+static size_t close_profile_drain(moq_session_t *s, size_t *bad_code)
+{
+    size_t closed = 0;
+    moq_event_t ev;
+    while (moq_session_poll_events(s, &ev, 1) == 1) {
+        if (ev.kind == MOQ_EVENT_SESSION_CLOSED) {
+            closed++;
+            if (ev.u.closed.code != 0x3) (*bad_code)++;
+        }
+        moq_event_cleanup(&ev);
+    }
+    return closed;
+}
+
+static int check_close_profiles(void)
+{
+    /* Independent wire oracle: unknown type 255 followed by uint16 length 0.
+     * D16 uses QUIC varint; D18/D22 use the leading-one-bit vi64 encoding. */
+    static const uint8_t wire[][4] = {
+        {0x40, 0xff, 0x00, 0x00},
+        {0x80, 0xff, 0x00, 0x00},
+        {0x80, 0xff, 0x00, 0x00}
+    };
+    static const moq_version_t versions[] = {
+        MOQ_VERSION_DRAFT_16, MOQ_VERSION_DRAFT_18, MOQ_VERSION_DRAFT_22
+    };
+    int failures = 0;
+    for (size_t v = 0; v < 3; v++) {
+        /* Injection; independently fed wire; disabled; zero rate; no flag. */
+        for (int mode = 0; mode < 5; mode++) {
+            uint64_t hash = 0;
+            for (int run = 0; run < 2; run++) {
+                oom_alloc_state_t as = {0};
+                moq_alloc_t alloc = oom_allocator(&as);
+                close_profile_trace_t t = {0};
+                t.trace.hash = 0xCBF29CE484222325ULL;
+                t.wire = wire[v];
+                moq_simpair_cfg_t cfg = MOQ_SIMPAIR_CFG_INIT;
+                cfg.version = versions[v];
+                cfg.alloc = &alloc;
+                cfg.seed = 0xE005;
+                cfg.initial_now_us = 1000;
+                cfg.trace_fn = close_profile_trace;
+                cfg.trace_ctx = &t;
+                cfg.fault_per_mille = mode == 3 ? 0 : 1000;
+                cfg.fault_flags = mode == 4 ? 0 : MOQ_SIM_FAULT_INJECT_CLOSE;
+                moq_simpair_t *sp = NULL;
+                MOQ_TEST_CHECK(moq_simpair_create(&cfg, &sp) == MOQ_OK);
+                if (!sp) continue;
+                MOQ_TEST_CHECK(moq_simpair_start(sp) == MOQ_OK);
+                MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(sp, 8, NULL) == MOQ_OK);
+                moq_session_t *c = moq_simpair_client(sp);
+                moq_session_t *s = moq_simpair_server(sp);
+                MOQ_TEST_CHECK(moq_session_version(c) == versions[v]);
+                MOQ_TEST_CHECK(moq_session_version(s) == versions[v]);
+                MOQ_TEST_CHECK(moq_session_state(c) == MOQ_SESS_ESTABLISHED);
+                MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_ESTABLISHED);
+                MOQ_TEST_CHECK(t.trace.inject_close == 0);
+                MOQ_TEST_CHECK(t.trace.close_action_count == 0);
+                MOQ_TEST_CHECK(close_profile_drain(c, &t.bad_code) == 0);
+                MOQ_TEST_CHECK(close_profile_drain(s, &t.bad_code) == 0);
+                if (mode == 1) {
+                    /* A partial envelope must not close; its final byte must.
+                     * Enabling faults afterwards also tests an already-closed
+                     * target before the first opportunity to inject. */
+                    MOQ_TEST_CHECK(moq_session_on_control_bytes(s, wire[v], 3,
+                        moq_simpair_now_us(sp)) == MOQ_OK);
+                    MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_ESTABLISHED);
+                    MOQ_TEST_CHECK(moq_session_on_control_bytes(s, wire[v] + 3, 1,
+                        moq_simpair_now_us(sp)) == MOQ_OK);
+                    MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_CLOSED);
+                }
+                if (mode != 2) moq_simpair_enable_faults(sp);
+                MOQ_TEST_CHECK(moq_simpair_step(sp, NULL) == MOQ_OK);
+                bool closes = mode < 2;
+                MOQ_TEST_CHECK(t.trace.inject_close == (mode == 0 ? 1u : 0u));
+                MOQ_TEST_CHECK(t.trace.close_action_count == (closes ? 1u : 0u));
+                MOQ_TEST_CHECK(moq_session_state(c) ==
+                    (closes ? MOQ_SESS_CLOSED : MOQ_SESS_ESTABLISHED));
+                MOQ_TEST_CHECK(moq_session_state(s) ==
+                    (closes ? MOQ_SESS_CLOSED : MOQ_SESS_ESTABLISHED));
+                MOQ_TEST_CHECK(close_profile_drain(c, &t.bad_code) == (closes ? 1u : 0u));
+                MOQ_TEST_CHECK(close_profile_drain(s, &t.bad_code) == (closes ? 1u : 0u));
+                size_t injected = t.trace.inject_close;
+                size_t actions = t.trace.close_action_count;
+                MOQ_TEST_CHECK(moq_simpair_step(sp, NULL) == MOQ_OK);
+                MOQ_TEST_CHECK(t.trace.inject_close == injected);
+                MOQ_TEST_CHECK(t.trace.close_action_count == actions);
+                MOQ_TEST_CHECK(close_profile_drain(c, &t.bad_code) == 0);
+                MOQ_TEST_CHECK(close_profile_drain(s, &t.bad_code) == 0);
+                MOQ_TEST_CHECK(t.bad_wire == 0 && t.bad_code == 0);
+                moq_simpair_destroy(sp);
+                MOQ_TEST_CHECK(as.balance == 0);
+                if (run) MOQ_TEST_CHECK(hash == t.trace.hash);
+                hash = t.trace.hash;
+            }
+        }
+    }
+    if (!failures)
+        printf("PASS: close profiles (3 profiles, 5 modes, 2 repeats, alloc balance=0)\n");
+    return failures;
+}
+
 int main(void)
 {
-    int failures = 0;
+    int failures = check_close_profiles();
 
     /* == Setup handshake through SimPair =========================== */
     {
@@ -7051,5 +7177,5 @@ int main(void)
 
 
     MOQ_TEST_PASS("test_simpair");
-    return failures;
+    return failures ? 1 : 0;
 }

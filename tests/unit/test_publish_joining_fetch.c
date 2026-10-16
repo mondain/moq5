@@ -1506,7 +1506,7 @@ static void expect_minted_owner(moq_session_t *s, const mint_pre_t *pre,
         fe->generation != pre->want_gen ||
         !moq_fetch_eq(fe->handle, pre->want_handle) ||
         fe->request_id != want_req_id ||
-        fe->request_stream_ref._v != want_ref._v) {
+        fe->rs.ref._v != want_ref._v) {
         printf("FAIL: %s: minted owner at slot %d differs: state=%d(want %d) "
                "role=%d(want %d) gen=%u(want %u) handle=%llu(want %llu) "
                "req_id=%llu(want %llu) ref=%llu(want %llu)\n",
@@ -1516,7 +1516,7 @@ static void expect_minted_owner(moq_session_t *s, const mint_pre_t *pre,
                (unsigned long long)pre->want_handle._opaque,
                (unsigned long long)fe->request_id,
                (unsigned long long)want_req_id,
-               (unsigned long long)fe->request_stream_ref._v,
+               (unsigned long long)fe->rs.ref._v,
                (unsigned long long)want_ref._v);
         failures++;
     }
@@ -2096,7 +2096,7 @@ static void pending_join_release_end_at(bool at_ceiling)
     moq_subscription_t svsub = se->handle;
     /* The subscription's OWN request bidi -- captured BEFORE the call, so the
      * action inventory below can tell it from the held FETCH ref. */
-    const moq_stream_ref_t sub_ref = se->request_stream_ref;
+    const moq_stream_ref_t sub_ref = se->rs.ref;
     MOQ_TEST_CHECK(sub_ref._v != ref._v);
     MOQ_TEST_CHECK_EQ_INT(
         (int)moq_session_accept_subscribe(sv, svsub, &ac,

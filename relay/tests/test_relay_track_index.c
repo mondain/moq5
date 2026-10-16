@@ -114,6 +114,8 @@ typedef struct r_track_baseline {
     uint64_t        largest_group;
     uint64_t        largest_object;
     uint64_t        linger_deadline_us;
+    bool            has_max_cache;
+    uint64_t        max_cache_us;
 } r_track_baseline_t;
 
 typedef struct r_sub_baseline {
@@ -132,15 +134,27 @@ typedef struct r_sub_baseline {
     uint64_t      gpos_gc_evicted;
     uint32_t      begun_count;
     bool          pending_skip;
+    bool          forward;
+    bool          range_end_holds;
     r_sub_state_t state;
     uint64_t      start_group;
     uint64_t      start_object;
     bool          has_end;
     uint64_t      end_group;
+    uint64_t      end_object;
+    bool          src_done;
+    bool          src_abort;
+    moqr_pd_desc_t src_done_pd;
+    bool          has_location;
+    bool          location_empty;
+    moq_location_filter_cfg_t location;
+    uint8_t      *excluded;
+    uint32_t      excluded_cap;
     uint8_t       subscriber_priority;
     moqr_group_order_t group_order;
     moqr_filter_type_t filter_type;
     uint64_t      cookie;
+    uint64_t      rendezvous_deadline_us;   /* not part of the track links */
 } r_sub_baseline_t;
 
 _Static_assert(sizeof(r_sub_t) == sizeof(r_sub_baseline_t) +
@@ -692,11 +706,12 @@ test_index_capacity_delta(void)
 
     /* Descriptor delta per added sub slot: the pool term (sizeof(r_sub_t),
      * which now carries track_next/track_prev) plus the per-sub gpos
-     * position + hash terms the model has always charged. */
+     * position + hash terms and the bounded exclusion-history bitmap. */
     uint64_t groups = 4;
     uint64_t lists = 16 + 1;   /* default max_subgroups + datagram list */
     uint64_t per_sub = sizeof(r_sub_t) + groups * gpos_stride_for(lists) +
-                       gpos_hash_cap_for(groups) * sizeof(uint32_t);
+                       gpos_hash_cap_for(groups) * sizeof(uint32_t) +
+                       ((uint64_t)MOQR_LOG_DEF_MAX_RECORDS + 7u) / 8u;
     uint64_t d8 = describe_structure(&a, 16, 4);
     uint64_t d24 = describe_structure(&a, 24, 4);
     MOQ_TEST_CHECK(d8 != UINT64_MAX && d24 != UINT64_MAX);
@@ -711,8 +726,11 @@ test_index_capacity_delta(void)
     lc.budget.max_bytes = 1 << 20;
     moqr_log_capacity_t logc;
     MOQ_TEST_CHECK(moqr_log_capacity_describe(&lc, &logc) == MOQR_OK);
-    uint64_t per_track =
-        sizeof(r_track_t) + logc.structure_bytes + logc.header_bytes;
+    /* Each track slot also carries one discovery offer state per track
+     * subscription slot (max_ns_subs, the default here). */
+    uint64_t per_track_offers = (uint64_t)R_DEF_NS_SUBS * sizeof(r_offer_t);
+    uint64_t per_track = sizeof(r_track_t) + per_track_offers +
+                         logc.structure_bytes + logc.header_bytes;
     uint64_t t4 = describe_structure(&a, 16, 4);
     uint64_t t6 = describe_structure(&a, 16, 6);
     MOQ_TEST_CHECK_EQ_U64(t6 - t4, 2 * per_track);
@@ -725,7 +743,8 @@ test_index_capacity_delta(void)
     long ct6 = create_live_bytes(&a, 16, 6);
     MOQ_TEST_CHECK(c16 > 0 && c24 > 0 && ct6 > 0);
     MOQ_TEST_CHECK_EQ_U64((uint64_t)(c24 - c16), 8 * sizeof(r_sub_t));
-    MOQ_TEST_CHECK_EQ_U64((uint64_t)(ct6 - c16), 2 * sizeof(r_track_t));
+    MOQ_TEST_CHECK_EQ_U64((uint64_t)(ct6 - c16),
+                          2 * (sizeof(r_track_t) + per_track_offers));
     MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
 
     MOQ_TEST_PASS("index_capacity_delta");

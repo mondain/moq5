@@ -196,11 +196,13 @@ static void handle_destroy(PyObject *capsule)
 static PyObject *connect_endpoint(PyObject *module, PyObject *args)
 {
     PyObject *url, *protocol, *backend, *versions, *sni, *ca, *path, *profile, *timeout;
-    if (!PyArg_ParseTuple(args, "OOOOOOOOO:connect", &url, &protocol, &backend,
-                          &versions, &sni, &ca, &path, &profile, &timeout)) return NULL;
+    PyObject *mode, *preferred;
+    if (!PyArg_ParseTuple(args, "OOOOOOOOOOO:connect", &url, &protocol, &backend,
+                          &versions, &sni, &ca, &path, &profile, &timeout,
+                          &mode, &preferred)) return NULL;
     moq_endpoint_cfg_t cfg;
     moq_endpoint_cfg_init_sized(&cfg, sizeof(cfg));
-    uint64_t p, b, w, t;
+    uint64_t p, b, w, t, m, v;
     if (bytes_value(url, "url", &cfg.url) < 0 ||
         bytes_value(sni, "sni", &cfg.sni) < 0 ||
         bytes_value(ca, "ca_file", &cfg.ca_file) < 0 ||
@@ -208,12 +210,18 @@ static PyObject *connect_endpoint(PyObject *module, PyObject *args)
         uint_value(protocol, MOQ_TRANSPORT_PROTOCOL_WEBTRANSPORT, "protocol", &p) < 0 ||
         uint_value(backend, MOQ_TRANSPORT_BACKEND_WTQUIC_MSQUIC, "backend", &b) < 0 ||
         uint_value(profile, MOQ_WT_PROFILE_D13_14_COMPAT, "wt_profile", &w) < 0 ||
-        uint_value(timeout, MOQ_ENDPOINT_HANDSHAKE_TIMEOUT_MAX_US, "handshake_timeout_us", &t) < 0)
+        uint_value(timeout, MOQ_ENDPOINT_HANDSHAKE_TIMEOUT_MAX_US, "handshake_timeout_us", &t) < 0 ||
+        uint_value(mode, MOQ_ENDPOINT_URI_STANDARD, "uri_mode", &m) < 0 ||
+        uint_value(preferred, UINT32_MAX, "preferred_version", &v) < 0)
         return NULL;
     cfg.protocol = (moq_transport_protocol_t)p;
     cfg.backend = (moq_transport_backend_t)b;
     cfg.wt_profile = (uint32_t)w;
     cfg.handshake_timeout_us = t;
+    /* Passed through as given: the service owns the URI-mode rules (a
+     * STANDARD wt_path) and the preference rules (AUTO only, supported). */
+    cfg.uri_mode = (uint32_t)m;
+    cfg.preferred_version = (moq_version_t)v;
     cfg.insecure_skip_verify = false;
     if (!PyTuple_Check(versions)) {
         PyErr_SetString(PyExc_TypeError, "versions must be a tuple");
@@ -444,13 +452,23 @@ static void receiver_capsule_destroy(PyObject *capsule)
 static PyObject *receiver_attach_py(PyObject *module, PyObject *args)
 {
     PyObject *endpoint_capsule, *namespace, *catalog, *auto_subscribe, *time_mode, *policy;
-    PyObject *max_objects, *max_bytes, *max_track_events;
-    if (!PyArg_ParseTuple(args, "OOOOOOOOO:receiver_attach", &endpoint_capsule, &namespace,
+    PyObject *max_objects, *max_bytes, *max_track_events, *companion = Py_None;
+    if (!PyArg_ParseTuple(args, "OOOOOOOOO|O:receiver_attach", &endpoint_capsule, &namespace,
                           &catalog, &auto_subscribe, &time_mode, &policy,
-                          &max_objects, &max_bytes, &max_track_events)) return NULL;
+                          &max_objects, &max_bytes, &max_track_events, &companion)) return NULL;
     moq_media_receiver_cfg_t cfg;
-    moq_media_receiver_cfg_init(&cfg);
+    moq_media_receiver_cfg_init_sized(&cfg, sizeof(cfg));
     uint64_t tm, pol, mo, mb, me;
+    uint64_t profile = MOQ_MEDIA_COMPANION_AUTO;
+    if (companion != Py_None && uint_value(companion, UINT32_MAX, "companion_profile", &profile) < 0)
+        return NULL;
+    if (profile != MOQ_MEDIA_COMPANION_AUTO &&
+        profile != MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01 &&
+        profile != MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC) {
+        PyErr_SetString(PyExc_ValueError, "unknown companion_profile");
+        return NULL;
+    }
+    cfg.companion_profile = (moq_media_companion_profile_t)profile;
     if (!PyBool_Check(auto_subscribe)) {
         PyErr_SetString(PyExc_TypeError, "auto_subscribe must be bool");
         return NULL;
@@ -612,15 +630,26 @@ static PyObject *receiver_stats_py(PyObject *module, PyObject *capsule)
         Py_DECREF(catalog_drops);
         return NULL;
     }
-    PyObject *result = Py_BuildValue("(KKKKKKKKKOOO)",
+    PyObject *tracks_malformed = Py_None;
+    if (st.struct_size >= STATS_FIELD_END(tracks_malformed))
+        tracks_malformed = PyLong_FromUnsignedLongLong(st.tracks_malformed);
+    else
+        Py_INCREF(tracks_malformed);
+    if (!tracks_malformed) {
+        Py_DECREF(catalog_drops);
+        Py_DECREF(catalog_complete);
+        return NULL;
+    }
+    PyObject *result = Py_BuildValue("(KKKKKKKKKOOOO)",
         (unsigned long long)st.objects_received, (unsigned long long)st.objects_queued,
         (unsigned long long)st.bytes_queued, (unsigned long long)st.objects_dropped,
         (unsigned long long)st.groups_dropped, (unsigned long long)st.keyframes_dropped,
         (unsigned long long)st.parse_drops, (unsigned long long)st.overflow_events,
         (unsigned long long)st.pause_transitions, st.paused ? Py_True : Py_False,
-        catalog_drops, catalog_complete);
+        catalog_drops, catalog_complete, tracks_malformed);
     Py_DECREF(catalog_drops);
     Py_DECREF(catalog_complete);
+    Py_DECREF(tracks_malformed);
     return result;
 }
 
@@ -696,10 +725,55 @@ static PyObject *track_key_py(PyObject *module, PyObject *capsule)
     return PyLong_FromVoidPtr(track->track);
 }
 
+static int receiver_location(PyObject *value, moq_location_filter_cfg_t *cfg)
+{
+    PyObject *kind, *relative, *sg, *so, *eg, *eo;
+    if (!PyArg_ParseTuple(value, "OOOOOO:location", &kind, &relative, &sg, &so, &eg, &eo)) return -1;
+    moq_location_filter_cfg_init_sized(cfg, sizeof(*cfg));
+    uint64_t k;
+    if (uint_value(kind, MOQ_LOCATION_FILTER_NEXT_OBJECT, "location.kind", &k) < 0 ||
+        uint_value(relative, UINT64_MAX, "relative_group_offset", &cfg->relative_group_offset) < 0 ||
+        uint_value(sg, UINT64_MAX, "start_group", &cfg->start_group) < 0 ||
+        uint_value(so, UINT64_MAX, "start_object", &cfg->start_object) < 0 ||
+        uint_value(eg, UINT64_MAX, "end_group", &cfg->end_group) < 0 ||
+        uint_value(eo, UINT64_MAX, "end_object", &cfg->end_object) < 0) return -1;
+    cfg->kind = (moq_location_filter_kind_t)k;
+    return 0;
+}
+
+static int receiver_fill(PyObject *value, moq_fill_cfg_t *cfg, moq_location_filter_cfg_t *location)
+{
+    PyObject *priority, *order, *timeout, *loc;
+    if (!PyArg_ParseTuple(value, "OOOO:fill", &priority, &order, &timeout, &loc)) return -1;
+    moq_fill_cfg_init_sized(cfg, sizeof(*cfg));
+    uint64_t p = 0, g = 0;
+    if (priority != Py_None && uint_value(priority, UINT8_MAX, "fill.priority", &p) < 0) return -1;
+    if (order != Py_None) {
+        if (uint_value(order, UINT32_MAX, "fill.group_order", &g) < 0) return -1;
+        if (g != MOQ_GROUP_ORDER_ASCENDING && g != MOQ_GROUP_ORDER_DESCENDING) {
+            PyErr_SetString(PyExc_ValueError, "fill.group_order must be ascending or descending");
+            return -1;
+        }
+    }
+    if (timeout != Py_None && uint_value(timeout, UINT64_MAX, "fill.timeout_ms", &cfg->fill_timeout_ms) < 0)
+        return -1;
+    if (loc != Py_None) {
+        if (receiver_location(loc, location) < 0) return -1;
+        cfg->location = location;
+    }
+    cfg->has_subscriber_priority = priority != Py_None;
+    cfg->subscriber_priority = (uint8_t)p;
+    cfg->has_group_order = order != Py_None;
+    cfg->group_order = (uint32_t)g;
+    cfg->has_fill_timeout = timeout != Py_None;
+    return 0;
+}
+
 static PyObject *receiver_subscribe_py(PyObject *module, PyObject *args)
 {
-    PyObject *capsule, *track_capsule, *start, *priority;
-    if (!PyArg_ParseTuple(args, "OOOO:receiver_subscribe", &capsule, &track_capsule, &start, &priority))
+    PyObject *capsule, *track_capsule, *start, *priority, *location = Py_None, *fill = Py_None;
+    if (!PyArg_ParseTuple(args, "OOOO|OO:receiver_subscribe", &capsule, &track_capsule, &start, &priority,
+                          &location, &fill))
         return NULL;
     uint64_t start_value, priority_value = 0;
     if (uint_value(start, MOQ_MEDIA_START_NEXT_GROUP, "start", &start_value) < 0) return NULL;
@@ -709,12 +783,37 @@ static PyObject *receiver_subscribe_py(PyObject *module, PyObject *args)
     track_handle_t *track = track_get(track_capsule, handle, capsule);
     if (!track) return NULL;
     moq_media_receiver_track_subscribe_cfg_t cfg;
-    moq_media_receiver_track_subscribe_cfg_init(&cfg);
+    moq_media_receiver_track_subscribe_cfg_init_sized(&cfg, sizeof(cfg));
+    moq_location_filter_cfg_t loc, fill_loc;
+    moq_fill_cfg_t fill_cfg;
+    if (location != Py_None) {
+        if (receiver_location(location, &loc) < 0) return NULL;
+        cfg.location = &loc;
+    }
+    if (fill != Py_None) {
+        if (receiver_fill(fill, &fill_cfg, &fill_loc) < 0) return NULL;
+        cfg.fill = &fill_cfg;
+    }
     cfg.start = (moq_media_start_mode_t)start_value;
     cfg.has_priority = priority != Py_None;
     cfg.priority = (uint8_t)priority_value;
     moq_result_t rc = moq_media_receiver_subscribe_track(handle->receiver, track->track, &cfg);
     if (rc != MOQ_OK) return native_error(module, rc, "subscribe");
+    Py_RETURN_NONE;
+}
+
+static PyObject *receiver_cancel_fill_py(PyObject *module, PyObject *args)
+{
+    PyObject *capsule, *track_capsule, *initiating;
+    if (!PyArg_ParseTuple(args, "OOO:receiver_cancel_fill", &capsule, &track_capsule, &initiating)) return NULL;
+    uint64_t request_id;
+    if (uint_value(initiating, UINT64_MAX, "initiating_request_id", &request_id) < 0) return NULL;
+    receiver_handle_t *handle = receiver_get(capsule, 1, 1);
+    if (!handle) return NULL;
+    track_handle_t *track = track_get(track_capsule, handle, capsule);
+    if (!track) return NULL;
+    moq_result_t rc = moq_media_receiver_cancel_fill(handle->receiver, track->track, request_id);
+    if (rc != MOQ_OK) return native_error(module, rc, "cancel_fill");
     Py_RETURN_NONE;
 }
 
@@ -1060,6 +1159,7 @@ static PyObject *receiver_poll_track_py(PyObject *module, PyObject *capsule)
     PyObject *kind = PyLong_FromLong((long)ev.kind);
     if (!kind) return NULL;
     PyObject *track = NULL, *desc = NULL, *largest = NULL, *expires = NULL, *drop = NULL, *result = NULL;
+    PyObject *local_result = NULL, *fill = NULL, *origin = NULL, *delivery_id = NULL;
 
     /* Shape by KNOWN kind: CATALOG_READY carries no handle; the known
      * track-scoped kinds require one; an unknown kind is preserved either
@@ -1068,6 +1168,8 @@ static PyObject *receiver_poll_track_py(PyObject *module, PyObject *capsule)
     switch (ev.kind) {
     case MOQ_MEDIA_TRACK_ADDED: case MOQ_MEDIA_TRACK_UPDATED: case MOQ_MEDIA_TRACK_REMOVED:
     case MOQ_MEDIA_TRACK_ENDED: case MOQ_MEDIA_TRACK_UPDATE_OK: case MOQ_MEDIA_TRACK_PARSE_DROP:
+    case MOQ_MEDIA_TRACK_LOCAL_FAILURE: case MOQ_MEDIA_TRACK_FILL_TERMINAL:
+    case MOQ_MEDIA_TRACK_DELIVERY_LOCAL_FAILURE:
         track_scoped = true; global = false; break;
     case MOQ_MEDIA_CATALOG_READY:
         track_scoped = false; global = true; break;
@@ -1138,7 +1240,36 @@ static PyObject *receiver_poll_track_py(PyObject *module, PyObject *capsule)
         drop = Py_NewRef(Py_None);
     }
     if (!drop) goto out;
-    result = Py_BuildValue("(OOOOOO)", kind, track, desc, largest, expires, drop);
+    local_result = (ev.kind == MOQ_MEDIA_TRACK_LOCAL_FAILURE ||
+                    ev.kind == MOQ_MEDIA_TRACK_DELIVERY_LOCAL_FAILURE) &&
+                   COVERS(ev.struct_size, moq_media_track_event_t, local_result)
+                       ? PyLong_FromLong(ev.local_result) : Py_NewRef(Py_None);
+    if (!local_result) goto out;
+    if (ev.kind == MOQ_MEDIA_TRACK_FILL_TERMINAL) {
+        fill = PyDict_New();
+        if (!fill) goto out;
+#define FILL_FIELD(name, field) \
+        if (put(fill, name, COVERS(ev.struct_size, moq_media_track_event_t, field) \
+                               ? PyLong_FromUnsignedLongLong(ev.field) : Py_NewRef(Py_None)) < 0) goto out
+        FILL_FIELD("initiating_request_id", initiating_request_id);
+        FILL_FIELD("reason", fill_reason);
+        FILL_FIELD("error_domain", fill_error_domain);
+        FILL_FIELD("error_code", fill_error_code);
+#undef FILL_FIELD
+    } else {
+        fill = Py_NewRef(Py_None);
+    }
+    if (!fill) goto out;
+    bool has_origin = ev.kind == MOQ_MEDIA_TRACK_DELIVERY_LOCAL_FAILURE &&
+        COVERS(ev.struct_size, moq_media_track_event_t, delivery_origin);
+    origin = has_origin ? PyLong_FromUnsignedLong(ev.delivery_origin) : Py_NewRef(Py_None);
+    if (!origin) goto out;
+    delivery_id = has_origin && ev.delivery_origin == MOQ_MEDIA_DELIVERY_FILL &&
+        COVERS(ev.struct_size, moq_media_track_event_t, delivery_initiating_request_id)
+            ? PyLong_FromUnsignedLongLong(ev.delivery_initiating_request_id) : Py_NewRef(Py_None);
+    if (!delivery_id) goto out;
+    result = Py_BuildValue("(OOOOOOOOOO)", kind, track, desc, largest, expires, drop, local_result, fill,
+                          origin, delivery_id);
 out:
     Py_XDECREF(kind);
     Py_XDECREF(track);
@@ -1146,6 +1277,10 @@ out:
     Py_XDECREF(largest);
     Py_XDECREF(expires);
     Py_XDECREF(drop);
+    Py_XDECREF(local_result);
+    Py_XDECREF(fill);
+    Py_XDECREF(origin);
+    Py_XDECREF(delivery_id);
     return result;
 }
 
@@ -1154,7 +1289,7 @@ out:
  * every byte and sample record is copied into Python-owned values, the
  * transferred buffers are released exactly once on this (the polling)
  * thread, and only then does anything return to Python. The ownership refs
- * live in the frozen v0 prefix, so the local object is zero-initialized
+ * include a stamped track-properties tail, so the local object is zero-initialized
  * (absent, never poison) before the poll. */
 #define OBJECT_V0_SIZE (offsetof(moq_media_object_t, samples_owned) + sizeof(moq_cmaf_sample_t *))
 
@@ -1180,6 +1315,88 @@ static void object_release(moq_media_object_t *o)
     PyObject *pending = PyErr_GetRaisedException();
     moq_media_object_cleanup(o);
     PyErr_SetRaisedException(pending);
+}
+
+static PyObject *object_span(PyObject *module, const moq_media_object_t *o,
+                             moq_bytes_t span, const char *stage)
+{
+    if ((span.len && !span.data) || span.len > (size_t)PY_SSIZE_T_MAX)
+        return object_lost(module, stage, o, true);
+    return PyBytes_FromStringAndSize(span.len ? (const char *)span.data : "", (Py_ssize_t)span.len);
+}
+
+static PyObject *object_properties(PyObject *module, const moq_media_object_t *o, moq_rcbuf_t *ref)
+{
+    if (!ref) Py_RETURN_NONE;
+    moq_bytes_t span = {moq_rcbuf_data(ref), moq_rcbuf_len(ref)};
+    return object_span(module, o, span, "properties");
+}
+
+static PyObject *object_metadata(PyObject *module, const moq_media_object_t *o)
+{
+    if (!COVERS(o->struct_size, moq_media_object_t, metadata)) Py_RETURN_NONE;
+    const moq_media_metadata_t *m = &o->metadata;
+    if (m->struct_size < MOQ_MEDIA_METADATA_V0_SIZE) Py_RETURN_NONE;
+    if (m->struct_size > sizeof(*m)) return object_lost(module, "metadata.struct_size", o, true);
+    PyObject *loc = NULL, *result = NULL;
+    const moq_loc_metadata_t *l = &m->loc;
+    if (l->struct_size < MOQ_LOC_METADATA_V0_SIZE) {
+        loc = Py_NewRef(Py_None);
+    } else {
+        if (l->struct_size > sizeof(*l)) return object_lost(module, "metadata.loc.struct_size", o, true);
+        if ((l->present & MOQ_LOC_METADATA_HAS_MARKING) && (l->marking_len < 1 || l->marking_len > sizeof(l->marking)))
+            return object_lost(module, "metadata.loc.marking", o, true);
+        loc = PyDict_New();
+        if (!loc) return NULL;
+        if (put(loc, "present", PyLong_FromUnsignedLong(l->present)) < 0 ||
+            put(loc, "timestamp", opt_u64(l->present & MOQ_LOC_METADATA_HAS_TIMESTAMP, l->timestamp)) < 0 ||
+            put(loc, "timescale", opt_u64(l->present & MOQ_LOC_METADATA_HAS_TIMESCALE, l->timescale)) < 0 ||
+            put(loc, "marking", l->present & MOQ_LOC_METADATA_HAS_MARKING
+                  ? PyBytes_FromStringAndSize((const char *)l->marking, l->marking_len) : Py_NewRef(Py_None)) < 0 ||
+            put(loc, "audio_level", opt_u64(l->present & MOQ_LOC_METADATA_HAS_AUDIO_LEVEL, l->audio_level)) < 0 ||
+            put(loc, "video_config", l->present & MOQ_LOC_METADATA_HAS_VIDEO_CONFIG
+                  ? object_span(module, o, l->video_config, "metadata.loc.video_config") : Py_NewRef(Py_None)) < 0 ||
+            put(loc, "audio_config", l->present & MOQ_LOC_METADATA_HAS_AUDIO_CONFIG
+                  ? object_span(module, o, l->audio_config, "metadata.loc.audio_config") : Py_NewRef(Py_None)) < 0) goto out;
+    }
+    result = PyDict_New();
+    if (!result) goto out;
+    if (put(result, "time_domain", PyLong_FromUnsignedLong(m->time_domain)) < 0 ||
+        put(result, "time_us", opt_u64(m->has_time_us, m->time_us)) < 0 ||
+        put(result, "independent", m->independence_known ? PyBool_FromLong(m->independent) : Py_NewRef(Py_None)) < 0 ||
+        PyDict_SetItemString(result, "loc", loc) < 0) Py_CLEAR(result);
+out:
+    Py_XDECREF(loc);
+    return result;
+}
+
+static PyObject *object_extended(PyObject *module, const moq_media_object_t *o)
+{
+    if (site_fails("object.metadata")) return NULL;
+    PyObject *d = PyDict_New();
+    if (!d) return NULL;
+    bool identity = COVERS(o->struct_size, moq_media_object_t, has_subgroup);
+    bool origin = COVERS(o->struct_size, moq_media_object_t, initiating_request_id);
+#define IDENTITY_FIELD(field) \
+    if (put(d, #field, identity ? PyLong_FromUnsignedLongLong(o->field) : Py_NewRef(Py_None)) < 0) goto fail
+    IDENTITY_FIELD(group_id);
+    IDENTITY_FIELD(object_id);
+    IDENTITY_FIELD(publisher_priority);
+#undef IDENTITY_FIELD
+    if (put(d, "has_subgroup", identity ? PyBool_FromLong(o->has_subgroup) : Py_NewRef(Py_None)) < 0 ||
+        put(d, "subgroup_id", identity && o->has_subgroup
+              ? PyLong_FromUnsignedLongLong(o->subgroup_id) : Py_NewRef(Py_None)) < 0 ||
+        put(d, "metadata", object_metadata(module, o)) < 0 ||
+        put(d, "object_properties", object_properties(module, o, o->properties_ref)) < 0 ||
+        put(d, "track_properties", COVERS(o->struct_size, moq_media_object_t, track_properties_ref)
+              ? object_properties(module, o, o->track_properties_ref) : Py_NewRef(Py_None)) < 0 ||
+        put(d, "delivery_origin", origin ? PyLong_FromUnsignedLong(o->delivery_origin) : Py_NewRef(Py_None)) < 0 ||
+        put(d, "initiating_request_id", origin && o->delivery_origin != MOQ_MEDIA_DELIVERY_LIVE
+              ? PyLong_FromUnsignedLongLong(o->initiating_request_id) : Py_NewRef(Py_None)) < 0) goto fail;
+    return d;
+fail:
+    Py_DECREF(d);
+    return NULL;
 }
 
 /* Validate every span, array and bound BEFORE any read or allocation that
@@ -1216,7 +1433,7 @@ static PyObject *object_convert(PyObject *module, PyObject *capsule, receiver_ha
     PROGRESS("validated");
 
     PyObject *payload = NULL, *fragment = NULL, *samples = NULL, *desc = NULL, *track = NULL;
-    PyObject *capture = NULL, *result = NULL;
+    PyObject *capture = NULL, *extended = NULL, *result = NULL;
     if (site_fails("object.payload")) goto out;
     payload = PyBytes_FromStringAndSize(o->payload.len ? (const char *)o->payload.data : "",
                                         (Py_ssize_t)o->payload.len);
@@ -1263,13 +1480,15 @@ static PyObject *object_convert(PyObject *module, PyObject *capsule, receiver_ha
     if (!track) goto out;
     capture = opt_u64(o->has_capture_time, o->capture_time_us);
     if (!capture) goto out;
-    result = Py_BuildValue("(OOIIIOOOOKLKOOnnO)", track, desc,
+    extended = object_extended(module, o);
+    if (!extended) goto out;
+    result = Py_BuildValue("(OOIIIOOOOKLKOOnnOO)", track, desc,
                            (unsigned)o->config_generation, (unsigned)o->packaging, (unsigned)o->status,
                            o->end_of_group ? Py_True : Py_False, o->datagram ? Py_True : Py_False,
                            o->keyframe ? Py_True : Py_False, capture,
                            (unsigned long long)o->decode_time_us, (long long)o->composition_offset_us,
                            (unsigned long long)o->presentation_time_us, payload, fragment,
-                           (Py_ssize_t)o->mdat_offset, (Py_ssize_t)o->mdat_len, samples);
+                           (Py_ssize_t)o->mdat_offset, (Py_ssize_t)o->mdat_len, samples, extended);
     if (result) PROGRESS("converted");
 out:
     Py_XDECREF(payload);
@@ -1278,6 +1497,7 @@ out:
     Py_XDECREF(desc);
     Py_XDECREF(track);
     Py_XDECREF(capture);
+    Py_XDECREF(extended);
     return result;
 }
 
@@ -1437,11 +1657,12 @@ static PyObject *sender_activate_py(PyObject *module, PyObject *args)
     PyObject *block_timeout, *queue_objects, *queue_bytes;
     PyObject *pre_ready_objects, *pre_ready_bytes;
     PyObject *validate_cmaf, *publish_tracks, *drop_without_demand, *refresh;
-    if (!PyArg_ParseTuple(args, "OOOOOOOOOOOOO:sender_activate", &capsule,
+    PyObject *companion = Py_None;
+    if (!PyArg_ParseTuple(args, "OOOOOOOOOOOOO|O:sender_activate", &capsule,
                           &namespace, &catalog, &backpressure, &block_timeout,
                           &queue_objects, &queue_bytes, &pre_ready_objects,
                           &pre_ready_bytes, &validate_cmaf, &publish_tracks,
-                          &drop_without_demand, &refresh)) return NULL;
+                          &drop_without_demand, &refresh, &companion)) return NULL;
     sender_handle_t *handle = sender_get(capsule, 1, 0);
     if (!handle) return NULL;
     if (handle->activated) {
@@ -1469,6 +1690,16 @@ static PyObject *sender_activate_py(PyObject *module, PyObject *args)
         return NULL;
     if (bp == MOQ_MEDIA_SEND_BP_UNSET) {
         PyErr_SetString(PyExc_ValueError, "backpressure is out of range");
+        return NULL;
+    }
+    uint64_t profile = MOQ_MEDIA_COMPANION_AUTO;
+    if (companion != Py_None &&
+        uint_value(companion, UINT32_MAX, "companion_profile", &profile) < 0)
+        return NULL;
+    if (profile != MOQ_MEDIA_COMPANION_AUTO &&
+        profile != MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01 &&
+        profile != MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC) {
+        PyErr_SetString(PyExc_ValueError, "unknown companion_profile");
         return NULL;
     }
     if (!PyTuple_Check(namespace)) {
@@ -1514,6 +1745,7 @@ static PyObject *sender_activate_py(PyObject *module, PyObject *args)
     cfg.publish_tracks = publish_tracks == Py_True;
     cfg.drop_without_demand = drop_without_demand == Py_True;
     cfg.catalog_refresh_interval_us = refresh_us;
+    cfg.companion_profile = (moq_media_companion_profile_t)profile;
 
     endpoint_handle_t *ep = handle_get(handle->endpoint, 1, 1);
     if (!ep) {
@@ -1715,11 +1947,13 @@ static PyObject *send_track_activate_py(PyObject *module, PyObject *args)
     PyObject *capsule, *codec, *init_data, *role, *lang, *channel_config;
     PyObject *media_type, *packaging, *bitrate, *timescale, *width, *height;
     PyObject *framerate, *samplerate, *is_live, *duration;
-    if (!PyArg_ParseTuple(args, "OOOOOOOOOOOOOOOO:send_track_activate",
+    PyObject *properties, *dynamic_groups;
+    if (!PyArg_ParseTuple(args, "OOOOOOOOOOOOOOOOOO:send_track_activate",
                           &capsule, &media_type, &packaging, &codec, &bitrate,
                           &timescale, &init_data, &role, &lang, &is_live,
                           &width, &height, &framerate, &samplerate,
-                          &channel_config, &duration))
+                          &channel_config, &duration, &properties,
+                          &dynamic_groups))
         return NULL;
     send_track_handle_t *handle = send_track_get(capsule, 1, 0, 0);
     if (!handle) return NULL;
@@ -1731,6 +1965,10 @@ static PyObject *send_track_activate_py(PyObject *module, PyObject *args)
         PyErr_SetString(PyExc_TypeError, "is_live must be bool");
         goto abort_prepared;
     }
+    if (!PyBool_Check(dynamic_groups)) {
+        PyErr_SetString(PyExc_TypeError, "dynamic_groups must be bool");
+        goto abort_prepared;
+    }
     /* The prepared owner must still be usable: prepare and activate are two
      * calls, so the sender may have been closed in between. */
     sender_handle_t *sender = sender_get(handle->sender, 1, 1);
@@ -1738,8 +1976,9 @@ static PyObject *send_track_activate_py(PyObject *module, PyObject *args)
 
     uint64_t mt, pk, rate, ts, w, h, fps, sr, dur = 0;
     moq_bytes_t codec_bytes, init_bytes, role_bytes, lang_bytes, channel_bytes;
-    moq_bytes_t name_bytes;
+    moq_bytes_t name_bytes, property_bytes;
     if (binary_value(handle->name, "name", &name_bytes) < 0 ||
+        binary_value(properties, "track_properties", &property_bytes) < 0 ||
         binary_value(codec, "codec", &codec_bytes) < 0 ||
         binary_value(init_data, "init_data", &init_bytes) < 0 ||
         binary_value(role, "role", &role_bytes) < 0 ||
@@ -1786,6 +2025,8 @@ static PyObject *send_track_activate_py(PyObject *module, PyObject *args)
     cfg.bitrate = rate;
     cfg.has_track_duration = has_duration;
     cfg.track_duration_ms = dur;
+    cfg.track_properties = property_bytes;
+    cfg.dynamic_groups = dynamic_groups == Py_True;
 
     moq_media_track_t *native = NULL;
     moq_result_t rc;
@@ -1921,16 +2162,79 @@ static int write_span(PyObject *value, int span, const char *name,
     return 0;
 }
 
+static int sender_metadata_value(PyObject *value, moq_media_metadata_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->struct_size = (uint32_t)sizeof(*out);
+    out->loc.struct_size = (uint32_t)sizeof(out->loc);
+    if (value == Py_None) return 0;
+    if (!PyTuple_Check(value) || PyTuple_Size(value) != 7) {
+        PyErr_SetString(PyExc_TypeError, "loc_metadata must be a seven-field tuple or None");
+        return -1;
+    }
+    PyObject *items[7];
+    for (Py_ssize_t i = 0; i < 7; ++i) items[i] = PyTuple_GetItem(value, i);
+    uint64_t present;
+    if (uint_value(items[0], UINT32_MAX, "loc_metadata.present", &present) < 0)
+        return -1;
+    if (present & ~((uint64_t)MOQ_LOC_METADATA_PRESENT_MASK)) {
+        PyErr_SetString(PyExc_ValueError, "loc_metadata.present has unknown bits");
+        return -1;
+    }
+    const uint32_t flags[] = {
+        MOQ_LOC_METADATA_HAS_TIMESTAMP, MOQ_LOC_METADATA_HAS_TIMESCALE,
+        MOQ_LOC_METADATA_HAS_MARKING, MOQ_LOC_METADATA_HAS_AUDIO_LEVEL,
+        MOQ_LOC_METADATA_HAS_VIDEO_CONFIG, MOQ_LOC_METADATA_HAS_AUDIO_CONFIG,
+    };
+    for (size_t i = 0; i < sizeof(flags) / sizeof(flags[0]); ++i) {
+        if (((present & flags[i]) != 0) != (items[i + 1] != Py_None)) {
+            PyErr_SetString(PyExc_ValueError, "loc_metadata fields must agree with present");
+            return -1;
+        }
+    }
+    out->loc.present = (uint32_t)present;
+    if (items[1] != Py_None &&
+        uint_value(items[1], UINT64_MAX, "loc_metadata.timestamp", &out->loc.timestamp) < 0)
+        return -1;
+    if (items[2] != Py_None &&
+        uint_value(items[2], UINT64_MAX, "loc_metadata.timescale", &out->loc.timescale) < 0)
+        return -1;
+    if (items[3] != Py_None) {
+        moq_bytes_t marking;
+        if (binary_value(items[3], "loc_metadata.marking", &marking) < 0) return -1;
+        if (marking.len < 1 || marking.len > sizeof(out->loc.marking)) {
+            PyErr_SetString(PyExc_ValueError, "loc_metadata.marking must contain 1 to 4 bytes");
+            return -1;
+        }
+        out->loc.marking_len = (uint8_t)marking.len;
+        memcpy(out->loc.marking, marking.data, marking.len);
+    }
+    if (items[4] != Py_None) {
+        uint64_t audio_level;
+        if (uint_value(items[4], UINT8_MAX, "loc_metadata.audio_level", &audio_level) < 0)
+            return -1;
+        out->loc.audio_level = (uint8_t)audio_level;
+    }
+    if (items[5] != Py_None &&
+        binary_value(items[5], "loc_metadata.video_config", &out->loc.video_config) < 0)
+        return -1;
+    if (items[6] != Py_None &&
+        binary_value(items[6], "loc_metadata.audio_config", &out->loc.audio_config) < 0)
+        return -1;
+    return 0;
+}
+
 static PyObject *sender_write_py(PyObject *module, PyObject *args)
 {
     PyObject *sender_capsule, *track_capsule, *payload, *properties;
     PyObject *is_sync, *starts_group, *ends_group;
     PyObject *decode_time, *presentation_time, *capture_time, *sap_type;
-    if (!PyArg_ParseTuple(args, "OOOOOOOOOOO:sender_write",
+    PyObject *metadata = Py_None;
+    if (!PyArg_ParseTuple(args, "OOOOOOOOOOO|O:sender_write",
                           &sender_capsule, &track_capsule, &payload,
                           &properties, &is_sync, &starts_group, &ends_group,
                           &decode_time, &presentation_time, &capture_time,
-                          &sap_type))
+                          &sap_type, &metadata))
         return NULL;
 
     /* Owner thread, same process, live sender and a REGISTERED track of THIS
@@ -1967,6 +2271,8 @@ static PyObject *sender_write_py(PyObject *module, PyObject *args)
         PyErr_SetString(PyExc_TypeError, "properties must be immutable bytes");
         return NULL;
     }
+    moq_media_metadata_t metadata_value;
+    if (sender_metadata_value(metadata, &metadata_value) < 0) return NULL;
 
     /* Nothing above runs foreign Python: uint_value requires PyLong and the
      * spans must be bytes. The owner is rechecked anyway, because prepare-time
@@ -2009,6 +2315,8 @@ static PyObject *sender_write_py(PyObject *module, PyObject *args)
     object.capture_time_us = capture_us;
     object.has_sap_type = has_sap;
     object.sap_type = (moq_sap_type_t)sap;
+    /* The argument tuple owns every borrowed bytes value through this call. */
+    object.metadata = metadata == Py_None ? NULL : &metadata_value;
 
     moq_result_t rc;
     Py_BEGIN_ALLOW_THREADS
@@ -2130,6 +2438,24 @@ static PyObject *sender_has_subscriber_py(PyObject *module, PyObject *args)
     bool any = moq_media_sender_track_has_subscriber(owner->sender,
                                                      track->track);
     return PyBool_FromLong(any);          /* a singleton: nothing to fail */
+}
+
+static PyObject *sender_take_new_group_request_py(PyObject *module, PyObject *args)
+{
+    PyObject *sender_capsule, *track_capsule;
+    if (!PyArg_ParseTuple(args, "OO:sender_take_new_group_request", &sender_capsule,
+                          &track_capsule))
+        return NULL;
+    sender_handle_t *owner;
+    send_track_handle_t *track = demand_track(sender_capsule, track_capsule,
+                                              &owner);
+    if (!track) return NULL;
+    uint64_t value = 0;
+    moq_result_t rc = moq_media_sender_take_new_group_request(owner->sender,
+                                                              track->track, &value);
+    if (rc == MOQ_DONE) Py_RETURN_NONE;
+    if (rc != MOQ_OK) return native_error(module, rc, "take_new_group_request");
+    return PyLong_FromUnsignedLongLong((unsigned long long)value);
 }
 
 static PyObject *sender_has_media_subscriber_py(PyObject *module,
@@ -2351,11 +2677,13 @@ static PyMethodDef methods[] = {
     {"sender_subscriptions", sender_subscriptions_py, METH_VARARGS, "Active subscriptions for one owned track."},
     {"sender_has_subscriber", sender_has_subscriber_py, METH_VARARGS, "Whether one owned track has a subscriber."},
     {"sender_has_media_subscriber", sender_has_media_subscriber_py, METH_O, "Whether any app-visible media track has a subscriber."},
+    {"sender_take_new_group_request", sender_take_new_group_request_py, METH_VARARGS, "Take a track's pending new-group request, or None."},
     {"receiver_enter", receiver_enter_py, METH_O, "Owner/process/liveness guard for context entry."},
     {"receiver_wait", receiver_wait_py, METH_VARARGS, "Wait with the GIL released; return the exact wait outcome."},
     {"receiver_stats", receiver_stats_py, METH_O, "Copy the sized stats snapshot."},
     {"receiver_terminal", receiver_terminal_py, METH_O, "Read closed/fatal/fatal_code and the endpoint terminal."},
     {"receiver_subscribe", receiver_subscribe_py, METH_VARARGS, "Record subscribe intent for a track."},
+    {"receiver_cancel_fill", receiver_cancel_fill_py, METH_VARARGS, "Cancel only the named fill child."},
     {"receiver_unsubscribe", receiver_unsubscribe_py, METH_VARARGS, "Record unsubscribe intent for a track."},
     {"receiver_track_state", receiver_track_state_py, METH_VARARGS, "Read a track's delivery state."},
     {"receiver_poll_track", receiver_poll_track_py, METH_O, "Dequeue one track event as owned copies, or EMPTY/CLOSED."},
@@ -2442,7 +2770,8 @@ PyMODINIT_FUNC PyInit__native(void)
     ADD(TRANSPORT_BACKEND_AUTO); ADD(TRANSPORT_BACKEND_PICOQUIC); ADD(TRANSPORT_BACKEND_MVFST);
     ADD(TRANSPORT_BACKEND_PROXYGEN); ADD(TRANSPORT_BACKEND_MSQUIC);
     ADD(TRANSPORT_BACKEND_WTQUIC_NETWORK); ADD(TRANSPORT_BACKEND_WTQUIC_MSQUIC);
-    ADD(VERSION_DRAFT_16); ADD(VERSION_DRAFT_18);
+    ADD(VERSION_DRAFT_16); ADD(VERSION_DRAFT_18); ADD(VERSION_DRAFT_22);
+    ADD(ENDPOINT_URI_STANDARD); ADD(ENDPOINT_URI_LEGACY);
     ADD(WT_PROFILE_BACKEND_DEFAULT); ADD(WT_PROFILE_CURRENT); ADD(WT_PROFILE_D13_14_COMPAT);
     ADD(ENDPOINT_CONNECTING); ADD(ENDPOINT_ESTABLISHED); ADD(ENDPOINT_RECONNECTING);
     ADD(ENDPOINT_DRAINING); ADD(ENDPOINT_CLOSED);
@@ -2453,6 +2782,20 @@ PyMODINIT_FUNC PyInit__native(void)
     ADD(MEDIA_SEND_BP_BLOCK_TIMEOUT); ADD(MEDIA_SEND_BP_RETURN_WOULD_BLOCK);
     ADD(MEDIA_TIME_RAW); ADD(MEDIA_TIME_SHARED_EPOCH);
     ADD(MEDIA_START_CURRENT); ADD(MEDIA_START_NEXT_GROUP);
+    ADD(MEDIA_COMPANION_LEGACY_MSF01_LOC01); ADD(MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC);
+    ADD(MEDIA_COMPANION_AUTO);
+    ADD(LOCATION_FILTER_NONE); ADD(LOCATION_FILTER_RELATIVE_GROUP); ADD(LOCATION_FILTER_ABSOLUTE_START);
+    ADD(LOCATION_FILTER_GROUP_END); ADD(LOCATION_FILTER_OBJECT_END); ADD(LOCATION_FILTER_NEXT_OBJECT);
+    ADD(GROUP_ORDER_ASCENDING); ADD(GROUP_ORDER_DESCENDING);
+    ADD(MEDIA_TIME_DOMAIN_NONE); ADD(MEDIA_TIME_DOMAIN_UNIX_US); ADD(MEDIA_TIME_DOMAIN_APPLICATION_MEDIA);
+    ADD(MEDIA_DELIVERY_LIVE); ADD(MEDIA_DELIVERY_FILL);
+    ADD(LOC_METADATA_HAS_TIMESTAMP); ADD(LOC_METADATA_HAS_TIMESCALE); ADD(LOC_METADATA_HAS_MARKING);
+    ADD(LOC_METADATA_HAS_AUDIO_LEVEL); ADD(LOC_METADATA_HAS_VIDEO_CONFIG); ADD(LOC_METADATA_HAS_AUDIO_CONFIG);
+    ADD(FILL_COMPLETE); ADD(FILL_NO_STREAM); ADD(FILL_LOCAL_CANCELLED); ADD(FILL_PEER_CANCELLED_OR_RESET);
+    ADD(FILL_LOCAL_ABORTED); ADD(FILL_PARENT_REJECTED); ADD(FILL_PARENT_TERMINATED);
+    ADD(FILL_ERROR_NONE); ADD(FILL_ERROR_STREAM); ADD(FILL_ERROR_PARENT_REQUEST); ADD(FILL_ERROR_PARENT_DONE);
+    ADD(MEDIA_TRACK_LOCAL_FAILURE); ADD(MEDIA_TRACK_FILL_TERMINAL); ADD(MEDIA_TRACK_STATE_FAILED);
+    ADD(MEDIA_TRACK_DELIVERY_LOCAL_FAILURE);
     ADD(MEDIA_TRACK_ADDED); ADD(MEDIA_TRACK_UPDATED); ADD(MEDIA_TRACK_REMOVED); ADD(MEDIA_TRACK_ENDED);
     ADD(MEDIA_CATALOG_READY); ADD(MEDIA_TRACK_UPDATE_OK); ADD(MEDIA_TRACK_PARSE_DROP);
     ADD(MEDIA_TRACK_STATE_DISCOVERED); ADD(MEDIA_TRACK_STATE_PENDING); ADD(MEDIA_TRACK_STATE_ACTIVE);

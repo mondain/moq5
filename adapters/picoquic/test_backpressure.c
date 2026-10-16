@@ -43,9 +43,21 @@ picoquic_quic_t *picoquic_get_quic_ctx(picoquic_cnx_t *c)
     { (void)c; return NULL; }
 uint64_t picoquic_get_quic_time(picoquic_quic_t *q)
     { (void)q; return g_time; }
+#if defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) && PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1
+/* The provider's terminal-observation contract (patch 0007): opt-in and the
+ * exact STOP code, inert here. */
+int picoquic_set_app_stream_ctx(picoquic_cnx_t *c, uint64_t sid, void *ctx)
+    { (void)c; (void)sid; (void)ctx; return 0; }
+int picoquic_enable_stream_send_commit(picoquic_cnx_t *c, uint64_t sid)
+    { (void)c; (void)sid; return 0; }
+int picoquic_get_remote_stop_error(picoquic_cnx_t *c, uint64_t sid,
+    uint64_t *out)
+    { (void)c; (void)sid; *out = 0x42; return 0; }   /* the peer's STOP code */
+#endif
+static int g_set_cb_count = 0;   /* callbacks installed (fn non-NULL) */
 void picoquic_set_callback(picoquic_cnx_t *c,
     picoquic_stream_data_cb_fn fn, void *ctx)
-    { (void)c; (void)fn; (void)ctx; }
+    { (void)c; (void)ctx; if (fn) g_set_cb_count++; }
 int picoquic_add_to_stream(picoquic_cnx_t *c, uint64_t sid,
     const uint8_t *d, size_t len, int fin)
     { (void)c; (void)sid; (void)d; (void)fin;
@@ -81,8 +93,19 @@ uint64_t picoquic_get_next_local_stream_id(picoquic_cnx_t *c, int uni)
     { (void)c; return uni ? g_next_uni++ : g_next_bidi++; }
 uint64_t picoquic_get_remote_stream_error(picoquic_cnx_t *c, uint64_t sid)
     { (void)c; (void)sid; return 0x42; }
+/* g_reset_fail makes picoquic refuse a plain RESET_STREAM as well. */
+static bool g_reset_fail = false;
 int picoquic_reset_stream(picoquic_cnx_t *c, uint64_t sid, uint64_t ec)
-    { (void)c; (void)sid; g_reset_count++; g_reset_code = ec; return 0; }
+    { (void)c; (void)sid; if (g_reset_fail) return -1;
+      g_reset_count++; g_reset_code = ec; return 0; }
+/* Reliable reset: which sides advertised reset_stream_at, and the frames
+ * picoquic was asked for. */
+static bool g_rsa_local = false, g_rsa_remote = false, g_rsa_fail = false;
+static int g_rsa_count = 0;
+static uint64_t g_rsa_sid = 0, g_rsa_code = 0, g_rsa_size = 0;
+int picoquic_reset_stream_at(picoquic_cnx_t *c, uint64_t sid, uint64_t ec, uint64_t rs)
+    { (void)c; if (g_rsa_fail) return -1;
+      g_rsa_count++; g_rsa_sid = sid; g_rsa_code = ec; g_rsa_size = rs; return 0; }
 int picoquic_stop_sending(picoquic_cnx_t *c, uint64_t sid, uint64_t ec)
     { (void)c; (void)sid; (void)ec; return 0; }
 static bool g_close_fail = false;
@@ -106,15 +129,17 @@ static uint64_t g_rx_window_bidi_local = 0;  /* locally-initiated bidi (0 = uni 
 static bool g_tp_null = false;               /* TPs unreadable -> fail closed */
 picoquic_tp_t const *picoquic_get_transport_parameters(picoquic_cnx_t *c,
     int get_local)
-    { (void)c; (void)get_local; static picoquic_tp_t tp;
+    { (void)c; static picoquic_tp_t tps[2];   /* remote, local: distinct */
       if (g_tp_null) return NULL;
-      memset(&tp, 0, sizeof(tp)); tp.max_datagram_frame_size = 1252;
-      tp.initial_max_stream_data_uni = g_rx_window;
-      tp.initial_max_stream_data_bidi_remote =
+      picoquic_tp_t *tp = &tps[get_local ? 1 : 0];
+      memset(tp, 0, sizeof(*tp)); tp->max_datagram_frame_size = 1252;
+      tp->initial_max_stream_data_uni = g_rx_window;
+      tp->initial_max_stream_data_bidi_remote =
           g_rx_window_bidi_remote ? g_rx_window_bidi_remote : g_rx_window;
-      tp.initial_max_stream_data_bidi_local =
+      tp->initial_max_stream_data_bidi_local =
           g_rx_window_bidi_local ? g_rx_window_bidi_local : g_rx_window;
-      return &tp; }
+      tp->is_reset_stream_at_enabled = get_local ? g_rsa_local : g_rsa_remote;
+      return tp; }
 
 /* -- Per-stream receive flow-control instrumentation ----------------- *
  * Records the adapter's picoquic_set_app_flow_control / open_flow_control calls
@@ -122,7 +147,7 @@ picoquic_tp_t const *picoquic_get_transport_parameters(picoquic_cnx_t *c,
  * Keyed by stream id; small fixed table is plenty for the test streams. */
 #define FC_MAX 32
 static struct { uint64_t sid; int use; int set_calls;
-                int open_calls; uint64_t open_total; } g_fc[FC_MAX];
+                int open_calls; } g_fc[FC_MAX];
 static int g_fc_n = 0;
 static int fc_slot(uint64_t sid)
     { for (int i = 0; i < g_fc_n; i++) if (g_fc[i].sid == sid) return i;
@@ -135,9 +160,6 @@ static int fc_use(uint64_t sid)     /* last app-flow-control flag, -1 if untouch
 static int fc_open_calls(uint64_t sid)
     { for (int i = 0; i < g_fc_n; i++) if (g_fc[i].sid == sid) return g_fc[i].open_calls;
       return 0; }
-static uint64_t fc_open_total(uint64_t sid)
-    { for (int i = 0; i < g_fc_n; i++) if (g_fc[i].sid == sid) return g_fc[i].open_total;
-      return 0; }
 static bool g_set_fc_fail = false;   /* failure injection (FC errors */
 static bool g_open_fc_fail = false;  /* must be fatal, not silently ignored)  */
 int picoquic_set_app_flow_control(picoquic_cnx_t *c, uint64_t sid, int use)
@@ -145,8 +167,8 @@ int picoquic_set_app_flow_control(picoquic_cnx_t *c, uint64_t sid, int use)
       int s = fc_slot(sid); g_fc[s].use = use; g_fc[s].set_calls++;
       return 0; }
 int picoquic_open_flow_control(picoquic_cnx_t *c, uint64_t sid, uint64_t sz)
-    { (void)c; if (g_open_fc_fail) return -1;
-      int s = fc_slot(sid); g_fc[s].open_calls++; g_fc[s].open_total += sz;
+    { (void)c; (void)sz; if (g_open_fc_fail) return -1;
+      int s = fc_slot(sid); g_fc[s].open_calls++;
       return 0; }
 /* Budget-direction plumbing: the adapter derives each stream's budget from the
  * LOCAL initial_max_stream_data_* for the stream's category + initiator, so the
@@ -289,6 +311,144 @@ int main(void)
         g_priority_fail = true;
         CHECK(ops.set_stream_priority(&ep, 14, 0x10000) == MOQ_TRANSPORT_ERROR);
         g_priority_fail = false;
+        pq_endpoint_cleanup(&ep);
+    }
+
+    /* Reliable reset at the endpoint. Not negotiated (either side lacks
+     * reset_stream_at): DROPPED, nothing touched, so the bridge resets plainly.
+     * A prefix picoquic already pulled: RESET_STREAM_AT at once. A prefix
+     * still queued: the rest of the queue (and its FIN) is dropped, the
+     * prefix is provided, and the frame follows on the next flush; a frame
+     * picoquic refuses still ends the stream with a plain reset. */
+    {
+        moq_transport_endpoint_ops_t ops = MOQ_TRANSPORT_ENDPOINT_OPS_INIT;
+        pq_endpoint_ctx_t ep;
+        memset(&ep, 0, sizeof(ep));
+        CHECK(pq_endpoint_init(&ops, &ep, (picoquic_cnx_t *)&ep, &al) == 0);
+        CHECK((ops.capabilities & MOQ_TRANSPORT_CAP_RELIABLE_RESET) != 0);
+        CHECK(ops.reset_stream_at != NULL);
+        const uint8_t hdr[5] = { 1, 2, 3, 4, 5 }, obj[7] = { 9, 9, 9, 9, 9, 9, 9 };
+
+        g_rsa_local = true; g_rsa_remote = false;
+        CHECK(ops.write(&ep, 3, hdr, 5, false) == MOQ_TRANSPORT_OK);
+        CHECK(ops.reset_stream_at(&ep, 3, 0x2, 5) == MOQ_TRANSPORT_DROPPED);
+        g_rsa_local = false; g_rsa_remote = true;
+        CHECK(ops.reset_stream_at(&ep, 3, 0x2, 5) == MOQ_TRANSPORT_DROPPED);
+        CHECK(moq_pq_send_queue_queued_bytes(ep.queue) == 5);
+        CHECK(g_rsa_count == 0);
+
+        /* Already pulled. */
+        g_rsa_local = g_rsa_remote = true;
+        pq_endpoint_on_prepare_to_send(&ep, 3, NULL, 64);
+        CHECK(g_provide_nb == 5);
+        CHECK(ops.reset_stream_at(&ep, 3, 0x2, 5) == MOQ_TRANSPORT_OK);
+        CHECK(g_rsa_count == 1 && g_rsa_sid == 3 && g_rsa_code == 0x2 && g_rsa_size == 5);
+        CHECK(g_active_flag == 0 && g_active_sid == 3);
+        CHECK(ep.reliable_resets == 1);
+
+        /* Still queued, with an object and a FIN behind it. */
+        CHECK(ops.write(&ep, 7, hdr, 5, false) == MOQ_TRANSPORT_OK);
+        CHECK(ops.write(&ep, 7, obj, 7, true) == MOQ_TRANSPORT_OK);
+        CHECK(ops.reset_stream_at(&ep, 7, 0x1, 5) == MOQ_TRANSPORT_OK);
+        CHECK(g_rsa_count == 1);
+        CHECK(moq_pq_send_queue_queued_bytes(ep.queue) == 5);
+        CHECK(ep.deferred_count == 1);
+        pq_endpoint_flush_resets(&ep);          /* prefix not sent yet */
+        CHECK(g_rsa_count == 1);
+        pq_endpoint_on_prepare_to_send(&ep, 7, NULL, 64);
+        CHECK(g_provide_nb == 5 && g_provide_fin == 0 && g_provide_still == 0);
+        CHECK(memcmp(g_provide_buf, hdr, 5) == 0);
+        pq_endpoint_flush_resets(&ep);
+        CHECK(g_rsa_count == 2 && g_rsa_sid == 7 && g_rsa_code == 0x1 && g_rsa_size == 5);
+        CHECK(ep.deferred_count == 0);
+
+        /* Header sent long ago, an object still queued behind it (e.g. flow
+         * control): the prefix is out, so the frame goes at once and the
+         * queued object is dropped rather than waited for. */
+        CHECK(ops.write(&ep, 15, hdr, 5, false) == MOQ_TRANSPORT_OK);
+        pq_endpoint_on_prepare_to_send(&ep, 15, NULL, 64);
+        CHECK(ops.write(&ep, 15, obj, 7, false) == MOQ_TRANSPORT_OK);
+        CHECK(ops.reset_stream_at(&ep, 15, 0x3, 5) == MOQ_TRANSPORT_OK);
+        CHECK(g_rsa_count == 3 && g_rsa_sid == 15 && g_rsa_size == 5);
+        CHECK(ep.deferred_count == 0);
+        CHECK(!moq_pq_send_queue_has_data(ep.queue, 15));
+
+        /* The same with the FIN already pushed behind the object, as a
+         * subgroup delivery timeout that runs from the FIN finds it
+         * (draft-ietf-moq-transport-22 §5.2). The header was handed over
+         * before the FIN was pushed, so nothing of the reliable prefix is
+         * owed: the frame goes at once, with no further provide-data call
+         * (no credit), and the object and FIN are dropped. First a separate
+         * zero-byte FIN, then a FIN carried by the object's own write. */
+        CHECK(ops.write(&ep, 19, hdr, 5, false) == MOQ_TRANSPORT_OK);
+        pq_endpoint_on_prepare_to_send(&ep, 19, NULL, 64);
+        CHECK(g_provide_nb == 5);
+        CHECK(ops.write(&ep, 19, obj, 7, false) == MOQ_TRANSPORT_OK);
+        CHECK(ops.write(&ep, 19, NULL, 0, true) == MOQ_TRANSPORT_OK);
+        CHECK(ops.reset_stream_at(&ep, 19, 0x3, 5) == MOQ_TRANSPORT_OK);
+        CHECK(g_rsa_count == 4 && g_rsa_sid == 19 && g_rsa_size == 5);
+        CHECK(ep.deferred_count == 0);
+        CHECK(!moq_pq_send_queue_has_data(ep.queue, 19));
+
+        CHECK(ops.write(&ep, 23, hdr, 5, false) == MOQ_TRANSPORT_OK);
+        pq_endpoint_on_prepare_to_send(&ep, 23, NULL, 64);
+        CHECK(ops.write(&ep, 23, obj, 7, true) == MOQ_TRANSPORT_OK);
+        CHECK(ops.reset_stream_at(&ep, 23, 0x3, 5) == MOQ_TRANSPORT_OK);
+        CHECK(g_rsa_count == 5 && g_rsa_sid == 23 && g_rsa_size == 5);
+        CHECK(ep.deferred_count == 0);
+        CHECK(!moq_pq_send_queue_has_data(ep.queue, 23));
+        CHECK(moq_pq_send_queue_queued_bytes(ep.queue) == 0);
+
+        /* Only three header bytes were handed over before the FIN was
+         * pushed: exactly the two owed header bytes stay queued (no object
+         * byte, no FIN), and the frame waits for them alone. */
+        CHECK(ops.write(&ep, 27, hdr, 5, false) == MOQ_TRANSPORT_OK);
+        pq_endpoint_on_prepare_to_send(&ep, 27, NULL, 3);
+        CHECK(g_provide_nb == 3);
+        CHECK(ops.write(&ep, 27, obj, 7, true) == MOQ_TRANSPORT_OK);
+        CHECK(ops.reset_stream_at(&ep, 27, 0x3, 5) == MOQ_TRANSPORT_OK);
+        CHECK(g_rsa_count == 5);
+        CHECK(ep.deferred_count == 1);
+        CHECK(moq_pq_send_queue_queued_bytes(ep.queue) == 2);
+        pq_endpoint_flush_resets(&ep);
+        CHECK(g_rsa_count == 5);
+        pq_endpoint_on_prepare_to_send(&ep, 27, NULL, 64);
+        CHECK(g_provide_nb == 2 && g_provide_fin == 0 && g_provide_still == 0);
+        CHECK(memcmp(g_provide_buf, hdr + 3, 2) == 0);
+        pq_endpoint_flush_resets(&ep);
+        CHECK(g_rsa_count == 6 && g_rsa_sid == 27 && g_rsa_size == 5);
+        CHECK(ep.deferred_count == 0);
+
+        /* The provider refuses its buffer: nothing is committed, so none of
+         * the header counts as handed over and the whole reliable prefix is
+         * still owed -- exactly the header, without the object or the FIN. */
+        CHECK(ops.write(&ep, 31, hdr, 5, false) == MOQ_TRANSPORT_OK);
+        CHECK(ops.write(&ep, 31, obj, 7, true) == MOQ_TRANSPORT_OK);
+        g_provide_fail = true;
+        pq_endpoint_on_prepare_to_send(&ep, 31, NULL, 3);
+        g_provide_fail = false;
+        CHECK(moq_pq_send_queue_queued_bytes(ep.queue) == 12);
+        CHECK(ops.reset_stream_at(&ep, 31, 0x3, 5) == MOQ_TRANSPORT_OK);
+        CHECK(g_rsa_count == 6);
+        CHECK(ep.deferred_count == 1);
+        CHECK(moq_pq_send_queue_queued_bytes(ep.queue) == 5);
+        pq_endpoint_on_prepare_to_send(&ep, 31, NULL, 64);
+        CHECK(g_provide_nb == 5 && g_provide_fin == 0 && g_provide_still == 0);
+        CHECK(memcmp(g_provide_buf, hdr, 5) == 0);
+        pq_endpoint_flush_resets(&ep);
+        CHECK(g_rsa_count == 7 && g_rsa_sid == 31 && g_rsa_size == 5);
+        CHECK(ep.deferred_count == 0);
+
+        /* Refused by picoquic: the stream still ends, plainly. */
+        int plain = g_reset_count;
+        g_rsa_fail = true;
+        CHECK(ops.write(&ep, 11, hdr, 5, false) == MOQ_TRANSPORT_OK);
+        CHECK(ops.reset_stream_at(&ep, 11, 0x1, 5) == MOQ_TRANSPORT_OK);
+        pq_endpoint_on_prepare_to_send(&ep, 11, NULL, 64);
+        pq_endpoint_flush_resets(&ep);
+        CHECK(g_reset_count == plain + 1);
+        g_rsa_fail = false;
+        g_rsa_local = g_rsa_remote = false;
         pq_endpoint_cleanup(&ep);
     }
 
@@ -2011,25 +2171,34 @@ int main(void)
         moq_session_destroy(c); moq_session_destroy(s);
     }
 
-    /* -- 114. Unreadable transport parameters: fail closed -------------------- *
-     * NULL TPs mean the credit-accounting basis is unavailable; the adapter
-     * must not fabricate a budget. */
+    /* -- 114. Unreadable transport parameters: attach refused ---------------- *
+     * NULL TPs mean the credit-accounting basis is unavailable: the adapter
+     * must not fabricate a budget, so create refuses the connection before
+     * allocating anything or installing its callback. (picoquic returns the
+     * parameters for every valid connection; the stub models a provider that
+     * does not.) */
     {
         fc_reset();
-        g_tp_null = true;
         moq_session_t *c = NULL, *s = NULL;
-        moq_subscription_t ss = setup(&al, &c, &s, 0, 0);
-        moq_pq_conn_t *ad = mkad(&al, c);
-        moq_subgroup_cfg_t sg; moq_subgroup_cfg_init(&sg);
-        moq_subgroup_handle_t sgh;
-        moq_session_open_subgroup(s, ss, &sg, 0, &sgh);
-        moq_rcbuf_t *p = NULL;
-        moq_rcbuf_create(&al, (const uint8_t *)"AAA", 3, &p);
-        moq_session_write_object(s, sgh, 0, p, 0);
-        moq_rcbuf_decref(p);
-        feed_data(s, ad, 3);
-        CHECK(moq_pq_conn_is_fatal(ad));
+        (void)setup(&al, &c, &s, 0, 0);
+        moq_alloc_t cal = calloc_();
+        long bal0 = g_bal;
+        int cb0 = g_set_cb_count;
+        g_tp_null = true;
+        moq_pq_conn_cfg_t ac; moq_pq_conn_cfg_init_sized(&ac, sizeof(ac));
+        ac.session = c; ac.cnx = (picoquic_cnx_t *)(uintptr_t)0xDEAD;
+        ac.alloc = &cal;
+        moq_pq_conn_t *ad = (moq_pq_conn_t *)(uintptr_t)1;
+        int crc = moq_pq_conn_create(&ac, &ad);
         g_tp_null = false;
+        CHECK(crc == -1);
+        CHECK(ad == NULL);
+        CHECK(g_set_cb_count == cb0);      /* no callback taken */
+        CHECK(g_bal == bal0);              /* nothing allocated */
+        /* The session is untouched: a later attach with readable
+         * parameters succeeds. */
+        ad = mkad(&al, c);
+        CHECK(ad != NULL);
         moq_pq_conn_destroy(ad);
         moq_session_destroy(c); moq_session_destroy(s);
     }
@@ -2153,6 +2322,119 @@ int main(void)
         moq_session_destroy(c); moq_session_destroy(s);
     }
 
+    /* -- 120/121/122. A deferred reliable reset that cannot end its stream --- *
+     * The subgroup is reset while its header is still queued, so the
+     * RESET_STREAM_AT waits for the header to be handed over and goes out on
+     * the next flush. If picoquic then refuses both that frame and the plain
+     * RESET_STREAM fallback, the stream cannot be ended at all: the adapter
+     * goes fatal with the local transport-failure code 0x1 -- the code the
+     * bridge latches when a reset is refused on the spot -- from service()
+     * (-1) and from the picoquic callback alike, and after_callback fires
+     * exactly once for the call that went fatal. The deferred entry is
+     * consumed, never retried.
+     *   via 0  control: only the frame is refused; the plain fallback ends
+     *          the stream and the connection stays healthy.
+     *   via 1  both refused, found by service().
+     *   via 2  both refused, found by a picoquic callback.
+     *   via 3  both refused after the peer already closed the connection:
+     *          the established close (and its code) stands; nothing turns
+     *          it into a local fatal. */
+    for (int via = 0; via < 4; via++) {
+        g_rsa_local = g_rsa_remote = true;
+        g_rsa_fail = false; g_reset_fail = false; g_send_fail = false;
+        g_cnx_state = picoquic_state_ready;
+        g_pending_app_error = 0;
+        moq_session_t *c = NULL, *s = NULL;
+        moq_subscription_t ss = setup(&al, &c, &s, 0, 0);
+        moq_pq_conn_cfg_t ac; moq_pq_conn_cfg_init_sized(&ac, sizeof(ac));
+        ac.session = s; ac.cnx = (picoquic_cnx_t *)(uintptr_t)0xDEAD;
+        ac.alloc = &al; ac.after_callback = hook_fn;
+        moq_pq_conn_t *ad = NULL;
+        CHECK(moq_pq_conn_create(&ac, &ad) == MOQ_OK);
+
+        moq_subgroup_cfg_t sg; moq_subgroup_cfg_init(&sg);
+        moq_subgroup_handle_t sgh;
+        CHECK(moq_session_open_subgroup(s, ss, &sg, 0, &sgh) == MOQ_OK);
+        moq_rcbuf_t *p = NULL;
+        moq_rcbuf_create(&al, (const uint8_t *)"PAYLOAD", 7, &p);
+        CHECK(moq_session_write_object(s, sgh, 0, p, 0) == MOQ_OK);
+        moq_rcbuf_decref(p);
+        CHECK(moq_pq_service(ad, g_time) == 0);      /* header + object queued */
+        uint64_t sid = g_active_sid;
+
+        int rsa0 = g_rsa_count, plain0 = g_reset_count;
+        CHECK(moq_session_reset_subgroup(s, sgh, 0x1, 0) == MOQ_OK);
+        CHECK(moq_pq_service(ad, g_time) == 0);      /* deferred behind header */
+        CHECK(g_rsa_count == rsa0 && g_reset_count == plain0);
+        CHECK(!moq_pq_conn_is_fatal(ad));
+
+        if (via == 3) {
+            /* The peer closes first; the header is still queued, so the
+             * close callback's flush keeps the entry. */
+            g_pending_app_error = 0x77;
+            CHECK(moq_pq_callback(NULL, 0, NULL, 0,
+                                  picoquic_callback_application_close, ad, NULL) == 0);
+            CHECK(moq_pq_conn_is_closed(ad));
+            CHECK(moq_pq_conn_close_code(ad) == 0x77);
+            CHECK(g_rsa_count == rsa0 && g_reset_count == plain0);
+        }
+
+        /* Hand the header over (serviced even on a closed adapter). */
+        g_provide_nb = 0;
+        moq_pq_callback(NULL, sid, NULL, 64,
+                        picoquic_callback_prepare_to_send, ad, NULL);
+        if (via != 3)
+            CHECK(g_provide_nb > 0 && g_provide_fin == 0);   /* the header only */
+
+        g_rsa_fail = true;
+        g_reset_fail = (via != 0);
+        g_hook_count = 0;
+        if (via == 0 || via == 1) {
+            int rc = moq_pq_service(ad, g_time);
+            CHECK(g_hook_count == 1);
+            if (via == 0) {
+                CHECK(rc == 0);
+                CHECK(g_reset_count == plain0 + 1);   /* ended plainly */
+                CHECK(!moq_pq_conn_is_fatal(ad));
+            } else {
+                CHECK(rc == -1);                      /* never success */
+                CHECK(moq_pq_conn_is_fatal(ad));
+                CHECK(moq_pq_conn_fatal_code(ad) == 0x1);
+            }
+        } else {
+            /* Any callback other than prepare_to_send flushes first; the
+             * callback still answers picoquic with 0. */
+            CHECK(moq_pq_callback(NULL, 0, NULL, 0,
+                                  picoquic_callback_almost_ready, ad, NULL) == 0);
+            CHECK(g_hook_count == 1);
+            if (via == 2) {
+                CHECK(moq_pq_conn_is_fatal(ad));
+                CHECK(moq_pq_conn_fatal_code(ad) == 0x1);
+            } else {
+                CHECK(!moq_pq_conn_is_fatal(ad));
+                CHECK(moq_pq_conn_is_closed(ad));
+                CHECK(moq_pq_conn_close_code(ad) == 0x77);
+            }
+        }
+        CHECK(g_rsa_count == rsa0);
+        if (via != 0) CHECK(g_reset_count == plain0);
+
+        /* Consumed, not retried: later calls ask picoquic for nothing, and a
+         * fatal adapter keeps reporting -1. */
+        g_rsa_fail = false; g_reset_fail = false;
+        int again = moq_pq_service(ad, g_time);
+        if (via == 1 || via == 2) CHECK(again == -1);
+        else CHECK(again == 0);
+        (void)moq_pq_callback(NULL, 0, NULL, 0,
+                              picoquic_callback_almost_ready, ad, NULL);
+        CHECK(g_rsa_count == rsa0);
+        CHECK(g_reset_count == plain0 + (via == 0 ? 1 : 0));
+
+        g_pending_app_error = 0;
+        g_rsa_local = g_rsa_remote = false;
+        moq_pq_conn_destroy(ad);
+        moq_session_destroy(c); moq_session_destroy(s);
+    }
     if (failures == 0)
         printf("PASS: test_adapter_backpressure\n");
     return failures;

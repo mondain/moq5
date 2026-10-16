@@ -3,6 +3,10 @@
  * for peer-controlled bytes, so a peer cannot inject terminal control
  * sequences. Pure C, no libmoq deps; run under CTest.
  */
+#if defined(__linux__) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "../moq_example_term.h"
 
 #include <stdio.h>

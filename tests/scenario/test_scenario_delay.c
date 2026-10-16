@@ -14,6 +14,7 @@
  * Each seed runs twice; trace hash must match.
  */
 #include <moq/sim.h>
+#include "scenario_pair_version.h"
 #include "../../tests/unit/test_support.h"
 #include <stdlib.h>
 #include <string.h>
@@ -141,6 +142,7 @@ static int run_seed(uint64_t seed, int max_steps, trace_t *ts,
 #define SET_PHASE(p) diag->phase = (p)
 
     moq_simpair_cfg_t cfg = MOQ_SIMPAIR_CFG_INIT;
+    cfg.version = scenario_selected_version(MOQ_VERSION_DRAFT_16);
     cfg.alloc = &alloc;
     cfg.seed = seed;
     cfg.initial_now_us = 1000;
@@ -250,6 +252,7 @@ static int run_seed(uint64_t seed, int max_steps, trace_t *ts,
     SET_PHASE(PHASE_NS_SUB);
     moq_subscribe_namespace_cfg_t sncfg;
     moq_subscribe_namespace_cfg_init(&sncfg);
+    sncfg.namespace_interest = MOQ_NAMESPACE_INTEREST_NAMESPACE_STATE;
     sncfg.track_namespace_prefix = (moq_namespace_t){ ns_parts, 1 };
     moq_ns_sub_handle_t nsh;
     moq_session_subscribe_namespace(cl, &sncfg, moq_simpair_now_us(sp), &nsh);
@@ -388,6 +391,7 @@ static void print_diag(uint64_t seed, int run, const char *reason,
 
 int main(void)
 {
+    if (scenario_selected_version(MOQ_VERSION_DRAFT_16) == 0) return 1;
     uint64_t seed_start = 0;
     uint64_t num_seeds = 100;
     int max_steps = 50;

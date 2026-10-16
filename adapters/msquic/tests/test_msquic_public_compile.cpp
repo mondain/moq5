@@ -25,6 +25,10 @@ int main()
         return 1;
     if (moq_msquic_managed_port(nullptr) != 0)
         return 1;
+    moq_result_t (*poll_flush)(const moq_msquic_managed_t *) =
+        moq_msquic_managed_poll_flush;
+    if (poll_flush(nullptr) != MOQ_ERR_INVAL)
+        return 1;
     /* appended max_open_subgroups: the C++ view agrees — zero after a
      * full-size init, settable, and after the app_deadline block. */
     if (mcfg.max_open_subgroups != 0)

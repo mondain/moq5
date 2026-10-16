@@ -79,12 +79,19 @@ typedef struct moqr_bind_limits {
  * pending fetch-refusal table); announce_bytes = the copied
  * peer namespace bytes ceiling (bounded by the CORE's ns-node pool — a slot
  * only exists once the core accepted the announce — times the shared
- * 4096-byte namespace cap). total_bytes additionally carries the two
- * forwarding ceilings that have no field of their own in this frozen layout:
+ * 4096-byte namespace cap). total_bytes additionally carries three variable
+ * ceilings that have no field of their own in this frozen layout:
  * the owned track-key copies on the upstream-subscription slots (one
  * 4096-byte namespace+name cap per slot) and the aggregate
- * fetch_forward_bytes pool. So total_bytes >= structure_bytes +
- * announce_bytes, with the difference being exactly those two terms. */
+ * fetch_forward_bytes pool, and a separate fixed 1 MiB metadata allocation
+ * budget (headers plus complete serialized sets, at most 64 KiB per set).
+ * Metadata includes PUBLISH/auth staging, latest track state and old reply
+ * snapshots still pinned across backpressure; sharing a local pin does not
+ * duplicate its charge. Replacement overlap counts, so sixteen full 64 KiB
+ * sets plus headers cannot fit. Eager directory/staging/pin tables are in
+ * structure_bytes. So total_bytes >= structure_bytes + announce_bytes, with
+ * the difference being exactly those three terms. These private limits do
+ * not change the embedded config layout or the Joining FETCH byte budget. */
 typedef struct moqr_bind_capacity {
     uint64_t structure_bytes;
     uint64_t announce_bytes;
@@ -122,20 +129,33 @@ typedef struct moqr_bind_cfg {
     moqr_bind_intent_router_fn  router;
     void                       *router_ctx;
 
-    /* Appended: aggregate byte bound, across the whole binding, of what a
-     * forwarded Joining FETCH may hold before its downstream FETCH_OK -- the
-     * transaction's owned copy of the track key (namespace + name), the
-     * payload and properties bytes of every collected object, and the owned
-     * copies of upstream Track Properties and error reasons. 0 (or a
-     * struct_size that does not reach this field) means the default,
-     * MOQR_BIND_DEF_FETCH_FORWARD_BYTES (1 MiB). Shared by every concurrent
-     * forwarded fetch, never per connection; an item that does not fit
-     * rejects that fetch before any OK. Values above UINT32_MAX are rejected
-     * at create/describe (never truncated). */
+    /* Appended: aggregate transient staging-byte bound shared by forwarded
+     * Joining FETCHes (collected before downstream FETCH_OK) and missing-span
+     * retrieval for subscription fills, including a pending cached object's
+     * owned bytes through commit/close. Includes owned track keys, object
+     * payload/properties, upstream Track Properties and error reasons. Fill
+     * retrieval owns exact-sized rcbuf copies and charges their allocation
+     * headers as well as data; Joining FETCH retains its payload-byte charges.
+     * Fixed collector/cursor storage and the bind-owned cached-borrow table
+     * (max_fetches slots) are included in capacity_describe's table sizes,
+     * not this pool. Permanent latest-set metadata uses its separate
+     * fixed budget, never this field. 0 (or an absent prefix field) means
+     * MOQR_BIND_DEF_FETCH_FORWARD_BYTES (1 MiB). Shared across the binding,
+     * never per connection; exhaustion rejects a Joining FETCH before OK or
+     * fails only the affected fill stream. Counts/key limits are unchanged.
+     * Values above UINT32_MAX are rejected at create/describe, not truncated. */
     uint64_t                    fetch_forward_bytes;
+
+    /* No field may be appended here: moqr_shards_cfg_t embeds this struct
+     * by value, ahead of its own appended fields, so growing it would move
+     * every one of those. Later binding settings are setters (the fill wait,
+     * moqr_bind_set_fill_timeouts) and, for the sharded runtime, fields
+     * appended to moqr_shards_cfg_t. */
 } moqr_bind_cfg_t;
 
 #define MOQR_BIND_DEF_FETCH_FORWARD_BYTES (1u << 20)
+#define MOQR_BIND_DEF_FILL_TIMEOUT_MS      1000u
+#define MOQR_BIND_DEF_FILL_TIMEOUT_MAX_MS  10000u
 
 MOQR_API void moqr_bind_cfg_init_sized(moqr_bind_cfg_t *cfg, size_t cfg_size,
                               const moq_alloc_t *alloc);
@@ -162,10 +182,18 @@ MOQR_API void moqr_bind_destroy(moqr_bind_t *b);
  * SESSION_CLOSED event starts detachment, which can remain pending while
  * ordered relay output drains. Duplicate attach is INVAL.
  *
+ * Attaching switches the session to deferred subscription-update answers
+ * (moq_session_set_defer_subscription_updates): the binding answers every
+ * downstream subscriber's update itself, after deciding and applying it, so
+ * the caller must not answer those updates. It also leaves FETCH ranges to
+ * the relay (moq_session_set_defer_fetch_ranges): a range stated relative to
+ * the Largest Object is resolved against the relay's own log, not the
+ * session's record of what it carried.
+ *
  * `version` is this connection's negotiated MoQ draft. One listener may carry
- * both drafts at once, and the status/reset registries disagree on several
- * codepoints, so every terminal this binding emits has to be encoded for the
- * peer that will read it. The version is a parameter rather than a later
+ * every supported draft at once, and the status/reset registries disagree on
+ * several codepoints, so every terminal this binding emits has to be encoded
+ * for the peer that will read it. The version is a parameter rather than a later
  * setter so a new attach site cannot forget it and silently emit another
  * draft's numbering.
  */
@@ -219,6 +247,121 @@ MOQR_API bool moqr_bind_pump_budget_pending(const moqr_bind_t *b);
  * pass that drained everything (or left only ACTION_CAP backpressure) leaves
  * this false, so an applied batch that fully delivered earns no wake. */
 MOQR_API bool moqr_bind_pump_continuation_pending(const moqr_bind_t *b);
+
+/* The fill wait: how long a fill fetch stream waits for upstream to deliver
+ * an Object inside its range that the retained log does not hold before the
+ * relay reports the run as a Timed-Out gap and moves on. A fill that carries
+ * FILL_TIMEOUT waits min(requested, max_ms); one without it waits default_ms
+ * (the relay's own duration). A requested timeout above the maximum is
+ * shortened without telling the subscriber. Zero selects the named default
+ * (MOQR_BIND_DEF_FILL_TIMEOUT_MS, MOQR_BIND_DEF_FILL_TIMEOUT_MAX_MS), which is
+ * also what a binding uses until this is called. Milliseconds, as on the
+ * wire.
+ *
+ * MOQR_ERR_INVAL for a NULL binding, a default (after defaulting) above the
+ * maximum, or a maximum too large to express in microseconds; the binding
+ * keeps its previous pair. Call on the binding's own thread, outside a pump
+ * callback; the pair applies to fills that start waiting after the call. The
+ * sharded runtime applies moqr_shards_cfg_t's fill_timeout_default_ms /
+ * fill_timeout_max_ms to every shard's binding with this. */
+MOQR_API moqr_result_t moqr_bind_set_fill_timeouts(moqr_bind_t *b,
+                                                   uint64_t default_ms,
+                                                   uint64_t max_ms);
+
+/* The earliest instant at which a pump would make progress on time alone: the
+ * nearest fill-timeout deadline a held fill fetch stream is waiting out, or
+ * the fill source's own next deadline when it is earlier, in the caller's
+ * clock (the now_us the pumps carry). UINT64_MAX when nothing is waiting on
+ * time. A runtime arms its next wake from this so a fill on a quiet
+ * track ends at its deadline instead of at the next unrelated event. */
+MOQR_API uint64_t moqr_bind_next_deadline_us(const moqr_bind_t *b);
+
+/*
+ * Fill source (multi-shard runtime). A fill fetch stream is normally served
+ * from the retained log of the shard whose binding holds the subscription.
+ * When that shard's log cannot hold part of the fill range -- its feed of the
+ * track started after that part was published, because another shard owns
+ * the track -- a runtime can serve that part from elsewhere. The binding asks
+ * the source first, every time it would open the fill's cursor:
+ *
+ *   open(ctx, query, claim) -> MOQR_OK: the source serves the range from the
+ *     query's start through claim->end_group/end_object (inclusive, never past
+ *     the query's end); the binding then reads that part through peek/commit
+ *     with claim->handle and serves anything after it from its own log.
+ *     MOQR_DONE: the source has nothing to do with this range; the log serves
+ *     all of it. MOQR_ERR_WOULD_BLOCK: the source would serve it but cannot
+ *     start now; the binding treats the range as not yet held and asks again
+ *     on a later pump, until the fill's deadline.
+ *   peek(ctx, handle, now_us, item) -> the head item, with the core fetch
+ *     cursor's contract (moqr_core_fetch_peek): OBJECT (its record view valid
+ *     until commit or close), GAP (Locations not held, through rec.group_id /
+ *     rec.object_id; the binding waits for the deadline, then writes them as
+ *     one End of Timed-Out Range), UNKNOWN (Locations without evidence
+ *     either way, same shape) or MARKER (an evicted prefix), both written at
+ *     once as an Unknown range before the deadline and a Timed-Out range
+ *     from it, or END (the claimed part is exhausted).
+ *     MOQR_ERR_WOULD_BLOCK holds the fill and is asked again on a later pump;
+ *     any other error fails the fill on its stream.
+ *   commit(ctx, handle) advances past the peeked item.
+ *   close(ctx, handle) ends the claim; called exactly once per successful
+ *     open, whether or not END was reached. Nothing is read after it.
+ *   next_deadline_us(ctx), optional (NULL, or a table whose struct_size
+ *     does not reach it, means none): the earliest instant at which the
+ *     source has work only time will advance -- a claimed part it will
+ *     report Timed-Out at the fill's deadline, or an answer it holds back
+ *     until a fill's deadline, for another shard's fill included. The
+ *     binding folds it into moqr_bind_next_deadline_us in place of the
+ *     deadlines of the fills reading through the source (the source knows
+ *     whether the part it serves still waits on time), so the runtime wakes
+ *     this binding's shard exactly when the source needs it. UINT64_MAX
+ *     when nothing waits on time. Without it, those fills' own deadlines
+ *     are reported as for any other fill.
+ *
+ * All of them run on the binding's own thread, inside moqr_bind_pump (close
+ * also inside moqr_bind_conn_close, for the fills of a connection going away;
+ * next_deadline_us wherever moqr_bind_next_deadline_us is called), and must
+ * not call back into the binding. The source is not owned; it must outlive every
+ * fill that claimed through it. Every pointer is required.
+ */
+typedef struct moqr_bind_fill_query {
+    uint32_t           struct_size;
+    moqr_track_t       track;            /* this shard's track of the fill */
+    uint64_t           track_gen;
+    uint64_t           start_group;      /* inclusive                      */
+    uint64_t           start_object;
+    uint64_t           end_group;        /* inclusive; an end_object of    */
+    uint64_t           end_object;       /* UINT64_MAX is the whole group  */
+    moqr_group_order_t group_order;
+    uint8_t            subscriber_priority;
+    /* The instant the fill stops waiting for Objects the relay does not
+     * hold (the binding's clock, the now_us its pumps carry). */
+    uint64_t           deadline_us;
+} moqr_bind_fill_query_t;
+
+typedef struct moqr_bind_fill_claim {
+    uint64_t handle;
+    uint64_t end_group;                  /* inclusive end of the claimed   */
+    uint64_t end_object;                 /* part, as in the query          */
+} moqr_bind_fill_claim_t;
+
+typedef struct moqr_bind_fill_source {
+    uint32_t       struct_size;
+    void          *ctx;
+    moqr_result_t (*open)(void *ctx, const moqr_bind_fill_query_t *query,
+                          moqr_bind_fill_claim_t *claim);
+    moqr_result_t (*peek)(void *ctx, uint64_t handle, uint64_t now_us,
+                          moqr_fetch_item_t *out);
+    moqr_result_t (*commit)(void *ctx, uint64_t handle);
+    void          (*close)(void *ctx, uint64_t handle);
+    uint64_t      (*next_deadline_us)(void *ctx);
+} moqr_bind_fill_source_t;
+
+/* Install (or with NULL remove) the fill source. The binding copies the
+ * table. MOQR_ERR_INVAL for a NULL binding, a table too small to hold
+ * open..close, or a missing one of those four; MOQR_ERR_WRONG_STATE while
+ * any fill is reading through the current source or a pump is running. */
+MOQR_API moqr_result_t moqr_bind_set_fill_source(
+    moqr_bind_t *b, const moqr_bind_fill_source_t *source);
 
 /*
  * Resolve a deferred (DEFER) auth ticket with the verifier's `result`

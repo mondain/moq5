@@ -4232,7 +4232,9 @@ scenario_evict_overtake_notbegun_fin(void)
     moq_subgroup_handle_t sg1;
     A_CHECK(&r, moq_session_open_subgroup(pub->peer, pps.up_sub, &sgc,
                                           r.now, &sg1) == MOQ_OK);
-    A_CHECK(&r, moq_session_begin_object(pub->peer, sg1, 0, 64, r.now) ==
+    /* Object 1: Object 0 of the group is subgroup 0's, and the same Object
+     * in another subgroup would make the Track malformed (draft-18 §9.1). */
+    A_CHECK(&r, moq_session_begin_object(pub->peer, sg1, 1, 64, r.now) ==
                     MOQ_OK);
     memset(body, 0xD1, 32);
     A_CHECK(&r, moq_rcbuf_create(&a.vt, body, 32, &pl) == MOQ_OK);

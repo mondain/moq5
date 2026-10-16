@@ -2199,7 +2199,7 @@ lc_minimize(uint64_t seed, const lc_faults_t *f, int poison,
     out->poison = -1;
     /* All working buffers up front, checked together: on OOM we fail loudly
      * (-2) rather than dereference NULL on an unusable artifact. */
-    lc_seg_t *segs = malloc((size_t)(ops ? ops : 1u) * sizeof(lc_seg_t));
+    lc_seg_t *segs = calloc((size_t)(ops ? ops : 1u), sizeof(lc_seg_t));
     uint64_t *scratch = malloc((size_t)(nv ? nv : 1u) * sizeof(uint64_t));
     lc_seg_t *trial = malloc((size_t)(ops ? ops : 1u) * sizeof(lc_seg_t));
     if (segs == NULL || scratch == NULL || trial == NULL) {
@@ -2298,6 +2298,30 @@ lc_minimize_selftest(void)
         g_lc_poison_at_op = saved_poison;
         return 1;
     }
+
+    /* A setup-only log has no segments and cannot reproduce an op failure. */
+    ca_t ae;
+    ca_init(&ae);
+    lc_result_t empty;
+    run_one(seed, 0, &f, &ae, &empty, NULL);
+    if (empty.failures != 0 || ae.live != 0 || empty.ops != 0 ||
+        empty.log_vals == NULL || empty.op_start == NULL ||
+        empty.log_n != empty.setup_end) {
+        printf("FAIL: minimizer zero-op setup (fail=%d live=%ld ops=%u)\n",
+               empty.failures, ae.live, empty.ops);
+        fails++;
+    } else {
+        lc_result_t zero_refused;
+        int zero_rc = lc_minimize(empty.seed, &empty.faults, -1,
+                                  empty.log_vals, empty.log_n, empty.setup_end,
+                                  empty.op_start, 0, &zero_refused, 0, false);
+        if (zero_rc != -1) {
+            printf("FAIL: minimizer accepted zero-op input (rc=%d)\n", zero_rc);
+            fails++;
+        }
+        lc_result_free_log(&zero_refused);
+    }
+    lc_result_free_log(&empty);
 
     /* (a) A clean input (poison=-1) must be refused: no single-log reproducer. */
     lc_result_t refj;

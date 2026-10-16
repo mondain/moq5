@@ -47,11 +47,13 @@ int main(void)
     cfg.on_activity = activity;
     cfg.on_stopped = stopped;
     cfg.app_deadline_us = deadline;
-    const char *offers[] = { NULL, "moqt-16", "moqt-18", "moqt-18,moqt-16",
-                             " moqt-18 , moqt-16 " };
-    /* Legacy, exact drafts and multi-offer all reject before negotiation.
-     * Verification/trust, actor/deadline callbacks and ownership cannot change
-     * that result. A second create is a fresh rejection, not async reconnect. */
+    const char *offers[] = { NULL, "moqt-16", "moqt-18", "moqt-22",
+                             "moqt-18,moqt-16", "moqt-22,moqt-18,moqt-16",
+                             "moqt-18,moqt-22", " moqt-18 , moqt-16 " };
+    /* Legacy, exact drafts and multi-offer all reject before allocation or
+     * negotiation. insecure_skip_verify is varied and does not change that
+     * result; the callbacks are set and never invoked. A second create is a
+     * fresh rejection, not an async reconnect. */
     for (size_t i = 0; i < sizeof(offers) / sizeof(offers[0]); i++) {
         cfg.wt_protocols = offers[i];
         for (int verify = 0; verify < 2; verify++) {
@@ -91,13 +93,19 @@ int main(void)
 
     size_t floor = offsetof(moq_wtquic_network_managed_cfg_t, insecure_skip_verify)
         + sizeof(cfg.insecure_skip_verify);
-    /* Exact allocations make accidental optional-tail reads causal under ASan. */
+    /* Exact allocations make an executed, instrumented read past struct_size
+     * on the reachable validation path (perspective, lane_count) visible to
+     * ASan; the optional-tail import lies below the unconditional capability
+     * rejection and is unreachable here. */
     for (size_t n = floor - 1; n <= sizeof(cfg); n++) {
         unsigned char *raw = malloc(n);
         CHECK(raw != NULL);
         if (!raw) break;
         memcpy(raw, &cfg, n);
-        ((moq_wtquic_network_managed_cfg_t *)raw)->struct_size = (uint32_t)n;
+        /* The stamp is copied in at its offset: the block is smaller than
+         * the struct type, so no member is written through that type. */
+        uint32_t stamp = (uint32_t)n;
+        memcpy(raw + offsetof(moq_wtquic_network_managed_cfg_t, struct_size), &stamp, sizeof(stamp));
         expect("exact prefix", (void *)raw, n < floor ? MOQ_ERR_INVAL : MOQ_ERR_UNSUPPORTED);
         free(raw);
     }

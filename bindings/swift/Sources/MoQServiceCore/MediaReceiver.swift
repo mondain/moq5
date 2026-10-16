@@ -34,6 +34,11 @@ public final class MediaReceiver: @unchecked Sendable {
         public var overflowPolicy: OverflowPolicy
         public var autoSubscribe: Bool
         public var timeMode: TimeMode
+        /// Media profile. `.automatic` (the default) follows the negotiated
+        /// draft; an explicit profile refuses the other drafts. Draft 22
+        /// supports only `.raw` time mode: `.sharedEpoch` is refused with the
+        /// explicit draft-22 profile, and fails `.automatic` on draft 22.
+        public var companionProfile: MediaCompanionProfile
         /// Catalog track name; `nil` uses the MSF default ("catalog").
         public var catalogTrack: String?
 
@@ -44,6 +49,7 @@ public final class MediaReceiver: @unchecked Sendable {
             self.overflowPolicy = overflowPolicy
             self.autoSubscribe = autoSubscribe
             self.timeMode = .raw
+            self.companionProfile = .automatic
             self.catalogTrack = nil
         }
 
@@ -177,8 +183,15 @@ public final class MediaReceiver: @unchecked Sendable {
     /// ``MoQServiceError/fatal(code:)`` once drained when the receiver
     /// failed; throws ``MoQServiceError/interrupted`` only when it would
     /// have to WAIT while the endpoint latch is set (queued events deliver
-    /// through the latch, like the C track-event poll).
+    /// through the latch, like the C track-event poll). Extended-only records are
+    /// consumed and skipped. Both event views share this consumer claim.
     public var trackEvents: TrackEvents { TrackEvents(receiver: self) }
+
+    /// Legacy events, fill terminals and local failures from one FIFO, without replay.
+    /// Overlapping next calls on either view throw wrongState. As with
+    /// trackEvents, already-staged records drain after detach; close does
+    /// not promise to drain the native queue before destroying the receiver.
+    public var trackEventsExtended: ExtendedTrackEvents { ExtendedTrackEvents(receiver: self) }
 
     /// Snapshot of every discovered track, in discovery order. Handles stay
     /// valid (and listed) after removal/end, mirroring the C handle
@@ -211,8 +224,28 @@ public final class MediaReceiver: @unchecked Sendable {
     public func subscribe(_ track: MediaTrack,
                           start: StartMode = .current,
                           priority: UInt8? = nil) async throws {
+        try await subscribe(track, start: start, priority: priority, options: .init())
+    }
+
+    /// Explicit location/fill input for the first subscription. Native service
+    /// validates the selected companion, negotiated version and ranges. Later
+    /// calls validate options but only resume; they do not reconfigure.
+    public func subscribe(_ track: MediaTrack,
+                          start: StartMode = .current,
+                          priority: UInt8? = nil,
+                          options: MediaTrackSubscriptionOptions) async throws {
         try await command(for: track, name: "subscribe") { backend, id in
-            backend.subscribe(handleID: id, start: start, priority: priority)
+            backend.subscribe(handleID: id, start: start, priority: priority, options: options)
+        }
+    }
+
+    /// Schedule cancellation of one known fill ID (including zero). Success
+    /// records intent, not a winning terminal cause; a peer terminal may win.
+    /// Leaves the parent, other fills and already-owned objects intact. Like
+    /// subscribe, this command is accepted through the endpoint interrupt latch.
+    public func cancelFill(_ track: MediaTrack, initiatingRequestID: UInt64) async throws {
+        try await command(for: track, name: "cancel fill") { backend, id in
+            backend.cancelFill(handleID: id, initiatingRequestID: initiatingRequestID)
         }
     }
 
@@ -221,6 +254,21 @@ public final class MediaReceiver: @unchecked Sendable {
     public func unsubscribe(_ track: MediaTrack) async throws {
         try await command(for: track, name: "unsubscribe") { backend, id in
             backend.unsubscribe(handleID: id)
+        }
+    }
+
+    /// Query the current native delivery state on the endpoint executor, not
+    /// an event-derived cache. The snapshot may advance before the caller acts.
+    /// Closed/detached receivers cannot be queried; staged events remain separate.
+    public func trackStateExtended(_ track: MediaTrack) async throws -> ExtendedTrackSubscriptionState {
+        guard let handleID = attachment.handleID(for: track) else {
+            throw MoQServiceError.invalidArgument(
+                "track state: the track does not belong to this receiver")
+        }
+        let attachment = self.attachment
+        return try await endpoint.engine.perform {
+            guard !attachment.state.isDetached else { throw MoQServiceError.closed }
+            return try attachment.backend.trackState(handleID: handleID).get()
         }
     }
 
@@ -248,6 +296,8 @@ public final class MediaReceiver: @unchecked Sendable {
                 throw MoQServiceError.closed
             case .unsupported:
                 throw MoQServiceError.unsupported
+            case .nativeFailure(let code):
+                throw MoQServiceError.internalError(code)
             }
         }
     }
@@ -256,6 +306,15 @@ public final class MediaReceiver: @unchecked Sendable {
 
     /// One stream element; see ``trackEvents`` for the contract.
     package func nextTrackEvent() async throws -> TrackEvent? {
+        guard case .legacy(let event)? = try await nextEvent(includeExtended: false) else { return nil }
+        return event
+    }
+
+    package func nextExtendedTrackEvent() async throws -> ExtendedTrackEvent? {
+        try await nextEvent(includeExtended: true)
+    }
+
+    private func nextEvent(includeExtended: Bool) async throws -> ExtendedTrackEvent? {
         guard state.claimConsumer() else {
             throw MoQServiceError.wrongState
         }
@@ -268,7 +327,11 @@ public final class MediaReceiver: @unchecked Sendable {
                  * parked object waiter to re-evaluate -- without this the async
                  * object stream would sit until an unrelated engine wake. */
                 if freedCapacity { endpoint.engine.nudgeWaiters() }
-                return event
+                if includeExtended { return event }
+                if case .legacy = event { return event }
+                // Keep the same consumer claim across filtered records and waits.
+                try Task.checkCancellation()
+                continue
             case .terminalClean:
                 return nil
             case .terminalFatal(let code):
@@ -389,7 +452,7 @@ package final class ReceiverAttachment: @unchecked Sendable {
     /// identity, and terminal disposition without the async engine, so the
     /// bounded-staging contract is provable deterministically.
     package enum TakenTrackEvent: Sendable {
-        case item(TrackEvent)
+        case item(ExtendedTrackEvent)
         case empty
         case terminalClean
         case terminalFatal(code: UInt64)
@@ -462,7 +525,12 @@ package final class ReceiverAttachment: @unchecked Sendable {
                     presentationTime: polled.presentationTime,
                     decodeTime: polled.decodeTime,
                     compositionOffset: polled.compositionOffset,
-                    captureTime: polled.captureTime))
+                    captureTime: polled.captureTime,
+                    wireIdentity: polled.wireIdentity,
+                    metadata: polled.metadata,
+                    objectProperties: polled.objectProperties,
+                    trackProperties: polled.trackProperties,
+                    delivery: polled.delivery))
             }
         }
     }
@@ -561,14 +629,14 @@ private final class ReceiverState: @unchecked Sendable {
         /// `freedCapacity` is true when this pop dropped the FIFO out of a
         /// full state -- the edge that makes a parked object waiter runnable
         /// again, so the consumer nudges the engine to re-evaluate it.
-        case item(TrackEvent, freedCapacity: Bool)
+        case item(ExtendedTrackEvent, freedCapacity: Bool)
         case empty
         case terminalClean
         case terminalFatal(code: UInt64)
     }
 
     private let lock = NSLock()
-    private var fifo: [TrackEvent] = []
+    private var fifo: [ExtendedTrackEvent] = []
     private var tracksByID: [UInt64: MediaTrack] = [:]
     private var idsByTrack: [ObjectIdentifier: UInt64] = [:]
     private var ordered: [MediaTrack] = []
@@ -592,30 +660,40 @@ private final class ReceiverState: @unchecked Sendable {
             tracksByID[polled.handleID] = track
             idsByTrack[ObjectIdentifier(track)] = polled.handleID
             ordered.append(track)
-            fifo.append(.added(track))
+            fifo.append(.legacy(.added(track)))
         case .updated:
             guard let track = tracksByID[polled.handleID] else { return }
             if let description = polled.trackDescription {
                 track.updateDescription(description)
             }
-            fifo.append(.updated(track))
+            fifo.append(.legacy(.updated(track)))
         case .removed:
             guard let track = tracksByID[polled.handleID] else { return }
-            fifo.append(.removed(track))
+            fifo.append(.legacy(.removed(track)))
         case .ended:
             guard let track = tracksByID[polled.handleID] else { return }
-            fifo.append(.ended(track))
+            fifo.append(.legacy(.ended(track)))
         case .parseDrop:
             /* Non-fatal diagnostic for a known track; never a track end. The
              * class is part of the diagnostic -- a missing class is dropped,
              * never defaulted to .media. */
             guard let track = tracksByID[polled.handleID],
                   let cls = polled.parseDropClass else { return }
-            fifo.append(.parseDrop(track, class: cls,
+            fifo.append(.legacy(.parseDrop(track, class: cls,
                                    total: polled.parseDropTotal,
-                                   delta: polled.parseDropDelta))
+                                   delta: polled.parseDropDelta)))
         case .catalogReady:
-            fifo.append(.catalogReady)
+            fifo.append(.legacy(.catalogReady))
+        case .fillTerminal(let terminal):
+            guard let track = tracksByID[polled.handleID] else { return }
+            fifo.append(.fillTerminal(track, terminal))
+        case .localFailure(let localResult):
+            guard let track = tracksByID[polled.handleID] else { return }
+            fifo.append(.localFailure(track, localResult: localResult))
+        case .deliveryLocalFailure(let localResult, let origin, let initiatingRequestID):
+            guard let track = tracksByID[polled.handleID] else { return }
+            fifo.append(.deliveryLocalFailure(track, localResult: localResult,
+                                               origin: origin, initiatingRequestID: initiatingRequestID))
         }
     }
 

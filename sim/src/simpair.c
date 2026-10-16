@@ -1,9 +1,41 @@
 #include "simpair_internal.h"
+#include <stdio.h>
+#include <stdlib.h>
 
 static bool cfg_has_field(const moq_simpair_cfg_t *cfg,
                           size_t offset, size_t size)
 {
     return cfg->struct_size >= offset && size <= cfg->struct_size - offset;
+}
+
+/* The simulated transport is native QUIC with every transport fact known
+ * and supported. The server accepts any connection target; the client names
+ * the simulator's own authority with an empty path. Profiles that need no
+ * binding are left unbound. */
+static uint32_t sim_accept_uri(void *ctx, uint32_t present,
+                               moq_bytes_t authority, moq_bytes_t path_query)
+{
+    (void)ctx; (void)present; (void)authority; (void)path_query;
+    return MOQ_URI_ACCEPT;
+}
+
+static moq_result_t bind_simulated_transport(moq_session_t *s)
+{
+    if (moq_session_binding_requirements(s) == 0) return MOQ_OK;
+    static const uint8_t authority[] = "sim.invalid";
+    moq_transport_binding_t b;
+    moq_transport_binding_init(&b);
+    b.kind = MOQ_BINDING_RAW_QUIC;
+    b.facts_known = MOQ_BINDING_FACTS_ALL;
+    b.facts_supported = MOQ_BINDING_FACTS_ALL;
+    if (moq_session_perspective(s) == MOQ_PERSPECTIVE_SERVER) {
+        b.accept_uri = sim_accept_uri;
+    } else {
+        b.target_present = MOQ_BINDING_TARGET_COMPLETE;
+        b.authority.data = authority;
+        b.authority.len = sizeof(authority) - 1;
+    }
+    return moq_session_bind_transport(s, &b, sizeof(b));
 }
 
 static moq_result_t make_session(const moq_alloc_t *alloc,
@@ -22,6 +54,8 @@ static moq_result_t make_session(const moq_alloc_t *alloc,
                                   uint32_t max_object_payload_size,
                                   uint64_t done_wait_timeout_us,
                                   uint64_t auth_token_cache_size,
+                                  bool defer_subscription_updates,
+                                  uint32_t max_data_streams,
                                   moq_session_t **out)
 {
     moq_session_cfg_t scfg = MOQ_SESSION_CFG_INIT;
@@ -47,7 +81,16 @@ static moq_result_t make_session(const moq_alloc_t *alloc,
         scfg.send_auth_token_cache_size = true;
         scfg.auth_token_cache_size = auth_token_cache_size;
     }
-    return moq_session_create(&scfg, initial_now_us, out);
+    scfg.defer_subscription_updates = defer_subscription_updates;
+    if (max_data_streams) scfg.max_data_streams = max_data_streams;
+    moq_result_t rc = moq_session_create(&scfg, initial_now_us, out);
+    if (rc < 0) return rc;
+    rc = bind_simulated_transport(*out);
+    if (rc < 0) {
+        moq_session_destroy(*out);
+        *out = NULL;
+    }
+    return rc;
 }
 
 moq_result_t moq_simpair_create(const moq_simpair_cfg_t *cfg,
@@ -170,6 +213,20 @@ moq_result_t moq_simpair_create(const moq_simpair_cfg_t *cfg,
     if (cfg_has_field(cfg, offsetof(moq_simpair_cfg_t, auth_token_cache_size),
                       sizeof(cfg->auth_token_cache_size)))
         auth_token_cache_size = cfg->auth_token_cache_size;
+    bool server_defer_subscription_updates = false;
+    if (cfg_has_field(cfg, offsetof(moq_simpair_cfg_t,
+                                    server_defer_subscription_updates),
+                      sizeof(cfg->server_defer_subscription_updates)))
+        server_defer_subscription_updates = cfg->server_defer_subscription_updates;
+    bool client_defer_subscription_updates = false;
+    if (cfg_has_field(cfg, offsetof(moq_simpair_cfg_t,
+                                    client_defer_subscription_updates),
+                      sizeof(cfg->client_defer_subscription_updates)))
+        client_defer_subscription_updates = cfg->client_defer_subscription_updates;
+    uint32_t client_max_data_streams = 0;   /* 0 -> session default */
+    if (cfg_has_field(cfg, offsetof(moq_simpair_cfg_t, client_max_data_streams),
+                      sizeof(cfg->client_max_data_streams)))
+        client_max_data_streams = cfg->client_max_data_streams;
     uint32_t max_object_payload_size = 0;   /* 0 -> session default */
     if (cfg_has_field(cfg, offsetof(moq_simpair_cfg_t, max_object_payload_size),
                       sizeof(cfg->max_object_payload_size)))
@@ -196,6 +253,11 @@ moq_result_t moq_simpair_create(const moq_simpair_cfg_t *cfg,
     sp->now_us = initial_now_us;
     sp->trace_fn = trace_fn;
     sp->trace_ctx = trace_ctx;
+    {
+        const char *env = getenv("MOQ_SIM_TRACE_HASH");
+        sp->trace_hash_enabled = env && *env && *env != '0';
+        sp->trace_hash = 1469598103934665603ULL;
+    }
     sp->next_rx_ref = 1000;
     sp->next_bidi_ref = 2000;
     sp->fault_per_mille = fault_per_mille;
@@ -216,6 +278,8 @@ moq_result_t moq_simpair_create(const moq_simpair_cfg_t *cfg,
                                    max_object_payload_size,
                                    done_wait_timeout_us,
                                    auth_token_cache_size,
+                                   client_defer_subscription_updates,
+                                   client_max_data_streams,
                                    &sp->client);
     if (rc < 0)
         goto fail;
@@ -234,6 +298,8 @@ moq_result_t moq_simpair_create(const moq_simpair_cfg_t *cfg,
                       max_object_payload_size,
                       done_wait_timeout_us,
                       auth_token_cache_size,
+                      server_defer_subscription_updates,
+                      0 /* server keeps the default pool */,
                       &sp->server);
     if (rc < 0)
         goto fail;
@@ -249,7 +315,12 @@ fail:
 void moq_simpair_destroy(moq_simpair_t *sp)
 {
     if (!sp) return;
+    if (sp->trace_hash_enabled)
+        fprintf(stderr, "TRACE_HASH seed=0x%llx version=%u hash=0x%016llx\n",
+                (unsigned long long)sp->seed, (unsigned)sp->version,
+                (unsigned long long)sp->trace_hash);
     sim_delay_clear(sp);
+    sim_held_clear(sp);
     moq_alloc_t alloc = sp->alloc;
     moq_session_destroy(sp->client);
     moq_session_destroy(sp->server);
@@ -282,7 +353,7 @@ uint64_t moq_simpair_seed(const moq_simpair_t *sp)
  * profiles that require a symmetric start are added here. */
 static bool version_requires_symmetric_start(moq_version_t version)
 {
-    return version == MOQ_VERSION_DRAFT_18;
+    return version == MOQ_VERSION_DRAFT_18 || version == MOQ_VERSION_DRAFT_22;
 }
 
 moq_result_t moq_simpair_start(moq_simpair_t *sp)
@@ -328,9 +399,14 @@ moq_result_t moq_simpair_step_directional(moq_simpair_t *sp,
 
     /* Matured delayed inputs attribute to the direction they target (only
      * fault-injected runs ever mature entries). */
+    /* Streams a receiving session refused resume first: their held inputs
+     * precede anything this step delivers on them. */
+    moq_result_t rc = sim_resume_held(sp, &to_server, &to_client);
+    if (rc < 0) return rc;
+
     size_t matured = 0;
     size_t matured_srv = 0;
-    moq_result_t rc = sim_delay_deliver_matured(sp, &matured, &matured_srv);
+    rc = sim_delay_deliver_matured(sp, &matured, &matured_srv);
     if (rc < 0) return rc;
     to_server += matured_srv;
     to_client += matured - matured_srv;

@@ -26,6 +26,8 @@
 #include <wtquic/wtquic_msquic.h>
 
 #include "../common/moq_alpn.h"
+#include "../common/moq_adapter_binding.h"
+#include "../common/moq_listen_port.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -535,11 +537,21 @@ struct moq_wtquic_msquic_managed {
 
     /* owned copies of borrowed config (freed at destroy) */
     char *host;
+    const char *authority;                   /* client CONNECT :authority,
+                                                in target_bytes */
     char *cert_path;
     char *key_path;
     char *wt_path;
     char **protos;                           /* deep-copied offer list */
     size_t proto_count;
+    /* The client's connection target (copied bytes); a server binds each
+     * accepted session with the identity its CONNECT named instead. */
+    moq_connection_target_t target;
+    uint8_t *target_bytes;
+    size_t target_bytes_len;
+    /* This side's QUIC DATAGRAM receive advertisement, from the provider
+     * tuning the env is opened with (a transport fact the binding reports). */
+    bool datagram_receive_enabled;
 
     uint16_t port;
     bool insecure_skip_verify;
@@ -571,6 +583,9 @@ struct moq_wtquic_msquic_managed {
      * Folded facade-wide into each lane's recomputed next deadline. */
     uint64_t (*app_deadline_us)(void *ctx);
     void *app_deadline_ctx;
+    /* the per-lane form (ONE ABI block); asked only for the pumping lane */
+    uint64_t (*app_lane_deadline_us)(void *ctx, uint32_t lane_index);
+    void *app_lane_deadline_ctx;
     void (*on_stopped)(void *ctx);
     void *on_stopped_ctx;
 
@@ -891,6 +906,34 @@ static _Thread_local bool mm_in_service;
  * callback — the BLOCKING teardown calls must be refused (see mm_in_callback). */
 static _Thread_local bool mm_in_activity;
 
+/* The flush query refuses only hooks of the queried instance. A stack also covers a
+ * nested callback on another facade without losing the outer hook's scope. */
+typedef struct mm_flush_hook_scope {
+    const moq_wtquic_msquic_managed_t *managed;
+    const struct mm_flush_hook_scope *previous;
+} mm_flush_hook_scope_t;
+static _Thread_local const mm_flush_hook_scope_t *mm_flush_hooks;
+
+static void mm_flush_hook_enter(mm_flush_hook_scope_t *scope,
+                                 const moq_wtquic_msquic_managed_t *m)
+{
+    scope->managed = m;
+    scope->previous = mm_flush_hooks;
+    mm_flush_hooks = scope;
+}
+
+static void mm_flush_hook_leave(const mm_flush_hook_scope_t *scope)
+{
+    mm_flush_hooks = scope->previous;
+}
+
+static bool mm_flush_in_hook(const moq_wtquic_msquic_managed_t *m)
+{
+    for (const mm_flush_hook_scope_t *s = mm_flush_hooks; s; s = s->previous)
+        if (s->managed == m) return true;
+    return false;
+}
+
 /* True when this thread is inside THIS lane's pump window. */
 static bool mm_in_lane_pump(const moq_wtquic_msquic_managed_lane_t *lane)
 {
@@ -1127,6 +1170,42 @@ static void mm_establish_fail(moq_wtquic_msquic_managed_t *m,
     mm_close_session(s, close_code);
 }
 
+/*
+ * Bind a session to the WebTransport session it is carried in, before its
+ * first SETUP byte: the connection's facts (this side's DATAGRAM
+ * advertisement from the tuning, the peer's from the transport's send limit)
+ * and either the client's configured target or, on the server, the
+ * :authority and :path the client's CONNECT named. A profile without
+ * requirements is bound only when there is a complete target to give it
+ * (moq_adapter_bind_session). The result is the core's.
+ */
+static moq_result_t mm_bind_session(moq_wtquic_msquic_managed_t *m,
+                                    moq_session_t *ms, wtq_session_t *s)
+{
+    uint32_t known, supported;
+    moq_wtquic_binding_facts(s, m->datagram_receive_enabled, true, &known,
+                             &supported);
+
+    const moq_connection_target_t *target = &m->target;
+    moq_connection_target_t named;
+    if (m->perspective == MOQ_PERSPECTIVE_SERVER) {
+        wtq_connect_request_metadata_t metadata =
+            WTQ_CONNECT_REQUEST_METADATA_INIT;
+        if (wtq_session_connect_request_metadata(s, &metadata) != WTQ_OK)
+            return MOQ_ERR_WRONG_STATE;
+        memset(&named, 0, sizeof(named));
+        named.struct_size = (uint32_t)sizeof(named);
+        named.target_present = MOQ_BINDING_TARGET_COMPLETE;
+        named.authority.data = (const uint8_t *)metadata.authority.data;
+        named.authority.len = metadata.authority.len;
+        named.path_query.data = (const uint8_t *)metadata.path.data;
+        named.path_query.len = metadata.path.len;
+        target = &named;
+    }
+    return moq_adapter_bind_session(ms, MOQ_BINDING_WEBTRANSPORT_H3, known,
+                                    supported, target);
+}
+
 static void mm_on_established(wtq_session_t *s, wtq_str_t sub, void *user)
 {
     moq_wtquic_msquic_managed_conn_t *c = user;
@@ -1171,6 +1250,18 @@ static void mm_on_established(wtq_session_t *s, wtq_str_t sub, void *user)
     if (moq_session_create(&scfg, mm_now_us(), &ms) < 0) {
         mm_establish_fail(m, c, s, 0);  /* construction failure: unchanged code */
         return;
+    }
+    /* A profile that must be told how it is carried is bound before the
+     * attach adapter starts it; a refusal ends the session (PROTOCOL_VIOLATION
+     * when the peer's negotiation lacks what the profile requires,
+     * INTERNAL_ERROR for a local defect). */
+    {
+        moq_result_t brc = mm_bind_session(m, ms, s);
+        if (brc != MOQ_OK) {
+            moq_session_destroy(ms);
+            mm_establish_fail(m, c, s, brc == MOQ_ERR_UNSUPPORTED ? 0x3 : 0x1);
+            return;
+        }
     }
 
     moq_wtquic_conn_cfg_t ccfg;
@@ -1334,6 +1425,14 @@ static void mm_on_stream_writable(wtq_session_t *s, wtq_stream_t *st,
         c->m->fwd->on_stream_writable(s, st, c->adapter);
 }
 
+static void mm_on_stream_committed(wtq_session_t *s, wtq_stream_t *st,
+                                   void *user)
+{
+    moq_wtquic_msquic_managed_conn_t *c = user;
+    if (c->adapter != NULL)
+        c->m->fwd->on_stream_send_committed(s, st, c->adapter);
+}
+
 static void mm_on_quiesced(wtq_session_t *s, void *user)
 {
     (void)s;
@@ -1359,6 +1458,7 @@ static const wtq_session_events_t g_mm_events = {
     .on_send_complete = mm_on_send_complete,
     .on_datagram = mm_on_datagram,
     .on_stream_writable = mm_on_stream_writable,
+    .on_stream_send_committed = mm_on_stream_committed,
 };
 
 /*
@@ -1508,10 +1608,13 @@ static void mm_fill_env_cfg(moq_wtquic_msquic_managed_t *m,
     ecfg->struct_size = (uint32_t)sizeof(*ecfg);
     ecfg->alloc = &m->wt_alloc;
     ecfg->app_name = "libmoq";
-    if (m->idle_timeout_ms != 0) {
-        wtq_msquic_tuning_init(&ecfg->tuning);
+    /* The tuning is always materialized (wtquic's defaults, plus the idle
+     * override when one was configured) so the facade knows, rather than
+     * assumes, the DATAGRAM receive advertisement its connections carry. */
+    wtq_msquic_tuning_init(&ecfg->tuning);
+    if (m->idle_timeout_ms != 0)
         ecfg->tuning.idle_timeout_ms = m->idle_timeout_ms;
-    }
+    m->datagram_receive_enabled = ecfg->tuning.datagram_receive_enabled;
 }
 
 static moq_result_t mm_client_start(moq_wtquic_msquic_managed_t *m)
@@ -1535,7 +1638,7 @@ static moq_result_t mm_client_start(moq_wtquic_msquic_managed_t *m)
     wtq_connect_config_t conn;
     memset(&conn, 0, sizeof(conn));
     conn.struct_size = (uint32_t)sizeof(conn);
-    conn.authority = m->host;
+    conn.authority = m->authority;
     conn.path = m->wt_path;
     conn.subprotocols = (const char *const *)m->protos;
     conn.subprotocol_count = m->proto_count;
@@ -1654,7 +1757,10 @@ static wtq_result_t mm_accept_prepare(void *luser,
     if (!have_lane) {
         moq_wtquic_msquic_accept_info_t finfo = { .struct_size =
                                                       (uint32_t)sizeof(finfo) };
+        mm_flush_hook_scope_t scope;
+        mm_flush_hook_enter(&scope, m);
         lane_idx = m->choose_lane(m, &finfo, m->choose_lane_user);
+        mm_flush_hook_leave(&scope);
         valid = (lane_idx < m->lane_count);
     }
 
@@ -1786,17 +1892,33 @@ static moq_result_t mm_server_start(moq_wtquic_msquic_managed_t *m)
         return MOQ_OK;
     }
 #endif
-    wtq_result_t lr;
+    /* port 0 is a port IPv4 and IPv6 clients both reach: picked from the
+     * IPv4 allocator (common/moq_listen_port.h). Only a backend failure --
+     * where a bind lost the picked port -- is retried; a refused
+     * configuration fails the same way on every port. */
+    wtq_result_t lr = WTQ_ERR_BACKEND;
+    for (int attempt = 0;; attempt++) {
+        uint16_t port = 0;
+
+        if (moq_listen_port_pick(m->port, &port)) {
+            lcfg.port = port;
+            m->listener = NULL;
 #if defined(MOQ_WTQ_MM_TESTING)
-    /* the substitute stands exactly where the native callee stands */
-    lr = g_mm_test_listener_start != NULL
-             ? g_mm_test_listener_start(m->env, &lcfg, &m->listener)
-             : wtq_msquic_listener_start(m->env, &lcfg, &m->listener);
+            /* the substitute stands exactly where the native callee stands */
+            lr = g_mm_test_listener_start != NULL
+                     ? g_mm_test_listener_start(m->env, &lcfg, &m->listener)
+                     : wtq_msquic_listener_start(m->env, &lcfg, &m->listener);
 #else
-    lr = wtq_msquic_listener_start(m->env, &lcfg, &m->listener);
+            lr = wtq_msquic_listener_start(m->env, &lcfg, &m->listener);
 #endif
-    if (lr != WTQ_OK)
-        return mm_map_wtq_result(lr);
+            if (lr == WTQ_OK)
+                break;
+            if (lr != WTQ_ERR_BACKEND)
+                return mm_map_wtq_result(lr);
+        }
+        if (!moq_listen_port_retry(m->port, attempt))
+            return mm_map_wtq_result(lr);
+    }
     /* a real start always yields a handle; a test substitute may not */
     m->bound_port =
         m->listener != NULL ? wtq_msquic_listener_port(m->listener) : 0;
@@ -1900,8 +2022,15 @@ static int mm_pump_lane(moq_wtquic_msquic_managed_t *m,
     const mm_pump_window_t win = { lane, head };
     mm_pump_win = &win;
     int rc = 0;
-    if (m->on_lane_pump != NULL)
-        rc = m->on_lane_pump(m, lane, mm_now_us(), m->on_lane_pump_user);
+    /* The pump's instant: what on_lane_pump is told, and what serves every
+     * application deadline at or before it (the fold below). */
+    const uint64_t pump_now = mm_now_us();
+    if (m->on_lane_pump != NULL) {
+        mm_flush_hook_scope_t scope;
+        mm_flush_hook_enter(&scope, m);
+        rc = m->on_lane_pump(m, lane, pump_now, m->on_lane_pump_user);
+        mm_flush_hook_leave(&scope);
+    }
     /* the exclusive window closes WITH the callback: nothing below (a latched
      * close, adapter service, a synchronous on_closed) runs inside it */
     mm_pump_win = NULL;
@@ -2041,16 +2170,38 @@ static int mm_pump_lane(moq_wtquic_msquic_managed_t *m,
 
     mm_guard_leave(lane);
 
-    /* Fold the facade-wide application service deadline (e.g. media_sender's
-     * periodic catalog refresh) into the recomputed lane deadline, so a purely
-     * time-based deadline wakes an otherwise-idle lane with no transport event.
-     * Pure cached read, off the lane guard; recomputed every pump, so there is
-     * no stale arm to guard against terminal state (the worker breaks on stop).
-     * lane-guard is released, so this only takes ep->mu — the same lock the
-     * pump already acquires via on_lane_pump. */
+    /* Fold the application service deadlines (e.g. media_sender's periodic
+     * catalog refresh, or a relay shard's fill deadline) into the recomputed
+     * lane deadline, so a purely time-based deadline wakes an otherwise-idle
+     * lane with no transport event: the facade-wide query, and the per-lane
+     * query asked for this lane only. Pure cached reads, off the lane guard;
+     * recomputed every pump, so there is no stale arm to guard against
+     * terminal state (the worker breaks on stop). lane-guard is released, so
+     * this only takes ep->mu — the same lock the pump already acquires via
+     * on_lane_pump.
+     *
+     * An instant at or before pump_now was due when this pump ran, so this
+     * pump served it. Publishing it would make the worker find it due on its
+     * next check and pump again at once, and again after that for as long as
+     * the query keeps answering it -- another lane's deadline under the
+     * facade-wide query, or one the application has not moved yet. It is
+     * dropped instead: the lane waits for a later instant, a wake or a
+     * transport event. */
     if (m->app_deadline_us != NULL) {
+        mm_flush_hook_scope_t scope;
+        mm_flush_hook_enter(&scope, m);
         uint64_t ad = m->app_deadline_us(m->app_deadline_ctx);
-        if (ad < next_dl)
+        mm_flush_hook_leave(&scope);
+        if (ad > pump_now && ad < next_dl)
+            next_dl = ad;
+    }
+    if (m->app_lane_deadline_us != NULL) {
+        mm_flush_hook_scope_t scope;
+        mm_flush_hook_enter(&scope, m);
+        uint64_t ad = m->app_lane_deadline_us(m->app_lane_deadline_ctx,
+                                              lane->index);
+        mm_flush_hook_leave(&scope);
+        if (ad > pump_now && ad < next_dl)
             next_dl = ad;
     }
 
@@ -2080,9 +2231,12 @@ static int mm_pump_lane(moq_wtquic_msquic_managed_t *m,
      * (mm_in_activity), so it cannot mutate sessions or self-deadlock; lane_wake
      * and the any-thread accessors remain available. */
     if (m->on_activity != NULL) {
+        mm_flush_hook_scope_t scope;
+        mm_flush_hook_enter(&scope, m);
         mm_in_activity = true;
         m->on_activity(m, m->on_activity_ctx);
         mm_in_activity = false;
+        mm_flush_hook_leave(&scope);
     }
     return rc;
 }
@@ -2325,8 +2479,12 @@ static void *mm_coord_main(void *arg)
      * freeing m, so nothing below touches it. on_stopped path: join is
      * refused, so no free races us; cb() is the final access and may destroy
      * m — after which we touch nothing. */
-    if (cb != NULL)
+    if (cb != NULL) {
+        mm_flush_hook_scope_t scope;
+        mm_flush_hook_enter(&scope, m);
         cb(cb_ctx);
+        mm_flush_hook_leave(&scope); /* cb may have destroyed m; TLS only */
+    }
     return NULL;
 }
 
@@ -2472,6 +2630,11 @@ moq_result_t moq_wtquic_msquic_managed_create(
         m->app_deadline_us = cfg->app_deadline_us;
         m->app_deadline_ctx = cfg->app_deadline_ctx;
     }
+    /* the per-lane query is its own block, gated the same way */
+    if (MM_CFG_HAS(app_lane_deadline_ctx)) {
+        m->app_lane_deadline_us = cfg->app_lane_deadline_us;
+        m->app_lane_deadline_ctx = cfg->app_lane_deadline_ctx;
+    }
     /* the validated view was preflighted before any allocation; only the
      * copies remain */
     m->origin_policy = mm_pre.policy;
@@ -2501,6 +2664,35 @@ moq_result_t moq_wtquic_msquic_managed_create(
         (cfg->cert_path != NULL && m->cert_path == NULL) ||
         (cfg->key_path != NULL && m->key_path == NULL) || m->wt_path == NULL)
         goto oom;
+    /* The client's one CONNECT identity: the configured target, else the
+     * dial parameters and the WebTransport path; the CONNECT sends exactly
+     * what the session binds (moq_adapter_wt_client_target). A server binds
+     * each accepted session with the identity its CONNECT names, so its
+     * configured target is ignored. */
+    if (cfg->perspective == MOQ_PERSPECTIVE_CLIENT) {
+        const char *connect_path = NULL;
+        moq_result_t trc = moq_adapter_wt_client_target(
+            &m->alloc, MM_CFG_HAS(target) ? cfg->target : NULL, m->host,
+            (int)m->port,
+            MM_CFG_HAS(wt_path) ? cfg->wt_path : NULL, "/moq", &m->target,
+            &m->target_bytes, &m->target_bytes_len, &m->authority,
+            &connect_path);
+        if (trc == MOQ_ERR_NOMEM)
+            goto oom;
+        if (trc != MOQ_OK)
+            goto inval;
+        char *path = mm_strdup(m, connect_path);
+        if (path == NULL)
+            goto oom;
+        mm_free_str(m, m->wt_path);
+        m->wt_path = path;
+    } else {
+        moq_result_t trc = moq_adapter_target_copy(&m->alloc, NULL, &m->target,
+                                                   &m->target_bytes,
+                                                   &m->target_bytes_len);
+        if (trc != MOQ_OK)
+            goto inval;
+    }
 
     /* Always run the validator on the size-gated members, so a nonzero count
      * with a NULL array is REJECTED (mm_dup_protos) rather than silently
@@ -2711,6 +2903,8 @@ void moq_wtquic_msquic_managed_destroy(moq_wtquic_msquic_managed_t *m)
     mm_free_str(m, m->cert_path);
     mm_free_str(m, m->key_path);
     mm_free_str(m, m->wt_path);
+    if (m->target_bytes != NULL)
+        m->alloc.free(m->target_bytes, m->target_bytes_len, m->alloc.ctx);
     mm_free_protos(m);
     mm_free_origins(m);
     mm_free_str(m, m->origin);
@@ -3102,6 +3296,50 @@ moq_result_t moq_wtquic_msquic_managed_wait(moq_wtquic_msquic_managed_t *m,
     return rc;
 }
 
+static bool mm_flush_terminal(moq_wtquic_msquic_managed_t *m)
+{
+    pthread_mutex_lock(&m->mu);
+    bool terminal = m->stop_requested || m->stopped || m->fatal || m->closed;
+    pthread_mutex_unlock(&m->mu);
+    return terminal;
+}
+
+moq_result_t moq_wtquic_msquic_managed_poll_flush(
+    const moq_wtquic_msquic_managed_t *managed)
+{
+    if (managed == NULL) return MOQ_ERR_INVAL;
+    if (managed->perspective != MOQ_PERSPECTIVE_CLIENT) return MOQ_ERR_UNSUPPORTED;
+    if (mm_flush_in_hook(managed)) return MOQ_ERR_WRONG_STATE;
+    moq_wtquic_msquic_managed_t *m = (moq_wtquic_msquic_managed_t *)managed;
+    if (mm_flush_terminal(m)) return MOQ_ERR_CLOSED;
+
+    moq_wtquic_msquic_managed_lane_t *lane = &m->lanes[0];
+    int lock_rc = pthread_mutex_trylock(&lane->mu);
+    if (lock_rc != 0) {
+        if (mm_flush_terminal(m)) return MOQ_ERR_CLOSED;
+        return lock_rc == EBUSY ? MOQ_DONE : MOQ_ERR_INTERNAL;
+    }
+    moq_result_t result = MOQ_DONE;
+    /* Stop crosses this lane before reclaiming the single client. Do not read
+     * that client after observing stop, even if this try-entry succeeded after
+     * teardown already crossed the lane. Destroy is externally serialized. */
+    if (mm_flush_terminal(m)) {
+        result = MOQ_ERR_CLOSED;
+    } else {
+        const moq_wtquic_msquic_managed_conn_t *c = m->client;
+        if (c && (c->logical_terminal || c->quiesce_requested ||
+                  c->transport_quiesced)) {
+            result = MOQ_ERR_CLOSED;
+        } else if (c && c->ws && c->session && c->adapter) {
+            result = moq_wtquic_conn_poll_flush(c->adapter);
+            if (result == MOQ_OK && c->close_pending) result = MOQ_DONE;
+        }
+    }
+    if (mm_flush_terminal(m)) result = MOQ_ERR_CLOSED;
+    pthread_mutex_unlock(&lane->mu);
+    return result;
+}
+
 bool moq_wtquic_msquic_managed_is_fatal(const moq_wtquic_msquic_managed_t *m)
 {
     if (m == NULL)
@@ -3280,6 +3518,26 @@ bool moq_wtquic_msquic_managed_test_server_child(
             if (out_has_ws != NULL)
                 *out_has_ws = (c->ws != NULL);
         }
+        mm_guard_leave(c->lane);
+        if (established)
+            return true;
+    }
+    return false;
+}
+
+bool moq_wtquic_msquic_managed_test_server_child_state(
+    const moq_wtquic_msquic_managed_t *m, moq_session_state_t *out_state)
+{
+    if (m == NULL || m->children == NULL)
+        return false;
+    for (uint32_t i = 0; i < m->max_connections; i++) {
+        moq_wtquic_msquic_managed_conn_t *c = &m->children[i];
+        if (!c->in_use || c->lane == NULL)
+            continue;
+        mm_guard_enter(c->lane);
+        bool established = (c->session != NULL);
+        if (established && out_state != NULL)
+            *out_state = moq_session_state(c->session);
         mm_guard_leave(c->lane);
         if (established)
             return true;

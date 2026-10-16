@@ -19,6 +19,7 @@
 #include <moq/codec.h>
 #include "../../tests/unit/test_support.h"
 #include "../../tests/unit/test_session_support.h"
+#include "scenario_version.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -644,6 +645,27 @@ static int run_prelude(moq_session_t *c, moq_session_t *sv,
 
 /* -- Run one scenario ----------------------------------------------- */
 
+static int establish_d16_pair(moq_alloc_t *alloc,
+                              moq_session_t **c, moq_session_t **sv)
+{
+    /* The shared test pump carries control frames, not request bidis. */
+    moq_session_cfg_t extra = MOQ_SESSION_CFG_INIT;
+    extra.version = MOQ_VERSION_DRAFT_16;
+    establish_pair(alloc, 2, 2, c, sv, &extra, &extra);
+    if (!*c || !*sv ||
+        moq_session_state(*c) != MOQ_SESS_ESTABLISHED ||
+        moq_session_state(*sv) != MOQ_SESS_ESTABLISHED ||
+        moq_session_version(*c) != MOQ_VERSION_DRAFT_16 ||
+        moq_session_version(*sv) != MOQ_VERSION_DRAFT_16) {
+        fprintf(stderr, "FAIL: test_scenario_request_credit: expected "
+                "established draft-16 scenario pair\n");
+        moq_session_destroy(*c);
+        moq_session_destroy(*sv);
+        return 1;
+    }
+    return 0;
+}
+
 static int run_scenario(uint64_t seed, moq_alloc_t *alloc,
                          run_summary_t *summary, int run_id,
                          int max_steps)
@@ -652,7 +674,7 @@ static int run_scenario(uint64_t seed, moq_alloc_t *alloc,
     summary->hash = 0xCBF29CE484222325ULL;
 
     moq_session_t *c = NULL, *sv = NULL;
-    establish_pair(alloc, 2, 2, &c, &sv, NULL, NULL);
+    if (establish_d16_pair(alloc, &c, &sv)) return 1;
     drain_both(c, sv);
 
     int failures = 0;
@@ -673,7 +695,7 @@ static int run_scenario(uint64_t seed, moq_alloc_t *alloc,
 
     /* Random phase: fresh pair with tiny credit. */
     if (prelude_rc >= 0) {
-        establish_pair(alloc, 2, 2, &c, &sv, NULL, NULL);
+        if (establish_d16_pair(alloc, &c, &sv)) return failures + 1;
         drain_both(c, sv);
 
         shadow_state_t st;
@@ -712,6 +734,7 @@ static int run_scenario(uint64_t seed, moq_alloc_t *alloc,
 
 int main(void)
 {
+    if (scenario_require_version("test_scenario_request_credit", "16")) return 1;
     int failures = 0;
     const char *env_seeds = getenv("MOQ_SCENARIO_SEEDS");
     const char *env_start = getenv("MOQ_SCENARIO_SEED_START");
@@ -807,7 +830,7 @@ int main(void)
 
     if (failures == 0)
         fprintf(stderr, "PASS: test_scenario_request_credit "
-                "(%llu seeds, blk_sub=%zu blk_ns=%zu grants=%zu "
+                "(draft-16, %llu seeds, blk_sub=%zu blk_ns=%zu grants=%zu "
                 "retry=%zu sub_ok=%zu ns_ok=%zu errors=%zu)\n",
                 (unsigned long long)num_seeds,
                 total_blocked_sub, total_blocked_ns,

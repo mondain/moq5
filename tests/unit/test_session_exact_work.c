@@ -1395,8 +1395,9 @@ typedef struct {
     /*
      * Three DISTINCT operation sets, because they are not the same set:
      *   idx_find_ops    - every moq_index_find call: a by-id registry lookup
-     *                     (request_registry_remove_by_id does one before its
-     *                     removal, present or not) and an rx-by-ref lookup;
+     *                     (subscription cleanup checks ownership first, and
+     *                     request_registry_remove_by_id looks up before its
+     *                     removal) and an rx-by-ref lookup;
      *   idx_remove_ops  - every moq_index_remove ATTEMPT, present or absent;
      *   idx_present_rm  - only the attempts whose key is PRESENT. An absent
      *                     removal searches and returns without ever entering
@@ -1715,7 +1716,7 @@ static void st_pub(state_t *v, const char *pfx, moq_session_t *s, size_t slot)
     st_addp(v, pfx, "gen",        e->generation);
     st_addp(v, pfx, "handle",     e->handle._opaque);
     st_addp(v, pfx, "req_id",     e->request_id);
-    st_addp(v, pfx, "req_ref",    e->request_stream_ref._v);
+    st_addp(v, pfx, "req_ref",    e->rs.ref._v);
     st_addp(v, pfx, "alias",      e->track_alias);
     st_addp(v, pfx, "send_ok",    e->send_allowed ? 1u : 0u);
     st_addp(v, pfx, "dn_pend",    e->done_pending ? 1u : 0u);
@@ -1741,7 +1742,7 @@ static void st_sub(state_t *v, const char *pfx, moq_session_t *s, size_t slot)
     st_addp(v, pfx, "gen",        e->generation);
     st_addp(v, pfx, "handle",     e->handle._opaque);
     st_addp(v, pfx, "req_id",     e->request_id);
-    st_addp(v, pfx, "req_ref",    e->request_stream_ref._v);
+    st_addp(v, pfx, "req_ref",    e->rs.ref._v);
     st_addp(v, pfx, "alias",      e->track_alias);
     st_addp(v, pfx, "forward",    e->forward ? 1u : 0u);
     st_addp(v, pfx, "dn_pend",    e->done_pending ? 1u : 0u);
@@ -1981,14 +1982,16 @@ static void st_expect_sub_ready(state_t *v, const char *pfx, uint32_t gen,
 }
 
 /* A stream the session STOPped and now holds in the discard state until the
- * peer's FIN/RESET: identity kept (ref + index entry), bindings and buffers
- * released. */
-static void st_expect_rx_stopped(state_t *v, const char *pfx, uint64_t ref)
+ * peer's FIN/RESET: identity kept (ref + index entry), buffers released. The
+ * publication binding it had (`pub_handle`, 0 for an unbound stream) is kept
+ * so the peer's terminal counts the stream toward the Stream Count gate. */
+static void st_expect_rx_stopped(state_t *v, const char *pfx, uint64_t ref,
+                                 uint64_t pub_handle)
 {
     st_addp(v, pfx, "active",  1);
     st_addp(v, pfx, "ref",     ref);
     st_addp(v, pfx, "sub",     0);
-    st_addp(v, pfx, "pub",     0);
+    st_addp(v, pfx, "pub",     pub_handle);
     st_addp(v, pfx, "parse",   (uint64_t)MOQ_RX_STOPPED);
     st_addp(v, pfx, "in_len",  0);
     st_addp(v, pfx, "pay_buf", 0);
@@ -2227,8 +2230,8 @@ static void st_fetch(state_t *v, const char *pfx, moq_session_t *s, size_t slot)
     st_addp(v, pfx, "slot",    (uint64_t)slot);
     st_addp(v, pfx, "handle",  e->handle._opaque);
     st_addp(v, pfx, "req_id",  e->request_id);
-    st_addp(v, pfx, "req_ref", e->request_stream_ref._v);
-    st_addp(v, pfx, "req_fin", e->req_recv_fin ? 1u : 0u);
+    st_addp(v, pfx, "req_ref", e->rs.ref._v);
+    st_addp(v, pfx, "req_fin", e->rs.recv_fin ? 1u : 0u);
     st_addp(v, pfx, "hoff_fin", e->handoff_fin_pending ? 1u : 0u);
     st_addp(v, pfx, "dstart",  e->data_stream_started ? 1u : 0u);
     st_addp(v, pfx, "dfin",    e->data_stream_fin ? 1u : 0u);
@@ -2404,7 +2407,7 @@ static void arm_pending_join(moq_session_t *s, size_t slot, uint64_t sub_req_id,
      * slot: the placement matrix must hold the symbolic owner fixed while the
      * slot moves, which a slot-derived id or ref would silently break. */
     fe->request_id         = req_id;
-    fe->request_stream_ref = moq_stream_ref_from_u64(req_ref);
+    fe->rs.ref = moq_stream_ref_from_u64(req_ref);
     {
         moq_request_endpoint_t ep;
         memset(&ep, 0, sizeof(ep));
@@ -2413,8 +2416,8 @@ static void arm_pending_join(moq_session_t *s, size_t slot, uint64_t sub_req_id,
         ep.has_request_id = true;
         ep.request_id = fe->request_id;
         ep.has_stream_ref = true;
-        ep.stream_ref = fe->request_stream_ref;
-        request_registry_insert_by_streamref(s, fe->request_stream_ref, ep);
+        ep.stream_ref = fe->rs.ref;
+        request_registry_insert_by_streamref(s, fe->rs.ref, ep);
     }
     fe->join_request_id          = sub_req_id;
     fe->join_start               = start;
@@ -2517,7 +2520,7 @@ static void register_sub_streamref(moq_session_t *s, size_t slot,
 {
     moq_sub_entry_t *e = &s->subs[slot];
     e->request_id         = req_id;
-    e->request_stream_ref = moq_stream_ref_from_u64(ref);
+    e->rs.ref = moq_stream_ref_from_u64(ref);
     moq_request_endpoint_t ep;
     memset(&ep, 0, sizeof(ep));
     ep.kind = MOQ_REQ_SUBSCRIPTION;
@@ -2525,8 +2528,8 @@ static void register_sub_streamref(moq_session_t *s, size_t slot,
     ep.has_request_id = true;
     ep.request_id     = req_id;
     ep.has_stream_ref = true;
-    ep.stream_ref     = e->request_stream_ref;
-    request_registry_insert_by_streamref(s, e->request_stream_ref, ep);
+    ep.stream_ref     = e->rs.ref;
+    request_registry_insert_by_streamref(s, e->rs.ref, ep);
 }
 
 /*
@@ -2865,10 +2868,11 @@ static int run_case(int case_id, const caps_t *caps_in, uint32_t seed,
         exp_event(&want, MOQ_EVENT_SUBSCRIBE_DONE, SYM_SUB0, SUB_STATUS,
                   SUB_SC, SUB_REASON);
         wm.catchup = 1; wm.rx_rescan = 1; wm.sub_pending = 1;
-        /* Subscriber-role free: ONE by-id lookup, then TWO removals -- the
+        /* Subscriber-role free: TWO by-id lookups (ownership, then release),
+         * then TWO removals -- the
          * by-id key (present) and the ESTABLISHED subscriber's alias key
          * (absent here, but attempted unconditionally). */
-        wm.idx_find_ops = 1; wm.idx_remove_ops = 2; wm.idx_present_rm = 1;
+        wm.idx_find_ops = 2; wm.idx_remove_ops = 2; wm.idx_present_rm = 1;
         st_expect_sub_free(&wst, "U0", sub0_gen);
         st_expect_cursor_retired(&wst, (uint64_t)MOQ_SESS_IDLE, now);
         PHASE("initial", session_begin_advance(s, now), &want, &wst, &wm,
@@ -2897,8 +2901,9 @@ static int run_case(int case_id, const caps_t *caps_in, uint32_t seed,
                   SUB_STATUS, SUB_SC, SUB_REASON);
         wm.catchup = 1; wm.rx_rescan = 5; wm.pub_pending = 2; wm.sub_pending = 3;
         /* Two publications (1 removal each) and three subscriptions (2 each:
-         * by-id present, alias attempted), one by-id lookup per owner. */
-        wm.idx_find_ops = 5; wm.idx_remove_ops = 8; wm.idx_present_rm = 5;
+         * by-id present, alias attempted). Each subscription first checks
+         * ownership; the release helper then looks up each of the five keys. */
+        wm.idx_find_ops = 8; wm.idx_remove_ops = 8; wm.idx_present_rm = 5;
         st_expect_pub_free(&wst, "P0", pub0_gen);
         st_expect_pub_free(&wst, "P1", pub1_gen);
         st_expect_sub_free(&wst, "U0", sub0_gen);
@@ -2934,13 +2939,13 @@ static int run_case(int case_id, const caps_t *caps_in, uint32_t seed,
         out_reset(&want); st_reset(&wst); model_reset(&wm);
         exp_event(&want, MOQ_EVENT_PUBLISH_FINISHED, SYM_PUB0, PUB_STATUS,
                   PUB_SC, PUB_REASON);
-        exp_action(&want, MOQ_ACTION_STOP_DATA, RX_REF_BASE + pl.r0, 0);
+        exp_action(&want, MOQ_ACTION_STOP_DATA, RX_REF_BASE + pl.r0, MOQ_STREAM_ERROR_CANCELLED);
         wm.catchup = 1; wm.rx_rescan = 2; wm.pub_pending = 1; wm.rx_charged = 1;
         /* The publication's by-id key is removed; the stopped stream keeps
          * its index entry until the peer's FIN/RESET retires it. */
         wm.idx_find_ops = 1; wm.idx_remove_ops = 1; wm.idx_present_rm = 1;
         st_expect_pub_free(&wst, "P0", pub0_gen);
-        st_expect_rx_stopped(&wst, "R0", RX_REF_BASE + pl.r0);
+        st_expect_rx_stopped(&wst, "R0", RX_REF_BASE + pl.r0, pub0_h);
         st_expect_cursor_retired(&wst, (uint64_t)MOQ_SESS_IDLE, now);
         PHASE("recovery", session_begin_advance(s, now), &want, &wst, &wm,
               do { st_pub(&p->st, "P0", s, pl.p0);
@@ -2957,7 +2962,7 @@ static int run_case(int case_id, const caps_t *caps_in, uint32_t seed,
         exp_event(&want, MOQ_EVENT_SUBSCRIBE_DONE, SYM_SUB0, SUB_STATUS,
                   SUB_SC, SUB_REASON);
         wm.catchup = 1; wm.rx_rescan = 2; wm.pub_pending = 1; wm.sub_pending = 1;
-        wm.idx_find_ops = 2; wm.idx_remove_ops = 3; wm.idx_present_rm = 2;
+        wm.idx_find_ops = 3; wm.idx_remove_ops = 3; wm.idx_present_rm = 2;
         st_expect_pub_free(&wst, "P0", pub0_gen);
         st_expect_sub_free(&wst, "U0", sub0_gen);
         st_expect_cursor_retired(&wst, (uint64_t)MOQ_SESS_IDLE, now);
@@ -2988,15 +2993,15 @@ static int run_case(int case_id, const caps_t *caps_in, uint32_t seed,
         out_reset(&want); st_reset(&wst); model_reset(&wm);
         exp_event(&want, MOQ_EVENT_PUBLISH_FINISHED, SYM_PUB0, PUB_STATUS,
                   PUB_SC, PUB_REASON);
-        exp_action(&want, MOQ_ACTION_STOP_DATA, RX_REF_BASE + ra, 0);
-        exp_action(&want, MOQ_ACTION_STOP_DATA, RX_REF_BASE + rb, 0);
+        exp_action(&want, MOQ_ACTION_STOP_DATA, RX_REF_BASE + ra, MOQ_STREAM_ERROR_CANCELLED);
+        exp_action(&want, MOQ_ACTION_STOP_DATA, RX_REF_BASE + rb, MOQ_STREAM_ERROR_CANCELLED);
         wm.catchup = 1; wm.rx_rescan = 2; wm.pub_pending = 1; wm.rx_charged = 2;
         /* The publication's by-id key is removed; BOTH stopped streams keep
          * their entries (and index keys) until the peer's FIN/RESET. */
         wm.idx_find_ops = 1; wm.idx_remove_ops = 1; wm.idx_present_rm = 1;
         st_expect_pub_free(&wst, "P0", pub0_gen);
-        st_expect_rx_stopped(&wst, "R0", RX_REF_BASE + pl.r0);
-        st_expect_rx_stopped(&wst, "R1", RX_REF_BASE + pl.r1);   /* BOTH rx entries */
+        st_expect_rx_stopped(&wst, "R0", RX_REF_BASE + pl.r0, pub0_h);
+        st_expect_rx_stopped(&wst, "R1", RX_REF_BASE + pl.r1, pub0_h);   /* BOTH rx entries */
         st_expect_cursor_retired(&wst, (uint64_t)MOQ_SESS_IDLE, now);
         PHASE("initial", session_begin_advance(s, now), &want, &wst, &wm,
               do { st_pub(&p->st, "P0", s, pl.p0);
@@ -3014,7 +3019,7 @@ static int run_case(int case_id, const caps_t *caps_in, uint32_t seed,
         exp_event(&want, MOQ_EVENT_SUBSCRIBE_DONE, SYM_SUB0, SUB_STATUS,
                   SUB_SC, SUB_REASON);
         wm.catchup = 1; wm.rx_rescan = 2; wm.pub_pending = 1; wm.sub_pending = 1;
-        wm.idx_find_ops = 2; wm.idx_remove_ops = 3; wm.idx_present_rm = 2;
+        wm.idx_find_ops = 3; wm.idx_remove_ops = 3; wm.idx_present_rm = 2;
         st_expect_pub_free(&wst, "P0", pub0_gen);
         st_expect_sub_free(&wst, "U0", sub0_gen);
         st_expect_cursor_retired(&wst, (uint64_t)MOQ_SESS_IDLE, now);
@@ -3060,7 +3065,7 @@ static int run_case(int case_id, const caps_t *caps_in, uint32_t seed,
         exp_event(&want, MOQ_EVENT_SUBSCRIBE_DONE, SYM_SUB1, SUB_STATUS,
                   SUB_SC, SUB_REASON);
         wm.catchup = 1; wm.rx_rescan = 2; wm.pub_pending = 1; wm.sub_pending = 1;
-        wm.idx_find_ops = 2; wm.idx_remove_ops = 3; wm.idx_present_rm = 2;
+        wm.idx_find_ops = 3; wm.idx_remove_ops = 3; wm.idx_present_rm = 2;
         st_expect_pub_free(&wst, "P0", pub_gen2);
         st_expect_sub_free(&wst, "U0", sub_gen2);
         st_expect_cursor_retired(&wst, (uint64_t)MOQ_SESS_IDLE, now);
@@ -3119,7 +3124,7 @@ static int run_case(int case_id, const caps_t *caps_in, uint32_t seed,
         exp_event(&want, MOQ_EVENT_SUBSCRIBE_DONE, SYM_SUB0, SUB_STATUS,
                   SUB_SC, SUB_REASON);
         wm.catchup = 1; wm.rx_rescan = 1; wm.sub_pending = 1;
-        wm.idx_find_ops = 1; wm.idx_remove_ops = 2; wm.idx_present_rm = 1;
+        wm.idx_find_ops = 2; wm.idx_remove_ops = 2; wm.idx_present_rm = 1;
         st_expect_sub_free(&wst, "U0", sub0_gen);
         st_expect_sub_fwd_pending(&wst, "U1", sub1_gen, sub_handle_at(s, pl.u1), REQ_SUB1);
         st_expect_sub_fwd_pending(&wst, "U2", sub2_gen, sub_handle_at(s, pl.u2), REQ_SUB2);
@@ -3153,12 +3158,13 @@ static int run_case(int case_id, const caps_t *caps_in, uint32_t seed,
                   SUB_SC, SUB_REASON);
         exp_action(&want, MOQ_ACTION_STOP_DATA, RX_REF_BASE + pl.r0, 0);
         wm.catchup = 1; wm.rx_rescan = 1; wm.sub_pending = 1;
-        /* The subscription free's by-id lookup; its by-id (present) and alias
+        /* The subscription free's ownership and release lookups; its by-id
+         * (present) and alias
          * (absent) removals. The discarded stream is stopped and keeps its
          * entry (and key) until the peer's FIN/RESET. */
-        wm.idx_find_ops = 1; wm.idx_remove_ops = 2; wm.idx_present_rm = 1;
+        wm.idx_find_ops = 2; wm.idx_remove_ops = 2; wm.idx_present_rm = 1;
         st_expect_sub_free(&wst, "U0", sub0_gen);
-        st_expect_rx_stopped(&wst, "R0", RX_REF_BASE + pl.r0);
+        st_expect_rx_stopped(&wst, "R0", RX_REF_BASE + pl.r0, 0);   /* never bound */
         st_expect_cursor_retired(&wst, (uint64_t)MOQ_SESS_IDLE, now);
         PHASE("discard", session_begin_advance(s, now), &want, &wst, &wm,
               do { st_sub(&p->st, "U0", s, pl.u0); st_rx(&p->st, "R0", s, pl.r0);
@@ -3172,9 +3178,9 @@ static int run_case(int case_id, const caps_t *caps_in, uint32_t seed,
         exp_event(&want, MOQ_EVENT_SUBSCRIBE_DONE, SYM_SUB0, SUB_STATUS,
                   SUB_SC, SUB_REASON);
         wm.catchup = 1; wm.rx_rescan = 1; wm.sub_pending = 1;
-        /* The subscription free's by-id lookup, plus one alias lookup per
+        /* The subscription free's two by-id lookups, plus one alias lookup per
          * staged entry the discard scan resolves. */
-        wm.idx_find_ops = 3; wm.idx_remove_ops = 2; wm.idx_present_rm = 1;
+        wm.idx_find_ops = 4; wm.idx_remove_ops = 2; wm.idx_present_rm = 1;
         wm.staged = 16;            /* the fixed ring is visited exactly once */
         st_expect_sub_free(&wst, "U0", sub0_gen);
         st_expect_sub_live(&wst, "U1", sub1_gen, sub_handle_at(s, pl.u1),
@@ -4118,7 +4124,7 @@ static int run_placement(place_kind_t k, work_t *w_out, out_t *o_out)
     st_expect_pub_free(&wst, "P0", pub_gen);
     st_expect_sub_free(&wst, "U0", sub_gen);
     st_expect_sg_free(&wst, "G0", sg_gen);
-    st_expect_rx_stopped(&wst, "R0", PLACE_RX_REF);   /* held for the peer's FIN/RESET */
+    st_expect_rx_stopped(&wst, "R0", PLACE_RX_REF, pub_h);   /* held for the peer's FIN/RESET */
     failures += st_check(&wst, &got, place_name(k));
     failures += check_retired(s, MOQ_REQ_PUBLISH, ps, pub_h, REQ_PUB0,
                               place_name(k));
@@ -4130,8 +4136,9 @@ static int run_placement(place_kind_t k, work_t *w_out, out_t *o_out)
      * (1 + 1 rescan), the subscription has none (1). */
     wm.catchup = 1; wm.rx_rescan = 3; wm.pub_pending = 1; wm.sub_pending = 1;
     wm.rx_charged = 1; wm.sg_charged = 1;
-    /* The stopped stream keeps its key: no rx index removal here. */
-    wm.idx_find_ops = 2; wm.idx_remove_ops = 3; wm.idx_present_rm = 2;
+    /* The stopped stream keeps its key: no rx index removal here. The
+     * subscription checks ownership before the two owners' release lookups. */
+    wm.idx_find_ops = 3; wm.idx_remove_ops = 3; wm.idx_present_rm = 2;
     failures += model_check(&wm, w_out, place_name(k));
 
     out_reset(o_out);
@@ -4142,7 +4149,7 @@ static int run_placement(place_kind_t k, work_t *w_out, out_t *o_out)
               PUB_REASON);
     exp_event(&want, MOQ_EVENT_SUBSCRIBE_DONE, SYM_SUB0, SUB_STATUS, SUB_SC,
               SUB_REASON);
-    exp_action(&want, MOQ_ACTION_STOP_DATA, PLACE_RX_REF, 0);
+    exp_action(&want, MOQ_ACTION_STOP_DATA, PLACE_RX_REF, MOQ_STREAM_ERROR_CANCELLED);
     failures += out_check(&want, o_out, place_name(k));
 
     moq_session_destroy(s);
@@ -4181,13 +4188,13 @@ static int sub_snap_spans_empty(moq_session_t *s, size_t slot, const char *who,
 {
     int failures = 0;
     const moq_sub_entry_t *e = &s->subs[slot];
-    if (e->req_recv_len != 0 || e->track_id_len != 0 ||
+    if (e->rs.recv_len != 0 || e->track_id_len != 0 ||
         e->done_reason_len != 0) {
         printf("      CONSERVATION FAIL-CLOSED (%s/%s): owned spans must be "
                "empty for a byte-exact record compare -- req_recv_len=%zu "
                "track_id_len=%zu done_reason_len=%zu\n", where, who,
-               e->req_recv_len, e->track_id_len, e->done_reason_len);
-        MOQ_TEST_CHECK(e->req_recv_len == 0 && e->track_id_len == 0 &&
+               e->rs.recv_len, e->track_id_len, e->done_reason_len);
+        MOQ_TEST_CHECK(e->rs.recv_len == 0 && e->track_id_len == 0 &&
                        e->done_reason_len == 0);
     }
     return failures;
@@ -4632,19 +4639,19 @@ static int run_join_lifecycle(place_kind_t k, uint32_t fetch_cap,
     /*
      * No advancing preamble runs on this route, so there is no catch-up pass
      * and no deferred-owner selection. The declared operation set:
-     *   finds   -- the teardown's own by-streamref lookup (1); the
-     *              migration-marker lookup queue_send_bidi() performs before
-     *              each reject is written (3); and the by-id lookup inside
-     *              each of the four frees, 3 joins plus U0 (4).
+     *   finds   -- the teardown's own by-streamref lookup (1) and the by-id
+     *              lookup inside each of the three join frees (3), plus U0's
+     *              ownership check (1). U0 has no by-id key to release.
      *   removes -- each join free removes its by-id key (absent here: a
      *              draft-18 join is keyed by stream ref alone) and its
-     *              stream-ref key (present); U0's free does the same, and its
+     *              stream-ref key (present); U0 removes only its stream-ref
+     *              key, and its
      *              alias key is not attempted at all (PENDING_PUBLISHER is not
      *              the ESTABLISHED subscriber state that clears an alias).
-     *              4 owners x 2 attempts = 8, of which 4 are present.
+     *              3 joins x 2 attempts + U0 = 7, of which 4 are present.
      */
     wm.auth_staging = 6;      /* two staged token values per join */
-    wm.idx_find_ops = 8; wm.idx_remove_ops = 8; wm.idx_present_rm = 4;
+    wm.idx_find_ops = 5; wm.idx_remove_ops = 7; wm.idx_present_rm = 4;
     failures += model_check(&wm, w_out, tag);
 
     moq_session_destroy(cl);
@@ -4923,7 +4930,7 @@ static int run_tomb_late_cancel(void)
                moq_index_find(s->idx_rx_by_ref, s->idx_rx_mask,
                               TOMB_REF) >= 0 ? 1u : 0u);
         st_add(&got, "sess.state", (uint64_t)moq_session_state(s));
-        st_expect_rx_stopped(&wst, "R0", TOMB_REF);
+        st_expect_rx_stopped(&wst, "R0", TOMB_REF, 0);
         st_add(&wst, "tomb_count", 0);      /* consumed exactly once */
         st_add(&wst, "idx_key",    1);      /* key kept with the stopped entry */
         st_add(&wst, "sess.state", (uint64_t)MOQ_SESS_ESTABLISHED);
@@ -4957,7 +4964,7 @@ static int run_tomb_late_cancel(void)
         st_add(&got, "sess.state", (uint64_t)moq_session_state(s));
         /* Still STOPped and held: the entry (with its key) stays until the
          * peer's FIN/RESET; the tombstone was consumed exactly once. */
-        st_expect_rx_stopped(&wst, "R0", TOMB_REF);
+        st_expect_rx_stopped(&wst, "R0", TOMB_REF, 0);
         st_add(&wst, "tomb_count", 0);
         st_add(&wst, "idx_key",    1);      /* key kept with the stopped entry */
         st_add(&wst, "sess.state", (uint64_t)MOQ_SESS_ESTABLISHED);

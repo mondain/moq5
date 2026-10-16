@@ -78,6 +78,31 @@ bool moq_session_has_events(const moq_session_t *s);
 bool moq_session_terminal_enqueued(const moq_session_t *s);
 bool moq_session_terminal_observed(const moq_session_t *s);
 
+/*
+ * Exclusive transport ownership. A session is driven by at most one transport
+ * owner (a transport bridge) at a time, from the owner's creation until its
+ * destruction; the session must outlive its owner. Register fails with
+ * MOQ_ERR_WRONG_STATE, changing nothing, while a different owner is
+ * registered -- a fatal or closed bridge still holds the registration until it
+ * is destroyed. Unregister clears the slot only when `owner` holds it. The
+ * owner is an opaque identity: the session never dereferences it. Not public
+ * API.
+ */
+moq_result_t moq_session_register_transport_owner(moq_session_t *s,
+                                                  const void *owner);
+void moq_session_unregister_transport_owner(moq_session_t *s,
+                                            const void *owner);
+
+/*
+ * The registered owner publishes its own next deadline (has == false clears
+ * it). The session reports it through moq_session_next_deadline_us so an
+ * idle adapter wakes for it, but never acts on it: moq_session_tick leaves it
+ * in place, and only the owner's service pass rearms it. Ignored unless
+ * `owner` is the registered owner; unregistering clears it. Not public API.
+ */
+void moq_session_set_owner_deadline(moq_session_t *s, const void *owner,
+                                    bool has, uint64_t deadline_us);
+
 
 /*
  * Private suspension sentinel.

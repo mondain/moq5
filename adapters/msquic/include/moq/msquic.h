@@ -61,6 +61,7 @@
  */
 
 #include <moq/session.h>
+#include <moq/connection_target.h>
 
 #include <msquic.h>
 
@@ -71,6 +72,7 @@ extern "C" {
 /* MoQ-over-QUIC ALPNs (raw QUIC; version selected per session). */
 #define MOQ_MSQUIC_ALPN_DRAFT16 "moqt-16"
 #define MOQ_MSQUIC_ALPN_DRAFT18 "moqt-18"
+#define MOQ_MSQUIC_ALPN_DRAFT22 "moqt-22"
 
 typedef struct moq_msquic_conn moq_msquic_conn_t;
 
@@ -96,8 +98,37 @@ typedef struct moq_msquic_conn_cfg {
     moq_msquic_guard_fn guard_enter; /* optional; both or neither */
     moq_msquic_guard_fn guard_leave;
     void *guard_user;
+
+    /* Appended (struct_size append-only ABI; read only when struct_size
+     * covers it) -- transport binding.
+     *
+     * target: the URI identity the adapter binds the session with when its
+     * wire profile requires a transport binding (see
+     * <moq/connection_target.h>; draft-22 does, draft-16/18 do not, and for
+     * those this field is never read). The binding happens inside
+     * QUIC_CONNECTION_EVENT_CONNECTED, before moq_session_start and before
+     * any byte reaches the session, with the facts MsQuic reports there: the
+     * handshake is complete, this side's DATAGRAM receive support is
+     * QUIC_PARAM_CONN_DATAGRAM_RECEIVE_ENABLED and the peer's DATAGRAM
+     * support is QUIC_PARAM_CONN_DATAGRAM_SEND_ENABLED (a parameter MsQuic
+     * cannot report is left unknown, never assumed). Borrowed: the target
+     * and its bytes must outlive the conn. CLIENT: the authority and
+     * path/query the connection dereferences, sent as the SETUP's AUTHORITY
+     * and PATH; a client session that requires a binding and has no target
+     * cannot start. SERVER: the URI policy consulted for each client's
+     * SETUP; NULL (or a target without accept_uri) serves every authority
+     * and path. A binding refusal is a connection failure -- the bridge is
+     * told the transport failed and the connection is shut down -- never a
+     * silently unbound session. */
+    const moq_connection_target_t *target;
 } moq_msquic_conn_cfg_t;
 
+/* Frozen v0 prefix: everything before `target`. A struct_size at or above it
+ * is accepted; appended fields are read only when struct_size covers them. */
+#define MOQ_MSQUIC_CONN_CFG_V0_SIZE offsetof(moq_msquic_conn_cfg_t, target)
+
+/* Clears and stamps min(size, sizeof(moq_msquic_conn_cfg_t)); a size below
+ * the v0 prefix is a no-op (such a cfg is refused by _create). */
 MOQ_API void moq_msquic_conn_cfg_init_sized(moq_msquic_conn_cfg_t *cfg,
                                             size_t size);
 

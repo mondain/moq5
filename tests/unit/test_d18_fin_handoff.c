@@ -74,7 +74,7 @@ static const moq_pub_entry_t *pub_by_ref(const moq_session_t *s,
 {
     for (size_t i = 0; i < s->pub_cap; i++) {
         const moq_pub_entry_t *e = &s->publishes[i];
-        if (e->state != MOQ_PUB_FREE && e->request_stream_ref._v == ref._v)
+        if (e->state != MOQ_PUB_FREE && e->rs.ref._v == ref._v)
             return e;
     }
     return NULL;
@@ -323,7 +323,9 @@ typedef struct pub_hook_state {
     int      role;
     uint64_t handle;
     uint64_t req_stream_ref;
-    int      req_recv_fin;
+    struct {
+        int recv_fin;
+    } rs;
     int      handoff_fin;
     int      busy;
 } pub_hook_state_t;
@@ -345,8 +347,8 @@ static void pub_hook_capture(const moq_session_t *s, void *vctx, void *vst)
     if (!e) return;
     st->role = (int)e->role;
     st->handle = e->handle._opaque;
-    st->req_stream_ref = e->request_stream_ref._v;
-    st->req_recv_fin = e->req_recv_fin;
+    st->req_stream_ref = e->rs.ref._v;
+    st->rs.recv_fin = e->rs.recv_fin;
     st->handoff_fin = e->handoff_fin_pending;
 }
 
@@ -359,7 +361,7 @@ static int pub_hook_check(const moq_session_t *s, void *vctx, const void *vst)
     if (now.role != want->role) bad++;
     if (now.handle != want->handle) bad++;
     if (now.req_stream_ref != want->req_stream_ref) bad++;
-    if (now.req_recv_fin != want->req_recv_fin) bad++;
+    if (now.rs.recv_fin != want->rs.recv_fin) bad++;
     if (now.handoff_fin != want->handoff_fin) bad++;
     if (now.busy != want->busy) bad++;
     if (bad)
@@ -367,10 +369,10 @@ static int pub_hook_check(const moq_session_t *s, void *vctx, const void *vst)
                  "handoff %d busy %d, expected role %d handle %llu ref %llu "
                  "fin %d handoff %d busy %d\n",
                  now.role, (unsigned long long)now.handle,
-                 (unsigned long long)now.req_stream_ref, now.req_recv_fin,
+                 (unsigned long long)now.req_stream_ref, now.rs.recv_fin,
                  now.handoff_fin, now.busy,
                  want->role, (unsigned long long)want->handle,
-                 (unsigned long long)want->req_stream_ref, want->req_recv_fin,
+                 (unsigned long long)want->req_stream_ref, want->rs.recv_fin,
                  want->handoff_fin, want->busy);
     return bad;
 }
@@ -488,14 +490,15 @@ static void want_reject_error_code(txs_norm_vec_t *v, moq_stream_ref_t ref,
 }
 
 static void want_reject_error_reason(txs_norm_vec_t *v, moq_stream_ref_t ref,
-                                     uint64_t error_code, const char *reason)
+                                     uint64_t error_code, uint64_t retry,
+                                     const char *reason)
 {
     uint8_t buf[192];
     moq_buf_writer_t w;
     moq_buf_writer_init(&w, buf, sizeof(buf));
     moq_bytes_t r = { (const uint8_t *)reason, strlen(reason) };
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_d18_encode_request_error(&w, error_code, 0, r), (int)MOQ_OK);
+        (int)moq_d18_encode_request_error(&w, error_code, retry, r), (int)MOQ_OK);
     moq_buf_reader_t rd;
     moq_buf_reader_init(&rd, buf, moq_buf_writer_offset(&w));
     moq_control_envelope_t env;
@@ -641,7 +644,7 @@ static void run_pub_case(const fin_owner_case_t *f, uint32_t max_events,
      * latch is NOT written on the way in, so a terminal that reads the latch
      * alone cannot mistake the deferral for a completed close. */
     MOQ_TEST_CHECK_EQ_INT(owner_before.handoff_fin, defer ? 1 : 0);
-    MOQ_TEST_CHECK_EQ_INT(owner_before.req_recv_fin, 0);
+    MOQ_TEST_CHECK_EQ_INT(owner_before.rs.recv_fin, 0);
 
     size_t filled = 0;
     if (fill_ring) {
@@ -769,7 +772,7 @@ static void run_pub_slot_reuse_case(const fin_owner_case_t *f)
     MOQ_TEST_CHECK_EQ_INT((int)s->publishes[slot].state, (int)MOQ_PUB_FREE);
     MOQ_TEST_CHECK_EQ_U64(s->publishes[slot].generation, gen_reuse - 1u);
     MOQ_TEST_CHECK_EQ_INT(s->publishes[slot].handoff_fin_pending, 0);
-    MOQ_TEST_CHECK_EQ_INT(s->publishes[slot].req_recv_fin, 0);
+    MOQ_TEST_CHECK_EQ_INT(s->publishes[slot].rs.recv_fin, 0);
 
     /* Second request on a fresh bidi, no FIN: it lands in the released slot. */
     moq_stream_ref_t second = moq_stream_ref_from_u64(c->ref._v + 4);
@@ -810,7 +813,7 @@ static void run_pub_slot_reuse_case(const fin_owner_case_t *f)
     /* Neither FIN fact is set before the terminal check: the consumed FIN did
      * not follow the slot to its next owner. */
     MOQ_TEST_CHECK_EQ_INT(owner.handoff_fin, 0);
-    MOQ_TEST_CHECK_EQ_INT(owner.req_recv_fin, 0);
+    MOQ_TEST_CHECK_EQ_INT(owner.rs.recv_fin, 0);
 
     /* The peer's send half is still open, so the terminal owes a drain
      * reference; with the ring exhausted it must refuse transactionally. */
@@ -1163,7 +1166,9 @@ typedef struct fetch_hook_state {
     int      present;
     uint64_t handle;
     uint64_t req_stream_ref;
-    int      req_recv_fin;
+    struct {
+        int recv_fin;
+    } rs;
     /* The transitional FIN ownership a same-call handoff installs. Both
      * publisher-role FETCH states consume it synchronously into req_recv_fin,
      * so every observation point must find it already clear. */
@@ -1214,7 +1219,7 @@ static const moq_fetch_entry_t *fetch_by_ref(const moq_session_t *s,
 {
     for (size_t i = 0; i < s->fetch_cap; i++) {
         const moq_fetch_entry_t *e = &s->fetches[i];
-        if (e->state != MOQ_FETCH_FREE && e->request_stream_ref._v == ref._v)
+        if (e->state != MOQ_FETCH_FREE && e->rs.ref._v == ref._v)
             return e;
     }
     return NULL;
@@ -1340,8 +1345,8 @@ static void fetch_hook_capture(const moq_session_t *s, void *vctx, void *vst)
     if (!e) return;
     st->present = 1;
     st->handle = e->handle._opaque;
-    st->req_stream_ref = e->request_stream_ref._v;
-    st->req_recv_fin = e->req_recv_fin;
+    st->req_stream_ref = e->rs.ref._v;
+    st->rs.recv_fin = e->rs.recv_fin;
     st->handoff_fin = e->handoff_fin_pending;
     st->state = (int)e->state;
     st->role = (int)e->role;
@@ -1357,7 +1362,7 @@ static int fetch_hook_check(const moq_session_t *s, void *vctx,
     if (now.present != want->present) bad++;
     if (now.handle != want->handle) bad++;
     if (now.req_stream_ref != want->req_stream_ref) bad++;
-    if (now.req_recv_fin != want->req_recv_fin) bad++;
+    if (now.rs.recv_fin != want->rs.recv_fin) bad++;
     if (now.handoff_fin != want->handoff_fin) bad++;
     if (now.state != want->state) bad++;
     if (now.role != want->role) bad++;
@@ -1367,10 +1372,10 @@ static int fetch_hook_check(const moq_session_t *s, void *vctx,
                  "state %d role %d busy %d, expected present %d handle %llu "
                  "ref %llu fin %d state %d role %d busy %d\n",
                  now.present, (unsigned long long)now.handle,
-                 (unsigned long long)now.req_stream_ref, now.req_recv_fin,
+                 (unsigned long long)now.req_stream_ref, now.rs.recv_fin,
                  now.state, now.role, now.busy, want->present,
                  (unsigned long long)want->handle,
-                 (unsigned long long)want->req_stream_ref, want->req_recv_fin,
+                 (unsigned long long)want->req_stream_ref, want->rs.recv_fin,
                  want->state, want->role, want->busy);
     return bad;
 }
@@ -1535,7 +1540,7 @@ static void run_fetch_case(const fin_owner_case_t *f, bool fin_in_request,
     f->hooks.capture(s, f->ctx, &owner);
     MOQ_TEST_CHECK(owner.present);
     MOQ_TEST_CHECK_EQ_U64(owner.handle, c->last_fetch);
-    MOQ_TEST_CHECK_EQ_INT(owner.req_recv_fin, fin_in_request ? 1 : 0);
+    MOQ_TEST_CHECK_EQ_INT(owner.rs.recv_fin, fin_in_request ? 1 : 0);
     /* Both publisher-role FETCH states consume a handed-over FIN synchronously
      * into the durable latch, so the transitional fact never survives the call
      * that installed it and the terminals below read the latch. */
@@ -1636,7 +1641,7 @@ static void run_fetch_slot_reuse_case(const fin_owner_case_t *f)
         if (e) {
             MOQ_TEST_CHECK_EQ_INT((int)(e - s->fetches), slot);
             MOQ_TEST_CHECK_EQ_U64(e->generation, gen_first);
-            MOQ_TEST_CHECK_EQ_INT(e->req_recv_fin, 1);
+            MOQ_TEST_CHECK_EQ_INT(e->rs.recv_fin, 1);
             MOQ_TEST_CHECK_EQ_INT(e->handoff_fin_pending, 0);
         }
     }
@@ -1655,7 +1660,7 @@ static void run_fetch_slot_reuse_case(const fin_owner_case_t *f)
      *    clear, and no edge anywhere still points at the retired owner. */
     MOQ_TEST_CHECK_EQ_INT((int)s->fetches[slot].state, (int)MOQ_FETCH_FREE);
     MOQ_TEST_CHECK_EQ_U64(s->fetches[slot].generation, gen_reuse - 1u);
-    MOQ_TEST_CHECK_EQ_INT(s->fetches[slot].req_recv_fin, 0);
+    MOQ_TEST_CHECK_EQ_INT(s->fetches[slot].rs.recv_fin, 0);
     MOQ_TEST_CHECK_EQ_INT(s->fetches[slot].handoff_fin_pending, 0);
     check_unregistered(s, first);
     {
@@ -1691,7 +1696,7 @@ static void run_fetch_slot_reuse_case(const fin_owner_case_t *f)
             MOQ_TEST_CHECK_EQ_INT((int)(e - s->fetches), slot);
             MOQ_TEST_CHECK_EQ_U64(e->generation, gen_reuse);
             MOQ_TEST_CHECK_EQ_U64(e->handle._opaque, handle_reuse);
-            MOQ_TEST_CHECK_EQ_INT(e->req_recv_fin, 0);
+            MOQ_TEST_CHECK_EQ_INT(e->rs.recv_fin, 0);
             MOQ_TEST_CHECK_EQ_INT(e->handoff_fin_pending, 0);
         }
         MOQ_TEST_CHECK_EQ_U64(c->last_fetch, handle_reuse);
@@ -2094,7 +2099,9 @@ typedef struct sub_owner_state {
     int      role;
     uint64_t handle;
     uint64_t req_stream_ref;
-    int      req_recv_fin;
+    struct {
+        int recv_fin;
+    } rs;
     int      slot;
     int      has_stream_ref;
     uint64_t registry_ref;
@@ -2129,8 +2136,8 @@ static void sub_owner_capture(const moq_session_t *s, moq_stream_ref_t ref,
     st->state = (int)e->state;
     st->role = (int)e->role;
     st->handle = e->handle._opaque;
-    st->req_stream_ref = e->request_stream_ref._v;
-    st->req_recv_fin = e->req_recv_fin;
+    st->req_stream_ref = e->rs.ref._v;
+    st->rs.recv_fin = e->rs.recv_fin;
 }
 
 static int sub_owner_check(const moq_session_t *s, moq_stream_ref_t ref,
@@ -2144,7 +2151,7 @@ static int sub_owner_check(const moq_session_t *s, moq_stream_ref_t ref,
     if (now.role != want->role) bad++;
     if (now.handle != want->handle) bad++;
     if (now.req_stream_ref != want->req_stream_ref) bad++;
-    if (now.req_recv_fin != want->req_recv_fin) bad++;
+    if (now.rs.recv_fin != want->rs.recv_fin) bad++;
     if (now.slot != want->slot) bad++;
     if (now.has_stream_ref != want->has_stream_ref) bad++;
     if (now.registry_ref != want->registry_ref) bad++;
@@ -2154,10 +2161,10 @@ static int sub_owner_check(const moq_session_t *s, moq_stream_ref_t ref,
                  "handle %llu ref %llu fin %d busy %d, expected %d/%d/%d/"
                  "%llu/%llu/%d/%d\n", now.present, now.state, now.role,
                  (unsigned long long)now.handle,
-                 (unsigned long long)now.req_stream_ref, now.req_recv_fin,
+                 (unsigned long long)now.req_stream_ref, now.rs.recv_fin,
                  now.busy, want->present, want->state, want->role,
                  (unsigned long long)want->handle,
-                 (unsigned long long)want->req_stream_ref, want->req_recv_fin,
+                 (unsigned long long)want->req_stream_ref, want->rs.recv_fin,
                  want->busy);
     return bad;
 }
@@ -2177,7 +2184,7 @@ static void check_pj_owners(const fin_owner_case_t *f, moq_session_t *s,
     MOQ_TEST_CHECK(so.present);
     MOQ_TEST_CHECK_EQ_INT(so.state, (int)MOQ_SUB_PENDING_PUBLISHER);
     MOQ_TEST_CHECK_EQ_INT(so.role, (int)MOQ_SUB_ROLE_PUBLISHER);
-    MOQ_TEST_CHECK_EQ_INT(so.req_recv_fin, 0);
+    MOQ_TEST_CHECK_EQ_INT(so.rs.recv_fin, 0);
     MOQ_TEST_CHECK(so.handle != 0);
     MOQ_TEST_CHECK_EQ_U64(so.req_stream_ref, sref._v);
     MOQ_TEST_CHECK(so.has_stream_ref);
@@ -2201,7 +2208,7 @@ static void check_pj_owners(const fin_owner_case_t *f, moq_session_t *s,
     MOQ_TEST_CHECK(e != NULL);
     if (e) {
         MOQ_TEST_CHECK_EQ_U64(e->handle._opaque, id->handle);
-        MOQ_TEST_CHECK_EQ_INT(e->req_recv_fin, fin_in_request ? 1 : 0);
+        MOQ_TEST_CHECK_EQ_INT(e->rs.recv_fin, fin_in_request ? 1 : 0);
         /* The FIN reaches this owner through the generic destination handoff,
          * which installs it as transitional ownership and drives this family's
          * own FIN handling; that consumption is synchronous, so the marker is
@@ -2375,7 +2382,9 @@ typedef struct pn_hook_state {
     int      present;
     uint64_t handle;
     uint64_t req_stream_ref;
-    int      req_recv_fin;
+    struct {
+        int recv_fin;
+    } rs;
     /* The transitional FIN ownership a same-call handoff installs. This family
      * consumes it synchronously into req_recv_fin, so every observation point
      * must find it already clear; captured separately so a refusal cannot move
@@ -2399,7 +2408,7 @@ static const moq_ann_entry_t *ann_by_ref(const moq_session_t *s,
 {
     for (size_t i = 0; i < s->ann_cap; i++) {
         const moq_ann_entry_t *e = &s->announcements[i];
-        if (e->state != MOQ_ANN_FREE && e->request_stream_ref._v == ref._v)
+        if (e->state != MOQ_ANN_FREE && e->rs.ref._v == ref._v)
             return e;
     }
     return NULL;
@@ -2451,8 +2460,8 @@ static void pn_hook_capture(const moq_session_t *s, void *vctx, void *vst)
     if (!e) return;
     st->present = 1;
     st->handle = e->handle._opaque;
-    st->req_stream_ref = e->request_stream_ref._v;
-    st->req_recv_fin = e->req_recv_fin;
+    st->req_stream_ref = e->rs.ref._v;
+    st->rs.recv_fin = e->rs.recv_fin;
     st->handoff_fin = e->handoff_fin_pending;
     st->state = (int)e->state;
     st->role = (int)e->role;
@@ -2467,7 +2476,7 @@ static int pn_hook_check(const moq_session_t *s, void *vctx, const void *vst)
     if (now.present != want->present) bad++;
     if (now.handle != want->handle) bad++;
     if (now.req_stream_ref != want->req_stream_ref) bad++;
-    if (now.req_recv_fin != want->req_recv_fin) bad++;
+    if (now.rs.recv_fin != want->rs.recv_fin) bad++;
     if (now.handoff_fin != want->handoff_fin) bad++;
     if (now.state != want->state) bad++;
     if (now.role != want->role) bad++;
@@ -2476,10 +2485,10 @@ static int pn_hook_check(const moq_session_t *s, void *vctx, const void *vst)
         TXS_DIAG("TXN pn hooks: present %d handle %llu ref %llu fin %d "
                  "state %d role %d busy %d, expected %d/%llu/%llu/%d/%d/%d/%d\n",
                  now.present, (unsigned long long)now.handle,
-                 (unsigned long long)now.req_stream_ref, now.req_recv_fin,
+                 (unsigned long long)now.req_stream_ref, now.rs.recv_fin,
                  now.state, now.role, now.busy, want->present,
                  (unsigned long long)want->handle,
-                 (unsigned long long)want->req_stream_ref, want->req_recv_fin,
+                 (unsigned long long)want->req_stream_ref, want->rs.recv_fin,
                  want->state, want->role, want->busy);
     return bad;
 }
@@ -2627,7 +2636,7 @@ static void run_pn_case(const fin_owner_case_t *f, bool fin_in_request,
         }
         check_registered(s, ref, MOQ_REQ_ANNOUNCEMENT, want_slot);
     }
-    MOQ_TEST_CHECK_EQ_INT(owner.req_recv_fin, fin_in_request ? 1 : 0);
+    MOQ_TEST_CHECK_EQ_INT(owner.rs.recv_fin, fin_in_request ? 1 : 0);
     /* Consumption is synchronous: a handed-over FIN lives in the durable latch
      * by now, never as transitional ownership. */
     MOQ_TEST_CHECK_EQ_INT(owner.handoff_fin, 0);
@@ -2740,7 +2749,7 @@ static void run_pn_slot_reuse_case(const fin_owner_case_t *f)
         if (e) {
             MOQ_TEST_CHECK_EQ_INT((int)(e - s->announcements), slot);
             MOQ_TEST_CHECK_EQ_U64(e->generation, gen_first);
-            MOQ_TEST_CHECK_EQ_INT(e->req_recv_fin, 1);
+            MOQ_TEST_CHECK_EQ_INT(e->rs.recv_fin, 1);
             MOQ_TEST_CHECK_EQ_INT(e->handoff_fin_pending, 0);
         }
     }
@@ -2762,7 +2771,7 @@ static void run_pn_slot_reuse_case(const fin_owner_case_t *f)
      *    edge anywhere still points at the retired owner. */
     MOQ_TEST_CHECK_EQ_INT((int)s->announcements[slot].state, (int)MOQ_ANN_FREE);
     MOQ_TEST_CHECK_EQ_U64(s->announcements[slot].generation, gen_reuse - 1u);
-    MOQ_TEST_CHECK_EQ_INT(s->announcements[slot].req_recv_fin, 0);
+    MOQ_TEST_CHECK_EQ_INT(s->announcements[slot].rs.recv_fin, 0);
     MOQ_TEST_CHECK_EQ_INT(s->announcements[slot].handoff_fin_pending, 0);
     check_unregistered(s, first);
     {
@@ -2799,7 +2808,7 @@ static void run_pn_slot_reuse_case(const fin_owner_case_t *f)
             MOQ_TEST_CHECK_EQ_U64(e->generation, gen_reuse);
             MOQ_TEST_CHECK_EQ_U64(e->handle._opaque, handle_reuse);
             /* The consumed FIN did not follow the slot to its next owner. */
-            MOQ_TEST_CHECK_EQ_INT(e->req_recv_fin, 0);
+            MOQ_TEST_CHECK_EQ_INT(e->rs.recv_fin, 0);
             MOQ_TEST_CHECK_EQ_INT(e->handoff_fin_pending, 0);
         }
         MOQ_TEST_CHECK_EQ_U64(c->last_ann, handle_reuse);
@@ -2880,7 +2889,9 @@ typedef struct st_hook_state {
     int      present;
     uint64_t handle;
     uint64_t req_stream_ref;
-    int      req_recv_fin;
+    struct {
+        int recv_fin;
+    } rs;
     int      handoff_fin;
     int      state;
     int      role;
@@ -2931,7 +2942,9 @@ typedef struct sto_snap {
     uint64_t ep_stream_ref;
     uint64_t stream_ref;
     int      forward;
-    int      req_recv_fin;
+    struct {
+        int recv_fin;
+    } rs;
     int      handoff_fin;
     int      goaway_sent;
     int      auth_committed;
@@ -2970,9 +2983,9 @@ static void sto_read(const moq_session_t *s, int slot, sto_snap_t *v)
     v->ep_request_id = e->request_ep.request_id;
     v->ep_has_stream_ref = e->request_ep.has_stream_ref ? 1 : 0;
     v->ep_stream_ref = e->request_ep.stream_ref._v;
-    v->stream_ref = e->request_stream_ref._v;
+    v->stream_ref = e->rs.ref._v;
     v->forward = e->forward ? 1 : 0;
-    v->req_recv_fin = e->req_recv_fin ? 1 : 0;
+    v->rs.recv_fin = e->rs.recv_fin ? 1 : 0;
     v->handoff_fin = e->handoff_fin_pending ? 1 : 0;
     v->goaway_sent = e->goaway_sent ? 1 : 0;
     v->auth_committed = e->auth_committed ? 1 : 0;
@@ -3023,15 +3036,15 @@ static void sto_read(const moq_session_t *s, int slot, sto_snap_t *v)
         v->prefix_len += l;
     }
     if (off != e->prefix_buf_len) { v->invalid = 1; return; }
-    v->recv_buf = (const void *)e->req_recv_buf;
-    v->recv_cap = e->req_recv_cap;
-    v->recv_len = e->req_recv_len;
-    if (e->req_recv_len > STO_BUF_MAX ||
-        (e->req_recv_len && !e->req_recv_buf)) {
+    v->recv_buf = (const void *)e->rs.recv_buf;
+    v->recv_cap = e->rs.recv_cap;
+    v->recv_len = e->rs.recv_len;
+    if (e->rs.recv_len > STO_BUF_MAX ||
+        (e->rs.recv_len && !e->rs.recv_buf)) {
         v->invalid = 1;
         return;
     }
-    if (e->req_recv_len) memcpy(v->recv, e->req_recv_buf, e->req_recv_len);
+    if (e->rs.recv_len) memcpy(v->recv, e->rs.recv_buf, e->rs.recv_len);
 }
 
 static int sto_diff(const sto_snap_t *have, const sto_snap_t *want,
@@ -3054,7 +3067,7 @@ static int sto_diff(const sto_snap_t *have, const sto_snap_t *want,
     STO_EQ(handle); STO_EQ(request_id);
     STO_EQ(ep_kind); STO_EQ(ep_slot); STO_EQ(ep_has_request_id);
     STO_EQ(ep_request_id); STO_EQ(ep_has_stream_ref); STO_EQ(ep_stream_ref);
-    STO_EQ(stream_ref); STO_EQ(forward); STO_EQ(req_recv_fin);
+    STO_EQ(stream_ref); STO_EQ(forward); STO_EQ(rs.recv_fin);
     STO_EQ(handoff_fin); STO_EQ(goaway_sent); STO_EQ(auth_committed);
     STO_EQ(auth_reject_code); STO_EQ(token_count); STO_EQ(prefix_count);
     STO_EQ(prefix_buf_len); STO_EQ(prefix_len); STO_EQ(recv_cap);
@@ -3104,7 +3117,7 @@ static void sto_declare(sto_snap_t *v, int slot, uint32_t gen, uint64_t handle,
     v->ep_stream_ref = 0;
     v->stream_ref = stream_ref;
     v->forward = 1;                      /* st_feed sets Forward = 1 */
-    v->req_recv_fin = 0;
+    v->rs.recv_fin = 0;
     v->handoff_fin = handoff_fin;
     v->goaway_sent = 0;
     /* The inbound publisher-side commit never writes the entry's auth staging:
@@ -3176,7 +3189,7 @@ static const moq_track_sub_entry_t *st_by_ref(const moq_session_t *s,
 {
     for (size_t i = 0; i < s->track_sub_cap; i++) {
         const moq_track_sub_entry_t *e = &s->track_subs[i];
-        if (e->state != MOQ_TRACK_SUB_FREE && e->request_stream_ref._v == ref._v)
+        if (e->state != MOQ_TRACK_SUB_FREE && e->rs.ref._v == ref._v)
             return e;
     }
     return NULL;
@@ -3227,8 +3240,8 @@ static void st_hook_capture(const moq_session_t *s, void *vctx, void *vst)
     if (!e) return;
     st->present = 1;
     st->handle = e->handle._opaque;
-    st->req_stream_ref = e->request_stream_ref._v;
-    st->req_recv_fin = e->req_recv_fin;
+    st->req_stream_ref = e->rs.ref._v;
+    st->rs.recv_fin = e->rs.recv_fin;
     st->handoff_fin = e->handoff_fin_pending;
     st->state = (int)e->state;
     st->role = (int)e->role;
@@ -3243,7 +3256,7 @@ static int st_hook_check(const moq_session_t *s, void *vctx, const void *vst)
     if (now.present != want->present) bad++;
     if (now.handle != want->handle) bad++;
     if (now.req_stream_ref != want->req_stream_ref) bad++;
-    if (now.req_recv_fin != want->req_recv_fin) bad++;
+    if (now.rs.recv_fin != want->rs.recv_fin) bad++;
     if (now.handoff_fin != want->handoff_fin) bad++;
     if (now.state != want->state) bad++;
     if (now.role != want->role) bad++;
@@ -3253,10 +3266,10 @@ static int st_hook_check(const moq_session_t *s, void *vctx, const void *vst)
                  "handoff %d state %d role %d busy %d, expected "
                  "%d/%llu/%llu/%d/%d/%d/%d/%d\n",
                  now.present, (unsigned long long)now.handle,
-                 (unsigned long long)now.req_stream_ref, now.req_recv_fin,
+                 (unsigned long long)now.req_stream_ref, now.rs.recv_fin,
                  now.handoff_fin, now.state, now.role, now.busy, want->present,
                  (unsigned long long)want->handle,
-                 (unsigned long long)want->req_stream_ref, want->req_recv_fin,
+                 (unsigned long long)want->req_stream_ref, want->rs.recv_fin,
                  want->handoff_fin, want->state, want->role, want->busy);
     return bad;
 }
@@ -3399,8 +3412,8 @@ static void run_st_case(const fin_owner_case_t *f, uint32_t max_events,
                                       s->session_tag, gen, (uint32_t)slot);
     /* The co-allocated receive buffer survives entry reuse, so its identity is
      * part of the declaration and is taken from the FREE slot. */
-    const void *slot_recv_buf = (const void *)s->track_subs[slot].req_recv_buf;
-    size_t slot_recv_cap = s->track_subs[slot].req_recv_cap;
+    const void *slot_recv_buf = (const void *)s->track_subs[slot].rs.recv_buf;
+    size_t slot_recv_cap = s->track_subs[slot].rs.recv_cap;
 
     /* The refused handoff is measured against a capture taken BEFORE it, so the
      * unrelated session facts cannot be defined by the call under test. */
@@ -3451,7 +3464,7 @@ static void run_st_case(const fin_owner_case_t *f, uint32_t max_events,
     /* The two FIN facts are distinct: a wire FIN whose cancellation was
      * refused on event capacity is held as transitional ownership, not as the
      * durable latch, and a request without FIN holds neither. */
-    MOQ_TEST_CHECK_EQ_INT(owner_before.req_recv_fin, 0);
+    MOQ_TEST_CHECK_EQ_INT(owner_before.rs.recv_fin, 0);
     MOQ_TEST_CHECK_EQ_INT(owner_before.handoff_fin, defer ? 1 : 0);
 
     /* The declared track-sub owner inventory, built before ingress. */
@@ -3579,8 +3592,8 @@ static void run_st_slot_reuse_case(const fin_owner_case_t *f)
                                             s->session_tag, gen_reuse,
                                             (uint32_t)slot);
     MOQ_TEST_CHECK(handle_first != handle_reuse);
-    const void *slot_recv_buf = (const void *)s->track_subs[slot].req_recv_buf;
-    size_t slot_recv_cap = s->track_subs[slot].req_recv_cap;
+    const void *slot_recv_buf = (const void *)s->track_subs[slot].rs.recv_buf;
+    size_t slot_recv_cap = s->track_subs[slot].rs.recv_cap;
 
     /* 1. SUBSCRIBE_TRACKS + FIN into a one-slot queue: the request event takes
      *    the slot, so the cancellation is refused and the marker survives it. */
@@ -3609,7 +3622,7 @@ static void run_st_slot_reuse_case(const fin_owner_case_t *f)
             MOQ_TEST_CHECK_EQ_U64(e->generation, gen_first);
             MOQ_TEST_CHECK_EQ_U64(e->handle._opaque, handle_first);
             /* Held as transitional ownership, never as the durable latch. */
-            MOQ_TEST_CHECK_EQ_INT(e->req_recv_fin, 0);
+            MOQ_TEST_CHECK_EQ_INT(e->rs.recv_fin, 0);
             MOQ_TEST_CHECK_EQ_INT(e->handoff_fin_pending, 1);
         }
     }
@@ -3650,7 +3663,7 @@ static void run_st_slot_reuse_case(const fin_owner_case_t *f)
     MOQ_TEST_CHECK_EQ_INT((int)s->track_subs[slot].state,
                           (int)MOQ_TRACK_SUB_FREE);
     MOQ_TEST_CHECK_EQ_U64(s->track_subs[slot].generation, gen_reuse - 1u);
-    MOQ_TEST_CHECK_EQ_INT(s->track_subs[slot].req_recv_fin, 0);
+    MOQ_TEST_CHECK_EQ_INT(s->track_subs[slot].rs.recv_fin, 0);
     MOQ_TEST_CHECK_EQ_INT(s->track_subs[slot].handoff_fin_pending, 0);
     check_st_retired_slot(s, first, slot, "st reuse retired");
 
@@ -3679,7 +3692,7 @@ static void run_st_slot_reuse_case(const fin_owner_case_t *f)
             MOQ_TEST_CHECK_EQ_INT((int)(e - s->track_subs), slot);
             MOQ_TEST_CHECK_EQ_U64(e->generation, gen_reuse);
             MOQ_TEST_CHECK_EQ_U64(e->handle._opaque, handle_reuse);
-            MOQ_TEST_CHECK_EQ_INT(e->req_recv_fin, 0);
+            MOQ_TEST_CHECK_EQ_INT(e->rs.recv_fin, 0);
             MOQ_TEST_CHECK_EQ_INT(e->handoff_fin_pending, 0);
         }
         MOQ_TEST_CHECK_EQ_U64(c->last_handle, handle_reuse);
@@ -3801,8 +3814,8 @@ static void st_inventory_selfchecks(const fin_owner_case_t *f)
     size_t       save_pc   = e->prefix_count;
     moq_bytes_t *save_pp   = e->prefix_parts;
     size_t       save_tc   = e->token_count;
-    size_t       save_rl   = e->req_recv_len;
-    uint8_t     *save_rb   = e->req_recv_buf;
+    size_t       save_rl   = e->rs.recv_len;
+    uint8_t     *save_rb   = e->rs.recv_buf;
     const uint8_t *save_d0 = e->prefix_parts ? e->prefix_parts[0].data : NULL;
 
     e->prefix_count = STO_MAX_PARTS + 1;
@@ -3823,15 +3836,15 @@ static void st_inventory_selfchecks(const fin_owner_case_t *f)
     st_selfcheck_invalid(s, slot, &valid, "excessive token count");
     e->token_count = save_tc;
 
-    e->req_recv_len = STO_BUF_MAX + 1;
+    e->rs.recv_len = STO_BUF_MAX + 1;
     st_selfcheck_invalid(s, slot, &valid, "oversized retained length");
-    e->req_recv_len = save_rl;
+    e->rs.recv_len = save_rl;
 
-    e->req_recv_len = 4;
-    e->req_recv_buf = NULL;
+    e->rs.recv_len = 4;
+    e->rs.recv_buf = NULL;
     st_selfcheck_invalid(s, slot, &valid, "retained length with NULL buffer");
-    e->req_recv_buf = save_rb;
-    e->req_recv_len = save_rl;
+    e->rs.recv_buf = save_rb;
+    e->rs.recv_len = save_rl;
 
     /* Prefix allocation topology, all four branches. Every perturbation is
      * itself safe -- a nulled pointer, an offset that stays INSIDE the owned
@@ -5872,7 +5885,9 @@ typedef struct ts_hook_state {
     int      present;
     uint64_t handle;
     uint64_t req_stream_ref;
-    int      req_recv_fin;
+    struct {
+        int recv_fin;
+    } rs;
     /* The transitional FIN ownership a same-call handoff installs. This family
      * consumes it into req_recv_fin without blocking, so every observation
      * point must find it already clear. */
@@ -5895,7 +5910,7 @@ static const moq_ts_entry_t *ts_by_ref(const moq_session_t *s,
 {
     for (size_t i = 0; i < s->ts_cap; i++) {
         const moq_ts_entry_t *e = &s->track_statuses[i];
-        if (e->state != MOQ_TS_FREE && e->request_stream_ref._v == ref._v)
+        if (e->state != MOQ_TS_FREE && e->rs.ref._v == ref._v)
             return e;
     }
     return NULL;
@@ -5967,8 +5982,8 @@ static void ts_hook_capture(const moq_session_t *s, void *vctx, void *vst)
     if (!e) return;
     st->present = 1;
     st->handle = e->handle._opaque;
-    st->req_stream_ref = e->request_stream_ref._v;
-    st->req_recv_fin = e->req_recv_fin;
+    st->req_stream_ref = e->rs.ref._v;
+    st->rs.recv_fin = e->rs.recv_fin;
     st->handoff_fin = e->handoff_fin_pending;
     st->state = (int)e->state;
     st->role = (int)e->role;
@@ -5983,7 +5998,7 @@ static int ts_hook_check(const moq_session_t *s, void *vctx, const void *vst)
     if (now.present != want->present) bad++;
     if (now.handle != want->handle) bad++;
     if (now.req_stream_ref != want->req_stream_ref) bad++;
-    if (now.req_recv_fin != want->req_recv_fin) bad++;
+    if (now.rs.recv_fin != want->rs.recv_fin) bad++;
     if (now.handoff_fin != want->handoff_fin) bad++;
     if (now.state != want->state) bad++;
     if (now.role != want->role) bad++;
@@ -5992,10 +6007,10 @@ static int ts_hook_check(const moq_session_t *s, void *vctx, const void *vst)
         TXS_DIAG("TXN ts hooks: present %d handle %llu ref %llu fin %d "
                  "state %d busy %d, expected %d/%llu/%llu/%d/%d/%d\n",
                  now.present, (unsigned long long)now.handle,
-                 (unsigned long long)now.req_stream_ref, now.req_recv_fin,
+                 (unsigned long long)now.req_stream_ref, now.rs.recv_fin,
                  now.state, now.busy, want->present,
                  (unsigned long long)want->handle,
-                 (unsigned long long)want->req_stream_ref, want->req_recv_fin,
+                 (unsigned long long)want->req_stream_ref, want->rs.recv_fin,
                  want->state, want->busy);
     return bad;
 }
@@ -6175,7 +6190,7 @@ static void run_ts_case(const fin_owner_case_t *f, bool fin_in_request,
     f->hooks.capture(s, f->ctx, &owner_before);
     MOQ_TEST_CHECK_EQ_U64(owner_before.handle, c->last_handle);
     MOQ_TEST_CHECK_EQ_U64(owner_before.req_stream_ref, ref._v);
-    MOQ_TEST_CHECK_EQ_INT(owner_before.req_recv_fin, fin_in_request ? 1 : 0);
+    MOQ_TEST_CHECK_EQ_INT(owner_before.rs.recv_fin, fin_in_request ? 1 : 0);
     /* This family's FIN handling cannot block, so a handed-over FIN is already
      * consumed into the durable latch: the transitional fact never survives
      * the call that installed it, and the terminals below read the latch. */
@@ -6346,7 +6361,7 @@ static void test_subscribe_control(void)
         MOQ_TEST_CHECK(so.present);
         MOQ_TEST_CHECK_EQ_INT(so.role, (int)MOQ_SUB_ROLE_PUBLISHER);
         MOQ_TEST_CHECK_EQ_INT(so.state, (int)MOQ_SUB_PENDING_PUBLISHER);
-        MOQ_TEST_CHECK_EQ_INT(so.req_recv_fin, fin);
+        MOQ_TEST_CHECK_EQ_INT(so.rs.recv_fin, fin);
         MOQ_TEST_CHECK_EQ_U64(so.req_stream_ref, ref._v);
         MOQ_TEST_CHECK_EQ_U64(so.handle, sub._opaque);
         MOQ_TEST_CHECK(so.slot >= 0);
@@ -6530,7 +6545,7 @@ static void test_route_exclusions(void)
 /* These branches answer before any destination owner exists, so they install no
  * handoff marker. The FIN they consult belongs to the generic staging owner
  * that carried the request: `handle_request_stream_bytes()` latches an arriving
- * FIN into `e->req_recv_fin`, retains it across a refused call, and hands that
+ * FIN into `e->rs.recv_fin`, retains it across a refused call, and hands that
  * latch -- not the raw call flag -- to the profile, so an empty re-feed still
  * knows the peer's send half is closed. Every PUBLISH branch shares one
  * observed-FIN decision, `reject_drain = d->endpoint.has_stream_ref &&
@@ -7046,10 +7061,10 @@ static void pub_seed_capture(const moq_session_t *s, moq_stream_ref_t seed_ref,
         r->generation = e->generation;
         r->handle     = e->handle._opaque;
         r->request_id = e->request_id;
-        r->stream_ref = e->request_stream_ref._v;
-        r->fin        = e->req_recv_fin ? 1 : 0;
-        r->recv_len   = e->req_recv_len;
-        req_seed_copy_buf(r, e->req_recv_buf, e->req_recv_len);
+        r->stream_ref = e->rs.ref._v;
+        r->fin        = e->rs.recv_fin ? 1 : 0;
+        r->recv_len   = e->rs.recv_len;
+        req_seed_copy_buf(r, e->rs.recv_buf, e->rs.recv_len);
     }
     /* Both keys: a request-stream owner is stream-ref keyed and, once its
      * request id has been committed and consumed, absent from the by-ID index. */
@@ -7078,10 +7093,10 @@ static void ann_seed_capture(const moq_session_t *s, moq_stream_ref_t seed_ref,
         r->generation = e->generation;
         r->handle     = e->handle._opaque;
         r->request_id = e->request_id;
-        r->stream_ref = e->request_stream_ref._v;
-        r->fin        = e->req_recv_fin ? 1 : 0;
-        r->recv_len   = e->req_recv_len;
-        req_seed_copy_buf(r, e->req_recv_buf, e->req_recv_len);
+        r->stream_ref = e->rs.ref._v;
+        r->fin        = e->rs.recv_fin ? 1 : 0;
+        r->recv_len   = e->rs.recv_len;
+        req_seed_copy_buf(r, e->rs.recv_buf, e->rs.recv_len);
     }
     /* Both keys: a request-stream owner is stream-ref keyed and, once its
      * request id has been committed and consumed, absent from the by-ID index. */
@@ -7194,10 +7209,10 @@ static void check_staging_retained(const moq_session_t *s,
     if (ep.slot < 0 || (size_t)ep.slot >= s->sub_cap) return;
     const moq_sub_entry_t *e = &s->subs[ep.slot];
     MOQ_TEST_CHECK_EQ_INT((int)e->state, (int)MOQ_SUB_RECVING_REQUEST);
-    MOQ_TEST_CHECK_EQ_U64(e->request_stream_ref._v, ref._v);
-    MOQ_TEST_CHECK_EQ_INT(e->req_recv_fin, want_fin ? 1 : 0);
+    MOQ_TEST_CHECK_EQ_U64(e->rs.ref._v, ref._v);
+    MOQ_TEST_CHECK_EQ_INT(e->rs.recv_fin, want_fin ? 1 : 0);
     /* The buffered request must be replayable byte for byte. */
-    failures += txs_check_span_bytes(e->req_recv_buf, e->req_recv_len,
+    failures += txs_check_span_bytes(e->rs.recv_buf, e->rs.recv_len,
                                      want_buf, want_len,
                                      "staging retained request bytes");
 }
@@ -7226,6 +7241,7 @@ typedef struct precommit_case {
     void        (*precondition)(moq_session_t *s);
     size_t      (*encode)(uint8_t *buf, size_t cap);
     uint64_t      err_code;
+    uint64_t      err_retry;     /* Retry Interval as sent */
     const char   *err_reason;    /* NULL: the branch carries no reason */
     /* No destination owner exists for the rejected stream, and any owner the
      * seed created still does. */
@@ -7249,7 +7265,7 @@ static void want_precommit_error(txs_norm_vec_t *v, const precommit_case_t *c,
                                  moq_stream_ref_t ref)
 {
     if (c->err_reason)
-        want_reject_error_reason(v, ref, c->err_code, c->err_reason);
+        want_reject_error_reason(v, ref, c->err_code, c->err_retry, c->err_reason);
     else
         want_reject_error_code(v, ref, c->err_code);
 }
@@ -7587,9 +7603,9 @@ static void rfin_check_staging(const moq_session_t *s, moq_stream_ref_t ref,
     MOQ_TEST_CHECK_EQ_INT((int)e->role, (int)MOQ_SUB_ROLE_PUBLISHER);
     MOQ_TEST_CHECK_EQ_U64((uint64_t)e->generation, (uint64_t)gen);
     MOQ_TEST_CHECK_EQ_U64(e->request_id, 0u);   /* no by-id key while receiving */
-    MOQ_TEST_CHECK_EQ_U64(e->request_stream_ref._v, ref._v);
-    MOQ_TEST_CHECK_EQ_INT(e->req_recv_fin, 1);  /* the carrier under test */
-    failures += txs_check_span_bytes(e->req_recv_buf, e->req_recv_len,
+    MOQ_TEST_CHECK_EQ_U64(e->rs.ref._v, ref._v);
+    MOQ_TEST_CHECK_EQ_INT(e->rs.recv_fin, 1);  /* the carrier under test */
+    failures += txs_check_span_bytes(e->rs.recv_buf, e->rs.recv_len,
                                      want_buf, want_len,
                                      "retained-FIN staging request bytes");
     /* Also reachable through the registry the profile actually uses. */
@@ -7755,11 +7771,14 @@ static void test_precommit_rejects(void)
         .err_reason = "unsupported mandatory track property",
         .check_owners = owners_publish_none
     };
-    /* PUBLISH, session_publish.c:451 -- publication pool exhausted. */
+    /* PUBLISH, session_publish.c:451 -- publication pool exhausted. A local
+     * capacity refusal is EXCESSIVE_LOAD, "The responder is overloaded and
+     * cannot process the request at this time" (draft-18 §10.6), retryable
+     * at once (Retry Interval 1); so are the two exhaustions below. */
     static const precommit_case_t publish_pool = {
         .name = "publish pool full", .make = make_session_pub_cap_1,
         .seed_ops = &pub_seed_ops, .encode = enc_publish_second,
-        .err_code = MOQ_REQUEST_ERROR_INTERNAL_ERROR,
+        .err_code = MOQ_REQUEST_ERROR_EXCESSIVE_LOAD, .err_retry = 1,
         .err_reason = "publish pool full",
         .check_owners = owners_publish_seeded,
     };
@@ -7768,7 +7787,7 @@ static void test_precommit_rejects(void)
         .name = "publish track history full", .make = make_session_hist_cap_1,
         .seed_ops = &hist_seed_ops, .precondition = expect_history_full,
         .encode = enc_publish_hist_target,
-        .err_code = MOQ_REQUEST_ERROR_INTERNAL_ERROR,
+        .err_code = MOQ_REQUEST_ERROR_EXCESSIVE_LOAD, .err_retry = 1,
         .err_reason = "track history full",
         .check_owners = owners_publish_none,
     };
@@ -7783,7 +7802,7 @@ static void test_precommit_rejects(void)
     static const precommit_case_t pns_pool = {
         .name = "publish_namespace pool full", .make = make_session_ann_cap_1,
         .seed_ops = &ann_seed_ops, .encode = enc_pns_second,
-        .err_code = MOQ_REQUEST_ERROR_INTERNAL_ERROR,
+        .err_code = MOQ_REQUEST_ERROR_EXCESSIVE_LOAD, .err_retry = 1,
         .err_reason = "announcement pool full",
         .check_owners = owners_ann_seeded,
     };
@@ -7960,10 +7979,10 @@ static void st_owner_capture(const moq_session_t *s, moq_stream_ref_t ref,
         r->generation = e->generation;
         r->handle     = e->handle._opaque;
         r->request_id = e->request_id;
-        r->stream_ref = e->request_stream_ref._v;
-        r->fin        = e->req_recv_fin ? 1 : 0;
-        r->recv_len   = e->req_recv_len;
-        req_seed_copy_buf(r, e->req_recv_buf, e->req_recv_len);
+        r->stream_ref = e->rs.ref._v;
+        r->fin        = e->rs.recv_fin ? 1 : 0;
+        r->recv_len   = e->rs.recv_len;
+        req_seed_copy_buf(r, e->rs.recv_buf, e->rs.recv_len);
     }
     req_seed_capture_registry(r, s, ref, r->request_id);
 }
@@ -8079,7 +8098,7 @@ static int terminal_problems(const terminal_case_t *c)
     if (c->extra && (!c->extra->capture || !c->extra->check_blocked ||
                      !c->extra->check_committed)) bad++;
     if (c->drain_reason != MOQ_DRAIN_NORMAL &&
-        c->drain_reason != MOQ_DRAIN_GOAWAY_STRICT) bad++;
+        c->drain_reason != MOQ_DRAIN_GOAWAY_RECEIVED) bad++;
     /* All-or-nothing: a declared capability must be COMPLETE, and its kind must
      * be a real family -- MOQ_REQ_NONE (the value a deleted initializer leaves
      * behind) would make the owner-target retirement scan pass vacuously. */
@@ -8461,10 +8480,10 @@ static void sub_term_capture(const moq_session_t *s, moq_stream_ref_t ref,
         r->generation = e->generation;
         r->handle     = e->handle._opaque;
         r->request_id = e->request_id;
-        r->stream_ref = e->request_stream_ref._v;
-        r->fin        = e->req_recv_fin ? 1 : 0;
-        r->recv_len   = e->req_recv_len;
-        req_seed_copy_buf(r, e->req_recv_buf, e->req_recv_len);
+        r->stream_ref = e->rs.ref._v;
+        r->fin        = e->rs.recv_fin ? 1 : 0;
+        r->recv_len   = e->rs.recv_len;
+        req_seed_copy_buf(r, e->rs.recv_buf, e->rs.recv_len);
     }
     req_seed_capture_registry(r, s, ref, r->request_id);
 }
@@ -8546,9 +8565,9 @@ static moq_stream_ref_t arm_goaway_local_subscribe(moq_session_t *s)
         MOQ_TEST_CHECK_EQ_INT((int)se->state, (int)MOQ_SUB_PENDING_SUBSCRIBER);
         MOQ_TEST_CHECK_EQ_INT((int)se->role, (int)MOQ_SUB_ROLE_SUBSCRIBER);
         MOQ_TEST_CHECK_EQ_U64(se->handle._opaque, h._opaque);
-        MOQ_TEST_CHECK_EQ_U64(se->request_stream_ref._v, ref._v);
-        MOQ_TEST_CHECK_EQ_INT(se->req_recv_fin ? 1 : 0, 0);
-        MOQ_TEST_CHECK_EQ_SIZE(se->req_recv_len, (size_t)0);
+        MOQ_TEST_CHECK_EQ_U64(se->rs.ref._v, ref._v);
+        MOQ_TEST_CHECK_EQ_INT(se->rs.recv_fin ? 1 : 0, 0);
+        MOQ_TEST_CHECK_EQ_SIZE(se->rs.recv_len, (size_t)0);
         check_registered(s, ref, MOQ_REQ_SUBSCRIPTION, (int)(se - s->subs));
     }
     g_goaway_handle = h._opaque;
@@ -9369,8 +9388,9 @@ static void test_ns_sub_local_teardown(void)
  * Terminal obligations, exact:
  *   pre-SETUP:  STOP_BIDI_STREAM + RESET_BIDI_STREAM, both CANCELLED (0x1),
  *               no event;
- *   post-SETUP: REQUEST_ERROR(INTERNAL_ERROR 0x0, retry=0,
- *               "request pool full") + FIN on the request bidi, no event;
+ *   post-SETUP: REQUEST_ERROR(EXCESSIVE_LOAD 0x9, Retry Interval 1,
+ *               "request pool full") + FIN on the request bidi, no event --
+ *               local capacity (draft-18 §10.6), retryable at once;
  *   no peer FIN: exactly one NORMAL drain ref, released by the later FIN;
  *   peer FIN:    no drain ref.
  *
@@ -9506,16 +9526,16 @@ static void nom_seed_capture(const moq_session_t *s, nom_seed_t *o)
     o->role = (int)e->role;
     o->request_id = e->request_id;
     o->generation = e->generation;
-    o->stream_ref = e->request_stream_ref._v;
-    o->recv_fin = e->req_recv_fin ? 1 : 0;
-    o->recv_len = e->req_recv_len;
+    o->stream_ref = e->rs.ref._v;
+    o->recv_fin = e->rs.recv_fin ? 1 : 0;
+    o->recv_len = e->rs.recv_len;
     if (o->recv_len > sizeof(o->recv) ||
-        (o->recv_len && !e->req_recv_buf))
+        (o->recv_len && !e->rs.recv_buf))
         return;                              /* valid stays 0: incomparable */
     if (o->recv_len)
-        memcpy(o->recv, e->req_recv_buf, o->recv_len);
+        memcpy(o->recv, e->rs.recv_buf, o->recv_len);
     moq_request_endpoint_t ep = request_registry_find_by_streamref(
-        s, e->request_stream_ref);
+        s, e->rs.ref);
     o->ep_kind = (int)ep.kind;
     o->ep_slot = ep.slot;
     o->ep_has_stream_ref = ep.has_stream_ref ? 1 : 0;
@@ -9650,7 +9670,7 @@ static int nom_edge_owns_target(const moq_session_t *s, const og_edge_t *f,
         }
         const moq_sub_entry_t *e = &s->subs[f->slot];
         if (e->state == MOQ_SUB_FREE ||
-            e->request_stream_ref._v != target_ref) {
+            e->rs.ref._v != target_ref) {
             if (!og_quiet) fprintf(stderr, "NOM %s: added edge's owner does not carry the"
                     " target identity\n", what);
             return 0;
@@ -9832,8 +9852,8 @@ static void nom_want_terminal(txs_norm_vec_t *v, bool pre_setup,
         txs_img_u64(&im, target_ref);
         txs_img_u64(&im, 1);                          /* FIN */
         txs_img_u64(&im, (uint64_t)MOQ_D18_REQUEST_ERROR);
-        txs_img_u64(&im, MOQ_REQUEST_ERROR_INTERNAL_ERROR);
-        txs_img_u64(&im, 0);                          /* retry interval */
+        txs_img_u64(&im, MOQ_REQUEST_ERROR_EXCESSIVE_LOAD);
+        txs_img_u64(&im, 1);                          /* retry interval */
         txs_img_bytes(&im, (const uint8_t *)nom_reason, strlen(nom_reason));
         MOQ_TEST_CHECK(txs_norm_append_img(v, MOQ_ACTION_SEND_BIDI_STREAM,
                                            &im));
@@ -9899,7 +9919,7 @@ static int nom_blk_conserved(const moq_session_t *s, const nom_blk_t *b,
     if ((int)e->state != (int)MOQ_ANN_ESTABLISHED ||
         (int)e->role != (int)MOQ_ANN_ROLE_RECEIVER ||
         e->generation != b->gen || e->handle._opaque != b->handle ||
-        e->request_id != b->rid || e->request_stream_ref._v != b->ref ||
+        e->request_id != b->rid || e->rs.ref._v != b->ref ||
         !e->goaway_sent) {
         fprintf(stderr, "NOM %s: blocker owner record changed\n", what);
         bad++;
@@ -10195,10 +10215,10 @@ static void run_nom_case(const nom_case_t *c)
         const moq_sub_entry_t *e = &s->subs[seed_slot];
         MOQ_TEST_CHECK_EQ_INT((int)e->state, (int)MOQ_SUB_RECVING_REQUEST);
         MOQ_TEST_CHECK_EQ_U64((uint64_t)e->generation, (uint64_t)seed_gen);
-        MOQ_TEST_CHECK_EQ_SIZE(e->req_recv_len, sub_len - 4);
-        MOQ_TEST_CHECK(e->req_recv_buf != NULL);
-        if (e->req_recv_buf && e->req_recv_len == sub_len - 4)
-            MOQ_TEST_CHECK(memcmp(e->req_recv_buf, sub, sub_len - 4) == 0);
+        MOQ_TEST_CHECK_EQ_SIZE(e->rs.recv_len, sub_len - 4);
+        MOQ_TEST_CHECK(e->rs.recv_buf != NULL);
+        if (e->rs.recv_buf && e->rs.recv_len == sub_len - 4)
+            MOQ_TEST_CHECK(memcmp(e->rs.recv_buf, sub, sub_len - 4) == 0);
     }
     nom_seed_t seed;
     nom_seed_capture(s, &seed);
@@ -10760,9 +10780,9 @@ static void test_no_owner_admission_matrix(void)
  * draft-18 §10.9.1: "When a REQUEST_UPDATE is unsuccessful, the publisher MUST
  * also terminate the subscription by sending a PUBLISH_DONE with error code
  * UPDATE_FAILED." The source reaches that through the shared
- * sub_reset_subgroups, so the subscription's open data streams are cancelled
- * first and its subgroup slots released rather than left pinned behind a
- * terminated subscription.
+ * sub_cancel_subgroups, so the subscription's open data streams are cancelled
+ * first. FIN-closed streams retain their delivery timers after the subscription
+ * retires, until transport commitment or expiry.
  *
  * Like the rest of Axis 3, this terminal reserves its drain FIN-aware: on a
  * stream-correlated profile it takes one NORMAL reference only when the peer
@@ -10779,7 +10799,7 @@ static void test_no_owner_admission_matrix(void)
 #define FU_LARGEST_OBJECT 0x07
 #define FU_EXPIRES_MS     9000
 
-/* Captured at arm time, in the POOL order sub_reset_subgroups scans, since
+/* Captured at arm time, in the POOL order sub_cancel_subgroups scans, since
  * that is the order the cancellations are queued in. */
 static moq_stream_ref_t g_fu_sg_refs[FU_SUBGROUPS];
 static size_t g_fu_sg_count;
@@ -10791,9 +10811,8 @@ static size_t enc_subscribe_pub_role(uint8_t *buf, size_t cap, uint64_t rid)
     moq_bytes_t parts[] = { MOQ_BYTES_LITERAL("live") };
     moq_namespace_t ns = { parts, 1 };
     moq_d18_msg_params_t p = { 0 };
-    /* A subscriber-declared subgroup DELIVERY_TIMEOUT, so every subgroup the
-     * publisher opens gets a FINITE deadline and the terminal's disarm is
-     * observable rather than vacuous. */
+    /* A subscriber-declared DELIVERY_TIMEOUT. The completed-stream wrapper
+     * checks exact FIN-started deadlines; unfinished streams have none. */
     p.has_subgroup_delivery_timeout = true;
     p.subgroup_delivery_timeout_ms = 5000;
     MOQ_TEST_CHECK_EQ_INT(
@@ -10826,16 +10845,15 @@ static uint64_t g_fu_sg_group[FU_SUBGROUPS];
 static uint64_t g_fu_sg_payload[FU_SUBGROUPS];
 static uint64_t g_fu_sg_written[FU_SUBGROUPS];
 static uint8_t  g_fu_sg_priority[FU_SUBGROUPS];
+static bool g_fu_completed;
 
-/* An ESTABLISHED publisher-role subscription with FU_SUBGROUPS data streams,
- * all through the public API: the peer's SUBSCRIBE arrives as request bytes
- * (carrying a subgroup DELIVERY_TIMEOUT so the opened streams get finite
- * deadlines), the application accepts it, opens the subgroups at distinct
- * times so their deadlines differ, and leaves each one STREAMING with a
- * partially written object -- so the counters and deadlines the terminal must
- * clear are all non-default before it runs. */
-static moq_stream_ref_t arm_failed_update_subscription(moq_session_t *s)
+/* Two lawful shapes cover distinct cleanup duties: unfinished objects have
+ * nonzero streaming counters but no subgroup timer; completed subgroups have
+ * finite, distinct FIN-started timers. Both use the public send APIs. */
+static moq_stream_ref_t arm_failed_update_subscription_shape(moq_session_t *s,
+                                                            bool completed)
 {
+    g_fu_completed = completed;
     moq_stream_ref_t ref = moq_stream_ref_from_u64(1);
     uint8_t msg[192];
     size_t n = enc_subscribe_pub_role(msg, sizeof(msg), 0);
@@ -10934,8 +10952,7 @@ static moq_stream_ref_t arm_failed_update_subscription(moq_session_t *s)
         MOQ_TEST_CHECK_EQ_INT(other, 0);
     }
 
-    /* Real subgroups, opened publicly at distinct times so the negotiated
-     * delivery timeout yields a distinct deadline for each. */
+    /* Opening a subgroup does not start its negotiated delivery timer. */
     moq_subgroup_handle_t sgh[FU_SUBGROUPS];
     for (int i = 0; i < FU_SUBGROUPS; i++) {
         moq_subgroup_cfg_t sgc;
@@ -11118,6 +11135,52 @@ static moq_stream_ref_t arm_failed_update_subscription(moq_session_t *s)
         MOQ_TEST_CHECK_EQ_INT(n_ev, 0);
     }
 
+    if (completed) {
+        static const uint8_t tail[16] = {
+            9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
+        };
+        for (size_t i = 0; i < g_fu_sg_count; i++) {
+            const size_t remaining = (size_t)(g_fu_sg_payload[i] - g_fu_sg_written[i]);
+            const uint64_t finish_time = 4 + i;
+            moq_rcbuf_t *chunk = NULL;
+            MOQ_TEST_CHECK(remaining <= sizeof(tail));
+            if (remaining > sizeof(tail)) return ref;
+            MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_create(
+                moq_alloc_default(), tail, remaining, &chunk), (int)MOQ_OK);
+            if (!chunk) return ref;
+            MOQ_TEST_CHECK_EQ_INT((int)moq_session_write_object_data(
+                s, sgh[i], chunk, finish_time), (int)MOQ_OK);
+            moq_rcbuf_decref(chunk);
+            MOQ_TEST_CHECK_EQ_INT((int)moq_session_end_object(s, sgh[i], finish_time),
+                                  (int)MOQ_OK);
+            MOQ_TEST_CHECK_EQ_INT((int)moq_session_close_subgroup(s, sgh[i], finish_time),
+                                  (int)MOQ_OK);
+            moq_action_t a;
+            size_t sends = 0;
+            while (moq_session_poll_actions(s, &a, 1) > 0) {
+                MOQ_TEST_CHECK_EQ_INT((int)a.kind, (int)MOQ_ACTION_SEND_DATA);
+                if (a.kind == MOQ_ACTION_SEND_DATA) {
+                    MOQ_TEST_CHECK_EQ_U64(a.u.send_data.stream_ref._v, g_fu_sg_refs[i]._v);
+                    MOQ_TEST_CHECK_EQ_SIZE(a.u.send_data.header_len, 0);
+                    MOQ_TEST_CHECK_EQ_INT(a.u.send_data.fin ? 1 : 0, sends == 1 ? 1 : 0);
+                    if (sends == 0) {
+                        MOQ_TEST_CHECK(a.u.send_data.payload != NULL);
+                        if (a.u.send_data.payload)
+                            failures += txs_check_span_bytes(
+                                moq_rcbuf_data(a.u.send_data.payload),
+                                moq_rcbuf_len(a.u.send_data.payload), tail, remaining,
+                                "failed-update completed payload tail");
+                    } else {
+                        MOQ_TEST_CHECK(a.u.send_data.payload == NULL);
+                    }
+                }
+                sends++;
+                moq_action_cleanup(&a);
+            }
+            MOQ_TEST_CHECK_EQ_SIZE(sends, 2);
+        }
+    }
+
     /* The streams really are in the non-default shape the oracle needs. */
     {
         uint64_t seen_deadline[FU_SUBGROUPS];
@@ -11126,21 +11189,24 @@ static moq_stream_ref_t arm_failed_update_subscription(moq_session_t *s)
             if (s->subgroups[i].state == MOQ_SG_FREE) continue;
             if (!moq_subscription_eq(s->subgroups[i].sub, sub)) continue;
             MOQ_TEST_CHECK_EQ_INT((int)s->subgroups[i].state,
-                                  (int)MOQ_SG_STREAMING);
+                                  completed ? (int)MOQ_SG_CLOSING : (int)MOQ_SG_STREAMING);
             MOQ_TEST_CHECK_EQ_U64(s->subgroups[i].streaming_payload_len,
-                                  g_fu_sg_payload[k]);
+                                  completed ? 0 : g_fu_sg_payload[k]);
             MOQ_TEST_CHECK_EQ_U64(s->subgroups[i].streaming_bytes_written,
-                                  g_fu_sg_written[k]);
-            MOQ_TEST_CHECK(s->subgroups[i].delivery_deadline_us != UINT64_MAX);
+                                  completed ? 0 : g_fu_sg_written[k]);
+            MOQ_TEST_CHECK_EQ_U64(s->subgroups[i].delivery_deadline_us,
+                                  completed ? 5000000u + 4u + k : UINT64_MAX);
             seen_deadline[k] = s->subgroups[i].delivery_deadline_us;
             k++;
         }
         MOQ_TEST_CHECK_EQ_SIZE(k, g_fu_sg_count);
         /* Distinct, so a per-stream disarm cannot be confused with a shared
          * one. */
-        for (size_t i = 0; i + 1 < k; i++)
-            MOQ_TEST_CHECK(seen_deadline[i] != seen_deadline[i + 1]);
-        MOQ_TEST_CHECK(s->subgroup_deadline_us != UINT64_MAX);
+        if (completed)
+            for (size_t i = 0; i + 1 < k; i++)
+                MOQ_TEST_CHECK(seen_deadline[i] != seen_deadline[i + 1]);
+        MOQ_TEST_CHECK_EQ_U64(s->subgroup_deadline_us,
+                              completed ? 5000004u : UINT64_MAX);
     }
 
     /* The ABSOLUTE owner shape the terminal will act on. */
@@ -11152,12 +11218,22 @@ static moq_stream_ref_t arm_failed_update_subscription(moq_session_t *s)
         MOQ_TEST_CHECK_EQ_INT((int)se->role, (int)MOQ_SUB_ROLE_PUBLISHER);
         MOQ_TEST_CHECK_EQ_U64(se->handle._opaque, sub._opaque);
         MOQ_TEST_CHECK_EQ_U64(se->request_id, 0);
-        MOQ_TEST_CHECK_EQ_U64(se->request_stream_ref._v, ref._v);
-        MOQ_TEST_CHECK_EQ_INT(se->req_recv_fin ? 1 : 0, 0);
-        MOQ_TEST_CHECK_EQ_SIZE(se->req_recv_len, (size_t)0);
+        MOQ_TEST_CHECK_EQ_U64(se->rs.ref._v, ref._v);
+        MOQ_TEST_CHECK_EQ_INT(se->rs.recv_fin ? 1 : 0, 0);
+        MOQ_TEST_CHECK_EQ_SIZE(se->rs.recv_len, (size_t)0);
         check_registered(s, ref, MOQ_REQ_SUBSCRIPTION, (int)(se - s->subs));
     }
     return ref;
+}
+
+static moq_stream_ref_t arm_failed_update_subscription(moq_session_t *s)
+{
+    return arm_failed_update_subscription_shape(s, false);
+}
+
+static moq_stream_ref_t arm_failed_update_completed_subscription(moq_session_t *s)
+{
+    return arm_failed_update_subscription_shape(s, true);
 }
 
 /* The failed-update terminal touches state the generic snapshot does not
@@ -11267,12 +11343,9 @@ static int fu_extra_check_blocked(const moq_session_t *s, const char *what)
     return bad;
 }
 
-/* A completion leaves them in the committed shape sub_reset_subgroups defines
- * (session_subscribe.c:2006): each stream keeps its identity, moves to
- * RESETTING, has its streaming counters cleared and its deadline disarmed, and
- * the aggregate deadline is recomputed away. The SLOTS are not free yet -- a
- * RESETTING entry is reclaimed later, by the terminal reap in
- * sg_reap_terminal_resumable (session_subgroup.c:131). */
+/* Open streams reset and clear their streaming counters. FIN-closed streams
+ * retain their distinct delivery timers until commitment or expiry; D18
+ * section10.11 explicitly permits stream state to outlive PUBLISH_DONE. */
 static int fu_extra_check_committed(const moq_session_t *s, const char *what)
 {
     fu_extra_t now;
@@ -11281,12 +11354,16 @@ static int fu_extra_check_committed(const moq_session_t *s, const char *what)
     for (size_t i = 0; i < now.count; i++) {
         FU_EQ(now.ref[i],        g_fu_extra.ref[i],        "subgroup ref");
         FU_EQ(now.generation[i], g_fu_extra.generation[i], "subgroup generation");
-        FU_EQ(now.state[i],      (uint64_t)MOQ_SG_RESETTING, "subgroup state");
+        FU_EQ(now.state[i], g_fu_completed ? (int)MOQ_SG_CLOSING
+                                          : (int)MOQ_SG_RESETTING,
+              "subgroup state");
         FU_EQ(now.payload_len[i],   0, "streaming payload length");
         FU_EQ(now.bytes_written[i], 0, "streaming bytes written");
-        FU_EQ(now.deadline[i], UINT64_MAX, "subgroup deadline");
+        FU_EQ(now.deadline[i], g_fu_completed ? g_fu_extra.deadline[i] : UINT64_MAX,
+              "subgroup deadline");
     }
-    FU_EQ(now.agg_deadline, UINT64_MAX, "aggregate subgroup deadline");
+    FU_EQ(now.agg_deadline, g_fu_completed ? g_fu_extra.agg_deadline : UINT64_MAX,
+          "aggregate subgroup deadline");
     /* The two atomic messages went out, so the send buffer holds exactly what
      * they cost -- not whatever was left over from an earlier attempt. */
     FU_EQ(now.send_len, g_fu_extra.send_len + g_fu_committed_bytes,
@@ -11327,23 +11404,24 @@ static void want_bidi_msg(txs_norm_vec_t *v, moq_stream_ref_t ref, bool fin,
     MOQ_TEST_CHECK(txs_norm_append_img(v, MOQ_ACTION_SEND_BIDI_STREAM, &im));
 }
 
-/* Exactly what §10.9.1 plus the shared teardown owe, in order: one
- * cancellation per bound subgroup, then the REQUEST_ERROR, then the terminal
- * PUBLISH_DONE closing our send half. No event at all. */
+/* Section10.9.1: cancel still-open subgroups before REQUEST_ERROR and terminal
+ * PUBLISH_DONE. Already FIN-closed streams need no second close. No event. */
 static void want_failed_update_output(txs_norm_vec_t *v, moq_stream_ref_t ref)
 {
-    for (size_t i = 0; i < g_fu_sg_count; i++)
-        want_reset_data(v, g_fu_sg_refs[i], 0x1);   /* CANCELLED (§3.3.3) */
+    if (!g_fu_completed)
+        for (size_t i = 0; i < g_fu_sg_count; i++)
+            want_reset_data(v, g_fu_sg_refs[i], 0x1);   /* CANCELLED (§3.3.3) */
 
     uint8_t err[128];
     size_t err_len = enc_request_error(err, sizeof(err), 0x17, 0, NULL);
     want_bidi_msg(v, ref, false, err, err_len);
 
+    /* Stream Count: every subgroup stream the subscription opened. */
     uint8_t done[128];
     moq_buf_writer_t dw;
     moq_buf_writer_init(&dw, done, sizeof(done));
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_d18_encode_publish_done(&dw, 0x8, 0, (moq_bytes_t){0}),
+        (int)moq_d18_encode_publish_done(&dw, 0x8, g_fu_sg_count, (moq_bytes_t){0}),
         (int)MOQ_OK);
     want_bidi_msg(v, ref, true, done, moq_buf_writer_offset(&dw));
 }
@@ -11371,7 +11449,7 @@ static void test_axis3_fin_terminals(void)
     static const terminal_case_t goaway_request_route = {
         .name = "goaway request route", .make = make_session_default,
         .arm = arm_goaway_announcement, .encode = enc_goaway_request,
-        .drain_reason = MOQ_DRAIN_GOAWAY_STRICT,
+        .drain_reason = MOQ_DRAIN_GOAWAY_RECEIVED,
         .want_output = want_goaway_output, .hooks = &goaway_hooks,
         .owner = &ann_owner_ops
     };
@@ -11385,7 +11463,7 @@ static void test_axis3_fin_terminals(void)
         static const terminal_case_t goaway_response_route = {
             .name = "goaway response route", .make = make_session_client,
             .arm = arm_goaway_local_subscribe, .encode = enc_goaway_request_uri,
-            .drain_reason = MOQ_DRAIN_GOAWAY_STRICT,
+            .drain_reason = MOQ_DRAIN_GOAWAY_RECEIVED,
             .want_output = want_goaway_output_uri, .hooks = &goaway_hooks,
             .owner = &sub_owner_ops
         };
@@ -11397,7 +11475,7 @@ static void test_axis3_fin_terminals(void)
         static const terminal_case_t goaway_ns_sub = {
             .name = "goaway ns_sub", .make = make_session_client,
             .arm = arm_goaway_local_ns_sub, .encode = enc_goaway_request_uri,
-            .drain_reason = MOQ_DRAIN_GOAWAY_STRICT,
+            .drain_reason = MOQ_DRAIN_GOAWAY_RECEIVED,
             .want_output = want_goaway_output_uri, .hooks = &goaway_hooks,
             .owner = &nsg_owner_ops
         };
@@ -11422,6 +11500,10 @@ static void test_axis3_fin_terminals(void)
             .extra = &fu_extra_ops
         };
         run_terminal_matrix(&failed_update, 2);
+        terminal_case_t completed_update = failed_update;
+        completed_update.name = "failed subscription update after subgroup FIN";
+        completed_update.arm = arm_failed_update_completed_subscription;
+        run_terminal_matrix(&completed_update, 2);
     }
 }
 
@@ -12430,10 +12512,10 @@ static void ann_full_read(const moq_session_t *s, ann_full_t *v)
     v->nsid_len = e->ns_id_len;
     if (e->ns_id_len > ANN_OWN_MAX || (e->ns_id_len && !e->ns_id_buf)) return;
     if (e->ns_id_len) memcpy(v->nsid, e->ns_id_buf, e->ns_id_len);
-    v->recv_len = e->req_recv_len;
-    if (e->req_recv_len > ANN_OWN_MAX || (e->req_recv_len && !e->req_recv_buf))
+    v->recv_len = e->rs.recv_len;
+    if (e->rs.recv_len > ANN_OWN_MAX || (e->rs.recv_len && !e->rs.recv_buf))
         return;
-    if (e->req_recv_len) memcpy(v->recv, e->req_recv_buf, e->req_recv_len);
+    if (e->rs.recv_len) memcpy(v->recv, e->rs.recv_buf, e->rs.recv_len);
     v->valid = 1;
 }
 
@@ -12459,13 +12541,16 @@ static int ann_full_check_blocked(const moq_session_t *s, const char *what)
      * A route whose terminal takes no peer bytes declares an append of zero and
      * the mask is then a no-op. */
     moq_ann_entry_t want = g_ann_full.raw;
-    want.req_recv_len = now.raw.req_recv_len;
+    want.rs.recv_len = now.raw.rs.recv_len;
+    /* Route 3 has validated its peer error and owes reciprocal FIN. */
+    if (g_ann_full_allow_append != 0)
+        want.rs.retained_output = MOQ_RETAINED_OUTPUT_FIN;
     if (memcmp(&now.raw, &want, sizeof(want)) != 0) {
         TXS_DIAG("TXN %s: announcement entry changed\n", what);
         bad++;
     }
     if (g_ann_full_allow_append == 0 &&
-        now.raw.req_recv_len != g_ann_full.raw.req_recv_len) {
+        now.raw.rs.recv_len != g_ann_full.raw.rs.recv_len) {
         TXS_DIAG("TXN %s: retained request bytes grew under a terminal that"
                  " takes none\n", what);
         bad++;
@@ -12491,6 +12576,10 @@ static int ann_full_check_committed(const moq_session_t *s, const char *what)
     if (g_ann_full_slot < 0 || (size_t)g_ann_full_slot >= s->ann_cap) return 0;
     if (s->announcements[g_ann_full_slot].state != MOQ_ANN_FREE) {
         TXS_DIAG("TXN %s: retired announcement slot is still live\n", what);
+        return 1;
+    }
+    if (s->announcements[g_ann_full_slot].rs.retained_output != MOQ_RETAINED_OUTPUT_NONE) {
+        TXS_DIAG("TXN %s: retired announcement kept output intent\n", what);
         return 1;
     }
     return 0;
@@ -12657,8 +12746,8 @@ static moq_stream_ref_t arm_announcer_established(moq_session_t *s,
         MOQ_TEST_CHECK_EQ_U64(e->generation, want_gen);
         MOQ_TEST_CHECK_EQ_U64(e->handle._opaque, ann._opaque);
         MOQ_TEST_CHECK_EQ_U64(e->request_id, 0);
-        MOQ_TEST_CHECK_EQ_U64(e->request_stream_ref._v, ref._v);
-        MOQ_TEST_CHECK_EQ_INT(e->req_recv_fin ? 1 : 0, fin_observed ? 1 : 0);
+        MOQ_TEST_CHECK_EQ_U64(e->rs.ref._v, ref._v);
+        MOQ_TEST_CHECK_EQ_INT(e->rs.recv_fin ? 1 : 0, fin_observed ? 1 : 0);
         /* And the registry edge targets that declared slot. */
         check_registered(s, ref, MOQ_REQ_ANNOUNCEMENT, want_slot);
     }
@@ -12901,8 +12990,8 @@ static moq_stream_ref_t arm_subscriber_established(moq_session_t *s,
         MOQ_TEST_CHECK_EQ_U64(e->handle._opaque, sub._opaque);
         MOQ_TEST_CHECK_EQ_U64(e->request_id, 0);
         MOQ_TEST_CHECK_EQ_U64(e->track_alias, R6_TRACK_ALIAS);
-        MOQ_TEST_CHECK_EQ_U64(e->request_stream_ref._v, ref._v);
-        MOQ_TEST_CHECK_EQ_INT(e->req_recv_fin ? 1 : 0, fin_observed ? 1 : 0);
+        MOQ_TEST_CHECK_EQ_U64(e->rs.ref._v, ref._v);
+        MOQ_TEST_CHECK_EQ_INT(e->rs.recv_fin ? 1 : 0, fin_observed ? 1 : 0);
         check_registered(s, ref, MOQ_REQ_SUBSCRIPTION, want_slot);
     }
     if (out_handle) *out_handle = sub._opaque;
@@ -12933,10 +13022,10 @@ static void r6_full_read(const moq_session_t *s, r6_full_t *v)
     if (g_r6_want_slot < 0 || (size_t)g_r6_want_slot >= s->sub_cap) return;
     const moq_sub_entry_t *e = &s->subs[g_r6_want_slot];
     v->raw = *e;
-    v->req_len = e->req_recv_len;
-    if (e->req_recv_len > R6_OWN_MAX || (e->req_recv_len && !e->req_recv_buf))
+    v->req_len = e->rs.recv_len;
+    if (e->rs.recv_len > R6_OWN_MAX || (e->rs.recv_len && !e->rs.recv_buf))
         return;
-    if (e->req_recv_len) memcpy(v->req, e->req_recv_buf, e->req_recv_len);
+    if (e->rs.recv_len) memcpy(v->req, e->rs.recv_buf, e->rs.recv_len);
     v->tid_len = e->track_id_len;
     if (e->track_id_len > R6_OWN_MAX || (e->track_id_len && !e->track_id_buf))
         return;
@@ -13070,10 +13159,10 @@ static void fetch_term_capture(const moq_session_t *s, moq_stream_ref_t ref,
         r->generation = e->generation;
         r->handle     = e->handle._opaque;
         r->request_id = e->request_id;
-        r->stream_ref = e->request_stream_ref._v;
-        r->fin        = e->req_recv_fin ? 1 : 0;
-        r->recv_len   = e->req_recv_len;
-        req_seed_copy_buf(r, e->req_recv_buf, e->req_recv_len);
+        r->stream_ref = e->rs.ref._v;
+        r->fin        = e->rs.recv_fin ? 1 : 0;
+        r->recv_len   = e->rs.recv_len;
+        req_seed_copy_buf(r, e->rs.recv_buf, e->rs.recv_len);
     }
     req_seed_capture_registry(r, s, ref, r->request_id);
 }
@@ -13117,10 +13206,10 @@ static void r5_full_read(const moq_session_t *s, r5_full_t *v)
     if (g_r5_want_slot < 0 || (size_t)g_r5_want_slot >= s->fetch_cap) return;
     const moq_fetch_entry_t *e = &s->fetches[g_r5_want_slot];
     v->raw = *e;
-    v->req_len = e->req_recv_len;
-    if (e->req_recv_len > sizeof(v->req) ||
-        (e->req_recv_len && !e->req_recv_buf)) return;
-    if (e->req_recv_len) memcpy(v->req, e->req_recv_buf, e->req_recv_len);
+    v->req_len = e->rs.recv_len;
+    if (e->rs.recv_len > sizeof(v->req) ||
+        (e->rs.recv_len && !e->rs.recv_buf)) return;
+    if (e->rs.recv_len) memcpy(v->req, e->rs.recv_buf, e->rs.recv_len);
     v->valid = 1;
 }
 
@@ -13331,13 +13420,13 @@ static moq_stream_ref_t arm_fetch_pending(moq_session_t *s, bool fin_observed,
         MOQ_TEST_CHECK_EQ_U64(e->generation, want_gen);
         MOQ_TEST_CHECK_EQ_U64(e->handle._opaque, fh._opaque);
         MOQ_TEST_CHECK_EQ_U64(e->request_id, 0);
-        MOQ_TEST_CHECK_EQ_U64(e->request_stream_ref._v, ref._v);
-        MOQ_TEST_CHECK_EQ_INT(e->req_recv_fin ? 1 : 0, fin_observed ? 1 : 0);
+        MOQ_TEST_CHECK_EQ_U64(e->rs.ref._v, ref._v);
+        MOQ_TEST_CHECK_EQ_INT(e->rs.recv_fin ? 1 : 0, fin_observed ? 1 : 0);
         /* No data stream was ever opened, so the cancel owes no STOP_DATA. */
         MOQ_TEST_CHECK_EQ_INT(e->data_stream_started ? 1 : 0, 0);
         MOQ_TEST_CHECK_EQ_INT(e->data_stream_fin ? 1 : 0, 0);
         MOQ_TEST_CHECK_EQ_U64(e->data_stream_ref._v, 0);
-        MOQ_TEST_CHECK_EQ_SIZE(e->req_recv_len, (size_t)0);
+        MOQ_TEST_CHECK_EQ_SIZE(e->rs.recv_len, (size_t)0);
         check_registered(s, ref, MOQ_REQ_FETCH, want_slot);
     }
     if (out_handle) *out_handle = fh._opaque;
@@ -13364,7 +13453,7 @@ static void want_fetch_cancel(txs_norm_vec_t *v, moq_stream_ref_t ref,
 
 /* -- Route: done SUBSCRIBE (session_subscribe.c:3250, moq_session_done_subscribe)
  *
- * The terminal reserves its drain FIN-aware: it consults `e->req_recv_fin`, so
+ * The terminal reserves its drain FIN-aware: it consults `e->rs.recv_fin`, so
  * it takes a reference only when the peer half is still open and a same-call FIN
  * owes none. */
 #define R7_STATUS   0x2
@@ -13413,10 +13502,10 @@ static void r7_full_read(const moq_session_t *s, r7_full_t *v)
     if (g_r7_want_slot < 0 || (size_t)g_r7_want_slot >= s->sub_cap) return;
     const moq_sub_entry_t *e = &s->subs[g_r7_want_slot];
     v->raw = *e;
-    v->req_len = e->req_recv_len;
-    if (e->req_recv_len > R6_OWN_MAX || (e->req_recv_len && !e->req_recv_buf))
+    v->req_len = e->rs.recv_len;
+    if (e->rs.recv_len > R6_OWN_MAX || (e->rs.recv_len && !e->rs.recv_buf))
         return;
-    if (e->req_recv_len) memcpy(v->req, e->req_recv_buf, e->req_recv_len);
+    if (e->rs.recv_len) memcpy(v->req, e->rs.recv_buf, e->rs.recv_len);
     v->tid_len = e->track_id_len;
     if (e->track_id_len > R6_OWN_MAX || (e->track_id_len && !e->track_id_buf))
         return;
@@ -13585,8 +13674,8 @@ static moq_stream_ref_t arm_accepted_subscription(moq_session_t *s,
         MOQ_TEST_CHECK_EQ_U64(e->generation, want_gen);
         MOQ_TEST_CHECK_EQ_U64(e->request_id, 0);
         MOQ_TEST_CHECK_EQ_U64(e->track_alias, R7_TRACK_ALIAS);
-        MOQ_TEST_CHECK_EQ_U64(e->request_stream_ref._v, ref._v);
-        MOQ_TEST_CHECK_EQ_INT(e->req_recv_fin ? 1 : 0, fin_observed ? 1 : 0);
+        MOQ_TEST_CHECK_EQ_U64(e->rs.ref._v, ref._v);
+        MOQ_TEST_CHECK_EQ_INT(e->rs.recv_fin ? 1 : 0, fin_observed ? 1 : 0);
         MOQ_TEST_CHECK_EQ_INT(e->goaway_sent ? 1 : 0, 0);
         check_registered(s, ref, MOQ_REQ_SUBSCRIPTION, want_slot);
     }
@@ -13701,10 +13790,10 @@ static void r4_owner_capture(const moq_session_t *s, moq_stream_ref_t ref,
         r->generation = e->generation;
         r->handle     = e->handle._opaque;
         r->request_id = e->request_id;
-        r->stream_ref = e->request_stream_ref._v;
-        r->fin        = e->req_recv_fin ? 1 : 0;
-        r->recv_len   = e->req_recv_len;
-        req_seed_copy_buf(r, e->req_recv_buf, e->req_recv_len);
+        r->stream_ref = e->rs.ref._v;
+        r->fin        = e->rs.recv_fin ? 1 : 0;
+        r->recv_len   = e->rs.recv_len;
+        req_seed_copy_buf(r, e->rs.recv_buf, e->rs.recv_len);
     }
     req_seed_capture_registry(r, s, ref, r->request_id);
 }
@@ -13744,10 +13833,10 @@ static void r4_full_read(const moq_session_t *s, r4_full_t *v)
     if (g_r4_want_slot < 0 || (size_t)g_r4_want_slot >= s->pub_cap) return;
     const moq_pub_entry_t *e = &s->publishes[g_r4_want_slot];
     v->raw = *e;
-    v->req_len = e->req_recv_len;
-    if (e->req_recv_len > R6_OWN_MAX || (e->req_recv_len && !e->req_recv_buf))
+    v->req_len = e->rs.recv_len;
+    if (e->rs.recv_len > R6_OWN_MAX || (e->rs.recv_len && !e->rs.recv_buf))
         return;
-    if (e->req_recv_len) memcpy(v->req, e->req_recv_buf, e->req_recv_len);
+    if (e->rs.recv_len) memcpy(v->req, e->rs.recv_buf, e->rs.recv_len);
     v->valid = 1;
 }
 
@@ -13951,8 +14040,8 @@ static moq_stream_ref_t arm_publisher_established(moq_session_t *s,
         MOQ_TEST_CHECK_EQ_U64(e->handle._opaque, ph._opaque);
         MOQ_TEST_CHECK_EQ_U64(e->request_id, 0);
         MOQ_TEST_CHECK_EQ_U64(e->track_alias, R4_TRACK_ALIAS);
-        MOQ_TEST_CHECK_EQ_U64(e->request_stream_ref._v, ref._v);
-        MOQ_TEST_CHECK_EQ_INT(e->req_recv_fin ? 1 : 0, fin_observed ? 1 : 0);
+        MOQ_TEST_CHECK_EQ_U64(e->rs.ref._v, ref._v);
+        MOQ_TEST_CHECK_EQ_INT(e->rs.recv_fin ? 1 : 0, fin_observed ? 1 : 0);
         MOQ_TEST_CHECK_EQ_INT(e->goaway_sent ? 1 : 0, 0);
         /* The acceptance's values committed onto the owner, independently of
          * the event that surfaced them. */
@@ -14013,7 +14102,7 @@ static void want_finish_publish(txs_norm_vec_t *v, moq_stream_ref_t ref,
  * (`req_stream && !ann_peer_fin_observed`, :594), so a same-call FIN owes none
  * -- the ordinary Axis 3 shape on the announcer side. */
 #define R3_ERROR_CODE  MOQ_REQUEST_ERROR_NOT_SUPPORTED
-#define R3_RETRY_MS    4500
+#define R3_RETRY_WIRE  4500   /* Retry Interval as sent: the time plus one */
 static const char k_r3_reason[] = "namespace refused";
 
 static uint64_t g_r3_handle;
@@ -14146,8 +14235,8 @@ static moq_stream_ref_t arm_announcement_pending(moq_session_t *s)
         MOQ_TEST_CHECK_EQ_U64(e->generation, want_gen);
         MOQ_TEST_CHECK_EQ_U64(e->handle._opaque, ann._opaque);
         MOQ_TEST_CHECK_EQ_U64(e->request_id, 0);
-        MOQ_TEST_CHECK_EQ_U64(e->request_stream_ref._v, ref._v);
-        MOQ_TEST_CHECK_EQ_INT(e->req_recv_fin ? 1 : 0, 0);
+        MOQ_TEST_CHECK_EQ_U64(e->rs.ref._v, ref._v);
+        MOQ_TEST_CHECK_EQ_INT(e->rs.recv_fin ? 1 : 0, 0);
         check_registered(s, ref, MOQ_REQ_ANNOUNCEMENT, want_slot);
     }
     return ref;
@@ -14163,7 +14252,7 @@ static size_t enc_announcement_error(uint8_t *buf, size_t cap)
     moq_buf_writer_init(&w, buf, cap);
     MOQ_TEST_CHECK_EQ_INT(
         (int)moq_d18_encode_request_error(
-            &w, R3_ERROR_CODE, R3_RETRY_MS + 1u,   /* wire = ms + 1, §10.6 */
+            &w, R3_ERROR_CODE, R3_RETRY_WIRE,
             (moq_bytes_t){ (const uint8_t *)k_r3_reason,
                            sizeof(k_r3_reason) - 1 }), (int)MOQ_OK);
     return moq_buf_writer_offset(&w);
@@ -14178,7 +14267,7 @@ static void want_announcement_error(txs_norm_vec_t *v, moq_stream_ref_t ref)
     txs_img_u64(&im, g_r3_handle);
     txs_img_u64(&im, (uint64_t)R3_ERROR_CODE);
     txs_img_u64(&im, 1);            /* can_retry, from the nonzero interval */
-    txs_img_u64(&im, R3_RETRY_MS);
+    txs_img_u64(&im, R3_RETRY_WIRE - 1);
     txs_img_bytes(&im, (const uint8_t *)k_r3_reason, sizeof(k_r3_reason) - 1);
     MOQ_TEST_CHECK(txs_norm_append_img(v, MOQ_EVENT_NAMESPACE_REJECTED, &im));
 
@@ -14454,7 +14543,7 @@ static moq_stream_ref_t arm_deferred_publish(moq_session_t *s, bool fin_observed
         MOQ_TEST_CHECK_EQ_INT((int)e->role, (int)MOQ_PUB_ROLE_SUBSCRIBER);
         MOQ_TEST_CHECK_EQ_U64(e->handle._opaque, want_handle);
         MOQ_TEST_CHECK_EQ_U64(e->generation, want_gen);
-        MOQ_TEST_CHECK_EQ_U64(e->request_stream_ref._v, ref._v);
+        MOQ_TEST_CHECK_EQ_U64(e->rs.ref._v, ref._v);
         MOQ_TEST_CHECK_EQ_INT(e->done_pending ? 1 : 0, 1);
         MOQ_TEST_CHECK_EQ_INT(e->done_expired ? 1 : 0, 0);
         failures += txs_check_span_bytes(e->done_reason_buf,
@@ -14463,7 +14552,7 @@ static moq_stream_ref_t arm_deferred_publish(moq_session_t *s, bool fin_observed
                                          "route1 done reason");
         MOQ_TEST_CHECK_EQ_U64(e->done_status_code, R1_STATUS);
         MOQ_TEST_CHECK_EQ_U64(e->done_stream_count, R1_STREAMS);
-        MOQ_TEST_CHECK_EQ_INT(e->req_recv_fin ? 1 : 0, fin_observed ? 1 : 0);
+        MOQ_TEST_CHECK_EQ_INT(e->rs.recv_fin ? 1 : 0, fin_observed ? 1 : 0);
         /* The deadline is stamped and still in the future, so the sweep the
          * terminal runs on is genuinely deferred rather than already due. */
         MOQ_TEST_CHECK(e->done_deadline_us > 1);
@@ -14609,8 +14698,8 @@ static moq_stream_ref_t t5_admit_and_accept_at(moq_session_t *s,
     /* The co-allocated receive buffer persists across entry reuse, so its
      * pointer and capacity are properties of the FREE slot: captured BEFORE
      * ingress rather than adopted from whatever admission leaves behind. */
-    const uint8_t *want_recv_buf = s->announcements[want_slot].req_recv_buf;
-    size_t want_recv_cap = s->announcements[want_slot].req_recv_cap;
+    const uint8_t *want_recv_buf = s->announcements[want_slot].rs.recv_buf;
+    size_t want_recv_cap = s->announcements[want_slot].rs.recv_cap;
 
     moq_stream_ref_t ref = moq_stream_ref_from_u64(peer_ref_v); /* peer-opened */
     uint8_t m[256];
@@ -14718,12 +14807,12 @@ static moq_stream_ref_t t5_admit_and_accept_at(moq_session_t *s,
         MOQ_TEST_CHECK_EQ_U64(e->generation, want_gen);
         MOQ_TEST_CHECK_EQ_U64(e->handle._opaque, want_handle);
         MOQ_TEST_CHECK_EQ_U64(e->request_id, rid);
-        MOQ_TEST_CHECK_EQ_U64(e->request_stream_ref._v, ref._v);
+        MOQ_TEST_CHECK_EQ_U64(e->rs.ref._v, ref._v);
         MOQ_TEST_CHECK_EQ_INT(e->goaway_sent ? 1 : 0, 0);
-        MOQ_TEST_CHECK_EQ_SIZE(e->req_recv_len, (size_t)0);
+        MOQ_TEST_CHECK_EQ_SIZE(e->rs.recv_len, (size_t)0);
         /* Both derived pre-ingress, so admission cannot define them. */
-        MOQ_TEST_CHECK(e->req_recv_buf == want_recv_buf);
-        MOQ_TEST_CHECK_EQ_SIZE(e->req_recv_cap, want_recv_cap);
+        MOQ_TEST_CHECK(e->rs.recv_buf == want_recv_buf);
+        MOQ_TEST_CHECK_EQ_SIZE(e->rs.recv_cap, want_recv_cap);
         /* The canonical namespace key, built INDEPENDENTLY from the fixture's
          * own parts rather than read back from the entry. */
         {
@@ -14746,7 +14835,7 @@ static moq_stream_ref_t t5_admit_and_accept_at(moq_session_t *s,
         /* The FIN FACT this arm claims, asserted rather than assumed -- and
          * that it lives in the DURABLE latch, never left as transitional
          * ownership: this family's consumption is synchronous. */
-        MOQ_TEST_CHECK_EQ_INT(e->req_recv_fin ? 1 : 0, want_latched ? 1 : 0);
+        MOQ_TEST_CHECK_EQ_INT(e->rs.recv_fin ? 1 : 0, want_latched ? 1 : 0);
         MOQ_TEST_CHECK_EQ_INT(e->handoff_fin_pending ? 1 : 0, 0);
         check_registered(s, ref, MOQ_REQ_ANNOUNCEMENT, want_slot);
     }
@@ -14793,10 +14882,10 @@ static moq_stream_ref_t arm_t5_post_accept_fin(moq_session_t *s,
     {
         const moq_ann_entry_t *e = &s->announcements[g_t5_want_slot];
         /* Latched, and the owner survives it whole. */
-        MOQ_TEST_CHECK_EQ_INT(e->req_recv_fin ? 1 : 0, 1);
+        MOQ_TEST_CHECK_EQ_INT(e->rs.recv_fin ? 1 : 0, 1);
         MOQ_TEST_CHECK_EQ_INT((int)e->state, (int)MOQ_ANN_ESTABLISHED);
         MOQ_TEST_CHECK_EQ_INT((int)e->role, (int)MOQ_ANN_ROLE_RECEIVER);
-        MOQ_TEST_CHECK_EQ_SIZE(e->req_recv_len, (size_t)0);
+        MOQ_TEST_CHECK_EQ_SIZE(e->rs.recv_len, (size_t)0);
         check_registered(s, ref, MOQ_REQ_ANNOUNCEMENT, g_t5_want_slot);
     }
     return ref;
@@ -14872,13 +14961,13 @@ static void ann_whole_capture(const moq_session_t *s, moq_stream_ref_t ref,
     const moq_ann_entry_t *e = ann_by_ref(s, ref);
     if (!e) return;
     if (e->ns_id_len > ANN_WHOLE_MAX || (e->ns_id_len && !e->ns_id_buf)) return;
-    if (e->req_recv_len > ANN_WHOLE_MAX || (e->req_recv_len && !e->req_recv_buf))
+    if (e->rs.recv_len > ANN_WHOLE_MAX || (e->rs.recv_len && !e->rs.recv_buf))
         return;
     o->raw = *e;
     o->ns_len = e->ns_id_len;
     if (o->ns_len) memcpy(o->ns, e->ns_id_buf, o->ns_len);
-    o->rx_len = e->req_recv_len;
-    if (o->rx_len) memcpy(o->rx, e->req_recv_buf, o->rx_len);
+    o->rx_len = e->rs.recv_len;
+    if (o->rx_len) memcpy(o->rx, e->rs.recv_buf, o->rx_len);
     o->valid = 1;
 }
 
@@ -14904,17 +14993,17 @@ static int ann_whole_check(const moq_session_t *s, moq_stream_ref_t ref,
     ANN_W_EQ("generation", now.raw.generation, want->raw.generation);
     ANN_W_EQ("handle", now.raw.handle._opaque, want->raw.handle._opaque);
     ANN_W_EQ("request_id", now.raw.request_id, want->raw.request_id);
-    ANN_W_EQ("request_stream_ref", now.raw.request_stream_ref._v,
-             want->raw.request_stream_ref._v);
+    ANN_W_EQ("request_stream_ref", now.raw.rs.ref._v,
+             want->raw.rs.ref._v);
     ANN_W_EQ("ns_id_len", now.raw.ns_id_len, want->raw.ns_id_len);
-    ANN_W_EQ("req_recv_cap", now.raw.req_recv_cap, want->raw.req_recv_cap);
-    ANN_W_EQ("req_recv_len", now.raw.req_recv_len, want->raw.req_recv_len);
-    ANN_W_EQ("req_recv_fin", now.raw.req_recv_fin ? 1 : 0,
-             want->raw.req_recv_fin ? 1 : 0);
+    ANN_W_EQ("req_recv_cap", now.raw.rs.recv_cap, want->raw.rs.recv_cap);
+    ANN_W_EQ("req_recv_len", now.raw.rs.recv_len, want->raw.rs.recv_len);
+    ANN_W_EQ("req_recv_fin", now.raw.rs.recv_fin ? 1 : 0,
+             want->raw.rs.recv_fin ? 1 : 0);
     ANN_W_EQ("goaway_sent", now.raw.goaway_sent ? 1 : 0,
              want->raw.goaway_sent ? 1 : 0);
 #undef ANN_W_EQ
-    if (now.raw.req_recv_buf != want->raw.req_recv_buf) {
+    if (now.raw.rs.recv_buf != want->raw.rs.recv_buf) {
         fprintf(stderr, "AXIS4 %s: whole owner req_recv_buf pointer\n", what);
         bad++;
     }
@@ -14986,23 +15075,24 @@ static moq_result_t fire_cancel_namespace_at(moq_session_t *s, uint64_t handle,
     return moq_session_cancel_namespace(s, ann, &c, now_us);
 }
 
-/* The DECLARED free record. `ann_free_entry` (session_namespace.c:44) is a
- * SELECTIVE free, not a memset, so the expectation is the live entry plus
- * exactly the transformation that function performs: everything else is
- * asserted as RETAINED rather than adopted from the post-free entry. */
+/* The declared retired record keeps only the co-allocated receive storage
+ * and incremented generation. It is derived before retirement, never copied
+ * from the post-free state under test. */
 typedef struct ann_free_expect {
     int             state;
     int             role;
     uint32_t        generation;
     uint64_t        handle;
     uint64_t        request_id;
-    uint64_t        request_stream_ref;
+    struct {
+        uint64_t ref;
+        const uint8_t  * recv_buf;
+        size_t recv_cap;
+        size_t recv_len;
+        int recv_fin;
+    } rs;
     const uint8_t  *ns_id_buf;
     size_t          ns_id_len;
-    const uint8_t  *req_recv_buf;
-    size_t          req_recv_cap;
-    size_t          req_recv_len;
-    int             req_recv_fin;
     int             goaway_sent;
 } ann_free_expect_t;
 
@@ -15012,17 +15102,17 @@ static ann_free_expect_t ann_declare_free(const moq_ann_entry_t *live)
 {
     ann_free_expect_t w;
     w.state              = (int)MOQ_ANN_FREE;
-    w.role               = (int)live->role;          /* retained */
+    w.role               = 0;
     w.generation         = live->generation + 1u;    /* uint32_t increment */
-    w.handle             = live->handle._opaque;     /* retained */
-    w.request_id         = live->request_id;         /* retained */
-    w.request_stream_ref = 0;                        /* cleared with its key */
+    w.handle             = 0;
+    w.request_id         = 0;
+    w.rs.ref = 0;                        /* cleared with its key */
     w.ns_id_buf          = NULL;                     /* owned key freed */
     w.ns_id_len          = 0;
-    w.req_recv_buf       = live->req_recv_buf;       /* co-allocated, retained */
-    w.req_recv_cap       = live->req_recv_cap;       /* retained */
-    w.req_recv_len       = 0;
-    w.req_recv_fin       = 0;
+    w.rs.recv_buf       = live->rs.recv_buf;       /* co-allocated, retained */
+    w.rs.recv_cap       = live->rs.recv_cap;       /* retained */
+    w.rs.recv_len       = 0;
+    w.rs.recv_fin       = 0;
     w.goaway_sent        = 0;
     return w;
 }
@@ -15050,19 +15140,54 @@ static int ann_check_free_record(const moq_session_t *s, int slot,
     ANN_FREE_EQ("generation", e->generation, w->generation);
     ANN_FREE_EQ("handle", e->handle._opaque, w->handle);
     ANN_FREE_EQ("request_id", e->request_id, w->request_id);
-    ANN_FREE_EQ("request_stream_ref", e->request_stream_ref._v,
-                w->request_stream_ref);
+    ANN_FREE_EQ("request_stream_ref", e->rs.ref._v,
+                w->rs.ref);
     ANN_FREE_EQ("ns_id_len", e->ns_id_len, w->ns_id_len);
-    ANN_FREE_EQ("req_recv_cap", e->req_recv_cap, w->req_recv_cap);
-    ANN_FREE_EQ("req_recv_len", e->req_recv_len, w->req_recv_len);
-    ANN_FREE_EQ("req_recv_fin", e->req_recv_fin ? 1 : 0, w->req_recv_fin);
+    ANN_FREE_EQ("req_recv_cap", e->rs.recv_cap, w->rs.recv_cap);
+    ANN_FREE_EQ("req_recv_len", e->rs.recv_len, w->rs.recv_len);
+    ANN_FREE_EQ("req_recv_fin", e->rs.recv_fin ? 1 : 0, w->rs.recv_fin);
     ANN_FREE_EQ("goaway_sent", e->goaway_sent ? 1 : 0, w->goaway_sent);
+#define ANN_FREE_ZERO(field) ANN_FREE_EQ(#field, e->field, 0)
+    ANN_FREE_ZERO(rs.lifetime.family);
+    ANN_FREE_ZERO(rs.lifetime.local_requester);
+    ANN_FREE_ZERO(rs.lifetime.response);
+    ANN_FREE_ZERO(rs.lifetime.local_fin);
+    ANN_FREE_ZERO(rs.lifetime.peer_fin);
+    ANN_FREE_ZERO(rs.lifetime.local_reset);
+    ANN_FREE_ZERO(rs.lifetime.peer_reset);
+    ANN_FREE_ZERO(rs.lifetime.local_stop);
+    ANN_FREE_ZERO(rs.lifetime.peer_stop);
+    ANN_FREE_ZERO(rs.lifetime.cancelled);
+    ANN_FREE_ZERO(rs.lifetime.peer_fin_failed);
+    ANN_FREE_ZERO(rs.lifetime.publisher_done);
+    ANN_FREE_ZERO(rs.lifetime.incoming_update);
+    ANN_FREE_ZERO(rs.lifetime.outgoing_update);
+    ANN_FREE_ZERO(rs.lifetime.update_failed);
+    ANN_FREE_ZERO(handoff_fin_pending);
+    ANN_FREE_ZERO(response_validated);
+    ANN_FREE_ZERO(response_fin);
+    ANN_FREE_ZERO(deferred_reset);
+    ANN_FREE_ZERO(deferred_stop);
+    ANN_FREE_ZERO(deferred_fin);
+    ANN_FREE_ZERO(terminal_notified);
+    ANN_FREE_ZERO(finish_fin);
+    ANN_FREE_ZERO(cancel_pending);
+    ANN_FREE_ZERO(migration_committed);
+    ANN_FREE_ZERO(deferred_cause);
+    ANN_FREE_ZERO(terminal_cause);
+    ANN_FREE_ZERO(deferred_code);
+    ANN_FREE_ZERO(terminal_code);
+    ANN_FREE_ZERO(migration_scan.skip);
+    ANN_FREE_ZERO(migration_scan.hdr_len);
+    for (size_t i = 0; i < sizeof(e->migration_scan.hdr); i++)
+        ANN_FREE_EQ("migration_scan.hdr", e->migration_scan.hdr[i], 0);
+#undef ANN_FREE_ZERO
 #undef ANN_FREE_EQ
     if (e->ns_id_buf != w->ns_id_buf) {
         fprintf(stderr, "AXIS4 %s: free record ns_id_buf pointer\n", what);
         bad++;
     }
-    if (e->req_recv_buf != w->req_recv_buf) {
+    if (e->rs.recv_buf != w->rs.recv_buf) {
         fprintf(stderr, "AXIS4 %s: free record req_recv_buf pointer\n", what);
         bad++;
     }
@@ -15135,7 +15260,7 @@ static void test_axis4_announce_torn_down_retirement(void)
         (int)MOQ_OK);
     MOQ_TEST_CHECK_EQ_INT((int)s->announcements[slot].state,
                           (int)MOQ_ANN_ESTABLISHED);
-    MOQ_TEST_CHECK_EQ_INT(s->announcements[slot].req_recv_fin ? 1 : 0, 1);
+    MOQ_TEST_CHECK_EQ_INT(s->announcements[slot].rs.recv_fin ? 1 : 0, 1);
     failures += ann_check_silent(s, "post-accept FIN");
 
     /* Declared BEFORE the terminal: the free record and the exact generation. */
@@ -15254,7 +15379,7 @@ static void test_axis4_announce_torn_down_retirement(void)
     MOQ_TEST_CHECK(h1 != h0);
     /* The reused owner carries NO FIN: this is what makes ann_free_entry's
      * explicit latch clear load-bearing. */
-    MOQ_TEST_CHECK_EQ_INT(s->announcements[slot].req_recv_fin ? 1 : 0, 0);
+    MOQ_TEST_CHECK_EQ_INT(s->announcements[slot].rs.recv_fin ? 1 : 0, 0);
     MOQ_TEST_CHECK_EQ_U64(s->announcements[slot].generation,
                           (uint64_t)want_reuse_gen);
 
@@ -16215,6 +16340,58 @@ static void test_harness(void)
     }
 }
 
+/* A retired subscription does not retire its FIN-started delivery timers. */
+static void test_failed_update_closing_timer(void)
+{
+    moq_session_t *s = make_session_default();
+    MOQ_TEST_CHECK(s != NULL);
+    if (!s) return;
+    moq_stream_ref_t ref = arm_failed_update_completed_subscription(s);
+    fu_extra_capture(s);
+    uint8_t msg[192];
+    size_t len = enc_update_unknown_alias(msg, sizeof(msg));
+    MOQ_TEST_CHECK(moq_session_on_bidi_stream_bytes(s, ref, msg, len, true, 10) == MOQ_OK);
+    check_sub_terminal_retired(s, ref);
+    const terminal_case_t terminal = {
+        .want_output = want_failed_update_output,
+        .hooks = &pub_hooks_for_actions
+    };
+    check_terminal_output(s, &terminal, ref, "closing stream terminal");
+    failures += fu_extra_check_committed(s, "closing stream terminal");
+    MOQ_TEST_CHECK_EQ_U64(s->subgroup_deadline_us, 5000004);
+
+    MOQ_TEST_CHECK(moq_session_on_data_committed(s, g_fu_sg_refs[1], 11) == MOQ_OK);
+    check_no_output(s, &pub_hooks_for_actions);
+    MOQ_TEST_CHECK_EQ_U64(s->subgroup_deadline_us, 5000004);
+    MOQ_TEST_CHECK(moq_session_tick(s, 5000003) == MOQ_OK);
+    check_no_output(s, &pub_hooks_for_actions);
+    MOQ_TEST_CHECK(moq_session_tick(s, 5000004) == MOQ_OK);
+    moq_event_t event;
+    size_t events = 0;
+    while (moq_session_poll_events(s, &event, 1)) {
+        ++events;
+        moq_event_cleanup(&event);
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(events, 0);
+    moq_action_t action;
+    size_t actions = 0;
+    while (moq_session_poll_actions(s, &action, 1)) {
+        ++actions;
+        MOQ_TEST_CHECK(action.kind == MOQ_ACTION_RESET_DATA);
+        if (action.kind == MOQ_ACTION_RESET_DATA) {
+            MOQ_TEST_CHECK_EQ_U64(action.u.reset_data.stream_ref._v, g_fu_sg_refs[0]._v);
+            MOQ_TEST_CHECK_EQ_U64(action.u.reset_data.error_code, 0x2);
+        }
+        moq_action_cleanup(&action);
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(actions, 1);
+    MOQ_TEST_CHECK_EQ_U64(s->subgroup_deadline_us, UINT64_MAX);
+    MOQ_TEST_CHECK(moq_session_tick(s, 5000005) == MOQ_OK);
+    check_no_output(s, &pub_hooks_for_actions);
+    check_sub_terminal_retired(s, ref);
+    moq_session_destroy(s);
+}
+
 int main(void)
 {
     test_harness();
@@ -16239,6 +16416,7 @@ int main(void)
     test_axis4_announce_torn_down_blocked_retry();
     test_ns_sub_local_teardown();
     test_no_owner_admission_matrix();
+    test_failed_update_closing_timer();
     if (failures) { printf("FAILURES: %d\n", failures); return 1; }
     MOQ_TEST_PASS("d18_fin_handoff");
     return 0;

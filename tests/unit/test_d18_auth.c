@@ -11,6 +11,7 @@
 #include <moq/sim.h>
 #include "test_support.h"
 #include "../../core/src/session/session_internal.h"
+#include <string.h>
 
 /* -- Codec round-trips and malformed rejection --------------------- */
 
@@ -328,16 +329,24 @@ static moq_session_t *make_server_ex(uint64_t cache_size)
 
 static moq_session_t *make_server(void) { return make_server_ex(0); }
 
-/* Encode a SUBSCRIBE with the supplied parameters into buf. */
-static size_t encode_subscribe(uint8_t *buf, size_t cap, uint64_t request_id,
-                               const moq_d18_msg_params_t *p)
+/* Encode a SUBSCRIBE for live/<track> with the supplied parameters into buf. */
+static size_t encode_subscribe_track(uint8_t *buf, size_t cap, uint64_t request_id,
+                                     moq_bytes_t track, const moq_d18_msg_params_t *p)
 {
     moq_buf_writer_t w;
     moq_buf_writer_init(&w, buf, cap);
     moq_bytes_t parts[] = { MOQ_BYTES_LITERAL("live") };
     moq_namespace_t ns = { parts, 1 };
-    moq_d18_encode_subscribe(&w, request_id, &ns, MOQ_BYTES_LITERAL("video"), p);
+    moq_d18_encode_subscribe(&w, request_id, &ns, track, p);
     return moq_buf_writer_offset(&w);
+}
+
+/* Encode a SUBSCRIBE for live/video with the supplied parameters into buf. */
+static size_t encode_subscribe(uint8_t *buf, size_t cap, uint64_t request_id,
+                               const moq_d18_msg_params_t *p)
+{
+    return encode_subscribe_track(buf, cap, request_id,
+                                  MOQ_BYTES_LITERAL("video"), p);
 }
 
 /* Publisher side: feed SUBSCRIBE on `ref`, accept -> ESTABLISHED. */

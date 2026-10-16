@@ -29,6 +29,19 @@
  * Thread safety: none. All calls must be serialized on the same
  * thread that drives picoquic (the callback thread).
  *
+ * Transport binding: a session whose wire profile requires one
+ * (moq_session_binding_requirements() != 0, e.g. draft-22) must be bound
+ * by the attaching caller with moq_session_bind_transport() before
+ * moq_session_start(): kind MOQ_BINDING_WEBTRANSPORT_H3, the
+ * handshake-complete fact (the WT session is established), QUIC DATAGRAM
+ * support from both sides' transport parameters with sending additionally
+ * requiring the peer's HTTP/3 datagram SETTING (h3_ctx->settings.h3_datagram),
+ * and the connection target -- the authority and path/query the CONNECT
+ * named, on both sides. A profile without requirements (draft-16, draft-18)
+ * accepts the same binding optionally; bound, its server refuses a target a
+ * client names inside WebTransport. The adapter never binds or starts the
+ * session; the managed facade in <moq/pico_wt_managed.h> does.
+ *
  * EXPERIMENTAL: installed as component adapter-pico-wt. Consume via
  * CMake (find_package(libmoq COMPONENTS adapter-pico-wt)) or pkg-config
  * (libmoq-pico-wt). The connection handle is opaque; the struct layout
@@ -194,6 +207,23 @@ MOQ_API void moq_pico_wt_conn_notify_transport_closed(
  * picoquic exposes no getter for that setting, so THIS ADAPTER MAKES NO
  * RUNTIME-DETECTION PROMISE: a nonzero max_data_control is invalid caller
  * configuration, not a condition that will be reported.
+ *
+ * Transport parameters are fixed at attach. Attach (moq_pico_wt_conn_create)
+ * only once the connection's local transport parameters are final, including
+ * picowt's own adjustment (picowt_set_transport_parameters, which
+ * picowt_prepare_client_cnx also applies) -- the managed facade attaches
+ * after the WebTransport CONNECT is answered. Never call
+ * picoquic_set_transport_parameters on an attached connection: it replaces
+ * the local parameters wholesale and restarts picoquic's per-connection
+ * stream limits while the streams it already counted stay counted, under
+ * this adapter's receive accounting. Create refuses a connection whose
+ * local transport parameters cannot be read, before taking anything. The
+ * adapter samples initial_max_stream_id_unidir at attach and fails the
+ * connection closed (the adapter's inbound failure) when a receive sweep
+ * finds it changed or unreadable. That check sees only a change of that one
+ * value; it does not see other parameters or the stream-credit history
+ * before attach, so attaching to a connection that has already carried peer
+ * streams is not supported.
  */
 MOQ_API int moq_pico_wt_service(moq_pico_wt_conn_t *conn, uint64_t now_us);
 

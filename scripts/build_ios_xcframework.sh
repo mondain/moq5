@@ -327,20 +327,7 @@ rm -rf "$headers"
 mkdir -p "$headers"
 cp -R "$hdr_prefix/include/moq" "$headers/moq"
 
-cat > "$headers/shim.h" <<'EOF'
-#ifndef MOQ_SERVICE_SHIM_H
-#define MOQ_SERVICE_SHIM_H
-
-/* The installed C service tier (pkg-config: libmoq-service). The service
- * headers pull types.h/session.h/media_object.h/cmaf.h/msf.h transitively;
- * rcbuf.h is included for the sender's payload buffers. */
-#include <moq/endpoint.h>
-#include <moq/media_receiver.h>
-#include <moq/media_sender.h>
-#include <moq/rcbuf.h>
-
-#endif
-EOF
+cp "$repo_root/bindings/swift/SystemModules/CMoQService/shim.h" "$headers/shim.h"
 
 cat > "$headers/module.modulemap" <<'EOF'
 module CMoQService [system] {

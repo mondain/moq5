@@ -22,6 +22,8 @@
 #include <moq/rcbuf.h>
 
 #include <quic/QuicConstants.h>
+#include <quic/handshake/TransportParameters.h>
+#include "../../../common/moq_alpn.h"
 #include <quic/client/QuicClientTransport.h>
 #include <quic/common/events/FollyQuicEventBase.h>
 #include <quic/common/udpsocket/FollyQuicAsyncUDPSocket.h>
@@ -61,12 +63,19 @@ struct test_cert { std::string cert_pem, key_pem; bool ok = false; };
 inline test_cert generate_self_signed_cert()
 {
     test_cert r;
-    auto pkey = folly::ssl::EvpPkeyUniquePtr(EVP_PKEY_new());
-    if (!pkey) return r;
-    auto *ec = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
-    if (!ec) return r;
-    if (!EC_KEY_generate_key(ec)) { EC_KEY_free(ec); return r; }
-    if (!EVP_PKEY_assign_EC_KEY(pkey.get(), ec)) { EC_KEY_free(ec); return r; }
+    /* P-256 key through the EVP keygen interface (OpenSSL 1.1 and 3). */
+    folly::ssl::EvpPkeyUniquePtr pkey;
+    {
+        EVP_PKEY_CTX *kctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr);
+        EVP_PKEY *raw = nullptr;
+        bool keyed = kctx && EVP_PKEY_keygen_init(kctx) > 0 &&
+            EVP_PKEY_CTX_set_ec_paramgen_curve_nid(kctx,
+                NID_X9_62_prime256v1) > 0 &&
+            EVP_PKEY_keygen(kctx, &raw) > 0;
+        EVP_PKEY_CTX_free(kctx);
+        if (!keyed) { EVP_PKEY_free(raw); return r; }
+        pkey.reset(raw);
+    }
     auto x509 = folly::ssl::X509UniquePtr(X509_new());
     if (!x509) return r;
     if (!ASN1_INTEGER_set(X509_get_serialNumber(x509.get()), 1)) return r;
@@ -115,9 +124,52 @@ struct server_state {
     std::string expect_sub_track;
 
     /* MoQ wire version for the server session (0 = draft-16 default).
-     * Draft-18 is a symmetric handshake: the server starts too. */
+     * Uni-control profiles (draft-18, draft-22) are a symmetric handshake:
+     * the server starts too. */
     moq_version_t version = (moq_version_t)0;
 };
+
+/* Both sides start their own control channel on these profiles. */
+inline bool version_server_starts(moq_version_t v) {
+    return v == MOQ_VERSION_DRAFT_18 || v == MOQ_VERSION_DRAFT_22;
+}
+
+/* Attaching callers bind a session whose profile requires it (draft-22)
+ * before starting it: natively over QUIC, handshake complete (the peer's
+ * transport parameters are known), QUIC DATAGRAM from the local settings and
+ * the peer's max_datagram_frame_size, the client's authority/path or the
+ * server's accept-any policy. A profile without requirements is untouched. */
+inline uint32_t accept_any_uri(void *, uint32_t, moq_bytes_t, moq_bytes_t) {
+    return MOQ_URI_ACCEPT;
+}
+inline moq_result_t bind_if_required(moq_session_t *s, const quic::QuicSocket &sock,
+                                     bool is_client) {
+    if (moq_session_binding_requirements(s) == 0) return MOQ_OK;
+    auto peer = sock.getPeerTransportParams();
+    if (!peer.has_value()) return MOQ_ERR_WOULD_BLOCK;
+    uint32_t supported = MOQ_BINDING_HANDSHAKE_COMPLETE;
+    if (sock.getTransportSettings().datagramConfig.enabled)
+        supported |= MOQ_BINDING_LOCAL_QUIC_DATAGRAM | MOQ_BINDING_DATAGRAM_RECEIVE;
+    auto size = quic::getIntegerParameter(
+        quic::TransportParameterId::max_datagram_frame_size, *peer);
+    if (size.has_value() && size.value().has_value() && *size.value() > 0)
+        supported |= MOQ_BINDING_PEER_QUIC_DATAGRAM | MOQ_BINDING_DATAGRAM_SEND;
+    static const uint8_t authority[] = "127.0.0.1:443";
+    static const uint8_t path[] = "/live";
+    moq_transport_binding_t b;
+    moq_transport_binding_init(&b);
+    b.kind = MOQ_BINDING_RAW_QUIC;
+    b.facts_known = MOQ_BINDING_FACTS_ALL;
+    b.facts_supported = supported;
+    if (is_client) {
+        b.target_present = MOQ_BINDING_TARGET_COMPLETE;
+        b.authority = { authority, sizeof(authority) - 1 };
+        b.path_query = { path, sizeof(path) - 1 };
+    } else {
+        b.accept_uri = accept_any_uri;
+    }
+    return moq_session_bind_transport(s, &b, sizeof(b));
+}
 
 /* -- Server callbacks ------------------------------------------------ */
 
@@ -141,11 +193,13 @@ public:
             ss_.adp = std::make_unique<moq::mvfst::adapter>(
                 moq::mvfst::adapter::config::server(),
                 ss_.session, ss_.transport);
-            /* Draft-18: symmetric handshake -- the server opens its own
-             * unidirectional control channel and sends SETUP too. The
-             * pending actions drain on the next pump_server service. */
-            if (ss_.version == MOQ_VERSION_DRAFT_18 &&
-                moq_session_start(ss_.session, 0) < 0) {
+            /* Uni-control profiles: symmetric handshake -- the server opens
+             * its own control channel and sends SETUP too (after binding
+             * when the profile requires it; the handshake is complete here).
+             * The pending actions drain on the next pump_server service. */
+            if (version_server_starts(ss_.version) &&
+                (bind_if_required(ss_.session, *ss_.transport, false) != MOQ_OK ||
+                 moq_session_start(ss_.session, 0) < 0)) {
                 ss_.error.store(true); return;
             }
         } catch (...) {
@@ -238,8 +292,9 @@ public:
         ss.version = version;
         client_cfg_.version = version;
         if (client_cfg_mutate) client_cfg_mutate(client_cfg_);
-        const std::string alpn =
-            (version == MOQ_VERSION_DRAFT_18) ? "moqt-18" : "moqt-16";
+        const char *alpn_tok = moq_alpn_for_version(
+            version ? version : MOQ_VERSION_DRAFT_16);
+        const std::string alpn = alpn_tok ? alpn_tok : "moqt-16";
         auto cm = generate_self_signed_cert();
         if (!cm.ok) return;
         auto sctx = std::make_shared<fizz::server::FizzServerContext>();
@@ -260,6 +315,15 @@ public:
         auto cc_factory = std::make_shared<quic::ServerCongestionControllerFactory>();
         server_->setCongestionControllerFactory(cc_factory);
         server_->setFizzContext(sctx);
+        /* The worker overwrites per-transport settings with the server-wide
+         * ones after the factory, so datagrams are enabled through the
+         * server's override. */
+        server_->setTransportSettingsOverrideFn([](quic::TransportSettings &sts) {
+            sts.advertisedInitialMaxStreamsBidi = 100;
+            sts.advertisedInitialMaxStreamsUni = 100;
+            sts.datagramConfig.enabled = true;
+            sts.datagramConfig.sendDropOldDataFirst = true;
+        });
         server_->setQuicServerTransportFactory(
             std::make_unique<server_transport_factory>(ss, *scb_, cc_factory));
         folly::SocketAddress addr("127.0.0.1", 0);
@@ -288,13 +352,25 @@ public:
         client_transport_->setTransportSettings(ts);
 
         if (moq_session_create(&client_cfg_, 0, &client_session) < 0) return;
-        if (moq_session_start(client_session, 0) < 0) return;
+        /* A profile that must be bound to its transport starts from
+         * pump_client() once the handshake has completed. */
+        client_needs_binding_ = moq_session_binding_requirements(client_session) != 0;
+        if (!client_needs_binding_ && moq_session_start(client_session, 0) < 0) return;
 
         client_transport_->start(&start_cb_, &start_cb_);
 
         client_adapter = std::make_unique<moq::mvfst::adapter>(
             moq::mvfst::adapter::config::client(),
             client_session, client_transport_);
+        if (client_needs_binding_) {
+            client_adapter->on_transport_ready([this]() {
+                if (!client_needs_binding_) return;
+                if (bind_if_required(client_session, *client_transport_, true) != MOQ_OK ||
+                    moq_session_start(client_session, 0) < 0)
+                    client_fatal_.store(true);
+                client_needs_binding_ = false;
+            });
+        }
         init_ok = true;
     }
 
@@ -404,6 +480,14 @@ public:
                 client_transport_->getNumOpenableUnidirectionalStreams() > 0;
             if (!client_peer_credit_seen_) return;
         }
+        if (client_needs_binding_ && client_session && client_transport_) {
+            moq_result_t brc = bind_if_required(client_session, *client_transport_, true);
+            if (brc == MOQ_ERR_WOULD_BLOCK) return;
+            if (brc != MOQ_OK || moq_session_start(client_session, 0) < 0) {
+                client_fatal_.store(true); return;
+            }
+            client_needs_binding_ = false;
+        }
         if (client_adapter) {
             auto rc = client_adapter->service(0);
             if (rc < 0 || client_adapter->is_fatal())
@@ -467,6 +551,7 @@ private:
 
     std::atomic<bool> client_fatal_{false};
     bool client_peer_credit_seen_ = false;
+    bool client_needs_binding_ = false;
     std::unique_ptr<server_callback> scb_;
     std::shared_ptr<quic::QuicServer> server_;
     std::unique_ptr<folly::EventBase> client_evb_;

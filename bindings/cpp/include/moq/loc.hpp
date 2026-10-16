@@ -6,6 +6,9 @@
 #include <moq/result.hpp>
 #include <moq/types.hpp>
 
+#include <array>
+#include <optional>
+
 namespace moq::loc {
 
 /*
@@ -134,6 +137,74 @@ inline result<buffer> encode(transport_version tv, profile p, const headers &h,
     if (rc < 0)
         return errc_from_result(rc);
 
+    return buffer::adopt(raw);
+}
+
+/*
+ * Lossless LOC companion metadata (moq_loc_parse_metadata /
+ * moq_loc_encode_metadata). The LOC profile follows the transport version
+ * (moq_loc_profile_for_version: LOC-01 on drafts 16 and 18, LOC-04 on draft
+ * 22), so no profile is named here. Values are raw: timestamp ticks and
+ * timescale units, the marking payload's 1..4 bytes verbatim, the audio level
+ * byte with its V bit. The configs borrow the parsed property bytes; on
+ * encode they are borrowed for the call.
+ */
+struct metadata {
+    std::optional<uint64_t>   timestamp    = {};
+    std::optional<uint64_t>   timescale    = {};
+    uint8_t                   marking_len  = 0;   /* 0: no marking */
+    std::array<uint8_t, 4>    marking      = {};
+    std::optional<uint8_t>    audio_level  = {};
+    std::optional<bytes_view> video_config = {};
+    std::optional<bytes_view> audio_config = {};
+};
+
+inline result<metadata> parse_metadata(transport_version tv, bytes_view properties)
+{
+    moq_loc_profile_t p = moq_loc_profile_for_version(tv);
+    if (p == 0)
+        return errc::invalid;
+    moq_loc_metadata_t c;
+    moq_loc_metadata_init_sized(&c, sizeof(c));
+    moq_result_t rc = moq_loc_parse_metadata(tv, p, properties.raw(), &c, sizeof(c));
+    if (rc < 0)
+        return errc_from_result(rc);
+    metadata m;
+    if (c.present & MOQ_LOC_METADATA_HAS_TIMESTAMP) m.timestamp = c.timestamp;
+    if (c.present & MOQ_LOC_METADATA_HAS_TIMESCALE) m.timescale = c.timescale;
+    if (c.present & MOQ_LOC_METADATA_HAS_MARKING) {
+        m.marking_len = c.marking_len;
+        for (size_t i = 0; i < c.marking_len && i < m.marking.size(); i++)
+            m.marking[i] = c.marking[i];
+    }
+    if (c.present & MOQ_LOC_METADATA_HAS_AUDIO_LEVEL) m.audio_level = c.audio_level;
+    if (c.present & MOQ_LOC_METADATA_HAS_VIDEO_CONFIG) m.video_config = bytes_view(c.video_config);
+    if (c.present & MOQ_LOC_METADATA_HAS_AUDIO_CONFIG) m.audio_config = bytes_view(c.audio_config);
+    return m;
+}
+
+inline result<buffer> encode_metadata(transport_version tv, const metadata &m,
+                                      const moq_alloc_t *alloc = moq_alloc_default())
+{
+    moq_loc_profile_t p = moq_loc_profile_for_version(tv);
+    if (p == 0 || m.marking_len > m.marking.size())
+        return errc::invalid;
+    moq_loc_metadata_t c;
+    moq_loc_metadata_init_sized(&c, sizeof(c));
+    if (m.timestamp) { c.present |= MOQ_LOC_METADATA_HAS_TIMESTAMP; c.timestamp = *m.timestamp; }
+    if (m.timescale) { c.present |= MOQ_LOC_METADATA_HAS_TIMESCALE; c.timescale = *m.timescale; }
+    if (m.marking_len) {
+        c.present |= MOQ_LOC_METADATA_HAS_MARKING;
+        c.marking_len = m.marking_len;
+        for (size_t i = 0; i < m.marking_len; i++) c.marking[i] = m.marking[i];
+    }
+    if (m.audio_level) { c.present |= MOQ_LOC_METADATA_HAS_AUDIO_LEVEL; c.audio_level = *m.audio_level; }
+    if (m.video_config) { c.present |= MOQ_LOC_METADATA_HAS_VIDEO_CONFIG; c.video_config = m.video_config->raw(); }
+    if (m.audio_config) { c.present |= MOQ_LOC_METADATA_HAS_AUDIO_CONFIG; c.audio_config = m.audio_config->raw(); }
+    moq_rcbuf_t *raw = nullptr;
+    moq_result_t rc = moq_loc_encode_metadata(alloc, tv, p, &c, &raw);
+    if (rc < 0)
+        return errc_from_result(rc);
     return buffer::adopt(raw);
 }
 

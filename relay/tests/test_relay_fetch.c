@@ -1199,10 +1199,1174 @@ test_chunked_fetch_payload_outlives_core(void)
     return failures;
 }
 
+/* -- gap reporting ----------------------------------------------------------- *
+ * A report_gaps fetch surfaces every run of Locations the log does not hold
+ * as a GAP item ending at the Location before the next retained object (or at
+ * the range end), recomputed on each peek so an arrival inside the run closes
+ * it; the same range without report_gaps passes over the holes silently. */
+static int
+test_gap_items(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, 0, 0, 0);
+    MOQ_TEST_CHECK(c != NULL);
+    moqr_binding_t pub, sub;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 1, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 2, &sub) == MOQR_OK);
+    moqr_track_t t;
+    MOQ_TEST_CHECK(mktrack(c, pub, "v", &t) == MOQR_OK);
+    /* Group 0 holds {0, 2}; group 1 is absent; group 2 holds {0, 1}. */
+    MOQ_TEST_CHECK(ing(c, &a, t, 0, 0, 0) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, t, 0, 0, 2) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, t, 2, 0, 0) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, t, 2, 0, 1) == MOQR_OK);
+
+    moq_bytes_t nsb[1];
+    moqr_fetch_req_t r;
+    fetch_req(&r, "v", nsb, 0, 0, 2, 2);   /* [0:0 .. 2:1] inclusive */
+    moqr_fetch_t fh;
+    moqr_fetch_plan_t plan;
+    moqr_fetch_item_t it;
+
+    /* Without report_gaps: the four objects, no GAP item (unchanged). */
+    MOQ_TEST_CHECK(moqr_core_fetch_open(c, sub, &r, FNOW, &fh, &plan) == MOQR_OK);
+    MOQ_TEST_CHECK(plan.admit == MOQR_FETCH_ACCEPT);
+    fitem_t got[8];
+    int pf = 0;
+    MOQ_TEST_CHECK_EQ_INT(collect(c, fh, got, 8, &pf), 4);
+    failures += pf;
+    MOQ_TEST_CHECK(moqr_core_fetch_close(c, fh) == MOQR_OK);
+
+    /* With report_gaps: object, gap, object, then -- group 0's extent ends at
+     * {0,2} and group 1 was never seen, so neither is a run -- object, object,
+     * end. */
+    r.report_gaps = true;
+    MOQ_TEST_CHECK(moqr_core_fetch_open(c, sub, &r, FNOW, &fh, &plan) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, FNOW, &it) == MOQR_OK);
+    MOQ_TEST_CHECK(it.kind == MOQR_FETCH_ITEM_OBJECT && it.rec.group_id == 0 &&
+                   it.rec.object_id == 0);
+    MOQ_TEST_CHECK(moqr_core_fetch_commit(c, fh) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, FNOW, &it) == MOQR_OK);
+    MOQ_TEST_CHECK(it.kind == MOQR_FETCH_ITEM_GAP);
+    MOQ_TEST_CHECK_EQ_U64(it.rec.group_id, 0);
+    MOQ_TEST_CHECK_EQ_U64(it.rec.object_id, 1);
+    MOQ_TEST_CHECK(it.rec.payload == NULL);
+    /* The run is not held: a re-peek says the same while nothing changed... */
+    MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, FNOW, &it) == MOQR_OK);
+    MOQ_TEST_CHECK(it.kind == MOQR_FETCH_ITEM_GAP && it.rec.object_id == 1);
+    /* ...and the missing object arriving closes it: the object is next. */
+    MOQ_TEST_CHECK(ing(c, &a, t, 0, 1, 1) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, FNOW, &it) == MOQR_OK);
+    MOQ_TEST_CHECK(it.kind == MOQR_FETCH_ITEM_OBJECT && it.rec.group_id == 0 &&
+                   it.rec.object_id == 1);
+    MOQ_TEST_CHECK(moqr_core_fetch_commit(c, fh) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, FNOW, &it) == MOQR_OK);
+    MOQ_TEST_CHECK(it.kind == MOQR_FETCH_ITEM_OBJECT && it.rec.object_id == 2);
+    MOQ_TEST_CHECK(moqr_core_fetch_commit(c, fh) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, FNOW, &it) == MOQR_OK);
+    MOQ_TEST_CHECK(it.kind == MOQR_FETCH_ITEM_OBJECT && it.rec.group_id == 2 &&
+                   it.rec.object_id == 0);
+    MOQ_TEST_CHECK(moqr_core_fetch_commit(c, fh) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, FNOW, &it) == MOQR_OK);
+    MOQ_TEST_CHECK(it.kind == MOQR_FETCH_ITEM_OBJECT && it.rec.object_id == 1);
+    MOQ_TEST_CHECK(moqr_core_fetch_commit(c, fh) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, FNOW, &it) == MOQR_OK);
+    MOQ_TEST_CHECK(it.kind == MOQR_FETCH_ITEM_END);
+    MOQ_TEST_CHECK(moqr_core_fetch_close(c, fh) == MOQR_OK);
+
+    /* A trailing run: the range ends inside a hole below Largest. Group 4
+     * holds {0, 3}; the range [4:0 .. 4:2] ends at a Location nothing is
+     * retained for, so the run after {4,0} ends at the range end. */
+    MOQ_TEST_CHECK(ing(c, &a, t, 4, 0, 0) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, t, 4, 0, 3) == MOQR_OK);
+    fetch_req(&r, "v", nsb, 4, 0, 4, 3);
+    r.report_gaps = true;
+    MOQ_TEST_CHECK(moqr_core_fetch_open(c, sub, &r, FNOW, &fh, &plan) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, FNOW, &it) == MOQR_OK);
+    MOQ_TEST_CHECK(it.kind == MOQR_FETCH_ITEM_OBJECT && it.rec.object_id == 0);
+    MOQ_TEST_CHECK(moqr_core_fetch_commit(c, fh) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, FNOW, &it) == MOQR_OK);
+    MOQ_TEST_CHECK(it.kind == MOQR_FETCH_ITEM_GAP);
+    MOQ_TEST_CHECK_EQ_U64(it.rec.group_id, 4);
+    MOQ_TEST_CHECK_EQ_U64(it.rec.object_id, 2);
+    MOQ_TEST_CHECK(moqr_core_fetch_commit(c, fh) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, FNOW, &it) == MOQR_OK);
+    MOQ_TEST_CHECK(it.kind == MOQR_FETCH_ITEM_END);
+    MOQ_TEST_CHECK(moqr_core_fetch_close(c, fh) == MOQR_OK);
+
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("gap_items");
+    return failures;
+}
+
+/* A group's extent bounds its runs: a status object at a Location is a known
+ * non-object (stepped over, never reported, and never the end of a run), the
+ * holes below an END_OF_GROUP marker are a run up to the Location before it,
+ * and a whole-group range end reports nothing past the last retained id. A
+ * group opening with holes before its first object reports them. */
+static int
+test_gap_extent(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, 0, 0, 0);
+    MOQ_TEST_CHECK(c != NULL);
+    moqr_binding_t pub, sub;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 1, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 2, &sub) == MOQR_OK);
+    moqr_track_t t;
+    MOQ_TEST_CHECK(mktrack(c, pub, "v", &t) == MOQR_OK);
+    /* Group 0: {0, 1} then END_OF_GROUP at 2 (final 2). Group 1: {0, 2}, no
+     * final. Group 2: {0}, END_OF_GROUP at 3 (final 3). Group 3: {0, 1}. */
+    MOQ_TEST_CHECK(ing(c, &a, t, 0, 0, 0) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, t, 0, 0, 1) == MOQR_OK);
+    MOQ_TEST_CHECK(ing_status(c, t, 0, 0, 2, MOQR_OBJ_END_OF_GROUP) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, t, 1, 0, 0) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, t, 1, 0, 2) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, t, 2, 0, 0) == MOQR_OK);
+    MOQ_TEST_CHECK(ing_status(c, t, 2, 0, 3, MOQR_OBJ_END_OF_GROUP) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, t, 3, 0, 0) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, t, 3, 0, 1) == MOQR_OK);
+
+    moq_bytes_t nsb[1];
+    moqr_fetch_req_t r;
+    moqr_fetch_t fh;
+    moqr_fetch_plan_t plan;
+    moqr_fetch_item_t it;
+
+    /* [0:0 .. 1:0]: the ended group 0 reports no gap at its marker or past
+     * its final; group 1's first object follows directly. */
+    fetch_req(&r, "v", nsb, 0, 0, 1, 1);
+    r.report_gaps = true;
+    MOQ_TEST_CHECK(moqr_core_fetch_open(c, sub, &r, FNOW, &fh, &plan) == MOQR_OK);
+    uint64_t seen[4] = { 0, 0, 0, 0 };
+    int n = 0;
+    for (;;) {
+        MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, FNOW, &it) == MOQR_OK);
+        if (it.kind == MOQR_FETCH_ITEM_END) {
+            break;
+        }
+        MOQ_TEST_CHECK(it.kind == MOQR_FETCH_ITEM_OBJECT);
+        if (n < 4) {
+            seen[n] = it.rec.group_id * 16 + it.rec.object_id;
+        }
+        n++;
+        MOQ_TEST_CHECK(moqr_core_fetch_commit(c, fh) == MOQR_OK);
+        if (n > 4) {
+            break;
+        }
+    }
+    MOQ_TEST_CHECK_EQ_INT(n, 3);
+    MOQ_TEST_CHECK(seen[0] == 0x00 && seen[1] == 0x01 && seen[2] == 0x10);
+    MOQ_TEST_CHECK(moqr_core_fetch_close(c, fh) == MOQR_OK);
+
+    /* Whole group 1 (no end marker): {1,0}, gap {1,1}, {1,2}, then the end --
+     * nothing past {1,2} is evidenced. */
+    fetch_req(&r, "v", nsb, 1, 0, 1, 0);
+    r.report_gaps = true;
+    MOQ_TEST_CHECK(moqr_core_fetch_open(c, sub, &r, FNOW, &fh, &plan) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, FNOW, &it) == MOQR_OK);
+    MOQ_TEST_CHECK(it.kind == MOQR_FETCH_ITEM_OBJECT && it.rec.object_id == 0);
+    MOQ_TEST_CHECK(moqr_core_fetch_commit(c, fh) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, FNOW, &it) == MOQR_OK);
+    MOQ_TEST_CHECK(it.kind == MOQR_FETCH_ITEM_GAP && it.rec.group_id == 1 &&
+                   it.rec.object_id == 1);
+    MOQ_TEST_CHECK(moqr_core_fetch_commit(c, fh) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, FNOW, &it) == MOQR_OK);
+    MOQ_TEST_CHECK(it.kind == MOQR_FETCH_ITEM_OBJECT && it.rec.object_id == 2);
+    MOQ_TEST_CHECK(moqr_core_fetch_commit(c, fh) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, FNOW, &it) == MOQR_OK);
+    MOQ_TEST_CHECK(it.kind == MOQR_FETCH_ITEM_END);
+    MOQ_TEST_CHECK(moqr_core_fetch_close(c, fh) == MOQR_OK);
+
+    /* Whole group 2 (END_OF_GROUP marker at 3): {2,0}, then the run
+     * {2,1}..{2,2} -- the marker's own Location is not an object. */
+    fetch_req(&r, "v", nsb, 2, 0, 2, 0);
+    r.report_gaps = true;
+    MOQ_TEST_CHECK(moqr_core_fetch_open(c, sub, &r, FNOW, &fh, &plan) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, FNOW, &it) == MOQR_OK);
+    MOQ_TEST_CHECK(it.kind == MOQR_FETCH_ITEM_OBJECT && it.rec.object_id == 0);
+    MOQ_TEST_CHECK(moqr_core_fetch_commit(c, fh) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, FNOW, &it) == MOQR_OK);
+    MOQ_TEST_CHECK(it.kind == MOQR_FETCH_ITEM_GAP && it.rec.group_id == 2 &&
+                   it.rec.object_id == 2);
+    MOQ_TEST_CHECK(moqr_core_fetch_commit(c, fh) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, FNOW, &it) == MOQR_OK);
+    MOQ_TEST_CHECK(it.kind == MOQR_FETCH_ITEM_END);
+    MOQ_TEST_CHECK(moqr_core_fetch_close(c, fh) == MOQR_OK);
+
+    /* A group opening with holes: group 5 holds {2}; a range from {3,0}
+     * passes group 3's end and the unseen group 4 silently, then reports
+     * {5,0}..{5,1} before the object. */
+    MOQ_TEST_CHECK(ing(c, &a, t, 5, 0, 2) == MOQR_OK);
+    fetch_req(&r, "v", nsb, 3, 0, 5, 3);
+    r.report_gaps = true;
+    MOQ_TEST_CHECK(moqr_core_fetch_open(c, sub, &r, FNOW, &fh, &plan) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, FNOW, &it) == MOQR_OK);
+    MOQ_TEST_CHECK(it.kind == MOQR_FETCH_ITEM_OBJECT && it.rec.group_id == 3);
+    MOQ_TEST_CHECK(moqr_core_fetch_commit(c, fh) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, FNOW, &it) == MOQR_OK);
+    MOQ_TEST_CHECK(it.kind == MOQR_FETCH_ITEM_OBJECT && it.rec.group_id == 3);
+    MOQ_TEST_CHECK(moqr_core_fetch_commit(c, fh) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, FNOW, &it) == MOQR_OK);
+    MOQ_TEST_CHECK(it.kind == MOQR_FETCH_ITEM_GAP && it.rec.group_id == 5 &&
+                   it.rec.object_id == 1);
+    MOQ_TEST_CHECK(moqr_core_fetch_commit(c, fh) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, FNOW, &it) == MOQR_OK);
+    MOQ_TEST_CHECK(it.kind == MOQR_FETCH_ITEM_OBJECT && it.rec.group_id == 5 &&
+                   it.rec.object_id == 2);
+    MOQ_TEST_CHECK(moqr_core_fetch_commit(c, fh) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, FNOW, &it) == MOQR_OK);
+    MOQ_TEST_CHECK(it.kind == MOQR_FETCH_ITEM_END);
+    MOQ_TEST_CHECK(moqr_core_fetch_close(c, fh) == MOQR_OK);
+
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("gap_extent");
+    return failures;
+}
+
+/* Peek the head item and check its kind and Location; commit it. */
+static int
+expect_item(moqr_core_t *c, moqr_fetch_t fh, moqr_fetch_item_kind_t kind,
+            uint64_t g, uint64_t o, int line)
+{
+    int failures = 0;
+    moqr_fetch_item_t it;
+    moqr_result_t rc = moqr_core_fetch_peek(c, fh, FNOW, &it);
+    if (rc != MOQR_OK || it.kind != kind ||
+        (kind != MOQR_FETCH_ITEM_END &&
+         (it.rec.group_id != g || it.rec.object_id != o))) {
+        printf("FAIL: %s:%d: got rc %d kind %u {%llu,%llu}, want kind %u "
+               "{%llu,%llu}\n",
+               __FILE__, line, (int)rc, (unsigned)it.kind,
+               (unsigned long long)it.rec.group_id,
+               (unsigned long long)it.rec.object_id, (unsigned)kind,
+               (unsigned long long)g, (unsigned long long)o);
+        return 1;
+    }
+    if (kind != MOQR_FETCH_ITEM_END) {
+        MOQ_TEST_CHECK(moqr_core_fetch_commit(c, fh) == MOQR_OK);
+    }
+    return failures;
+}
+#define EXPECT(kind, g, o) failures += expect_item(c, fh, (kind), (g), (o), __LINE__)
+#define OBJ MOQR_FETCH_ITEM_OBJECT
+#define GAP MOQR_FETCH_ITEM_GAP
+#define UNK MOQR_FETCH_ITEM_UNKNOWN
+#define FEND MOQR_FETCH_ITEM_END
+
+/* With report_unknown every Location of the range is accounted for: served,
+ * reported, or known not to exist. The tail of a group whose final object is
+ * not known, and every group the log never saw, are runs of unknown state; a
+ * run ends just before the next group the log holds, or at the range end.
+ * Past a known final nothing is reported. Holes keep their own kind, and an
+ * object arriving inside an unknown run is served in order. */
+static int
+test_unknown_items(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, 0, 0, 0);
+    MOQ_TEST_CHECK(c != NULL);
+    moqr_binding_t pub, sub;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 1, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 2, &sub) == MOQR_OK);
+    moqr_track_t t;
+    MOQ_TEST_CHECK(mktrack(c, pub, "v", &t) == MOQR_OK);
+    /* Group 0: {0, 1}, its subgroup FIN'd without END_OF_GROUP (final
+     * unknown). Group 1: never seen. Group 2: {0, 2}, END_OF_GROUP at 3.
+     * Group 3: {1} (opens with a hole), final unknown. Group 4: {0, 1} on a
+     * subgroup whose header carried END_OF_GROUP, FIN'd (final 1). Group 5:
+     * {0}. */
+    MOQ_TEST_CHECK(ing(c, &a, t, 0, 0, 0) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, t, 0, 0, 1) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_seal_subgroup(c, t, 0, 0) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, t, 2, 0, 0) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, t, 2, 0, 2) == MOQR_OK);
+    MOQ_TEST_CHECK(ing_status(c, t, 2, 0, 3, MOQR_OBJ_END_OF_GROUP) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, t, 3, 0, 1) == MOQR_OK);
+    for (uint64_t o = 0; o < 2; o++) {
+        uint8_t body[8] = { 0 };
+        moq_rcbuf_t *pl = NULL;
+        MOQ_TEST_CHECK(moq_rcbuf_create(&a.vt, body, sizeof(body), &pl) == 0);
+        moqr_log_append_desc_t d;
+        moqr_log_append_desc_init(&d);
+        d.group_id = 4;
+        d.object_id = o;
+        d.publisher_priority = 128;
+        d.end_of_group = true;
+        d.payload = pl;
+        d.now_us = 1;
+        MOQ_TEST_CHECK(moqr_core_ingest(c, t, &d) == MOQR_OK);
+    }
+    MOQ_TEST_CHECK(moqr_core_seal_subgroup(c, t, 4, 0) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, t, 5, 0, 0) == MOQR_OK);
+
+    moq_bytes_t nsb[1];
+    moqr_fetch_req_t r;
+    moqr_fetch_t fh;
+    moqr_fetch_plan_t plan;
+
+    /* The whole track to Largest {5,0}. */
+    fetch_req(&r, "v", nsb, 0, 0, 5, 1);
+    r.report_gaps = true;
+    r.report_unknown = true;
+    MOQ_TEST_CHECK(moqr_core_fetch_open(c, sub, &r, FNOW, &fh, &plan) == MOQR_OK);
+    MOQ_TEST_CHECK(plan.admit == MOQR_FETCH_ACCEPT);
+    EXPECT(OBJ, 0, 0);
+    EXPECT(OBJ, 0, 1);
+    EXPECT(UNK, 1, UINT64_MAX);   /* group 0's tail and the unseen group 1 */
+    EXPECT(OBJ, 2, 0);
+    EXPECT(GAP, 2, 1);
+    EXPECT(OBJ, 2, 2);            /* nothing past END_OF_GROUP at 3 */
+    EXPECT(GAP, 3, 0);
+    EXPECT(OBJ, 3, 1);
+    EXPECT(UNK, 3, UINT64_MAX);   /* group 3's tail */
+    EXPECT(OBJ, 4, 0);
+    EXPECT(OBJ, 4, 1);            /* nothing past the header-EOG final */
+    EXPECT(OBJ, 5, 0);
+    EXPECT(FEND, 0, 0);
+    MOQ_TEST_CHECK(moqr_core_fetch_close(c, fh) == MOQR_OK);
+
+    /* The same range without report_unknown: the holes only, as before. */
+    r.report_unknown = false;
+    MOQ_TEST_CHECK(moqr_core_fetch_open(c, sub, &r, FNOW, &fh, &plan) == MOQR_OK);
+    EXPECT(OBJ, 0, 0);
+    EXPECT(OBJ, 0, 1);
+    EXPECT(OBJ, 2, 0);
+    EXPECT(GAP, 2, 1);
+    EXPECT(OBJ, 2, 2);
+    EXPECT(GAP, 3, 0);
+    EXPECT(OBJ, 3, 1);
+    EXPECT(OBJ, 4, 0);
+    EXPECT(OBJ, 4, 1);
+    EXPECT(OBJ, 5, 0);
+    EXPECT(FEND, 0, 0);
+    MOQ_TEST_CHECK(moqr_core_fetch_close(c, fh) == MOQR_OK);
+
+    /* report_unknown is read only with report_gaps: the objects alone. */
+    r.report_gaps = false;
+    r.report_unknown = true;
+    MOQ_TEST_CHECK(moqr_core_fetch_open(c, sub, &r, FNOW, &fh, &plan) == MOQR_OK);
+    fitem_t got[16];
+    int pf = 0;
+    MOQ_TEST_CHECK_EQ_INT(collect(c, fh, got, 16, &pf), 8);
+    failures += pf;
+    MOQ_TEST_CHECK(moqr_core_fetch_close(c, fh) == MOQR_OK);
+
+    /* A range ending inside an unfinished group's tail ends the run there;
+     * a whole-group end runs it to the group's last id. */
+    fetch_req(&r, "v", nsb, 0, 0, 0, 6);   /* [0:0 .. 0:5] */
+    r.report_gaps = true;
+    r.report_unknown = true;
+    MOQ_TEST_CHECK(moqr_core_fetch_open(c, sub, &r, FNOW, &fh, &plan) == MOQR_OK);
+    EXPECT(OBJ, 0, 0);
+    EXPECT(OBJ, 0, 1);
+    EXPECT(UNK, 0, 5);
+    EXPECT(FEND, 0, 0);
+    MOQ_TEST_CHECK(moqr_core_fetch_close(c, fh) == MOQR_OK);
+    fetch_req(&r, "v", nsb, 3, 0, 3, 0);   /* whole group 3 */
+    r.report_gaps = true;
+    r.report_unknown = true;
+    MOQ_TEST_CHECK(moqr_core_fetch_open(c, sub, &r, FNOW, &fh, &plan) == MOQR_OK);
+    EXPECT(GAP, 3, 0);
+    EXPECT(OBJ, 3, 1);
+    EXPECT(UNK, 3, UINT64_MAX);
+    EXPECT(FEND, 0, 0);
+    MOQ_TEST_CHECK(moqr_core_fetch_close(c, fh) == MOQR_OK);
+
+    /* A range starting in the unseen group opens with the run; an object
+     * that lands inside it is served in order, and the run resumes after
+     * it. */
+    fetch_req(&r, "v", nsb, 1, 0, 2, 1);   /* [1:0 .. 2:0] */
+    r.report_gaps = true;
+    r.report_unknown = true;
+    MOQ_TEST_CHECK(moqr_core_fetch_open(c, sub, &r, FNOW, &fh, &plan) == MOQR_OK);
+    moqr_fetch_item_t it;
+    MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, FNOW, &it) == MOQR_OK);
+    MOQ_TEST_CHECK(it.kind == UNK && it.rec.group_id == 1 &&
+                   it.rec.object_id == UINT64_MAX && it.rec.payload == NULL);
+    MOQ_TEST_CHECK(ing(c, &a, t, 1, 0, 4) == MOQR_OK);
+    EXPECT(GAP, 1, 3);            /* group 1 now opens with a hole */
+    EXPECT(OBJ, 1, 4);
+    EXPECT(UNK, 1, UINT64_MAX);
+    EXPECT(OBJ, 2, 0);
+    EXPECT(FEND, 0, 0);
+    MOQ_TEST_CHECK(moqr_core_fetch_close(c, fh) == MOQR_OK);
+
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("unknown_items");
+    return failures;
+}
+#undef EXPECT
+#undef OBJ
+#undef GAP
+#undef UNK
+#undef FEND
+
+/* A caller built before report_gaps was appended: its struct ends at cookie
+ * and struct_size is that layout's sizeof. The field it never had -- set true
+ * in current storage past struct_size, absent from an exact heap block -- is
+ * not read: the holes pass silently, as for any request without it. */
+static int
+test_gap_items_old_caller(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, 0, 0, 0);
+    MOQ_TEST_CHECK(c != NULL);
+    moqr_binding_t pub, sub;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 1, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 2, &sub) == MOQR_OK);
+    moqr_track_t t;
+    MOQ_TEST_CHECK(mktrack(c, pub, "v", &t) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, t, 0, 0, 0) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, t, 0, 0, 2) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, t, 2, 0, 0) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, t, 2, 0, 1) == MOQR_OK);
+
+    const size_t end = offsetof(moqr_fetch_req_t, cookie) + sizeof(uint64_t);
+    const size_t align = _Alignof(moqr_fetch_req_t);
+    const size_t old = (end + align - 1) / align * align;
+    MOQ_TEST_CHECK(offsetof(moqr_fetch_req_t, report_gaps) >= old);
+
+    moq_bytes_t nsb[1];
+    moqr_fetch_req_t r;
+    fetch_req(&r, "v", nsb, 0, 0, 2, 2);
+    r.report_gaps = true;
+    r.struct_size = (uint32_t)old;
+    for (int view = 0; view < 2; view++) {
+        unsigned char *blk = NULL;
+        const moqr_fetch_req_t *rq = &r;
+        if (view == 0) {
+            blk = malloc(old);
+            MOQ_TEST_CHECK(blk != NULL);
+            if (blk == NULL) {
+                continue;
+            }
+            memcpy(blk, &r, end);
+            memset(blk + end, 0xA5, old - end);
+            rq = (const moqr_fetch_req_t *)(const void *)blk;
+        }
+        moqr_fetch_t fh;
+        moqr_fetch_plan_t plan;
+        MOQ_TEST_CHECK(moqr_core_fetch_open(c, sub, rq, FNOW, &fh, &plan) == MOQR_OK);
+        MOQ_TEST_CHECK(plan.admit == MOQR_FETCH_ACCEPT);
+        fitem_t got[8];
+        int pf = 0;
+        MOQ_TEST_CHECK_EQ_INT(collect(c, fh, got, 8, &pf), 4);
+        failures += pf;
+        MOQ_TEST_CHECK(moqr_core_fetch_close(c, fh) == MOQR_OK);
+        free(blk);
+    }
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("gap_items_old_caller");
+    return failures;
+}
+
+/* The sizeof of the request layout that ends at cookie: what a caller built
+ * before report_gaps was appended allocates and passes as struct_size. */
+#define FETCH_REQ_SIZE_THROUGH_COOKIE                                         \
+    ((offsetof(moqr_fetch_req_t, cookie) + sizeof(uint64_t) +                 \
+      _Alignof(moqr_fetch_req_t) - 1) /                                       \
+     _Alignof(moqr_fetch_req_t) * _Alignof(moqr_fetch_req_t))
+
+/* The initializer symbol -- what a caller built before report_gaps was
+ * appended reaches -- clears and stamps only the layout through cookie, never
+ * writing past that caller's storage. The header's macro gives a caller built
+ * against the current layout the whole struct. */
+static int
+test_fetch_req_init_old_caller(void)
+{
+    int failures = 0;
+    const size_t old = FETCH_REQ_SIZE_THROUGH_COOKIE;
+    union {
+        moqr_fetch_req_t r;
+        unsigned char b[sizeof(moqr_fetch_req_t) + 16];
+    } u;
+    memset(&u, 0xA5, sizeof(u));
+    (moqr_fetch_req_init)(&u.r);
+    MOQ_TEST_CHECK_EQ_U64(u.r.struct_size, old);
+    size_t nonzero = 0, past = 0;
+    for (size_t i = sizeof(uint32_t); i < old; i++) {
+        nonzero += u.b[i] != 0;
+    }
+    for (size_t i = old; i < sizeof(u); i++) {
+        past += u.b[i] != 0xA5;
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(nonzero, (size_t)0);
+    MOQ_TEST_CHECK_EQ_SIZE(past, (size_t)0);
+    /* An exact block of the old size: ASan reports any write past it. */
+    void *blk = malloc(old);
+    MOQ_TEST_CHECK(blk != NULL);
+    if (blk != NULL) {
+        (moqr_fetch_req_init)((moqr_fetch_req_t *)blk);
+        uint32_t stamped_size = 0;
+        memcpy(&stamped_size, blk, sizeof(stamped_size));
+        MOQ_TEST_CHECK_EQ_U64(stamped_size, old);
+        free(blk);
+    }
+
+    /* A caller built against the current header reaches the whole struct
+     * through the macro; the sized form never exceeds the size it is given. */
+    memset(&u, 0xA5, sizeof(u));
+    moqr_fetch_req_init(&u.r);
+    MOQ_TEST_CHECK_EQ_U64(u.r.struct_size, sizeof(moqr_fetch_req_t));
+    MOQ_TEST_CHECK(!u.r.report_gaps);
+    past = 0;
+    for (size_t i = sizeof(moqr_fetch_req_t); i < sizeof(u); i++) {
+        past += u.b[i] != 0xA5;
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(past, (size_t)0);
+    memset(&u, 0xA5, sizeof(u));
+    moqr_fetch_req_init_sized(&u.r, old);
+    MOQ_TEST_CHECK_EQ_U64(u.r.struct_size, old);
+    past = 0;
+    for (size_t i = old; i < sizeof(u); i++) {
+        past += u.b[i] != 0xA5;
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(past, (size_t)0);
+    MOQ_TEST_PASS("fetch_req_init_old_caller");
+    return failures;
+}
+
+#define EXPECT(kind, g, o) failures += expect_item(c, fh, (kind), (g), (o), __LINE__)
+#define OBJ MOQR_FETCH_ITEM_OBJECT
+#define GAP MOQR_FETCH_ITEM_GAP
+#define UNK MOQR_FETCH_ITEM_UNKNOWN
+#define FEND MOQR_FETCH_ITEM_END
+
+/* Open a request in the given range form over track "v" and return the plan
+ * (and the handle when accepted). */
+static moqr_fetch_plan_t
+open_form(moqr_core_t *c, moqr_binding_t sub, uint32_t form, uint64_t rel,
+          uint64_t sg, uint64_t so, uint64_t eg, uint64_t eo, moqr_fetch_t *fh,
+          int *pf)
+{
+    int failures = 0;
+    moq_bytes_t nsb[1];
+    moqr_fetch_req_t r;
+    fetch_req(&r, "v", nsb, sg, so, eg, eo);
+    r.range_form = form;
+    r.relative_start = rel;
+    r.report_gaps = true;
+    r.report_unknown = true;
+    moqr_fetch_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    *fh = MOQR_FETCH_INVALID;
+    MOQ_TEST_CHECK(moqr_core_fetch_open(c, sub, &r, FNOW, fh, &plan) == MOQR_OK);
+    *pf += failures;
+    return plan;
+}
+
+/* A range stated relative to the Largest Object resolves against the core's
+ * own Largest when the fetch is opened: a relative start N groups before the
+ * next group (clamped at group 0), a Next Object start, an end at the Largest
+ * Object. A start past the Largest Object -- the next group, the Next Object
+ * -- or a track with no Largest is INVALID_RANGE; the resolved range is the
+ * one served, and an Object arriving after the open is not part of it. */
+static int
+test_range_form(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, 0, 0, 0);
+    MOQ_TEST_CHECK(c != NULL);
+    moqr_binding_t pub, sub;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 1, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 2, &sub) == MOQR_OK);
+    moqr_track_t t;
+    MOQ_TEST_CHECK(mktrack(c, pub, "v", &t) == MOQR_OK);
+    moqr_fetch_t fh;
+    moqr_fetch_plan_t p;
+    const uint32_t REL = MOQR_FETCH_START_RELATIVE;
+    const uint32_t NXT = MOQR_FETCH_START_NEXT_OBJECT;
+    const uint32_t LRG = MOQR_FETCH_END_AT_LARGEST;
+
+    /* No Largest yet: every form is INVALID_RANGE. */
+    p = open_form(c, sub, REL | LRG, 1, 0, 0, 0, 0, &fh, &failures);
+    MOQ_TEST_CHECK(p.admit == MOQR_FETCH_REJECT && p.error_code == 0x11u);
+    MOQ_TEST_CHECK(!moqr_fetch_is_valid(fh));
+
+    /* Largest {3,2}: groups 1..3, two objects each plus {3,2}. */
+    for (uint64_t g = 1; g <= 3; g++) {
+        MOQ_TEST_CHECK(ing(c, &a, t, g, 0, 0) == MOQR_OK);
+        MOQ_TEST_CHECK(ing(c, &a, t, g, 0, 1) == MOQR_OK);
+    }
+    MOQ_TEST_CHECK(ing(c, &a, t, 3, 0, 2) == MOQR_OK);
+    MOQ_TEST_CHECK(ing_status(c, t, 1, 0, 2, MOQR_OBJ_END_OF_GROUP) == MOQR_OK);
+    MOQ_TEST_CHECK(ing_status(c, t, 2, 0, 2, MOQR_OBJ_END_OF_GROUP) == MOQR_OK);
+
+    /* Relative 1: the Largest Object's own group, through it. The start
+     * fields are ignored for the part the form names. */
+    p = open_form(c, sub, REL | LRG, 1, 9, 9, 0, 0, &fh, &failures);
+    MOQ_TEST_CHECK(p.admit == MOQR_FETCH_ACCEPT);
+    MOQ_TEST_CHECK(p.end_group == 3 && p.end_object == 3 && !p.end_of_track);
+    /* Ingested after the open: past the resolved End, so not served. */
+    MOQ_TEST_CHECK(ing(c, &a, t, 3, 0, 3) == MOQR_OK);
+    EXPECT(OBJ, 3, 0);
+    EXPECT(OBJ, 3, 1);
+    EXPECT(OBJ, 3, 2);
+    EXPECT(FEND, 0, 0);
+    MOQ_TEST_CHECK(moqr_core_fetch_close(c, fh) == MOQR_OK);
+
+    /* Largest is now {3,3}. Relative 2: from group 2. */
+    p = open_form(c, sub, REL | LRG, 2, 0, 0, 0, 0, &fh, &failures);
+    MOQ_TEST_CHECK(p.admit == MOQR_FETCH_ACCEPT);
+    MOQ_TEST_CHECK(p.end_group == 3 && p.end_object == 4);
+    EXPECT(OBJ, 2, 0);
+    EXPECT(OBJ, 2, 1);
+    EXPECT(OBJ, 3, 0);
+    EXPECT(OBJ, 3, 1);
+    EXPECT(OBJ, 3, 2);
+    EXPECT(OBJ, 3, 3);
+    EXPECT(FEND, 0, 0);
+    MOQ_TEST_CHECK(moqr_core_fetch_close(c, fh) == MOQR_OK);
+
+    /* A relative start further back than group 0 clamps there; the log
+     * starts at group 1, so what precedes it is one evicted-prefix marker. */
+    p = open_form(c, sub, REL | LRG, 9, 0, 0, 0, 0, &fh, &failures);
+    MOQ_TEST_CHECK(p.admit == MOQR_FETCH_ACCEPT);
+    {
+        moqr_fetch_item_t mk;
+        MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, FNOW, &mk) == MOQR_OK);
+        MOQ_TEST_CHECK(mk.kind == MOQR_FETCH_ITEM_MARKER && mk.marker_group == 1);
+        MOQ_TEST_CHECK(moqr_core_fetch_commit(c, fh) == MOQR_OK);
+    }
+    EXPECT(OBJ, 1, 0);
+    MOQ_TEST_CHECK(moqr_core_fetch_close(c, fh) == MOQR_OK);
+
+    /* Absolute start, end at the Largest Object. */
+    p = open_form(c, sub, LRG, 0, 3, 2, 0, 0, &fh, &failures);
+    MOQ_TEST_CHECK(p.admit == MOQR_FETCH_ACCEPT);
+    MOQ_TEST_CHECK(p.end_group == 3 && p.end_object == 4);
+    EXPECT(OBJ, 3, 2);
+    EXPECT(OBJ, 3, 3);
+    EXPECT(FEND, 0, 0);
+    MOQ_TEST_CHECK(moqr_core_fetch_close(c, fh) == MOQR_OK);
+
+    /* Past the Largest Object: the next group, the Next Object, and an
+     * absolute start after it. None allocates a cursor. */
+    p = open_form(c, sub, REL | LRG, 0, 0, 0, 0, 0, &fh, &failures);
+    MOQ_TEST_CHECK(p.admit == MOQR_FETCH_REJECT && p.error_code == 0x11u);
+    MOQ_TEST_CHECK(!moqr_fetch_is_valid(fh));
+    p = open_form(c, sub, NXT | LRG, 0, 0, 0, 0, 0, &fh, &failures);
+    MOQ_TEST_CHECK(p.admit == MOQR_FETCH_REJECT && p.error_code == 0x11u);
+    p = open_form(c, sub, LRG, 0, 3, 4, 0, 0, &fh, &failures);
+    MOQ_TEST_CHECK(p.admit == MOQR_FETCH_REJECT && p.error_code == 0x11u);
+    /* A relative start with an explicit end: the end still clamps at the
+     * Largest Object. */
+    p = open_form(c, sub, REL, 2, 0, 0, 9, 0, &fh, &failures);
+    MOQ_TEST_CHECK(p.admit == MOQR_FETCH_ACCEPT);
+    MOQ_TEST_CHECK(p.end_group == 3 && p.end_object == 4);
+    MOQ_TEST_CHECK(moqr_core_fetch_close(c, fh) == MOQR_OK);
+
+    /* Unknown bits, or two starts, are refused outright. */
+    moq_bytes_t nsb[1];
+    moqr_fetch_req_t r;
+    moqr_fetch_plan_t plan;
+    fetch_req(&r, "v", nsb, 0, 0, 0, 0);
+    r.range_form = 0x8u;
+    MOQ_TEST_CHECK(moqr_core_fetch_open(c, sub, &r, FNOW, &fh, &plan) ==
+                   MOQR_ERR_INVAL);
+    r.range_form = REL | NXT;
+    MOQ_TEST_CHECK(moqr_core_fetch_open(c, sub, &r, FNOW, &fh, &plan) ==
+                   MOQR_ERR_INVAL);
+
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("range_form");
+    return failures;
+}
+
+/* A request sized before the range form never has it read: the explicit
+ * range is served, whatever the bytes past that caller's struct hold. */
+static int
+test_range_form_old_caller(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, 0, 0, 0);
+    MOQ_TEST_CHECK(c != NULL);
+    moqr_binding_t pub, sub;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 1, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 2, &sub) == MOQR_OK);
+    moqr_track_t t;
+    MOQ_TEST_CHECK(mktrack(c, pub, "v", &t) == MOQR_OK);
+    for (uint64_t g = 0; g <= 2; g++) {
+        MOQ_TEST_CHECK(ing(c, &a, t, g, 0, 0) == MOQR_OK);
+    }
+    const size_t end = offsetof(moqr_fetch_req_t, report_unknown) + sizeof(bool);
+    const size_t align = _Alignof(moqr_fetch_req_t);
+    const size_t old = (end + align - 1) / align * align;
+    MOQ_TEST_CHECK(offsetof(moqr_fetch_req_t, relative_start) >= old);
+    moq_bytes_t nsb[1];
+    moqr_fetch_req_t r;
+    fetch_req(&r, "v", nsb, 0, 0, 1, 0);   /* groups 0..1 */
+    r.struct_size = (uint32_t)old;
+    unsigned char *blk = malloc(sizeof(r));
+    MOQ_TEST_CHECK(blk != NULL);
+    if (blk != NULL) {
+        memcpy(blk, &r, old);
+        memset(blk + old, 0xFF, sizeof(r) - old);   /* every form bit set */
+        moqr_fetch_t fh;
+        moqr_fetch_plan_t plan;
+        MOQ_TEST_CHECK(moqr_core_fetch_open(c, sub,
+                                            (const moqr_fetch_req_t *)(void *)blk,
+                                            FNOW, &fh, &plan) == MOQR_OK);
+        MOQ_TEST_CHECK(plan.admit == MOQR_FETCH_ACCEPT);
+        MOQ_TEST_CHECK(plan.end_group == 1 && plan.end_object == 0);
+        fitem_t got[4];
+        int pf = 0;
+        MOQ_TEST_CHECK_EQ_INT(collect(c, fh, got, 4, &pf), 2);
+        failures += pf;
+        MOQ_TEST_CHECK(moqr_core_fetch_close(c, fh) == MOQR_OK);
+        free(blk);
+    }
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("range_form_old_caller");
+    return failures;
+}
+
+/* Open an in-progress record at (g, 0, o) with one chunk of `len` bytes. */
+static void
+open_rec(moqr_core_t *c, ca_t *a, moqr_track_t t, uint64_t g, uint64_t o,
+         size_t len, int *pf)
+{
+    int failures = 0;
+    moqr_log_append_desc_t d;
+    moqr_log_append_desc_init(&d);
+    d.group_id = g;
+    d.subgroup_id = 0;
+    d.object_id = o;
+    d.publisher_priority = 128;
+    d.status = MOQR_OBJ_NORMAL;
+    d.obj_state = MOQR_OBJ_OPEN;
+    d.declared_len = 2 * len;
+    d.now_us = 1;
+    MOQ_TEST_CHECK(moqr_core_ingest(c, t, &d) == MOQR_OK);
+    uint8_t buf[16];
+    memset(buf, 0x77, sizeof(buf));
+    moq_rcbuf_t *ch = NULL;
+    MOQ_TEST_CHECK(moq_rcbuf_create(&a->vt, buf, len, &ch) == 0);
+    MOQ_TEST_CHECK(moqr_core_append_chunk(c, t, g, 0, o, ch) == MOQR_OK);
+    moq_rcbuf_decref(ch);
+    *pf += failures;
+}
+
+static void
+finish_rec(moqr_core_t *c, ca_t *a, moqr_track_t t, uint64_t g, uint64_t o,
+           size_t len, int *pf)
+{
+    int failures = 0;
+    uint8_t buf[16];
+    memset(buf, 0x78, sizeof(buf));
+    moq_rcbuf_t *ch = NULL;
+    MOQ_TEST_CHECK(moq_rcbuf_create(&a->vt, buf, len, &ch) == 0);
+    MOQ_TEST_CHECK(moqr_core_append_chunk(c, t, g, 0, o, ch) == MOQR_OK);
+    moq_rcbuf_decref(ch);
+    MOQ_TEST_CHECK(moqr_core_complete_record(c, t, g, 0, o) == MOQR_OK);
+    *pf += failures;
+}
+
+static void
+largest_is(moqr_core_t *c, moqr_track_t t, uint64_t g, uint64_t o, int *pf)
+{
+    int failures = 0;
+    bool has = false;
+    uint64_t lg = 0, lo = 0;
+    MOQ_TEST_CHECK(moqr_core_track_largest(c, t, 1, &has, &lg, &lo) == MOQR_OK);
+    MOQ_TEST_CHECK(has && lg == g && lo == o);
+    *pf += failures;
+}
+
+/* The Largest Object advances on the first byte of an Object past it
+ * (draft-22 3.1.4), so it can name an Object still arriving -- and a range
+ * that includes it includes it in full (3.2): the cursor reaches it only
+ * after everything before it is served or reported, then waits (PENDING, or
+ * WOULD_BLOCK without report_pending) until it completes and is served,
+ * reports its Location as not held if it is abandoned, or skips it when the
+ * caller gives it up. Completing or abandoning it never moves the Largest
+ * back. */
+static int
+test_largest_first_byte(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, 0, 0, 0);
+    MOQ_TEST_CHECK(c != NULL);
+    moqr_binding_t pub, sub;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 1, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 2, &sub) == MOQR_OK);
+    moqr_track_t t;
+    MOQ_TEST_CHECK(mktrack(c, pub, "v", &t) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, t, 0, 0, 0) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, t, 0, 0, 2) == MOQR_OK);
+    largest_is(c, t, 0, 2, &failures);
+    open_rec(c, &a, t, 0, 4, 8, &failures);
+    largest_is(c, t, 0, 4, &failures);
+
+    /* Through the Largest Object, with every kind reported: the hole at
+     * {0,1}, {0,2}, the hole at {0,3} ending before the Object still
+     * arriving, then that Object -- PENDING until it is whole. */
+    moqr_fetch_t fh;
+    moqr_fetch_plan_t p =
+        open_form(c, sub, MOQR_FETCH_END_AT_LARGEST, 0, 0, 0, 0, 0, &fh, &failures);
+    MOQ_TEST_CHECK(p.admit == MOQR_FETCH_ACCEPT);
+    MOQ_TEST_CHECK(p.end_group == 0 && p.end_object == 5);
+    moq_bytes_t nsb[1];
+    moqr_fetch_req_t r;
+    fetch_req(&r, "v", nsb, 0, 0, 0, 5);
+    r.report_gaps = true;
+    r.report_unknown = true;
+    r.report_pending = true;
+    moqr_fetch_plan_t plan;
+    MOQ_TEST_CHECK(moqr_core_fetch_close(c, fh) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_fetch_open(c, sub, &r, FNOW, &fh, &plan) == MOQR_OK);
+    MOQ_TEST_CHECK(plan.admit == MOQR_FETCH_ACCEPT);
+    EXPECT(OBJ, 0, 0);
+    EXPECT(GAP, 0, 1);
+    EXPECT(OBJ, 0, 2);
+    EXPECT(GAP, 0, 3);
+    moqr_fetch_item_t it;
+    for (int k = 0; k < 2; k++) {   /* idempotent while it waits */
+        MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, FNOW, &it) == MOQR_OK);
+        MOQ_TEST_CHECK(it.kind == MOQR_FETCH_ITEM_PENDING);
+        MOQ_TEST_CHECK(it.rec.group_id == 0 && it.rec.object_id == 4);
+        MOQ_TEST_CHECK(it.rec.payload == NULL);
+    }
+    finish_rec(c, &a, t, 0, 4, 8, &failures);
+    largest_is(c, t, 0, 4, &failures);
+    MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, FNOW, &it) == MOQR_OK);
+    MOQ_TEST_CHECK(it.kind == MOQR_FETCH_ITEM_OBJECT);
+    MOQ_TEST_CHECK(it.rec.group_id == 0 && it.rec.object_id == 4);
+    MOQ_TEST_CHECK(it.rec.payload != NULL &&
+                   moq_rcbuf_len(it.rec.payload) == 16);
+    MOQ_TEST_CHECK(moqr_core_fetch_commit(c, fh) == MOQR_OK);
+    EXPECT(FEND, 0, 0);
+    MOQ_TEST_CHECK(moqr_core_fetch_close(c, fh) == MOQR_OK);
+
+    /* Without report_pending the cursor answers WOULD_BLOCK at it. An
+     * abandoned record is then not held: a GAP at its Location. */
+    open_rec(c, &a, t, 1, 0, 4, &failures);
+    largest_is(c, t, 1, 0, &failures);
+    fetch_req(&r, "v", nsb, 1, 0, 1, 1);
+    r.report_gaps = true;
+    MOQ_TEST_CHECK(moqr_core_fetch_open(c, sub, &r, FNOW, &fh, &plan) == MOQR_OK);
+    MOQ_TEST_CHECK(plan.admit == MOQR_FETCH_ACCEPT);
+    MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, FNOW, &it) == MOQR_ERR_WOULD_BLOCK);
+    MOQ_TEST_CHECK(moqr_core_abandon_record(c, t, 1, 0, 0, rd_wire(0)) == MOQR_OK);
+    largest_is(c, t, 1, 0, &failures);
+    EXPECT(GAP, 1, 0);
+    EXPECT(FEND, 0, 0);
+    MOQ_TEST_CHECK(moqr_core_fetch_close(c, fh) == MOQR_OK);
+
+    /* A caller that will not wait commits the PENDING item: its one
+     * Location is skipped and the cursor moves on. */
+    open_rec(c, &a, t, 2, 0, 4, &failures);
+    MOQ_TEST_CHECK(ing(c, &a, t, 2, 1, 1) == MOQR_OK);   /* a later Object, whole */
+    largest_is(c, t, 2, 1, &failures);
+    fetch_req(&r, "v", nsb, 2, 0, 2, 2);
+    r.report_gaps = true;
+    r.report_pending = true;
+    MOQ_TEST_CHECK(moqr_core_fetch_open(c, sub, &r, FNOW, &fh, &plan) == MOQR_OK);
+    EXPECT(MOQR_FETCH_ITEM_PENDING, 2, 0);
+    EXPECT(OBJ, 2, 1);
+    EXPECT(FEND, 0, 0);
+    MOQ_TEST_CHECK(moqr_core_fetch_close(c, fh) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_abandon_record(c, t, 2, 0, 0, rd_wire(0)) == MOQR_OK);
+
+    /* A subscription from the Next Object starts past the Object still
+     * arriving: the acceptance carries it as the Largest. */
+    open_rec(c, &a, t, 3, 0, 4, &failures);
+    moqr_intent_t its[8];
+    (void)moqr_core_poll_intents(c, its, 8);
+    moqr_subscribe_req_t sr;
+    moqr_subscribe_req_init(&sr);
+    sr.ns = NS1(nsb, "demo");
+    sr.name = B("v");
+    sr.filter.type = MOQR_FILTER_LARGEST_OBJECT;
+    sr.cookie = 9;
+    moqr_sub_t sh;
+    MOQ_TEST_CHECK(moqr_core_subscribe(c, sub, &sr, &sh) == MOQR_OK);
+    size_t n = moqr_core_poll_intents(c, its, 8);
+    int acc = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (its[i].kind == MOQR_INTENT_ACCEPT_SUB && its[i].cookie == 9) {
+            acc++;
+            MOQ_TEST_CHECK(its[i].has_largest && its[i].largest_group == 3 &&
+                           its[i].largest_object == 0);
+        }
+    }
+    MOQ_TEST_CHECK_EQ_INT(acc, 1);
+
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("largest_first_byte");
+    return failures;
+}
+
+#undef EXPECT
+#undef OBJ
+#undef GAP
+#undef UNK
+#undef FEND
+
+/* Group MAX is retained data, not the empty-log sentinel. The prefix variant
+ * first evicts the preceding group through the ordinary byte budget. */
+static int
+test_fetch_group_presence(uint64_t group, bool prefix)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, 8, 0, 0);
+    moqr_fetch_t fh = MOQR_FETCH_INVALID;
+    MOQ_TEST_CHECK(c != NULL);
+    if (c == NULL) {
+        goto done;
+    }
+    moqr_binding_t pub, sub;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 1, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 2, &sub) == MOQR_OK);
+    if (failures != 0) {
+        goto done;
+    }
+    moqr_track_t t;
+    MOQ_TEST_CHECK(mktrack(c, pub, "presence", &t) == MOQR_OK);
+    if (failures != 0) {
+        goto done;
+    }
+    if (prefix) {
+        MOQ_TEST_CHECK(ing(c, &a, t, group - 1, 0, 0) == MOQR_OK);
+    }
+    MOQ_TEST_CHECK(ing(c, &a, t, group, 0, 0) == MOQR_OK);
+    if (failures != 0) {
+        goto done;
+    }
+
+    moq_bytes_t nsb[1];
+    moqr_fetch_req_t r;
+    fetch_req(&r, "presence", nsb, prefix ? group - 1 : group, 0, group, 0);
+    moqr_fetch_plan_t plan;
+    MOQ_TEST_CHECK(moqr_core_fetch_open(c, sub, &r, FNOW, &fh, &plan) == MOQR_OK);
+    MOQ_TEST_CHECK(plan.admit == MOQR_FETCH_ACCEPT);
+    MOQ_TEST_CHECK(moqr_fetch_is_valid(fh));
+    if (failures != 0) {
+        goto done;
+    }
+    MOQ_TEST_CHECK_EQ_U64(plan.end_group, group);
+    MOQ_TEST_CHECK_EQ_U64(plan.end_object, 1);
+    moqr_fetch_item_t it;
+    if (prefix) {
+        for (unsigned i = 0; i < 2; i++) {
+            MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, FNOW, &it) == MOQR_OK);
+            MOQ_TEST_CHECK(it.kind == MOQR_FETCH_ITEM_MARKER);
+            MOQ_TEST_CHECK_EQ_U64(it.marker_group, group);
+        }
+        if (failures != 0) {
+            goto done;
+        }
+        MOQ_TEST_CHECK(moqr_core_fetch_commit(c, fh) == MOQR_OK);
+    }
+    for (unsigned i = 0; i < 2; i++) {
+        moqr_result_t rc = moqr_core_fetch_peek(c, fh, FNOW, &it);
+        MOQ_TEST_CHECK(rc == MOQR_OK);
+        MOQ_TEST_CHECK(it.kind == MOQR_FETCH_ITEM_OBJECT);
+        if (rc != MOQR_OK || it.kind != MOQR_FETCH_ITEM_OBJECT) {
+            goto done;
+        }
+        MOQ_TEST_CHECK_EQ_U64(it.rec.group_id, group);
+        MOQ_TEST_CHECK_EQ_U64(it.rec.object_id, 0);
+        MOQ_TEST_CHECK(it.rec.payload != NULL);
+        if (it.rec.payload != NULL) {
+            MOQ_TEST_CHECK_EQ_SIZE(moq_rcbuf_len(it.rec.payload), 8);
+            MOQ_TEST_CHECK_EQ_INT(((const uint8_t *)moq_rcbuf_data(it.rec.payload))[0],
+                                  (uint8_t)(group * 16));
+        }
+    }
+    MOQ_TEST_CHECK(moqr_core_fetch_commit(c, fh) == MOQR_OK);
+    for (unsigned i = 0; i < 2; i++) {
+        MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, FNOW, &it) == MOQR_OK);
+        MOQ_TEST_CHECK(it.kind == MOQR_FETCH_ITEM_END);
+    }
+    MOQ_TEST_CHECK(moqr_core_fetch_close(c, fh) == MOQR_OK);
+    fh = MOQR_FETCH_INVALID;
+
+    if (prefix) {
+        fetch_req(&r, "presence", nsb, group - 1, 0, group - 1, 0);
+        MOQ_TEST_CHECK(moqr_core_fetch_open(c, sub, &r, FNOW, &fh, &plan) == MOQR_OK);
+        MOQ_TEST_CHECK(plan.admit == MOQR_FETCH_REJECT);
+        MOQ_TEST_CHECK_EQ_U64(plan.error_code, 0x11);   /* INVALID_RANGE */
+        MOQ_TEST_CHECK(!moqr_fetch_is_valid(fh));
+    }
+done:
+    if (moqr_fetch_is_valid(fh)) {
+        MOQ_TEST_CHECK(moqr_core_fetch_close(c, fh) == MOQR_OK);
+    }
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    printf("ORACLE fetch_group_presence group=%llu prefix=%u failures=%d\n",
+           (unsigned long long)group, (unsigned)prefix, failures);
+    if (failures == 0) {
+        MOQ_TEST_PASS("fetch_group_presence");
+    }
+    return failures;
+}
+
+/* Capacity eviction can advance the horizon to MAX while a FETCH is open.
+ * The lost prefix must terminate, never silently skip to the remaining group. */
+static int
+test_fetch_group_presence_midread(uint64_t group)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, 16, 0, 0);
+    moqr_fetch_t fh = MOQR_FETCH_INVALID;
+    MOQ_TEST_CHECK(c != NULL);
+    if (c == NULL) {
+        goto done;
+    }
+    moqr_binding_t pub, sub;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 1, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 2, &sub) == MOQR_OK);
+    if (failures != 0) {
+        goto done;
+    }
+    moqr_track_t t;
+    MOQ_TEST_CHECK(mktrack(c, pub, "presence", &t) == MOQR_OK);
+    if (failures != 0) {
+        goto done;
+    }
+    MOQ_TEST_CHECK(ing(c, &a, t, group - 1, 0, 0) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, t, group, 0, 0) == MOQR_OK);
+    if (failures != 0) {
+        goto done;
+    }
+    moq_bytes_t nsb[1];
+    moqr_fetch_req_t r;
+    fetch_req(&r, "presence", nsb, group - 1, 0, group, 0);
+    moqr_fetch_plan_t plan;
+    MOQ_TEST_CHECK(moqr_core_fetch_open(c, sub, &r, FNOW, &fh, &plan) == MOQR_OK);
+    MOQ_TEST_CHECK(plan.admit == MOQR_FETCH_ACCEPT);
+    MOQ_TEST_CHECK(moqr_fetch_is_valid(fh));
+    if (failures != 0) {
+        goto done;
+    }
+    MOQ_TEST_CHECK(ing(c, &a, t, group, 0, 1) == MOQR_OK);
+    if (failures != 0) {
+        goto done;
+    }
+    moqr_fetch_item_t it;
+    for (unsigned i = 0; i < 2; i++) {
+        MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, FNOW, &it) == MOQR_ERR_TOO_OLD);
+    }
+done:
+    if (moqr_fetch_is_valid(fh)) {
+        MOQ_TEST_CHECK(moqr_core_fetch_close(c, fh) == MOQR_OK);
+    }
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    printf("ORACLE fetch_group_presence_midread group=%llu failures=%d\n",
+           (unsigned long long)group, failures);
+    if (failures == 0) {
+        MOQ_TEST_PASS("fetch_group_presence_midread");
+    }
+    return failures;
+}
+
+/* Preserve INVALID_RANGE both before the first object and after all retained
+ * data ages out, when the remembered Largest Object is still present. */
+static int
+test_fetch_group_presence_empty(uint64_t group)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_relay_cfg_t cfg;
+    moqr_core_relay_cfg_init_sized(&cfg, sizeof(cfg), &a.vt);
+    cfg.log_budget.max_age_us = 100;
+    moqr_core_t *c = NULL;
+    moqr_fetch_t fh = MOQR_FETCH_INVALID;
+    MOQ_TEST_CHECK(moqr_core_create(&cfg, &c) == MOQR_OK);
+    if (c == NULL) {
+        goto done;
+    }
+    moqr_binding_t pub, sub;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 1, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 2, &sub) == MOQR_OK);
+    if (failures != 0) {
+        goto done;
+    }
+    moqr_track_t t;
+    MOQ_TEST_CHECK(mktrack(c, pub, "presence", &t) == MOQR_OK);
+    if (failures != 0) {
+        goto done;
+    }
+    moq_bytes_t nsb[1];
+    moqr_fetch_req_t r;
+    fetch_req(&r, "presence", nsb, group, 0, group, 0);
+    for (unsigned aged = 0; aged < 2; aged++) {
+        if (aged != 0) {
+            MOQ_TEST_CHECK(ing(c, &a, t, group, 0, 0) == MOQR_OK);
+            MOQ_TEST_CHECK(moqr_core_tick(c, FNOW) == MOQR_OK);
+        }
+        moqr_fetch_plan_t plan;
+        MOQ_TEST_CHECK(moqr_core_fetch_open(c, sub, &r, FNOW, &fh, &plan) == MOQR_OK);
+        MOQ_TEST_CHECK(plan.admit == MOQR_FETCH_REJECT);
+        MOQ_TEST_CHECK_EQ_U64(plan.error_code, 0x11);
+        MOQ_TEST_CHECK(!moqr_fetch_is_valid(fh));
+        if (moqr_fetch_is_valid(fh)) {
+            goto done;
+        }
+    }
+done:
+    if (moqr_fetch_is_valid(fh)) {
+        MOQ_TEST_CHECK(moqr_core_fetch_close(c, fh) == MOQR_OK);
+    }
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    printf("ORACLE fetch_group_presence_empty group=%llu failures=%d\n",
+           (unsigned long long)group, failures);
+    if (failures == 0) {
+        MOQ_TEST_PASS("fetch_group_presence_empty");
+    }
+    return failures;
+}
+
 int
 main(void)
 {
     int failures = 0;
+    const uint64_t groups[] = { 7, UINT64_MAX - 1, UINT64_MAX };
+    for (size_t i = 0; i < sizeof(groups) / sizeof(groups[0]); i++) {
+        failures += test_fetch_group_presence(groups[i], false);
+        failures += test_fetch_group_presence(groups[i], true);
+        failures += test_fetch_group_presence_midread(groups[i]);
+        failures += test_fetch_group_presence_empty(groups[i]);
+    }
+    failures += test_range_form();
+    failures += test_range_form_old_caller();
+    failures += test_largest_first_byte();
+    failures += test_gap_items();
+    failures += test_gap_items_old_caller();
+    failures += test_fetch_req_init_old_caller();
+    failures += test_gap_extent();
+    failures += test_unknown_items();
     failures += test_chunk_ingest_core();
     failures += test_chunked_complete_fetch();   /* FETCH over a chunked COMPLETE record */
     failures += test_chunked_fetch_oom();        /* coalesce fail-closed under OOM */

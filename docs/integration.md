@@ -200,11 +200,23 @@ moq_session_t *session = NULL;
 moq_result_t rc = moq_session_create(&cfg, now_us, &session);
 if (rc < 0) { /* handle error */ }
 
-/* Client: call start to initiate setup handshake. */
+/* Tell the session how it is carried before it starts: required on
+ * draft-22 (moq_session_binding_requirements(session) != 0), optional on
+ * draft-16 and draft-18, where a raw-QUIC client bound with its moqt URI
+ * names that target in its setup. Managed facades do this for you; see
+ * docs/adapters.md, "Transport binding". */
+/* rc = moq_session_bind_transport(session, &binding, sizeof binding); */
+
+/* Client: call start to initiate the setup handshake. */
 rc = moq_session_start(session, now_us);
 
-/* Server: ready to receive peer setup immediately after create. */
+/* Server: on draft-16, ready to receive the peer's setup immediately after
+ * create. On draft-18 and draft-22 each side sends its own SETUP without
+ * waiting, so a server calls moq_session_start too. */
 ```
+
+`cfg.version` selects the wire profile (0 is draft-16; `MOQ_VERSION_DRAFT_18`,
+`MOQ_VERSION_DRAFT_22`). Set it to the version the transport negotiated.
 
 ## Cleanup
 

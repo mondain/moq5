@@ -13,6 +13,40 @@ import CMoQService
 struct ReceiverConfigurationMappingTests {
 
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("The receiver bridge exposes the complete native configuration")
+    func sizedConfiguration() {
+        withReceiverCFG(.live(namespace: "live/cam1")) { cfg in
+            #expect(cfg.struct_size == MemoryLayout<moq_media_receiver_cfg_t>.size)
+            #expect(cfg.companion_profile == moq_swift_media_companion_auto())
+        }
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("The receiver profile maps independently of its other settings")
+    func companionProfileMapping() {
+        var configuration = MediaReceiver.Configuration(
+            namespace: "live/cam1", overflowPolicy: .flowControl(maxObjects: 4),
+            autoSubscribe: false)
+        for profile in MediaCompanionProfile.allCases {
+            configuration.companionProfile = profile
+            withReceiverCFG(configuration) { cfg in
+                let expected: moq_media_companion_profile_t
+                switch profile {
+                case .automatic: expected = moq_swift_media_companion_auto()
+                case .legacyMSF01LOC01: expected = moq_swift_media_companion_legacy()
+                case .draft22MSF01LOC04Public: expected = moq_swift_media_companion_d22_public()
+                }
+                #expect(cfg.companion_profile == expected)
+                #expect(cfg.struct_size == MemoryLayout<moq_media_receiver_cfg_t>.size)
+                #expect(cfg.time_mode == MOQ_MEDIA_TIME_RAW)
+                #expect(cfg.auto_subscribe == false)
+                #expect(cfg.overflow.max_objects == 4)
+                #expect(cfg.overflow.policy == MOQ_MEDIA_OVERFLOW_FLOW_CONTROL)
+            }
+        }
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
     @Test("The model configuration maps into moq_media_receiver_cfg_t")
     func fullMapping() throws {
         var configuration = MediaReceiver.Configuration(
@@ -49,6 +83,7 @@ struct ReceiverConfigurationMappingTests {
         }
         withReceiverCFG(.flowControl(namespace: "vod/movie")) { cfg in
             #expect(cfg.overflow.policy == MOQ_MEDIA_OVERFLOW_FLOW_CONTROL)
+            #expect(cfg.companion_profile == moq_swift_media_companion_auto())
         }
     }
 }

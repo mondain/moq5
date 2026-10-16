@@ -39,18 +39,23 @@ public final class LiveMediaSession: @unchecked Sendable {
         /// expiry the watch fails with a `.transport` connection failure and the
         /// endpoint is closed, instead of sitting in `.connecting` forever.
         public var establishmentTimeout: Duration?
+        /// Media profile. Defaults to `.automatic`, which follows the
+        /// negotiated draft; an explicit profile refuses the other drafts.
+        public var companionProfile: MediaCompanionProfile
 
         public init(endpoint: MoQEndpoint.Configuration,
                     namespace: MediaNamespace,
                     selector: TrackSelector = .firstVideo,
                     overflowPolicy: MediaReceiver.Configuration.OverflowPolicy
                         = .dropToKeyframe(),
-                    establishmentTimeout: Duration? = nil) {
+                    establishmentTimeout: Duration? = nil,
+                    companionProfile: MediaCompanionProfile = .automatic) {
             self.endpoint = endpoint
             self.namespace = namespace
             self.selector = selector
             self.overflowPolicy = overflowPolicy
             self.establishmentTimeout = establishmentTimeout
+            self.companionProfile = companionProfile
         }
     }
 
@@ -267,12 +272,13 @@ public final class LiveMediaSession: @unchecked Sendable {
             emit(.established(version: endpoint.negotiatedVersion), gen: gen)
             emit(.awaitingCatalog, gen: gen)
 
+            var receiverConfiguration = MediaReceiver.Configuration(
+                namespace: config.namespace,
+                overflowPolicy: config.overflowPolicy,
+                autoSubscribe: true)
+            receiverConfiguration.companionProfile = config.companionProfile
             let attached = try MediaReceiver.attach(
-                to: endpoint,
-                configuration: MediaReceiver.Configuration(
-                    namespace: config.namespace,
-                    overflowPolicy: config.overflowPolicy,
-                    autoSubscribe: true))
+                to: endpoint, configuration: receiverConfiguration)
             receiver = attached
             _ = setCurrentReceiver(attached, selector: config.selector, gen: gen)
 

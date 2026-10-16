@@ -963,6 +963,17 @@ static void test_stop_sending_preserves_retained_bidi_state(void)
     h3zero_stream_ctx_t sctx;
     memset(&sctx, 0, sizeof(sctx));
     sctx.stream_id = probe.stream_id;
+#if defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) && PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1
+    /* The provider records a peer STOP_SENDING on its stream before it calls
+     * back, and the adapter reads the exact code from there. */
+    picoquic_stream_head_t *pst =
+        picoquic_create_stream(h.test_ctx->cnx_client, probe.stream_id);
+    CHECK(pst != NULL);
+    if (pst != NULL) {
+        pst->stop_sending_received = 1;
+        pst->remote_stop_error = 0;
+    }
+#endif
     int rc = moq_pico_wt_callback(h.test_ctx->cnx_client, NULL, 0,
                                   picohttp_callback_stop_sending, &sctx, c);
     CHECK(rc == 0);

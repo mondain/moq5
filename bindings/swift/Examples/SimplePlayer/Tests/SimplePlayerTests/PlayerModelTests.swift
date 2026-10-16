@@ -20,6 +20,39 @@ final class PlayerModelTests: XCTestCase {
 
     // MARK: Configuration mapping
 
+    func testDraft22ExplicitlySelectsWireOfferAndCompanion() {
+        let m = model(backend: .picoquic)
+        m.version = .draft22
+        let cfg = m.makeWatchConfiguration(url: URL(string: "moqt://relay.example:4443")!)
+        XCTAssertEqual(cfg.endpoint.versions, .automatic)
+        XCTAssertEqual(cfg.endpoint.wireVersions, .list([.draft22]))
+        XCTAssertEqual(cfg.companionProfile, .draft22MSF01LOC04Public)
+        XCTAssertNil(cfg.endpoint.preferredVersion)
+        XCTAssertNil(cfg.endpoint.preferredWireVersion)
+    }
+
+    func testAutomaticKeepsLegacyOfferAndCompanion() {
+        let m = model(backend: .picoquic)
+        XCTAssertEqual(m.version, .automatic)
+        let cfg = m.makeWatchConfiguration(url: URL(string: "moqt://relay.example:4443")!)
+        XCTAssertEqual(cfg.endpoint.versions, .automatic)
+        XCTAssertNil(cfg.endpoint.wireVersions)
+        XCTAssertEqual(cfg.companionProfile, .legacyMSF01LOC01)
+        XCTAssertEqual(cfg.establishmentTimeout, .seconds(15))
+    }
+
+    func testLegacySelectionsKeepTheirOfferAndCompanion() {
+        let m = model(backend: .picoquic)
+        for (choice, version) in [(PlayerModel.VersionChoice.draft16, MoQVersion.draft16),
+                                  (.draft18, .draft18)] {
+            m.version = choice
+            let cfg = m.makeWatchConfiguration(url: URL(string: "moqt://relay.example:4443")!)
+            XCTAssertEqual(cfg.endpoint.versions, .list([version]))
+            XCTAssertNil(cfg.endpoint.wireVersions)
+            XCTAssertEqual(cfg.companionProfile, .legacyMSF01LOC01)
+        }
+    }
+
     func testWtquicNetworkNeverAttachesCAFile() {
         let m = model(backend: .wtquicNetwork)
         m.caFilePath = "/tmp/some-ca.pem"   // must be ignored

@@ -299,33 +299,41 @@ static void test_examples_values(void)
     CHECK(g_count.balance == 0);
 }
 
-/* A deterministic encode, pinned byte-exact. */
+/* A deterministic encode, pinned byte-exact. The fixture's version is the
+ * draft name, which the parser reports and the encoder keeps (MSF-01
+ * section 5.1.1's "draft-XX" convention); the numeral form encodes "1". */
 static void test_golden_encode(void)
 {
     size_t len;
     char *j = read_fixture("mpeg2ts_live_m2ts.json", &len);
-    moq_msf_catalog_t c;
-    CHECK(moq_msf_catalog_parse(&g_alloc, (moq_bytes_t){ (uint8_t *)j, len }, &c) == MOQ_OK);
-    moq_rcbuf_t *out = NULL;
-    CHECK(moq_msf_catalog_encode(&g_alloc, &c, &out) == MOQ_OK);
-    const char *want =
-        "{\"version\":\"1\",\"generatedAt\":1746104606044,\"tracks\":[{"
-        "\"name\":\"program-1-mpeg2ts\",\"packaging\":\"mpeg2ts\","
-        "\"isLive\":true,\"namespace\":\"contribution.example.net/feed/a\","
-        "\"role\":\"video\",\"bitrate\":12000000,\"targetLatency\":500,"
-        "\"mimeType\":\"video/mp2t\",\"mpeg2tsMode\":\"unmodified-program\","
-        "\"mpeg2tsPacketSize\":192,\"mpeg2tsProgramNumber\":1,"
-        "\"mpeg2tsRandomAccess\":true,"
-        "\"mpeg2tsTimestampMode\":\"arrival-time\"}]}";
-    size_t wl = strlen(want);
-    CHECK(out && moq_rcbuf_len(out) == wl &&
-          memcmp(moq_rcbuf_data(out), want, wl) == 0);
-    if (out && (moq_rcbuf_len(out) != wl ||
-                memcmp(moq_rcbuf_data(out), want, wl) != 0))
-        fprintf(stderr, "  got: %.*s\n", (int)moq_rcbuf_len(out),
-                (const char *)moq_rcbuf_data(out));
-    moq_rcbuf_decref(out);
-    moq_msf_catalog_cleanup(&g_alloc, &c);
+    static const char *const version[2] = { "\"draft-01\"", "\"1\"" };
+    for (int round = 0; round < 2; round++) {
+        moq_msf_catalog_t c;
+        CHECK(moq_msf_catalog_parse(&g_alloc, (moq_bytes_t){ (uint8_t *)j, len }, &c) == MOQ_OK);
+        CHECK(c.version_form == MOQ_MSF_VERSION_FORM_DRAFT_NAME);
+        if (round) c.version_form = MOQ_MSF_VERSION_FORM_NUMERAL;
+        moq_rcbuf_t *out = NULL;
+        CHECK(moq_msf_catalog_encode(&g_alloc, &c, &out) == MOQ_OK);
+        char want[1024];
+        snprintf(want, sizeof(want),
+            "{\"version\":%s,\"generatedAt\":1746104606044,\"tracks\":[{"
+            "\"name\":\"program-1-mpeg2ts\",\"packaging\":\"mpeg2ts\","
+            "\"isLive\":true,\"namespace\":\"contribution.example.net/feed/a\","
+            "\"role\":\"video\",\"bitrate\":12000000,\"targetLatency\":500,"
+            "\"mimeType\":\"video/mp2t\",\"mpeg2tsMode\":\"unmodified-program\","
+            "\"mpeg2tsPacketSize\":192,\"mpeg2tsProgramNumber\":1,"
+            "\"mpeg2tsRandomAccess\":true,"
+            "\"mpeg2tsTimestampMode\":\"arrival-time\"}]}", version[round]);
+        size_t wl = strlen(want);
+        CHECK(out && moq_rcbuf_len(out) == wl &&
+              memcmp(moq_rcbuf_data(out), want, wl) == 0);
+        if (out && (moq_rcbuf_len(out) != wl ||
+                    memcmp(moq_rcbuf_data(out), want, wl) != 0))
+            fprintf(stderr, "  got: %.*s\n", (int)moq_rcbuf_len(out),
+                    (const char *)moq_rcbuf_data(out));
+        moq_rcbuf_decref(out);
+        moq_msf_catalog_cleanup(&g_alloc, &c);
+    }
     free(j);
 }
 

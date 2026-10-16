@@ -18,10 +18,12 @@
  * deterministic complements, not a substitute.
  */
 #include "wtquic_network_managed_test_internal.h"
+#include "wtquic_managed_forwarding_test.h"
 
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 static int failures = 0;
 #define CHECK(expr) do { \
@@ -277,8 +279,69 @@ static void t_terminal_fatal_no_rearm(void)
 { terminal_no_rearm("terminal_fatal_no_rearm",
                     moq_wtquic_network_managed_test_latch_fatal); }
 
-int main(void)
+static wtq_session_t *commit_session;
+static wtq_stream_t *commit_stream;
+static void *commit_adapter;
+static unsigned commit_calls, policy_allocs;
+static void record_managed_commit(wtq_session_t *session, wtq_stream_t *stream,
+                                  void *user)
 {
+    CHECK(session == commit_session);
+    CHECK(stream == commit_stream);
+    CHECK(user == commit_adapter);
+    ++commit_calls;
+}
+static void *policy_alloc(size_t n, void *ctx)
+{ (void)n; (void)ctx; ++policy_allocs; return NULL; }
+static void *policy_realloc(void *p, size_t old_n, size_t new_n, void *ctx)
+{ (void)p; (void)old_n; (void)new_n; (void)ctx; ++policy_allocs; return NULL; }
+static void policy_free(void *p, size_t n, void *ctx)
+{ (void)p; (void)n; (void)ctx; ++policy_allocs; }
+static void check_network_unsupported(void)
+{
+    const moq_alloc_t alloc = {
+        .alloc = policy_alloc, .realloc = policy_realloc, .free = policy_free,
+    };
+    moq_wtquic_network_managed_cfg_t cfg;
+    moq_wtquic_network_managed_cfg_init_sized(&cfg, sizeof(cfg));
+    cfg.alloc = &alloc;
+    cfg.host = "unused.invalid";
+    cfg.port = 443;
+    cfg.wt_protocols = "moqt-22";
+    cfg.perspective = MOQ_PERSPECTIVE_CLIENT;
+    moq_wtquic_network_managed_t *m = NULL;
+    policy_allocs = 0;
+    CHECK(moq_wtquic_network_managed_create(&cfg, &m) == MOQ_ERR_UNSUPPORTED);
+    CHECK(m == NULL && policy_allocs == 0);
+}
+static void test_commit_table_dispatch(void)
+{
+    int before = failures;
+    check_network_unsupported();
+    unsigned char session_tag, stream_tag, adapter_tag;
+    commit_session = (wtq_session_t *)&session_tag;
+    commit_stream = (wtq_stream_t *)&stream_tag;
+    commit_adapter = &adapter_tag;
+    commit_calls = 0;
+    const wtq_session_events_t forward = {
+        .struct_size = sizeof(forward),
+        .on_stream_send_committed = record_managed_commit,
+    };
+    wtq_test_forward_table_t result = wtq_test_network_commit_dispatch(
+        &forward, commit_session, commit_stream, commit_adapter);
+    CHECK(result.table_size == sizeof(wtq_session_events_t));
+    CHECK(result.installed);
+    CHECK(commit_calls == 2);
+    check_network_unsupported();
+    if (failures == before) puts("PASS: network managed commit table dispatch; unsupported policy retained");
+}
+
+int main(int argc, char **argv)
+{
+    test_commit_table_dispatch();
+    if (argc == 2 && strcmp(argv[1], "--commit-forwarding") == 0)
+        return failures ? 1 : 0;
+    if (argc != 1) return 2;
     moq_wtquic_network_managed_test_set_op_recorder(rec, NULL);
 
     t_due_orders_service_before_pump();

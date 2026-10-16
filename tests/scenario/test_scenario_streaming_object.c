@@ -26,6 +26,8 @@
  */
 
 #include <moq/sim.h>
+#include "scenario_pair_version.h"
+#include "scenario_action_transport.h"
 #include "../../tests/unit/test_support.h"
 #include <stdlib.h>
 #include <string.h>
@@ -69,6 +71,7 @@ typedef struct {
     /* Persistent chunk-oracle state (survives across drain calls). */
     bool     rnd_in_object;
     int      rnd_violations;
+    scenario_action_transport_t transport;
 } trace_summary_t;
 
 /* -- Zero-copy release callbacks ------------------------------------ */
@@ -148,16 +151,16 @@ static void sa_free(void *p, size_t sz, void *ctx) {
 
 /* -- Prelude helpers ------------------------------------------------ */
 
-static int pump_control(moq_session_t *from, moq_session_t *to, uint64_t now)
+static int pump_control(scenario_action_transport_t *transport,
+    moq_session_t *from, moq_session_t *to, uint64_t now)
 {
     moq_action_t acts[16];
     size_t n;
     while ((n = moq_session_poll_actions(from, acts, 16)) > 0)
         for (size_t i = 0; i < n; i++) {
-            if (acts[i].kind == MOQ_ACTION_SEND_CONTROL) {
-                moq_result_t rc = moq_session_on_control_bytes(
-                    to, acts[i].u.send_control.data,
-                    acts[i].u.send_control.len, now);
+            {
+                moq_result_t rc = scenario_route_action(transport, from, to,
+                                                       &acts[i], now);
                 if (rc < 0) {
                     moq_action_cleanup(&acts[i]);
                     for (size_t j = i + 1; j < n; j++)
@@ -170,10 +173,37 @@ static int pump_control(moq_session_t *from, moq_session_t *to, uint64_t now)
     return 0;
 }
 
-static int establish_streaming_pair(const moq_alloc_t *alloc,
+static uint32_t accept_prelude_uri(void *ctx, uint32_t present,
+    moq_bytes_t authority, moq_bytes_t path_query)
+{
+    (void)ctx; (void)present; (void)authority; (void)path_query;
+    return MOQ_URI_ACCEPT;
+}
+
+static moq_result_t bind_prelude_transport(moq_session_t *s)
+{
+    if (moq_session_binding_requirements(s) == 0) return MOQ_OK;
+    moq_transport_binding_t binding;
+    moq_transport_binding_init(&binding);
+    binding.kind = MOQ_BINDING_RAW_QUIC;
+    binding.facts_known = MOQ_BINDING_FACTS_ALL;
+    binding.facts_supported = MOQ_BINDING_FACTS_ALL;
+    if (moq_session_perspective(s) == MOQ_PERSPECTIVE_CLIENT) {
+        binding.target_present = MOQ_BINDING_TARGET_COMPLETE;
+        binding.authority = MOQ_BYTES_LITERAL("sim.invalid");
+    } else {
+        binding.accept_uri = accept_prelude_uri;
+    }
+    return moq_session_bind_transport(s, &binding, sizeof(binding));
+}
+
+static int establish_streaming_pair(scenario_action_transport_t *transport,
+    const moq_alloc_t *alloc,
     uint32_t max_events, moq_session_t **c_out, moq_session_t **s_out)
 {
+    memset(transport, 0, sizeof(*transport));
     moq_session_cfg_t ccfg = MOQ_SESSION_CFG_INIT;
+    ccfg.version = scenario_selected_version(MOQ_VERSION_DRAFT_16);
     ccfg.alloc = alloc;
     ccfg.perspective = MOQ_PERSPECTIVE_CLIENT;
     ccfg.send_request_capacity = true;
@@ -182,6 +212,7 @@ static int establish_streaming_pair(const moq_alloc_t *alloc,
     if (max_events > 0) ccfg.max_events = max_events;
 
     moq_session_cfg_t scfg = MOQ_SESSION_CFG_INIT;
+    scfg.version = scenario_selected_version(MOQ_VERSION_DRAFT_16);
     scfg.alloc = alloc;
     scfg.perspective = MOQ_PERSPECTIVE_SERVER;
     scfg.send_request_capacity = true;
@@ -189,16 +220,28 @@ static int establish_streaming_pair(const moq_alloc_t *alloc,
 
     if (moq_session_create(&ccfg, 0, c_out) < 0) return -1;
     if (moq_session_create(&scfg, 0, s_out) < 0) return -1;
-    moq_session_start(*c_out, 0);
-    if (pump_control(*c_out, *s_out, 0) < 0) return -1;
-    if (pump_control(*s_out, *c_out, 0) < 0) return -1;
+    if (!scenario_profile_matches(*c_out, *s_out)) {
+        fprintf(stderr, "FAIL prelude-profile: expected D%u on both sessions\n",
+                scenario_profile_number());
+        return -1;
+    }
+    if (bind_prelude_transport(*c_out) != MOQ_OK ||
+        bind_prelude_transport(*s_out) != MOQ_OK) return -1;
+    if (moq_session_start(*c_out, 0) != MOQ_OK) return -1;
+    if (ccfg.version != MOQ_VERSION_DRAFT_16 &&
+        moq_session_start(*s_out, 0) != MOQ_OK) return -1;
+    if (pump_control(transport, *c_out, *s_out, 0) < 0) return -1;
+    if (pump_control(transport, *s_out, *c_out, 0) < 0) return -1;
+    if (moq_session_state(*c_out) != MOQ_SESS_ESTABLISHED ||
+        moq_session_state(*s_out) != MOQ_SESS_ESTABLISHED) return -1;
     moq_event_t d;
     if (moq_session_poll_events(*c_out, &d, 1) == 1) moq_event_cleanup(&d);
     if (moq_session_poll_events(*s_out, &d, 1) == 1) moq_event_cleanup(&d);
     return 0;
 }
 
-static int subscribe_and_accept(moq_session_t *c, moq_session_t *sv,
+static int subscribe_and_accept(scenario_action_transport_t *transport,
+    moq_session_t *c, moq_session_t *sv,
     moq_subscription_t *ssub_out)
 {
     moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("ns") };
@@ -210,7 +253,7 @@ static int subscribe_and_accept(moq_session_t *c, moq_session_t *sv,
 
     moq_subscription_t csub;
     if (moq_session_subscribe(c, &sub_cfg, 0, &csub) != MOQ_OK) return -1;
-    if (pump_control(c, sv, 0) < 0) return -1;
+    if (pump_control(transport, c, sv, 0) < 0) return -1;
     moq_event_t ev;
     if (moq_session_poll_events(sv, &ev, 1) != 1) return -1;
     if (ev.kind != MOQ_EVENT_SUBSCRIBE_REQUEST) { moq_event_cleanup(&ev); return -1; }
@@ -220,7 +263,7 @@ static int subscribe_and_accept(moq_session_t *c, moq_session_t *sv,
     moq_accept_subscribe_cfg_t acc;
     moq_accept_subscribe_cfg_init(&acc);
     if (moq_session_accept_subscribe(sv, *ssub_out, &acc, 0) != MOQ_OK) return -1;
-    if (pump_control(sv, c, 0) < 0) return -1;
+    if (pump_control(transport, sv, c, 0) < 0) return -1;
     if (moq_session_poll_events(c, &ev, 1) == 1) moq_event_cleanup(&ev);
     return 0;
 }
@@ -303,12 +346,13 @@ static int run_prelude(uint64_t seed, const moq_alloc_t *alloc,
 {
     moq_session_t *c = NULL, *sv = NULL;
     int rc = -1;
+    scenario_action_transport_t transport = {0};
 
     /* -- Segment 1-4: normal max_events ------------------------------ */
-    if (establish_streaming_pair(alloc, 0, &c, &sv) < 0) goto done;
+    if (establish_streaming_pair(&transport, alloc, 0, &c, &sv) < 0) goto done;
 
     moq_subscription_t ssub;
-    if (subscribe_and_accept(c, sv, &ssub) < 0) goto done;
+    if (subscribe_and_accept(&transport, c, sv, &ssub) < 0) goto done;
 
     moq_subgroup_cfg_t sg_cfg;
     moq_subgroup_cfg_init(&sg_cfg);
@@ -599,7 +643,7 @@ static int run_prelude(uint64_t seed, const moq_alloc_t *alloc,
     moq_session_destroy(sv); sv = NULL;
 
     /* -- Segment 7: WOULD_BLOCK mid-object (max_events=1) ------------ */
-    if (establish_streaming_pair(alloc, 1, &c, &sv) < 0) goto done;
+    if (establish_streaming_pair(&transport, alloc, 1, &c, &sv) < 0) goto done;
 
     /* Manual subscribe/accept WITHOUT draining SUBSCRIBE_OK from client,
      * so the 1-slot event queue remains full for the data feed. */
@@ -612,7 +656,7 @@ static int run_prelude(uint64_t seed, const moq_alloc_t *alloc,
         scfg5.track_name = MOQ_BYTES_LITERAL("wb");
         moq_subscription_t csub5;
         if (moq_session_subscribe(c, &scfg5, 0, &csub5) != MOQ_OK) goto done;
-        if (pump_control(c, sv, 0) < 0) goto done;
+        if (pump_control(&transport, c, sv, 0) < 0) goto done;
         moq_event_t sev;
         if (moq_session_poll_events(sv, &sev, 1) != 1) goto done;
         if (sev.kind != MOQ_EVENT_SUBSCRIBE_REQUEST) { moq_event_cleanup(&sev); goto done; }
@@ -621,7 +665,7 @@ static int run_prelude(uint64_t seed, const moq_alloc_t *alloc,
         moq_accept_subscribe_cfg_t acc5;
         moq_accept_subscribe_cfg_init(&acc5);
         if (moq_session_accept_subscribe(sv, ssub, &acc5, 0) != MOQ_OK) goto done;
-        if (pump_control(sv, c, 0) < 0) goto done;
+        if (pump_control(&transport, sv, c, 0) < 0) goto done;
         /* SUBSCRIBE_OK now queued on client — DO NOT drain. */
     }
 
@@ -689,7 +733,7 @@ static int run_prelude(uint64_t seed, const moq_alloc_t *alloc,
     if (sv) { moq_session_destroy(sv); sv = NULL; }
 
     /* -- Segment 8: zero-copy WOULD_BLOCK on rcbuf continuation -------- */
-    if (establish_streaming_pair(alloc, 1, &c, &sv) < 0) goto done;
+    if (establish_streaming_pair(&transport, alloc, 1, &c, &sv) < 0) goto done;
     {
         moq_bytes_t ns8[] = { MOQ_BYTES_LITERAL("ns") };
         moq_namespace_t nns8 = { ns8, 1 };
@@ -699,7 +743,7 @@ static int run_prelude(uint64_t seed, const moq_alloc_t *alloc,
         scfg8.track_name = MOQ_BYTES_LITERAL("zcwb");
         moq_subscription_t csub8;
         if (moq_session_subscribe(c, &scfg8, 0, &csub8) != MOQ_OK) goto done;
-        if (pump_control(c, sv, 0) < 0) goto done;
+        if (pump_control(&transport, c, sv, 0) < 0) goto done;
         moq_event_t sev;
         if (moq_session_poll_events(sv, &sev, 1) != 1) goto done;
         if (sev.kind != MOQ_EVENT_SUBSCRIBE_REQUEST) { moq_event_cleanup(&sev); goto done; }
@@ -708,7 +752,7 @@ static int run_prelude(uint64_t seed, const moq_alloc_t *alloc,
         moq_accept_subscribe_cfg_t acc8;
         moq_accept_subscribe_cfg_init(&acc8);
         if (moq_session_accept_subscribe(sv, ssub, &acc8, 0) != MOQ_OK) goto done;
-        if (pump_control(sv, c, 0) < 0) goto done;
+        if (pump_control(&transport, sv, c, 0) < 0) goto done;
         /* Drain SUBSCRIBE_OK so we can control timing. */
         moq_event_t sev2;
         if (moq_session_poll_events(c, &sev2, 1) == 1) moq_event_cleanup(&sev2);
@@ -868,11 +912,18 @@ static moq_result_t pump_resolve_reset_would_block(moq_simpair_t *sp,
 
 /* -- Random phase: chunked data pump -------------------------------- */
 
+static void drain_transport_client(moq_session_t *client, void *ctx)
+{
+    drain_client_chunks(client, ctx);
+}
+
 static int pump_with_chunking(moq_simpair_t *sp, rng_t *chunk_rng,
                                trace_summary_t *ts,
                                const moq_alloc_t *alloc) {
     moq_session_t *server = moq_simpair_server(sp);
     moq_session_t *client = moq_simpair_client(sp);
+    ts->transport.drain_client = drain_transport_client;
+    ts->transport.drain_ctx = ts;
 
     for (int rounds = 0; rounds < 4; rounds++) {
         moq_action_t acts[16];
@@ -881,12 +932,12 @@ static int pump_with_chunking(moq_simpair_t *sp, rng_t *chunk_rng,
             moq_action_t cacts[16];
             size_t cn = moq_session_poll_actions(client, cacts, 16);
             for (size_t i = 0; i < cn; i++) {
-                if (cacts[i].kind == MOQ_ACTION_SEND_CONTROL) {
-                    moq_result_t crc = moq_session_on_control_bytes(
-                        server, cacts[i].u.send_control.data,
-                        cacts[i].u.send_control.len,
-                        moq_simpair_now_us(sp));
+                {
+                    moq_result_t crc = scenario_route_action(&ts->transport,
+                        client, server, &cacts[i], moq_simpair_now_us(sp));
                     if (crc < 0) {
+                        fprintf(stderr, "FAIL client-action: kind=%u rc=%d\n",
+                                cacts[i].kind, crc);
                         moq_action_cleanup(&cacts[i]);
                         for (size_t j = i + 1; j < cn; j++)
                             moq_action_cleanup(&cacts[j]);
@@ -900,18 +951,7 @@ static int pump_with_chunking(moq_simpair_t *sp, rng_t *chunk_rng,
         }
 
         for (size_t i = 0; i < na; i++) {
-            if (acts[i].kind == MOQ_ACTION_SEND_CONTROL) {
-                moq_result_t crc = moq_session_on_control_bytes(
-                    client, acts[i].u.send_control.data,
-                    acts[i].u.send_control.len,
-                    moq_simpair_now_us(sp));
-                if (crc < 0) {
-                    moq_action_cleanup(&acts[i]);
-                    for (size_t j = i + 1; j < na; j++)
-                        moq_action_cleanup(&acts[j]);
-                    return -1;
-                }
-            } else if (acts[i].kind == MOQ_ACTION_SEND_DATA) {
+            if (acts[i].kind == MOQ_ACTION_SEND_DATA) {
                 uint8_t combined[4096];
                 size_t clen = 0;
                 size_t hlen = acts[i].u.send_data.header_len;
@@ -995,6 +1035,9 @@ static int pump_with_chunking(moq_simpair_t *sp, rng_t *chunk_rng,
 
                     drc = pump_resolve_would_block(sp, client, ref, drc, ts);
                     if (drc < 0) {
+                        fprintf(stderr, "FAIL streaming-data: rc=%d ref=%llu "
+                                "offset=%zu/%zu fin=%d\n", drc,
+                                (unsigned long long)ref._v, off, clen, chunk_fin);
                         moq_action_cleanup(&acts[i]);
                         for (size_t j = i + 1; j < na; j++)
                             moq_action_cleanup(&acts[j]);
@@ -1012,6 +1055,8 @@ static int pump_with_chunking(moq_simpair_t *sp, rng_t *chunk_rng,
                         moq_simpair_now_us(sp));
                     frc = pump_resolve_would_block(sp, client, ref, frc, ts);
                     if (frc < 0) {
+                        fprintf(stderr, "FAIL streaming-fin: rc=%d ref=%llu\n",
+                                frc, (unsigned long long)ref._v);
                         moq_action_cleanup(&acts[i]);
                         for (size_t j = i + 1; j < na; j++)
                             moq_action_cleanup(&acts[j]);
@@ -1033,11 +1078,19 @@ static int pump_with_chunking(moq_simpair_t *sp, rng_t *chunk_rng,
                 rrc = pump_resolve_reset_would_block(
                     sp, client, ref, acts[i].u.reset_data.error_code, rrc, ts);
                 if (rrc < 0) {
+                    fprintf(stderr, "FAIL streaming-reset: rc=%d ref=%llu\n",
+                            rrc, (unsigned long long)ref._v);
                     moq_action_cleanup(&acts[i]);
                     for (size_t j = i + 1; j < na; j++)
                         moq_action_cleanup(&acts[j]);
                     return -1;
                 }
+            } else if (scenario_route_action(&ts->transport, server, client,
+                           &acts[i], moq_simpair_now_us(sp)) != MOQ_OK) {
+                moq_action_cleanup(&acts[i]);
+                for (size_t j = i + 1; j < na; j++)
+                    moq_action_cleanup(&acts[j]);
+                return -1;
             }
             moq_action_cleanup(&acts[i]);
         }
@@ -1142,7 +1195,7 @@ static int execute_step(moq_simpair_t *sp, shadow_state_t *st,
         moq_result_t rc = moq_session_subscribe(c, &cfg,
             moq_simpair_now_us(sp), &h);
         if (rc == MOQ_OK) {
-            pump_with_chunking(sp, chunk_rng, ts, alloc);
+            if (pump_with_chunking(sp, chunk_rng, ts, alloc) < 0) return -1;
             moq_event_t evts[4];
             size_t ne = moq_session_poll_events(sv, evts, 4);
             for (size_t j = 0; j < ne; j++) {
@@ -1167,14 +1220,14 @@ static int execute_step(moq_simpair_t *sp, shadow_state_t *st,
         int idx = -1;
         for (int i = 0; i < MAX_SUBS; i++)
             if (st->subs[i].active && !st->subs[i].accepted) { idx = i; break; }
-        if (idx < 0) { pump_with_chunking(sp, chunk_rng, ts, alloc); break; }
+        if (idx < 0) { if (pump_with_chunking(sp, chunk_rng, ts, alloc) < 0) return -1; break; }
         moq_accept_subscribe_cfg_t acc;
         moq_accept_subscribe_cfg_init(&acc);
         moq_result_t rc = moq_session_accept_subscribe(sv,
             st->subs[idx].server_handle, &acc, moq_simpair_now_us(sp));
         if (rc == MOQ_OK) {
             st->subs[idx].accepted = true;
-            pump_with_chunking(sp, chunk_rng, ts, alloc);
+            if (pump_with_chunking(sp, chunk_rng, ts, alloc) < 0) return -1;
             drain_client_chunks(c, ts);
         }
         break;
@@ -1184,11 +1237,11 @@ static int execute_step(moq_simpair_t *sp, shadow_state_t *st,
         int sub_idx = -1;
         for (int i = 0; i < MAX_SUBS; i++)
             if (st->subs[i].active && st->subs[i].accepted) { sub_idx = i; break; }
-        if (sub_idx < 0) { pump_with_chunking(sp, chunk_rng, ts, alloc); break; }
+        if (sub_idx < 0) { if (pump_with_chunking(sp, chunk_rng, ts, alloc) < 0) return -1; break; }
         int sg_slot = -1;
         for (int i = 0; i < MAX_SGS; i++)
             if (!st->sgs[i].active) { sg_slot = i; break; }
-        if (sg_slot < 0) { pump_with_chunking(sp, chunk_rng, ts, alloc); break; }
+        if (sg_slot < 0) { if (pump_with_chunking(sp, chunk_rng, ts, alloc) < 0) return -1; break; }
         moq_subgroup_cfg_t cfg;
         moq_subgroup_cfg_init(&cfg);
         cfg.group_id = st->next_group;
@@ -1210,7 +1263,7 @@ static int execute_step(moq_simpair_t *sp, shadow_state_t *st,
         int sg_idx = -1;
         for (int i = 0; i < MAX_SGS; i++)
             if (st->sgs[i].active) { sg_idx = i; break; }
-        if (sg_idx < 0) { pump_with_chunking(sp, chunk_rng, ts, alloc); break; }
+        if (sg_idx < 0) { if (pump_with_chunking(sp, chunk_rng, ts, alloc) < 0) return -1; break; }
         uint64_t obj_id = st->sgs[sg_idx].next_object_id;
         size_t payload_len = rng_next(rng) % 64;
         if (rng_next(rng) % 10 == 0) payload_len = 0;
@@ -1254,7 +1307,7 @@ static int execute_step(moq_simpair_t *sp, shadow_state_t *st,
         int sg_idx = -1;
         for (int i = 0; i < MAX_SGS; i++)
             if (st->sgs[i].active) { sg_idx = i; break; }
-        if (sg_idx < 0) { pump_with_chunking(sp, chunk_rng, ts, alloc); break; }
+        if (sg_idx < 0) { if (pump_with_chunking(sp, chunk_rng, ts, alloc) < 0) return -1; break; }
         if (moq_session_close_subgroup(sv, st->sgs[sg_idx].handle,
             moq_simpair_now_us(sp)) == MOQ_OK)
             st->sgs[sg_idx].active = false;
@@ -1265,7 +1318,7 @@ static int execute_step(moq_simpair_t *sp, shadow_state_t *st,
         int sg_idx = -1;
         for (int i = 0; i < MAX_SGS; i++)
             if (st->sgs[i].active) { sg_idx = i; break; }
-        if (sg_idx < 0) { pump_with_chunking(sp, chunk_rng, ts, alloc); break; }
+        if (sg_idx < 0) { if (pump_with_chunking(sp, chunk_rng, ts, alloc) < 0) return -1; break; }
         if (moq_session_reset_subgroup(sv, st->sgs[sg_idx].handle,
             0x1, moq_simpair_now_us(sp)) == MOQ_OK)
             st->sgs[sg_idx].active = false;
@@ -1290,7 +1343,7 @@ static int execute_step(moq_simpair_t *sp, shadow_state_t *st,
     }
 
     default:
-        pump_with_chunking(sp, chunk_rng, ts, alloc);
+        if (pump_with_chunking(sp, chunk_rng, ts, alloc) < 0) return -1;
         break;
     }
     return 0;
@@ -1310,14 +1363,12 @@ static int run_scenario(uint64_t seed, const moq_alloc_t *alloc,
     if (run_prelude(seed, alloc, summary) < 0) {
         fprintf(stderr, "FAIL seed=0x%llx run=%d: prelude failed\n",
                 (unsigned long long)seed, run_id);
-        fprintf(stderr, "  Replay: MOQ_SCENARIO_SEED_START=0x%llx "
-                "MOQ_SCENARIO_SEEDS=1 MOQ_SCENARIO_STEPS=%d "
-                "./build/tests/test_scenario_streaming_object\n",
-                (unsigned long long)seed, max_steps);
+        scenario_replay(seed, 1, max_steps);
         return 1;
     }
 
     moq_simpair_cfg_t cfg = MOQ_SIMPAIR_CFG_INIT;
+    cfg.version = scenario_selected_version(MOQ_VERSION_DRAFT_16);
     cfg.alloc = alloc;
     cfg.seed = seed;
     cfg.initial_now_us = 1000;
@@ -1333,6 +1384,12 @@ static int run_scenario(uint64_t seed, const moq_alloc_t *alloc,
     if (moq_simpair_create(&cfg, &sp) < 0) return -1;
     moq_simpair_start(sp);
     moq_simpair_run_until_quiescent(sp, 8, NULL);
+    if (!scenario_profile_matches(moq_simpair_client(sp), moq_simpair_server(sp))) {
+        fprintf(stderr, "FAIL random-profile: expected D%u on both sessions\n",
+                scenario_profile_number());
+        moq_simpair_destroy(sp);
+        return 1;
+    }
 
     {
         moq_event_t ev;
@@ -1355,10 +1412,7 @@ static int run_scenario(uint64_t seed, const moq_alloc_t *alloc,
             fprintf(stderr, "FAIL seed=0x%llx run=%d step=%d: "
                     "data input error\n",
                     (unsigned long long)seed, run_id, step);
-            fprintf(stderr, "  Replay: MOQ_SCENARIO_SEED_START=0x%llx "
-                    "MOQ_SCENARIO_SEEDS=1 MOQ_SCENARIO_STEPS=%d "
-                    "./build/tests/test_scenario_streaming_object\n",
-                    (unsigned long long)seed, max_steps);
+            scenario_replay(seed, 1, max_steps);
             failures++;
             st.closed = true;
             break;
@@ -1370,10 +1424,7 @@ static int run_scenario(uint64_t seed, const moq_alloc_t *alloc,
                 fprintf(stderr, "FAIL seed=0x%llx run=%d step=%d: "
                         "unexpected close\n",
                         (unsigned long long)seed, run_id, step);
-                fprintf(stderr, "  Replay: MOQ_SCENARIO_SEED_START=0x%llx "
-                        "MOQ_SCENARIO_SEEDS=1 MOQ_SCENARIO_STEPS=%d "
-                        "./build/tests/test_scenario_streaming_object\n",
-                        (unsigned long long)seed, max_steps);
+                scenario_replay(seed, 1, max_steps);
                 failures++;
             }
             st.closed = true;
@@ -1407,10 +1458,7 @@ static int run_scenario(uint64_t seed, const moq_alloc_t *alloc,
         fprintf(stderr, "FAIL seed=0x%llx run=%d: %d chunk oracle "
                 "violations (begin/end pairing)\n",
                 (unsigned long long)seed, run_id, summary->rnd_violations);
-        fprintf(stderr, "  Replay: MOQ_SCENARIO_SEED_START=0x%llx "
-                "MOQ_SCENARIO_SEEDS=1 MOQ_SCENARIO_STEPS=%d "
-                "./build/tests/test_scenario_streaming_object\n",
-                (unsigned long long)seed, max_steps);
+        scenario_replay(seed, 1, max_steps);
         failures++;
     }
 
@@ -1420,8 +1468,11 @@ static int run_scenario(uint64_t seed, const moq_alloc_t *alloc,
 
 /* -- Main ----------------------------------------------------------- */
 
-int main(void)
+int main(int argc, char **argv)
 {
+    (void)argc;
+    scenario_runner = argv[0];
+    if (scenario_selected_version(MOQ_VERSION_DRAFT_16) == 0) return 1;
     int failures = 0;
     const char *env_seeds = getenv("MOQ_SCENARIO_SEEDS");
     const char *env_start = getenv("MOQ_SCENARIO_SEED_START");
@@ -1432,6 +1483,7 @@ int main(void)
 
     size_t total_pre = 0, total_chunks = 0, total_complete = 0, total_wb = 0;
     size_t total_rnd_sent = 0, total_rnd_complete = 0;
+    size_t total_control_retries = 0;
     size_t total_zc_in = 0, total_zc_chunks = 0, total_zc_rel = 0;
 
     for (uint64_t seed = seed_start; seed < seed_start + num_seeds; seed++) {
@@ -1440,16 +1492,14 @@ int main(void)
         for (int run = 0; run < 2; run++) {
             scen_alloc_t as = {0};
             moq_alloc_t alloc = { &as, sa_alloc, sa_realloc, sa_free };
-            failures += run_scenario(seed, &alloc, &sums[run], run, max_steps);
+            int rf = run_scenario(seed, &alloc, &sums[run], run, max_steps);
+            failures += rf < 0 ? 1 : rf;
             if (as.balance != 0) {
                 fprintf(stderr, "FAIL seed=0x%llx run=%d: "
                         "alloc balance=%lld\n",
                         (unsigned long long)seed, run,
                         (long long)as.balance);
-                fprintf(stderr, "  Replay: MOQ_SCENARIO_SEED_START=0x%llx "
-                        "MOQ_SCENARIO_SEEDS=1 MOQ_SCENARIO_STEPS=%d "
-                        "./build/tests/test_scenario_streaming_object\n",
-                        (unsigned long long)seed, max_steps);
+                scenario_replay(seed, 1, max_steps);
                 failures++;
             }
         }
@@ -1464,6 +1514,7 @@ int main(void)
             sums[0].rnd_chunks != sums[1].rnd_chunks ||
             sums[0].rnd_complete != sums[1].rnd_complete ||
             sums[0].rnd_wb != sums[1].rnd_wb ||
+            sums[0].transport.retries != sums[1].transport.retries ||
             sums[0].rnd_chunk_hash != sums[1].rnd_chunk_hash ||
             sums[0].rnd_violations != sums[1].rnd_violations ||
             sums[0].zc_inputs != sums[1].zc_inputs ||
@@ -1471,10 +1522,7 @@ int main(void)
             sums[0].zc_releases != sums[1].zc_releases) {
             fprintf(stderr, "FAIL seed=0x%llx: determinism mismatch\n",
                     (unsigned long long)seed);
-            fprintf(stderr, "  Replay: MOQ_SCENARIO_SEED_START=0x%llx "
-                    "MOQ_SCENARIO_SEEDS=1 MOQ_SCENARIO_STEPS=%d "
-                    "./build/tests/test_scenario_streaming_object\n",
-                    (unsigned long long)seed, max_steps);
+            scenario_replay(seed, 1, max_steps);
             failures++;
         }
 
@@ -1483,10 +1531,7 @@ int main(void)
             fprintf(stderr, "FAIL seed=0x%llx: prelude objects=%zu "
                     "(expected 9)\n",
                     (unsigned long long)seed, sums[0].pre_objects);
-            fprintf(stderr, "  Replay: MOQ_SCENARIO_SEED_START=0x%llx "
-                    "MOQ_SCENARIO_SEEDS=1 MOQ_SCENARIO_STEPS=%d "
-                    "./build/tests/test_scenario_streaming_object\n",
-                    (unsigned long long)seed, max_steps);
+            scenario_replay(seed, 1, max_steps);
             failures++;
         }
 
@@ -1496,10 +1541,7 @@ int main(void)
                     "zc_inputs=%zu\n",
                     (unsigned long long)seed,
                     sums[0].zc_releases, sums[0].zc_inputs);
-            fprintf(stderr, "  Replay: MOQ_SCENARIO_SEED_START=0x%llx "
-                    "MOQ_SCENARIO_SEEDS=1 MOQ_SCENARIO_STEPS=%d "
-                    "./build/tests/test_scenario_streaming_object\n",
-                    (unsigned long long)seed, max_steps);
+            scenario_replay(seed, 1, max_steps);
             failures++;
         }
 
@@ -1509,10 +1551,7 @@ int main(void)
                     "sent=%zu complete=%zu\n",
                     (unsigned long long)seed,
                     sums[0].rnd_sent, sums[0].rnd_complete);
-            fprintf(stderr, "  Replay: MOQ_SCENARIO_SEED_START=0x%llx "
-                    "MOQ_SCENARIO_SEEDS=1 MOQ_SCENARIO_STEPS=%d "
-                    "./build/tests/test_scenario_streaming_object\n",
-                    (unsigned long long)seed, max_steps);
+            scenario_replay(seed, 1, max_steps);
             failures++;
         }
 
@@ -1522,24 +1561,29 @@ int main(void)
         total_wb += sums[0].rnd_wb;
         total_rnd_sent += sums[0].rnd_sent;
         total_rnd_complete += sums[0].rnd_complete;
+        total_control_retries += sums[0].transport.retries;
         total_zc_in += sums[0].zc_inputs;
         total_zc_chunks += sums[0].zc_chunks;
         total_zc_rel += sums[0].zc_releases;
     }
 
+    failures += scenario_random_delivery_floor(seed_start, num_seeds, max_steps,
+        total_rnd_sent, total_rnd_complete);
+
     if (failures == 0)
         fprintf(stderr, "PASS: test_scenario_streaming_object "
-                "(%llu seeds, prelude=%zu chunks=%zu complete=%zu "
-                "wb=%zu random=%zu/%zu "
+                "(D%u, %llu seeds, prelude=%zu chunks=%zu complete=%zu "
+                "wb=%zu control_retries=%zu random=%zu/%zu "
                 "zc_in=%zu zc_chunks=%zu zc_rel=%zu)\n",
-                (unsigned long long)num_seeds,
+                scenario_profile_number(), (unsigned long long)num_seeds,
                 total_pre, total_chunks, total_complete,
-                total_wb, total_rnd_sent, total_rnd_complete,
+                total_wb, total_control_retries, total_rnd_sent, total_rnd_complete,
                 total_zc_in, total_zc_chunks, total_zc_rel);
     else
         fprintf(stderr, "FAIL: test_scenario_streaming_object "
-                "(%d failures in %llu seeds)\n",
-                failures, (unsigned long long)num_seeds);
+                "(D%u, %d failures in %llu seeds, prelude=%zu random=%zu/%zu)\n",
+                scenario_profile_number(), failures, (unsigned long long)num_seeds,
+                total_pre, total_rnd_sent, total_rnd_complete);
 
-    return failures;
+    return failures ? 1 : 0;
 }

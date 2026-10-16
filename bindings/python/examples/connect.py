@@ -13,6 +13,8 @@ from moq5 import (
     EndpointState,
     MoqError,
     TerminalReason,
+    UriMode,
+    Version,
     WaitResult,
     build_info,
 )
@@ -34,6 +36,13 @@ def _label(value: int) -> str:
     return value.name if isinstance(value, IntEnum) else str(value)
 
 
+def _version_label(value: int) -> str:
+    try:
+        return f"{Version(value).name} ({value})"
+    except ValueError:
+        return str(value)
+
+
 def _report_terminal(endpoint: Endpoint) -> int:
     terminal = endpoint.terminal
     print(
@@ -50,12 +59,25 @@ def main() -> int:
     parser.add_argument(
         "--sni", help="TLS server-name override for a supporting backend"
     )
-    parser.add_argument("--wt-path", help="WebTransport path override")
+    parser.add_argument(
+        "--uri-mode",
+        choices=[mode.name.lower() for mode in UriMode],
+        default=UriMode.STANDARD.name.lower(),
+        help="how the URL is read; under standard the URL carries the "
+        "WebTransport path",
+    )
+    parser.add_argument(
+        "--wt-path", help="WebTransport path override (--uri-mode legacy only)"
+    )
     parser.add_argument("--timeout-us", type=_timeout_us, default=10_000_000)
     args = parser.parse_args()
     try:
         config = EndpointConfig(
-            url=args.url, ca_file=args.ca_file, sni=args.sni, wt_path=args.wt_path
+            url=args.url,
+            ca_file=args.ca_file,
+            sni=args.sni,
+            wt_path=args.wt_path,
+            uri_mode=UriMode[args.uri_mode.upper()],
         )
         print(build_info())
         deadline_ns = time.monotonic_ns() + args.timeout_us * 1_000
@@ -69,7 +91,10 @@ def main() -> int:
                 if state == EndpointState.CLOSED:
                     return _report_terminal(endpoint)
                 if state == EndpointState.ESTABLISHED:
-                    print(f"negotiated_version={endpoint.negotiated_version}")
+                    print(
+                        "negotiated_version="
+                        f"{_version_label(endpoint.negotiated_version)}"
+                    )
                     return 0
                 remaining_ns = deadline_ns - time.monotonic_ns()
                 if remaining_ns <= 0:

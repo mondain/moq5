@@ -14,6 +14,7 @@
 
 #include <moq/codec.h>
 #include "../../tests/unit/test_support.h"
+#include "scenario_version.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -505,6 +506,7 @@ static void execute_step(moq_session_t *client, moq_session_t *sv,
 
 int main(void)
 {
+    if (scenario_require_version("test_scenario_auth", "16")) return 1;
     int failures = 0;
     const char *env_seeds = getenv("MOQ_SCENARIO_SEEDS");
     const char *env_start = getenv("MOQ_SCENARIO_SEED_START");
@@ -520,6 +522,7 @@ int main(void)
         /* Create sessions directly (not via SimPair) to configure auth cache. */
         moq_session_cfg_t ccfg;
         moq_session_cfg_init_sized(&ccfg, sizeof(ccfg), &alloc, MOQ_PERSPECTIVE_CLIENT);
+        ccfg.version = MOQ_VERSION_DRAFT_16;
         ccfg.send_request_capacity = true;
         ccfg.initial_request_capacity = 100;
         ccfg.send_auth_token_cache_size = true;
@@ -527,19 +530,35 @@ int main(void)
 
         moq_session_cfg_t scfg;
         moq_session_cfg_init_sized(&scfg, sizeof(scfg), &alloc, MOQ_PERSPECTIVE_SERVER);
+        scfg.version = MOQ_VERSION_DRAFT_16;
         scfg.send_request_capacity = true;
         scfg.initial_request_capacity = 100;
         scfg.send_auth_token_cache_size = true;
         scfg.auth_token_cache_size = 4096;
 
         moq_session_t *client = NULL, *server = NULL;
-        if (moq_session_create(&ccfg, 0, &client) < 0) continue;
+        if (moq_session_create(&ccfg, 0, &client) < 0) {
+            fprintf(stderr, "FAIL: test_scenario_auth: client creation failed\n");
+            return 1;
+        }
         if (moq_session_create(&scfg, 0, &server) < 0) {
-            moq_session_destroy(client); continue;
+            fprintf(stderr, "FAIL: test_scenario_auth: server creation failed\n");
+            moq_session_destroy(client); return 1;
         }
         moq_session_start(client, 0);
         pump_control(client, server);
         pump_control(server, client);
+
+        if (moq_session_state(client) != MOQ_SESS_ESTABLISHED ||
+            moq_session_state(server) != MOQ_SESS_ESTABLISHED ||
+            moq_session_version(client) != MOQ_VERSION_DRAFT_16 ||
+            moq_session_version(server) != MOQ_VERSION_DRAFT_16) {
+            fprintf(stderr, "FAIL: test_scenario_auth: expected established "
+                    "draft-16 scenario pair\n");
+            moq_session_destroy(client);
+            moq_session_destroy(server);
+            return 1;
+        }
 
         {
             moq_event_t ev;
@@ -617,7 +636,7 @@ int main(void)
     }
 
     if (failures == 0)
-        fprintf(stderr, "PASS: test_scenario_auth (%llu seeds)\n",
+        fprintf(stderr, "PASS: test_scenario_auth (draft-16, %llu seeds)\n",
                 (unsigned long long)num_seeds);
     else
         fprintf(stderr, "FAIL: test_scenario_auth (%d failures in %llu seeds)\n",

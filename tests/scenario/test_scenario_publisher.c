@@ -14,6 +14,7 @@
 
 #include <moq/publisher.h>
 #include <moq/sim.h>
+#include "scenario_pair_version.h"
 #include "../../tests/unit/test_support.h"
 #include <stdlib.h>
 #include <string.h>
@@ -502,6 +503,7 @@ static int run_scenario(uint64_t seed, const moq_alloc_t *alloc,
     summary->received_hash = fnv_init();
 
     moq_simpair_cfg_t cfg = MOQ_SIMPAIR_CFG_INIT;
+    cfg.version = scenario_selected_version(MOQ_VERSION_DRAFT_16);
     cfg.alloc = alloc;
     cfg.seed = seed;
     cfg.initial_now_us = 1000;
@@ -798,6 +800,7 @@ prelude_done:
 
 int main(void)
 {
+    if (scenario_selected_version(MOQ_VERSION_DRAFT_16) == 0) return 1;
     int failures = 0;
     const char *env_seeds = getenv("MOQ_SCENARIO_SEEDS");
     const char *env_start = getenv("MOQ_SCENARIO_SEED_START");

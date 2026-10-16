@@ -11,6 +11,10 @@
  * plausibly forward raw->WebTransport while dropping WebTransport->raw.
  */
 
+#if defined(__linux__) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "../cli/config.h"
 #include <moq/relay/moqr_shards.h>
 
@@ -19,10 +23,14 @@
 #include <moq/session.h>
 #include <moq/wtquic_msquic_managed.h>
 
+#include "msq_loopback_port.h"
+#include "wtq_loopback_port.h"
+
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 extern moq_msquic_lane_pump_fn moqr_test_lanes_pump(void);
 extern moq_wtquic_msquic_lane_pump_fn moqr_test_wt_lanes_pump(void);
@@ -37,9 +45,21 @@ static int g_failures;
     fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #x); \
     g_failures++; } } while (0)
 
+/* How long delivery may take, in wall-clock time. */
+#define DELIVERY_BUDGET_MS 12000u
+#define PACE_MS 10
+
 #define NS_PART_0 "dual"
 #define TRACK_NAME "t"
 static const uint8_t kPayload[] = "cross-transport";
+
+static uint64_t
+mono_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
 
 /* -- the client peers ------------------------------------------------------
  * Both transports carry the same moq_session_t, so the protocol side is one
@@ -222,7 +242,6 @@ run_cross(const char *cert, const char *key, bool raw_publishes)
     rc.alloc = moq_alloc_default();
     rc.perspective = MOQ_PERSPECTIVE_SERVER;
     rc.host = "127.0.0.1";
-    rc.port = 0;                   /* ephemeral: no fixed port to collide */
     rc.cert_path = cert;
     rc.key_path = key;
     rc.version = MOQ_VERSION_DRAFT_18;   /* match the WebTransport default */
@@ -232,7 +251,7 @@ run_cross(const char *cert, const char *key, bool raw_publishes)
     rc.on_lane_pump = moqr_test_lanes_pump();
     rc.on_lane_pump_user = ctx;
     moq_msquic_managed_t *relay_raw = NULL;
-    CHECK(moq_msquic_managed_create(&rc, &relay_raw) == MOQ_OK);
+    CHECK(msqt_server_create(&rc, &relay_raw) == MOQ_OK);
 
     /* the relay's WebTransport listener, on the SAME runtime */
     moq_wtquic_msquic_managed_cfg_t wc;
@@ -240,7 +259,6 @@ run_cross(const char *cert, const char *key, bool raw_publishes)
     wc.alloc = moq_alloc_default();
     wc.perspective = MOQ_PERSPECTIVE_SERVER;
     wc.host = "127.0.0.1";
-    wc.port = 0;
     wc.cert_path = cert;
     wc.key_path = key;
     wc.lane_count = 1;
@@ -250,7 +268,7 @@ run_cross(const char *cert, const char *key, bool raw_publishes)
     wc.on_lane_pump = moqr_test_wt_lanes_pump();
     wc.on_lane_pump_user = ctx;
     moq_wtquic_msquic_managed_t *relay_wt = NULL;
-    CHECK(moq_wtquic_msquic_managed_create(&wc, &relay_wt) == MOQ_OK);
+    CHECK(wtqt_managed_server_create(&wc, &relay_wt) == MOQ_OK);
     if (relay_raw == NULL || relay_wt == NULL) {
         if (relay_wt != NULL) {
             (void)moq_wtquic_msquic_managed_stop(relay_wt);
@@ -306,24 +324,32 @@ run_cross(const char *cert, const char *key, bool raw_publishes)
     moq_wtquic_msquic_managed_t *cwt = NULL;
     CHECK(moq_wtquic_msquic_managed_create(&cwc, &cwt) == MOQ_OK);
 
-    /* Drive until the subscriber has the object. Bounded by attempts, and the
-     * loop exits on the event rather than on elapsed time. */
+    /* Drive until the subscriber has the object or the budget is spent. Each
+     * pass wakes all four facades so both peers re-run their protocol step
+     * (a refused subscribe is retried on a later pump). A facade's wait would
+     * return at once after its own wake, so the pace is a plain sleep and the
+     * budget is a monotonic deadline: a slow delivery gets the whole budget,
+     * not a number of passes. */
     peer_t *sub = raw_publishes ? &wt_peer : &raw_peer;
     bool delivered = false;
-    for (int i = 0; i < 600 && !delivered; i++) {
+    const uint64_t started_ms = mono_ms();
+    const uint64_t deadline_ms = started_ms + DELIVERY_BUDGET_MS;
+    while (!delivered && mono_ms() < deadline_ms) {
         if (craw != NULL) {
             (void)moq_msquic_managed_wake(craw);
-            (void)moq_msquic_managed_wait(craw, 10 * 1000);
         }
         if (cwt != NULL) {
             (void)moq_wtquic_msquic_managed_wake(cwt);
-            (void)moq_wtquic_msquic_managed_wait(cwt, 10 * 1000);
         }
         (void)moq_msquic_managed_wake(relay_raw);
         (void)moq_wtquic_msquic_managed_wake(relay_wt);
+        const struct timespec pace = { 0, PACE_MS * 1000000L };
+        (void)nanosleep(&pace, NULL);
         delivered = atomic_load(&sub->received) > 0;
     }
     if (!delivered) {
+        fprintf(stderr, "  not delivered after %llu ms\n",
+                (unsigned long long)(mono_ms() - started_ms));
         /* Say WHERE it stopped: a silent "not delivered" cannot distinguish a
          * handshake that never completed from a relay that never forwarded. */
         fprintf(stderr,

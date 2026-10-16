@@ -299,7 +299,7 @@ static void test_partial_then_stop(moq_version_t v, bool reset)
  * is repeated without one and the stream then ends with the peer's FIN. */
 static void test_fin_then_stop_and_duplicate(moq_version_t v)
 {
-    const bool fin_first = false;   /* draft-18: a FIN is not the case here */
+    const bool fin_first = v == MOQ_VERSION_DRAFT_22;
     const char *what = fin_first ? "FIN then STOP, STOP twice" : "STOP twice";
     rig_t r;
     if (!rig_open(&r, v, 0, 0)) { failures++; rig_close(&r, what); return; }
@@ -496,6 +496,75 @@ static void test_slot_reuse(moq_version_t v)
     rig_close(&r, what);
 }
 
+/* An established request stream: a second initial request on it is a
+ * protocol violation that leaves the owner as it was; a REQUEST_UPDATE is
+ * the request's own and is taken. */
+static void test_established_second_request(moq_version_t v, bool update)
+{
+    const char *what = update ? "REQUEST_UPDATE on established stream"
+                              : "second request on established stream";
+    rig_t r;
+    if (!rig_open(&r, v, 0, 0)) { failures++; rig_close(&r, what); return; }
+    static moq_bytes_t parts[] = { { (const uint8_t *)"live", 4 } };
+    moq_subscribe_cfg_t cfg;
+    moq_subscribe_cfg_init(&cfg);
+    cfg.track_namespace = (moq_namespace_t){ parts, 1 };
+    cfg.track_name = (moq_bytes_t){ (const uint8_t *)"a", 1 };
+    moq_subscription_t csub;
+    MOQ_TEST_CHECK(moq_session_subscribe(r.c, &cfg, 0, &csub) == MOQ_OK);
+    moq_simpair_run_until_quiescent(r.sp, 32, NULL);
+    observe(&r);
+    moq_subscription_t owner = r.last_request;
+    moq_accept_subscribe_cfg_t acc;
+    moq_accept_subscribe_cfg_init(&acc);
+    MOQ_TEST_CHECK(moq_session_accept_subscribe(r.sv, owner, &acc, 0) == MOQ_OK);
+    moq_simpair_run_until_quiescent(r.sp, 32, NULL);
+    observe(&r);
+    moq_event_t ev;
+    while (moq_session_poll_events(r.c, &ev, 1) > 0) moq_event_cleanup(&ev);
+    int slot = sub_resolve_handle(r.sv, owner);
+    MOQ_TEST_CHECK(slot >= 0);
+    if (slot < 0) { rig_close(&r, what); return; }
+    moq_stream_ref_t ref = r.sv->subs[slot].rs.ref;
+    uint64_t rid = r.sv->subs[slot].request_id;
+    uint8_t wire[512];
+    size_t n = 0;
+    if (update) {
+        moq_subscription_update_cfg_t up;
+        moq_subscription_update_cfg_init_sized(&up, sizeof(up));
+        up.has_subscriber_priority = true;
+        up.subscriber_priority = 9;
+        MOQ_TEST_CHECK(moq_session_update_subscription(r.c, csub, &up, 0) == MOQ_OK);
+        moq_action_t a;
+        while (moq_session_poll_actions(r.c, &a, 1) > 0) {
+            if (a.kind == MOQ_ACTION_SEND_BIDI_STREAM && a.u.send_bidi_stream.len <= sizeof(wire)) {
+                memcpy(wire, a.u.send_bidi_stream.data, a.u.send_bidi_stream.len);
+                n = a.u.send_bidi_stream.len;
+            }
+            moq_action_cleanup(&a);
+        }
+    } else {
+        n = request_bytes(&r, "b", wire, sizeof(wire));
+    }
+    MOQ_TEST_CHECK(n > 0);
+    int before = r.requests;
+    (void)feed(&r, ref, wire, n, false);
+    observe(&r);
+    expect(r.requests == before, "no second request", &r);
+    if (update) {
+        expect(r.closes == 0 && moq_session_state(r.sv) == MOQ_SESS_ESTABLISHED, what, &r);
+        expect(sub_resolve_handle(r.sv, owner) == slot &&
+               r.sv->subs[slot].state == MOQ_SUB_ESTABLISHED, "owner established", &r);
+        expect(r.updates == 1 && r.update_priority == 9, "update taken with its priority", &r);
+    } else {
+        expect(moq_session_state(r.sv) == MOQ_SESS_CLOSED && r.close_code == 0x3, what, &r);
+        expect(sub_resolve_handle(r.sv, owner) == slot &&
+               r.sv->subs[slot].request_id == rid &&
+               r.sv->subs[slot].state == MOQ_SUB_ESTABLISHED, "owner untouched", &r);
+    }
+    rig_close(&r, what);
+}
+
 /* A pending SUBSCRIBE with one buffered Joining FETCH (§10.12.2), both peer
  * halves open, and room for exactly one more drain reference. A STOP on the
  * SUBSCRIBE needs two: the rejected join keeps its stream's identity, and so
@@ -682,7 +751,7 @@ static void test_controls(moq_version_t v, bool goaway)
 
 int main(void)
 {
-    const moq_version_t vs[] = { MOQ_VERSION_DRAFT_18 };
+    const moq_version_t vs[] = { MOQ_VERSION_DRAFT_18, MOQ_VERSION_DRAFT_22 };
     for (size_t i = 0; i < sizeof(vs) / sizeof(vs[0]); i++) {
         moq_version_t v = vs[i];
         int before = failures;
@@ -701,8 +770,13 @@ int main(void)
         test_pressure(v, false);
         test_pressure(v, true);
         test_slot_reuse(v);
-        test_stop_with_buffered_join(v, false);
-        test_stop_with_buffered_join(v, true);
+        /* Draft-22 has no Joining FETCH. */
+        if (v == MOQ_VERSION_DRAFT_18) {
+            test_stop_with_buffered_join(v, false);
+            test_stop_with_buffered_join(v, true);
+        }
+        test_established_second_request(v, false);
+        test_established_second_request(v, true);
         test_controls(v, false);
         test_controls(v, true);
         if (failures != before) fprintf(stderr, "  in d%u\n", (unsigned)v);

@@ -56,12 +56,19 @@ struct test_cert { std::string cert_pem, key_pem; bool ok = false; };
 static test_cert gen_cert()
 {
     test_cert r;
-    auto pkey = folly::ssl::EvpPkeyUniquePtr(EVP_PKEY_new());
-    if (!pkey) return r;
-    auto *ec = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
-    if (!ec) return r;
-    if (!EC_KEY_generate_key(ec)) { EC_KEY_free(ec); return r; }
-    if (!EVP_PKEY_assign_EC_KEY(pkey.get(), ec)) { EC_KEY_free(ec); return r; }
+    /* P-256 key through the EVP keygen interface (OpenSSL 1.1 and 3). */
+    folly::ssl::EvpPkeyUniquePtr pkey;
+    {
+        EVP_PKEY_CTX *kctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr);
+        EVP_PKEY *raw = nullptr;
+        bool keyed = kctx && EVP_PKEY_keygen_init(kctx) > 0 &&
+            EVP_PKEY_CTX_set_ec_paramgen_curve_nid(kctx,
+                NID_X9_62_prime256v1) > 0 &&
+            EVP_PKEY_keygen(kctx, &raw) > 0;
+        EVP_PKEY_CTX_free(kctx);
+        if (!keyed) { EVP_PKEY_free(raw); return r; }
+        pkey.reset(raw);
+    }
     auto x509 = folly::ssl::X509UniquePtr(X509_new());
     if (!x509) return r;
     if (!ASN1_INTEGER_set(X509_get_serialNumber(x509.get()), 1)) return r;

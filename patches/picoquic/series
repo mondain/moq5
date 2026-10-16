@@ -1,0 +1,6 @@
+# picoquic patches LibMoQ applies, in order. Read by
+# scripts/setup_picoquic_deps.sh and scripts/provider_patches.sh.
+0002-reset-stream-after-fin.patch
+0006-own-application-close-reason.patch
+0007-stream-terminal-observation.patch
+0008-use-declared-project-version.patch

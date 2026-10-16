@@ -42,6 +42,9 @@ package enum EndpointDrainResult: Sendable, Hashable {
 package protocol EndpointBackend: AnyObject, Sendable {
     var state: MoQEndpoint.State { get }
     var negotiatedVersion: MoQVersion? { get }
+    var negotiatedWireVersion: WireVersion? { get }
+    /// The session-wide GOAWAY's New Session URI, `nil` until one arrives.
+    var goawayNewSessionURI: Data? { get }
     var isFatal: Bool { get }
     var fatalCode: UInt64 { get }
     /// Why the endpoint went terminal, classified transport-agnostically.
@@ -53,6 +56,12 @@ package protocol EndpointBackend: AnyObject, Sendable {
     func drain(timeoutMicroseconds: UInt64) -> EndpointDrainResult
     func stop()
     func destroy()
+}
+
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+extension EndpointBackend {
+    package var negotiatedWireVersion: WireVersion? { negotiatedVersion.map(WireVersion.init) }
+    package var goawayNewSessionURI: Data? { nil }
 }
 
 /// Mirror of the C `moq_endpoint_terminal_reason_t`, carrying the transport-
@@ -77,6 +86,9 @@ package enum TerminalFailure: Sendable, Equatable {
 package struct ReceiverPolledEvent: Sendable {
     package enum Kind: Sendable {
         case added, updated, removed, ended, catalogReady, parseDrop
+        case fillTerminal(MediaFillTerminal)
+        case localFailure(localResult: Int32?)
+        case deliveryLocalFailure(localResult: Int32?, origin: UInt32?, initiatingRequestID: UInt64?)
     }
     package var kind: Kind
     package var handleID: UInt64
@@ -125,11 +137,21 @@ package struct ReceiverPolledObject: Sendable {
     package var decodeTime: Duration
     package var compositionOffset: Duration
     package var captureTime: Date?
+    package var wireIdentity: MediaObjectIdentity?
+    package var metadata: MediaObjectMetadata?
+    package var objectProperties: Data?
+    package var trackProperties: Data?
+    package var delivery: MediaObjectDelivery?
 
     package init(handleID: UInt64, storage: any OwnedObjectStorage,
                  isKeyframe: Bool, endsGroup: Bool, isDatagram: Bool,
                  presentationTime: Duration, decodeTime: Duration,
-                 compositionOffset: Duration, captureTime: Date?) {
+                 compositionOffset: Duration, captureTime: Date?,
+                 wireIdentity: MediaObjectIdentity? = nil,
+                 metadata: MediaObjectMetadata? = nil,
+                 objectProperties: Data? = nil,
+                 trackProperties: Data? = nil,
+                 delivery: MediaObjectDelivery? = nil) {
         self.handleID = handleID
         self.storage = storage
         self.isKeyframe = isKeyframe
@@ -139,6 +161,11 @@ package struct ReceiverPolledObject: Sendable {
         self.decodeTime = decodeTime
         self.compositionOffset = compositionOffset
         self.captureTime = captureTime
+        self.wireIdentity = wireIdentity
+        self.metadata = metadata
+        self.objectProperties = objectProperties
+        self.trackProperties = trackProperties
+        self.delivery = delivery
     }
 }
 
@@ -154,7 +181,7 @@ package enum ReceiverObjectPollResult: Sendable {
     case closed                         /* MOQ_ERR_CLOSED (empty AND terminal) */
 }
 
-/// One subscribe/unsubscribe command outcome (asynchronous commands in C:
+/// One subscribe/unsubscribe/cancel-fill outcome (asynchronous commands in C:
 /// ok means validated-and-recorded, not peer-accepted).
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
 package enum ReceiverCommandResult: Sendable {
@@ -163,6 +190,7 @@ package enum ReceiverCommandResult: Sendable {
     case wrongState                     /* track already ended */
     case closed
     case unsupported                    /* MSF namespace-override tracks */
+    case nativeFailure(Int32)           /* unmodeled refusal, lossless */
 }
 
 /// An endpoint backend that can vend REAL attachment backends (the
@@ -182,7 +210,7 @@ package protocol ReceiverBackendFactory {
 /// own fatal codes with the endpoint's), `isTerminal` (closed OR fatal --
 /// the object waiter's level term), `hasQueuedObjects` (stats under the C
 /// receiver lock). Service-thread only: `pollTrackEvent`, `pollObject`,
-/// `subscribe`, `unsubscribe`, and `detach` (the C receiver destroy, called
+/// `subscribe`, `unsubscribe`, `cancelFill`, `trackState`, and `detach` (the C receiver destroy, called
 /// exactly once, after which NO method may be called; queued undelivered
 /// objects die with it, like the C destroy).
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
@@ -194,8 +222,10 @@ package protocol ReceiverBackend: AnyObject, Sendable {
     func pollTrackEvent() -> ReceiverPollResult
     func pollObject() -> ReceiverObjectPollResult
     func subscribe(handleID: UInt64, start: StartMode,
-                   priority: UInt8?) -> ReceiverCommandResult
+                   priority: UInt8?, options: MediaTrackSubscriptionOptions) -> ReceiverCommandResult
     func unsubscribe(handleID: UInt64) -> ReceiverCommandResult
+    func cancelFill(handleID: UInt64, initiatingRequestID: UInt64) -> ReceiverCommandResult
+    func trackState(handleID: UInt64) -> Result<ExtendedTrackSubscriptionState, MoQServiceError>
     func detach()
 }
 
@@ -210,6 +240,7 @@ package enum SenderOperationResult: Sendable {
     case interrupted       /* the endpoint latch (C checks it in write) */
     case closed            /* terminal; discriminate via isFatal/fatalCode */
     case outOfMemory       /* allocation failure (payload buffer, C NOMEM) */
+    case unsupported       /* native companion/profile eligibility refusal */
 }
 
 /// One addTrack outcome.
@@ -266,6 +297,14 @@ package protocol SenderBackend: AnyObject, Sendable {
     func endTrack(handleID: UInt64) -> SenderOperationResult
     func wait(timeoutMicroseconds: UInt64) -> SenderWaitOutcome
     func detach()
+    /// The pending new-group request on a track (its value), cleared by
+    /// taking it; nil when none is pending.
+    func takeNewGroupRequest(handleID: UInt64) -> UInt64?
+}
+
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+extension SenderBackend {
+    package func takeNewGroupRequest(handleID: UInt64) -> UInt64? { nil }
 }
 
 /// Exclusive ownership of one received object's backing storage (the C

@@ -927,11 +927,12 @@ int main(void)
         t.has_codec = true;
         t.codec = lit("avc1.64001e");
 
-        /* -- both drafts stamp exactly, at the current size ------------ */
+        /* -- every registered draft stamps exactly, at the current size - */
         {
-            const moq_version_t vs[2] = { MOQ_VERSION_DRAFT_16,
-                                          MOQ_VERSION_DRAFT_18 };
-            for (size_t i = 0; i < 2; i++) {
+            const moq_version_t vs[3] = { MOQ_VERSION_DRAFT_16,
+                                          MOQ_VERSION_DRAFT_18,
+                                          MOQ_VERSION_DRAFT_22 };
+            for (size_t i = 0; i < 3; i++) {
                 moq_media_track_info_t info;
                 memset(&info, 0xAB, sizeof(info));
                 CHECK(moq_msf_track_to_media_info_sized(

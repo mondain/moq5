@@ -119,17 +119,6 @@ static bool got_fetch_request(moq_session_t *s)
     return got;
 }
 
-static bool any_send_control(moq_session_t *s)
-{
-    moq_action_t a;
-    bool found = false;
-    while (moq_session_poll_actions(s, &a, 1) > 0) {
-        if (a.kind == MOQ_ACTION_SEND_CONTROL) found = true;
-        moq_action_cleanup(&a);
-    }
-    return found;
-}
-
 int main(void)
 {
     int failures = 0;
@@ -150,42 +139,57 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT((int)byref.kind, (int)MOQ_REQ_FETCH);
         MOQ_TEST_CHECK_EQ_INT((int)s->fetches[byref.slot].state,
                               (int)MOQ_FETCH_PENDING_PUBLISHER);
-        MOQ_TEST_CHECK_EQ_U64(s->fetches[byref.slot].request_stream_ref._v,
+        MOQ_TEST_CHECK_EQ_U64(s->fetches[byref.slot].rs.ref._v,
                               ref._v);
         moq_session_destroy(s);
     }
 
     /* == A2. Inbound FETCH after local GOAWAY is refused ============== */
     {
-        /* After we send GOAWAY (§10.4) the peer must not open new requests.
-         * A fresh FETCH on a request bidi must be a protocol violation, not a
-         * committed fetch entry + app event. */
+        /* After our GOAWAY the peer SHOULD NOT open new requests (§10.4); one
+         * that crossed it is refused with REQUEST_ERROR GOING_AWAY on its own
+         * bidi -- no committed fetch entry, no app event, no session close. */
         moq_session_t *s = make_established_d18_server();
         MOQ_TEST_CHECK(s != NULL);
         MOQ_TEST_CHECK_EQ_INT((int)moq_session_goaway(s, NULL, 0, 0),
                               (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(s),
                               (int)MOQ_SESS_DRAINING);
+        moq_action_t ga;
+        while (moq_session_poll_actions(s, &ga, 1) > 0) moq_action_cleanup(&ga);
 
         uint8_t msg[128];
         size_t n = make_fetch(msg, sizeof(msg), 0, 1, "video");
         moq_stream_ref_t ref = moq_stream_ref_from_u64(0xF0A2);
         moq_session_on_bidi_stream_bytes(s, ref, msg, n, false, 1);
 
-        MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(s), (int)MOQ_SESS_CLOSED);
-        /* No FETCH_REQUEST surfaced; the close is a protocol violation (0x3). */
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(s), (int)MOQ_SESS_DRAINING);
         moq_event_t cev;
-        bool saw_fetch = false, saw_closed = false;
+        bool saw_fetch = false;
         while (moq_session_poll_events(s, &cev, 1) > 0) {
             if (cev.kind == MOQ_EVENT_FETCH_REQUEST) saw_fetch = true;
-            if (cev.kind == MOQ_EVENT_SESSION_CLOSED) {
-                saw_closed = true;
-                MOQ_TEST_CHECK_EQ_U64(cev.u.closed.code, 0x3);
-            }
             moq_event_cleanup(&cev);
         }
         MOQ_TEST_CHECK(!saw_fetch);
-        MOQ_TEST_CHECK(saw_closed);
+        bool refused = false;
+        moq_action_t act;
+        while (moq_session_poll_actions(s, &act, 1) > 0) {
+            if (act.kind == MOQ_ACTION_SEND_BIDI_STREAM &&
+                act.u.send_bidi_stream.stream_ref._v == ref._v &&
+                act.u.send_bidi_stream.fin) {
+                moq_buf_reader_t r;
+                moq_buf_reader_init(&r, act.u.send_bidi_stream.data,
+                                    act.u.send_bidi_stream.len);
+                moq_control_envelope_t env;
+                moq_d18_request_error_t e;
+                if (moq_d18_decode_envelope(&r, &env) == MOQ_OK &&
+                    moq_d18_decode_request_error(env.payload, env.payload_len, &e) == MOQ_OK &&
+                    e.error_code == MOQ_REQUEST_ERROR_GOING_AWAY)
+                    refused = true;
+            }
+            moq_action_cleanup(&act);
+        }
+        MOQ_TEST_CHECK(refused);
         /* No committed fetch entry was created for the refused request. */
         MOQ_TEST_CHECK_EQ_INT(
             (int)request_registry_find_by_streamref(s, ref).kind,
@@ -342,7 +346,11 @@ int main(void)
         moq_session_destroy(s);
     }
 
-    /* == F. Fetch pool full fails closed with no control-channel error  */
+    /* == F. Fetch pool full: REQUEST_ERROR + FIN on the request bidi ==== *
+     *  §3.3.2: "When an endpoint rejects a request without performing any
+     *  application processing, it SHOULD send a REQUEST_ERROR and FIN the
+     *  stream." A slot shortfall is EXCESSIVE_LOAD, retryable, and never a
+     *  session close or a control-channel message. */
     {
         moq_session_cfg_t cfg;
         moq_session_cfg_init_sized(&cfg, sizeof(cfg), moq_alloc_default(), MOQ_PERSPECTIVE_SERVER);
@@ -369,13 +377,44 @@ int main(void)
         MOQ_TEST_CHECK(got_fetch_request(s));
         while (moq_session_poll_actions(s, &a, 1) > 0) moq_action_cleanup(&a);
 
-        /* Second FETCH cannot allocate a slot -> fail closed, no SEND_CONTROL. */
+        /* Second FETCH cannot allocate a slot: refused on its own bidi. */
         uint8_t m2[128];
         size_t n2 = make_fetch(m2, sizeof(m2), 2, 1, "b");
-        (void)moq_session_on_bidi_stream_bytes(s,
-            moq_stream_ref_from_u64(0xF201), m2, n2, false, 1);
-        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_CLOSED);
-        MOQ_TEST_CHECK(!any_send_control(s));
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_session_on_bidi_stream_bytes(s,
+                moq_stream_ref_from_u64(0xF201), m2, n2, false, 1), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
+        MOQ_TEST_CHECK(!got_fetch_request(s));
+        bool refused = false, control = false;
+        while (moq_session_poll_actions(s, &a, 1) > 0) {
+            if (a.kind == MOQ_ACTION_SEND_CONTROL) control = true;
+            if (a.kind == MOQ_ACTION_SEND_BIDI_STREAM &&
+                a.u.send_bidi_stream.stream_ref._v == 0xF201) {
+                moq_buf_reader_t r;
+                moq_buf_reader_init(&r, a.u.send_bidi_stream.data,
+                                    a.u.send_bidi_stream.len);
+                moq_control_envelope_t env;
+                moq_d18_request_error_t err;
+                if (moq_d18_decode_envelope(&r, &env) == MOQ_OK &&
+                    env.msg_type == MOQ_D18_REQUEST_ERROR &&
+                    moq_d18_decode_request_error(env.payload, env.payload_len,
+                                                 &err) == MOQ_OK) {
+                    MOQ_TEST_CHECK_EQ_U64(err.error_code,
+                                          MOQ_REQUEST_ERROR_EXCESSIVE_LOAD);
+                    MOQ_TEST_CHECK(err.retry_interval != 0);
+                    MOQ_TEST_CHECK(a.u.send_bidi_stream.fin);
+                    refused = true;
+                }
+            }
+            moq_action_cleanup(&a);
+        }
+        MOQ_TEST_CHECK(refused);
+        MOQ_TEST_CHECK(!control);
+        /* The requester's FIN on the refused bidi is absorbed. */
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_session_on_bidi_stream_bytes(s,
+                moq_stream_ref_from_u64(0xF201), NULL, 0, true, 2), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
         moq_session_destroy(s);
     }
 

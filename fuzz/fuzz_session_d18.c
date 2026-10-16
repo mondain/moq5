@@ -221,10 +221,10 @@ static moq_session_t *make_d18_session(const moq_alloc_t *alloc,
     moq_buf_writer_t w;
     moq_buf_writer_init(&w, setup, sizeof(setup));
     moq_d18_setup_opts_t sopts;
-    memset(&sopts, 0, sizeof(sopts));
+    moq_d18_setup_opts_init(&sopts);
     sopts.has_max_auth_token_cache_size = true;
     sopts.max_auth_token_cache_size = 256;
-    if (moq_d18_encode_setup_opts(&w, &sopts) != MOQ_OK)
+    if (moq_d18_encode_setup_opts(&w, &sopts, sizeof(sopts)) != MOQ_OK)
         __builtin_trap();
     if (moq_session_on_control_bytes(s, setup,
                                      moq_buf_writer_offset(&w), 0) != MOQ_OK)

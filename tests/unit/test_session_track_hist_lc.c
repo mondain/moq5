@@ -395,43 +395,43 @@ static void test_varint_boundary(void)
 
     moq_resolved_window_t w;
     /* d16 LargestObject with LO at ceiling -> start {LG+1,0}, NOT empty. */
-    moq_resolve_filter_window(MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT, 0, 0, 0,
+    moq_resolve_filter_window(MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT, 0, 0, 0, 0,
                               true, 5, D16, D16, &w);
     MOQ_TEST_CHECK(w.has_window && !w.unsatisfiable &&
                    w.start_group == 6 && w.start_object == 0);
     /* d16 LargestObject at double ceiling -> unsatisfiable. */
-    moq_resolve_filter_window(MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT, 0, 0, 0,
+    moq_resolve_filter_window(MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT, 0, 0, 0, 0,
                               true, D16, D16, D16, &w);
     MOQ_TEST_CHECK(w.has_window && w.unsatisfiable);
     /* d18: the SAME {D16,D16} snapshot is far below the vi64 ceiling -> a plain
      * object++ within the group, satisfiable. */
-    moq_resolve_filter_window(MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT, 0, 0, 0,
+    moq_resolve_filter_window(MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT, 0, 0, 0, 0,
                               true, D16, D16, D18, &w);
     MOQ_TEST_CHECK(w.has_window && !w.unsatisfiable &&
                    w.start_group == D16 && w.start_object == D16 + 1);
     /* d18 LargestObject at the vi64 double ceiling -> unsatisfiable. */
-    moq_resolve_filter_window(MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT, 0, 0, 0,
+    moq_resolve_filter_window(MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT, 0, 0, 0, 0,
                               true, D18, D18, D18, &w);
     MOQ_TEST_CHECK(w.has_window && w.unsatisfiable);
     /* NextGroup -> {LG+1,0}; empty only at the profile ceiling group. */
-    moq_resolve_filter_window(MOQ_SUBSCRIBE_FILTER_NEXT_GROUP, 0, 0, 0,
+    moq_resolve_filter_window(MOQ_SUBSCRIBE_FILTER_NEXT_GROUP, 0, 0, 0, 0,
                               true, 9, 3, D16, &w);
     MOQ_TEST_CHECK(w.has_window && !w.unsatisfiable &&
                    w.start_group == 10 && w.start_object == 0);
-    moq_resolve_filter_window(MOQ_SUBSCRIBE_FILTER_NEXT_GROUP, 0, 0, 0,
+    moq_resolve_filter_window(MOQ_SUBSCRIBE_FILTER_NEXT_GROUP, 0, 0, 0, 0,
                               true, D16, 0, D16, &w);
     MOQ_TEST_CHECK(w.has_window && w.unsatisfiable);            /* d16 ceiling */
-    moq_resolve_filter_window(MOQ_SUBSCRIBE_FILTER_NEXT_GROUP, 0, 0, 0,
+    moq_resolve_filter_window(MOQ_SUBSCRIBE_FILTER_NEXT_GROUP, 0, 0, 0, 0,
                               true, D16, 0, D18, &w);
     MOQ_TEST_CHECK(w.has_window && !w.unsatisfiable &&
                    w.start_group == D16 + 1);                   /* d18: not ceiling */
     /* AbsoluteRange stores a finite end. */
-    moq_resolve_filter_window(MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE, 2, 1, 8,
+    moq_resolve_filter_window(MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE, 2, 1, 8, 0,
                               false, 0, 0, D16, &w);
     MOQ_TEST_CHECK(w.has_window && w.has_end && w.start_group == 2 &&
                    w.start_object == 1 && w.end_group == 8);
     /* Relative with no snapshot resolves to an open window from origin. */
-    moq_resolve_filter_window(MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT, 0, 0, 0,
+    moq_resolve_filter_window(MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT, 0, 0, 0, 0,
                               false, 0, 0, D16, &w);
     MOQ_TEST_CHECK(w.has_window && !w.unsatisfiable &&
                    w.start_group == 0 && w.start_object == 0);
@@ -725,13 +725,13 @@ static bool pub_update_pending(moq_session_t *s, moq_publication_t h)
 static moq_stream_ref_t sub_req_ref(moq_session_t *s, moq_subscription_t h)
 {
     int slot = sub_resolve_handle(s, h);
-    return slot >= 0 ? s->subs[slot].request_stream_ref
+    return slot >= 0 ? s->subs[slot].rs.ref
                      : moq_stream_ref_from_u64(0);
 }
 static moq_stream_ref_t pub_req_ref(moq_session_t *s, moq_publication_t h)
 {
     int slot = pub_resolve_handle(s, h);
-    return slot >= 0 ? s->publishes[slot].request_stream_ref
+    return slot >= 0 ? s->publishes[slot].rs.ref
                      : moq_stream_ref_from_u64(0);
 }
 /* Re-drive a session's deferred control/response processing DIRECTLY (no bridge
@@ -1778,9 +1778,9 @@ static moq_result_t feed_d18_subscribe_split(moq_session_t *s,
             moq_sub_entry_t *e = &s->subs[ep.slot];
             MOQ_TEST_CHECK_EQ_INT((int)e->state,
                                   (int)MOQ_SUB_RECVING_REQUEST);
-            MOQ_TEST_CHECK_EQ_SIZE(e->req_recv_len, head);
-            MOQ_TEST_CHECK(e->req_recv_buf != NULL &&
-                           memcmp(e->req_recv_buf, buf, head) == 0);
+            MOQ_TEST_CHECK_EQ_SIZE(e->rs.recv_len, head);
+            MOQ_TEST_CHECK(e->rs.recv_buf != NULL &&
+                           memcmp(e->rs.recv_buf, buf, head) == 0);
         }
     }
 

@@ -3,15 +3,21 @@
  *
  * CLIENT: stands up the EXISTING public wtquic-MsQuic listener and connects the
  * managed facade client to it, proving actual WT-Protocol negotiation and
- * MoQ-session/attach-adapter creation at the negotiated version — for draft-16
- * and draft-18 SEPARATELY. Establishment is observed through the facade's own
- * condition variable (broadcast on establishment).
+ * MoQ-session/attach-adapter creation at the negotiated version — for draft-16,
+ * draft-18 and draft-22 SEPARATELY (the draft-22 session exists only once the
+ * facade has bound it to the WebTransport session it is carried in).
+ * Establishment is observed through the facade's own condition variable
+ * (broadcast on establishment). The listener records the CONNECT's :authority:
+ * the client's target authority as spelled, or host:port when derived --
+ * never the bare TLS server name.
  *
  * SERVER: stands up the managed facade server and connects a raw wtquic client,
- * proving the server admits AND establishes a child (draft-18 version + attach
- * adapter + retained ws, read under the child's lane guard) and then quiesces it
- * server-first at teardown (env_close must return). This case recompiles the
- * facade with MOQ_WTQ_MM_TESTING for the guarded child observation.
+ * proving the server admits AND establishes a child (the negotiated version +
+ * attach adapter + retained ws, read under the child's lane guard) and then
+ * quiesces it server-first at teardown (env_close must return) — for draft-18
+ * and for draft-22, whose child is bound with the identity the CONNECT named.
+ * This case recompiles the facade with MOQ_WTQ_MM_TESTING for the guarded child
+ * observation.
  *
  * Establishment only: no subscribe/object flow (that needs the pump), no
  * datagrams, no service integration. The per-call wait timeout and overall
@@ -26,6 +32,7 @@
 
 #include <wtquic/wtquic.h>
 #include <wtquic/wtquic_msquic.h>
+#include "wtq_loopback_port.h"
 
 #include <pthread.h>
 #include <stdbool.h>
@@ -70,6 +77,11 @@ static struct {
     int seen;            /* pumps that observed the client's terminal */
     moq_result_t rc;     /* ack result for the client, AFTER observation */
     moq_result_t rc_null;
+    int state_seen;      /* the first pump recorded the session's state */
+    moq_session_state_t state; /* that state: a started session has left
+                                * MOQ_SESS_IDLE, which for a profile that
+                                * requires a transport binding proves the
+                                * facade bound it before starting it */
 } g_cap;
 
 /* The client facade's lane callback. It receives the single client connection
@@ -91,6 +103,12 @@ static int client_ack_probe_pump(moq_wtquic_msquic_managed_t *m,
          * OBSERVED does the acknowledgment reach the client check -- before
          * that it would be refused for the unobserved reason instead, which
          * would not discriminate the guard under test. */
+        pthread_mutex_lock(&g_cap.mu);
+        if (!g_cap.state_seen) {
+            g_cap.state_seen = 1;
+            g_cap.state = moq_session_state(sess);
+        }
+        pthread_mutex_unlock(&g_cap.mu);
         moq_event_t ev;
         bool closed = false;
         while (moq_session_poll_events(sess, &ev, 1) == 1)
@@ -119,9 +137,49 @@ static int client_ack_probe_pump(moq_wtquic_msquic_managed_t *m,
     return 0;
 }
 
-/* One offer/version pair over a fresh listener + facade client. */
-static void run_case(const char *token, moq_version_t expected)
+/* The :authority and :path the listener's accepted CONNECT named. */
+static struct {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    int seen;
+    char authority[256];
+    char path[256];
+} g_srv;
+
+static void srv_established(wtq_session_t *s, wtq_str_t sub, void *user)
 {
+    (void)sub;
+    (void)user;
+    wtq_connect_request_metadata_t md = WTQ_CONNECT_REQUEST_METADATA_INIT;
+    bool ok = wtq_session_connect_request_metadata(s, &md) == WTQ_OK;
+    pthread_mutex_lock(&g_srv.mu);
+    size_t n = ok ? md.authority.len : 0;
+    if (n >= sizeof(g_srv.authority))
+        n = sizeof(g_srv.authority) - 1;
+    if (n)
+        memcpy(g_srv.authority, md.authority.data, n);
+    g_srv.authority[n] = '\0';
+    n = ok ? md.path.len : 0;
+    if (n >= sizeof(g_srv.path))
+        n = sizeof(g_srv.path) - 1;
+    if (n)
+        memcpy(g_srv.path, md.path.data, n);
+    g_srv.path[n] = '\0';
+    g_srv.seen = 1;
+    pthread_cond_broadcast(&g_srv.cv);
+    pthread_mutex_unlock(&g_srv.mu);
+}
+
+/* One offer/version pair over a fresh listener + facade client.
+ * target_authority NULL derives the target from the dial parameters and
+ * "/moq"; otherwise the target's path/query is target_path and the CONNECT
+ * must dereference want_path, which the listener serves. */
+static void run_case(const char *token, moq_version_t expected,
+                     const char *target_authority, const char *target_path,
+                     const char *want_path)
+{
+    if (want_path == NULL)
+        want_path = "/moq";
     /* server: the public wtquic-MsQuic listener, supporting both MoQ
      * subprotocols. No-op events, no admission, no MoQ session — it only
      * accepts the WebTransport session so the client can establish. */
@@ -131,18 +189,22 @@ static void run_case(const char *token, moq_version_t expected)
     if (senv == NULL)
         return;
 
-    static const char *const server_protos[] = { "moqt-18", "moqt-16" };
+    static const char *const server_protos[] = { "moqt-22", "moqt-18",
+                                                 "moqt-16" };
     wtq_serve_config_t serve = WTQ_SERVE_CONFIG_INIT;
-    serve.path = "/moq";
+    serve.path = want_path;
     serve.subprotocols = server_protos;
-    serve.subprotocol_count = 2;
+    serve.subprotocol_count = 3;
     serve.require_subprotocol = true;
 
+    memset(&g_srv, 0, sizeof(g_srv));
+    CHECK(pthread_mutex_init(&g_srv.mu, NULL) == 0);
+    CHECK(pthread_cond_init(&g_srv.cv, NULL) == 0);
     wtq_session_events_t sev;
     wtq_session_events_init(&sev);
+    sev.on_established = srv_established;
     wtq_msquic_listener_cfg_t lcfg = WTQ_MSQUIC_LISTENER_CFG_INIT;
     lcfg.bind_address = "127.0.0.1";
-    lcfg.port = 0;
     lcfg.cert_file = cert_path;
     lcfg.key_file = key_path;
     lcfg.paths = &serve;
@@ -150,12 +212,25 @@ static void run_case(const char *token, moq_version_t expected)
     lcfg.events = &sev;
     lcfg.user = NULL;
     wtq_msquic_listener_t *listener = NULL;
-    CHECK(wtq_msquic_listener_start(senv, &lcfg, &listener) == WTQ_OK);
+    CHECK(wtqt_listener_start(senv, &lcfg, &listener) == WTQ_OK);
     if (listener == NULL) {
         wtq_msquic_env_close(senv);
+        pthread_cond_destroy(&g_srv.cv);
+        pthread_mutex_destroy(&g_srv.mu);
         return;
     }
     uint16_t port = wtq_msquic_listener_port(listener);
+
+    moq_connection_target_t target;
+    memset(&target, 0, sizeof(target));
+    target.struct_size = (uint32_t)sizeof(target);
+    target.target_present = MOQ_BINDING_TARGET_COMPLETE;
+    if (target_authority != NULL) {
+        target.authority.data = (const uint8_t *)target_authority;
+        target.authority.len = strlen(target_authority);
+    }
+    target.path_query.data = (const uint8_t *)target_path;
+    target.path_query.len = target_path != NULL ? strlen(target_path) : 0;
 
     /* client: the managed facade, offering exactly `token` so the negotiated
      * version is unambiguous. */
@@ -167,10 +242,11 @@ static void run_case(const char *token, moq_version_t expected)
     cfg.host = "127.0.0.1";
     cfg.port = port;
     cfg.insecure_skip_verify = true;
-    cfg.wt_path = "/moq";
+    cfg.wt_path = target_authority != NULL ? NULL : "/moq";
     cfg.wt_protocols = offers;
     cfg.wt_protocol_count = 1;
     cfg.on_lane_pump = client_ack_probe_pump;
+    cfg.target = target_authority != NULL ? &target : NULL;
 
     memset(&g_cap, 0, sizeof(g_cap));
     CHECK(pthread_mutex_init(&g_cap.mu, NULL) == 0);
@@ -188,6 +264,30 @@ static void run_case(const char *token, moq_version_t expected)
          * after the MoQ session + attach adapter are both created) */
         CHECK(moq_wtquic_msquic_managed_negotiated_version(m) == expected);
         CHECK(!moq_wtquic_msquic_managed_is_fatal(m));
+        {
+            char want[300];
+            if (target_authority != NULL)
+                snprintf(want, sizeof(want), "%s", target_authority);
+            else
+                snprintf(want, sizeof(want), "127.0.0.1:%u", (unsigned)port);
+            struct timespec sdl;
+            clock_gettime(CLOCK_REALTIME, &sdl);
+            sdl.tv_sec += WAIT_SECS;
+            pthread_mutex_lock(&g_srv.mu);
+            int src = 0;
+            while (!g_srv.seen && src == 0)
+                src = pthread_cond_timedwait(&g_srv.cv, &g_srv.mu, &sdl);
+            CHECK(g_srv.seen);
+            if (strcmp(g_srv.authority, want) != 0)
+                fprintf(stderr, "  :authority \"%s\" (want \"%s\")\n",
+                        g_srv.authority, want);
+            CHECK(strcmp(g_srv.authority, want) == 0);
+            if (strcmp(g_srv.path, want_path) != 0)
+                fprintf(stderr, "  :path \"%s\" (want \"%s\")\n",
+                        g_srv.path, want_path);
+            CHECK(strcmp(g_srv.path, want_path) == 0);
+            pthread_mutex_unlock(&g_srv.mu);
+        }
         /* The CLIENT connection is not reaped per-child, so acknowledging it is
          * a state error EVEN ONCE ITS TERMINAL HAS BEEN OBSERVED. Proven from
          * the real client's own on_lane_pump, using the handle that callback
@@ -212,6 +312,9 @@ static void run_case(const char *token, moq_version_t expected)
         CHECK(g_cap.seen != 0);                       /* the pump saw the client */
         CHECK(g_cap.rc == MOQ_ERR_WRONG_STATE);       /* and refused the ack */
         CHECK(g_cap.rc_null == MOQ_ERR_INVAL);        /* NULL is an arg error */
+        /* the session was started at establishment (its SETUP is out): a
+         * profile that requires a binding gets here only once bound */
+        CHECK(g_cap.state_seen && g_cap.state != MOQ_SESS_IDLE);
         pthread_mutex_unlock(&g_cap.mu);
         /* clean client stop + teardown */
         CHECK(moq_wtquic_msquic_managed_stop(m) == MOQ_OK);
@@ -223,6 +326,8 @@ static void run_case(const char *token, moq_version_t expected)
     if (listener != NULL)
         wtq_msquic_listener_stop(listener);
     wtq_msquic_env_close(senv);
+    pthread_cond_destroy(&g_srv.cv);
+    pthread_mutex_destroy(&g_srv.mu);
 }
 
 /*
@@ -259,25 +364,24 @@ static bool raw_wait_established(struct raw_cli *r)
     return set;
 }
 
-static void run_server_case(void)
+static void run_server_case(const char *token, moq_version_t expected)
 {
-    const char *offers[] = { "moqt-18", "moqt-16" };
+    const char *offers[] = { "moqt-22", "moqt-18", "moqt-16" };
     moq_wtquic_msquic_managed_cfg_t cfg;
     moq_wtquic_msquic_managed_cfg_init_sized(&cfg, sizeof(cfg));
     cfg.alloc = moq_alloc_default();
     cfg.perspective = MOQ_PERSPECTIVE_SERVER;
     cfg.host = "127.0.0.1"; /* bind address */
-    cfg.port = 0;           /* ephemeral */
     cfg.cert_path = cert_path;
     cfg.key_path = key_path;
     cfg.wt_path = "/moq";
     cfg.wt_protocols = offers;
-    cfg.wt_protocol_count = 2;
+    cfg.wt_protocol_count = 3;
     cfg.max_connections = 4;
     cfg.on_lane_pump = dummy_pump;
 
     moq_wtquic_msquic_managed_t *srv = NULL;
-    CHECK(moq_wtquic_msquic_managed_create(&cfg, &srv) == MOQ_OK);
+    CHECK(wtqt_managed_server_create(&cfg, &srv) == MOQ_OK);
     if (srv == NULL)
         return;
     uint16_t port = moq_wtquic_msquic_managed_port(srv);
@@ -295,7 +399,7 @@ static void run_server_case(void)
      * can outlive the connect block. */
     wtq_session_t *cs = NULL;
     if (cenv != NULL && port != 0) {
-        static const char *const cprotos[] = { "moqt-18" };
+        const char *const cprotos[] = { token };
         wtq_session_events_t cev;
         wtq_session_events_init(&cev);
         cev.on_established = raw_established;
@@ -321,14 +425,20 @@ static void run_server_case(void)
 
         /* conn_count == 1 only proves ADMISSION. Prove the managed server also
          * completed ESTABLISHMENT: under the child's lane guard it holds the
-         * negotiated draft-18 version, an attach adapter, and the retained ws. */
+         * negotiated version, an attach adapter, and the retained ws. */
         moq_version_t child_ver = 0;
         bool child_has_adapter = false, child_has_ws = false;
         CHECK(moq_wtquic_msquic_managed_test_server_child(
             srv, &child_ver, &child_has_adapter, &child_has_ws));
-        CHECK(child_ver == MOQ_VERSION_DRAFT_18);
+        CHECK(child_ver == expected);
         CHECK(child_has_adapter);
         CHECK(child_has_ws);
+        /* and the child's session was started: bound first when its profile
+         * requires it, with the identity the CONNECT named */
+        moq_session_state_t child_state = MOQ_SESS_IDLE;
+        CHECK(moq_wtquic_msquic_managed_test_server_child_state(srv,
+                                                                &child_state));
+        CHECK(child_state != MOQ_SESS_IDLE);
     }
 
     /* Prove SERVER-INITIATED quiescence: keep the client alive and stop the
@@ -547,7 +657,6 @@ static void run_terminal_conservation_case(void)
     cfg.alloc = moq_alloc_default();
     cfg.perspective = MOQ_PERSPECTIVE_SERVER;
     cfg.host = "127.0.0.1";
-    cfg.port = 0;
     cfg.cert_path = cert_path;
     cfg.key_path = key_path;
     cfg.wt_path = "/moq";
@@ -560,7 +669,7 @@ static void run_terminal_conservation_case(void)
 
     acc_init();
     moq_wtquic_msquic_managed_t *srv = NULL;
-    CHECK(moq_wtquic_msquic_managed_create(&cfg, &srv) == MOQ_OK);
+    CHECK(wtqt_managed_server_create(&cfg, &srv) == MOQ_OK);
     if (srv == NULL) { acc_destroy(); return; }
     uint16_t port = moq_wtquic_msquic_managed_port(srv);
     CHECK(port != 0);
@@ -699,9 +808,20 @@ int main(int argc, char **argv)
     cert_path = argv[1];
     key_path = argv[2];
 
-    run_case("moqt-16", MOQ_VERSION_DRAFT_16);
-    run_case("moqt-18", MOQ_VERSION_DRAFT_18);
-    run_server_case();
+    run_case("moqt-16", MOQ_VERSION_DRAFT_16, NULL, NULL, NULL);
+    run_case("moqt-18", MOQ_VERSION_DRAFT_18, NULL, NULL, NULL);
+    run_case("moqt-22", MOQ_VERSION_DRAFT_22, NULL, NULL, NULL);
+    /* https://relay.example/moq: the default port stays elided */
+    run_case("moqt-18", MOQ_VERSION_DRAFT_18, "relay.example", "/moq", "/moq");
+    /* a percent-encoded path and query, sent and bound as spelled */
+    run_case("moqt-22", MOQ_VERSION_DRAFT_22, "relay.example:4433",
+             "/tenant%2Fone?token=a%26b", "/tenant%2Fone?token=a%26b");
+    /* https://relay.example?q=1: the query follows the "/" an empty path
+     * sends (RFC 9114 Section 4.3.1) */
+    run_case("moqt-18", MOQ_VERSION_DRAFT_18, "relay.example", "?q=1",
+             "/?q=1");
+    run_server_case("moqt-18", MOQ_VERSION_DRAFT_18);
+    run_server_case("moqt-22", MOQ_VERSION_DRAFT_22);
     run_terminal_conservation_case();
 
     if (g_fail != 0) {

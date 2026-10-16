@@ -47,6 +47,7 @@ ATTACH_FORWARD(stream_reset, (wtq_session_t *s, wtq_stream_t *st, uint32_t code,
 ATTACH_FORWARD(stream_stop, (wtq_session_t *s, wtq_stream_t *st, uint32_t code, void *user), (s, st, code, *b->out))
 ATTACH_FORWARD(stream_closed, (wtq_session_t *s, wtq_stream_t *st, void *user), (s, st, *b->out))
 ATTACH_FORWARD(stream_writable, (wtq_session_t *s, wtq_stream_t *st, void *user), (s, st, *b->out))
+ATTACH_FORWARD(stream_send_committed, (wtq_session_t *s, wtq_stream_t *st, void *user), (s, st, *b->out))
 ATTACH_FORWARD(send_complete, (wtq_session_t *s, void *ctx, bool canceled, void *user), (s, ctx, canceled, *b->out))
 ATTACH_FORWARD(datagram, (wtq_session_t *s, const uint8_t *p, size_t n, void *user), (s, p, n, *b->out))
 #undef ATTACH_FORWARD
@@ -80,6 +81,7 @@ static const wtq_session_events_t events = {
     .on_stream_reset = attach_stream_reset, .on_stream_stop = attach_stream_stop,
     .on_stream_closed = attach_stream_closed, .on_stream_writable = attach_stream_writable,
     .on_send_complete = attach_send_complete, .on_datagram = attach_datagram,
+    .on_stream_send_committed = attach_stream_send_committed,
 };
 return &events;
 }

@@ -552,10 +552,147 @@ test_route_dump_before_retention(void)
     return failures;
 }
 
+/* Empty, retained-but-owed, and caught-up must use count facts rather than
+ * reserving a valid Group ID. A one-group budget also proves the loss flag. */
+static int
+test_route_dump_group_presence(uint64_t group)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_relay_cfg_t cfg;
+    moqr_core_relay_cfg_init_sized(&cfg, sizeof(cfg), &a.vt);
+    cfg.log_budget.max_groups = 1;
+    moqr_core_t *c = NULL;
+    MOQ_TEST_CHECK(moqr_core_create(&cfg, &c) == MOQR_OK);
+    if (c == NULL) {
+        goto done;
+    }
+    moqr_binding_t pub, sub;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 1, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 2, &sub) == MOQR_OK);
+    if (failures != 0) {
+        goto done;
+    }
+    moq_bytes_t nsb[2];
+    MOQ_TEST_CHECK(moqr_core_announce(c, pub, NS2(nsb, "a", "b")) == MOQR_OK);
+    moqr_track_t track;
+    MOQ_TEST_CHECK(moqr_core_publish_open(c, pub, NS2(nsb, "a", "b"), B("t"),
+                                         5, &track) == MOQR_OK);
+    if (failures != 0) {
+        goto done;
+    }
+    moqr_intent_t its[8];
+    (void)drain(c, its, 8);
+    moqr_subscribe_req_t rq;
+    moqr_subscribe_req_init(&rq);
+    rq.ns = NS2(nsb, "a", "b");
+    rq.name = B("t");
+    rq.filter.type = MOQR_FILTER_ABSOLUTE_START;
+    rq.filter.start_group = group - 1;
+    moqr_sub_t sh;
+    MOQ_TEST_CHECK(moqr_core_subscribe(c, sub, &rq, &sh) == MOQR_OK);
+    (void)drain(c, its, 8);
+    if (failures != 0) {
+        goto done;
+    }
+
+    for (unsigned state = 0; state < 3; state++) {
+        if (state == 1) {
+            MOQ_TEST_CHECK(ing(c, &a, track, group - 1, 0) == MOQR_OK);
+            MOQ_TEST_CHECK(ing(c, &a, track, group, 0) == MOQR_OK);
+            if (failures != 0) {
+                goto done;
+            }
+        } else if (state == 2) {
+            unsigned records = 0;
+            bool finished = false;
+            for (unsigned i = 0; i < 4; i++) {
+                moqr_delivery_t d;
+                moqr_result_t rc = moqr_core_next_delivery(c, sub, 1000, &d);
+                if (rc == MOQR_DONE) {
+                    finished = true;
+                    break;
+                }
+                MOQ_TEST_CHECK(rc == MOQR_OK);
+                if (rc != MOQR_OK) {
+                    break;
+                }
+                if (d.notice == MOQR_DELIVERY_NOTICE_NONE) {
+                    records++;
+                    MOQ_TEST_CHECK_EQ_U64(d.rec.group_id, group);
+                    MOQ_TEST_CHECK_EQ_U64(d.rec.object_id, 0);
+                }
+                MOQ_TEST_CHECK(moqr_core_delivery_done(c, sub, MOQR_DELIVERY_DELIVERED,
+                                                       1000) == MOQR_OK);
+            }
+            MOQ_TEST_CHECK(finished);
+            MOQ_TEST_CHECK_EQ_INT(records, 1);
+        }
+        char buf[2048], retained[160], frontier[96];
+        size_t w = 0;
+        MOQ_TEST_CHECK(moqr_core_route_dump_json(c, buf, sizeof(buf), &w) == MOQR_OK);
+        MOQ_TEST_CHECK_EQ_SIZE(strlen(buf), w);
+        if (state == 0) {
+            MOQ_TEST_CHECK(HAS(buf, "\"oldest_group\":null,\"newest_group\":null,\"groups\":0"));
+            MOQ_TEST_CHECK(HAS(buf, "\"start_before_retention\":false"));
+        } else {
+            (void)snprintf(retained, sizeof(retained),
+                           "\"oldest_group\":%llu,\"newest_group\":%llu,\"groups\":1",
+                           (unsigned long long)group, (unsigned long long)group);
+            MOQ_TEST_CHECK(HAS(buf, retained));
+            MOQ_TEST_CHECK(HAS(buf, "\"start_before_retention\":true"));
+        }
+        if (state == 1) {
+            (void)snprintf(frontier, sizeof(frontier),
+                           "\"lag_groups\":1,\"frontier_group\":%llu",
+                           (unsigned long long)group);
+            MOQ_TEST_CHECK(HAS(buf, frontier));
+            MOQ_TEST_CHECK(HAS(buf, "\"skip_pending\":false"));
+        } else {
+            MOQ_TEST_CHECK(HAS(buf, "\"lag_groups\":0,\"frontier_group\":null"));
+        }
+        MOQ_TEST_CHECK(moqr_core_route_dump_text(c, buf, sizeof(buf), &w) == MOQR_OK);
+        MOQ_TEST_CHECK_EQ_SIZE(strlen(buf), w);
+        if (state == 0) {
+            MOQ_TEST_CHECK(HAS(buf, "groups=0 records=0"));
+            MOQ_TEST_CHECK(HAS(buf, "oldest=null newest=null"));
+            MOQ_TEST_CHECK(HAS(buf, "start_before_retention=0"));
+        } else {
+            (void)snprintf(retained, sizeof(retained), "oldest=%llu newest=%llu",
+                           (unsigned long long)group, (unsigned long long)group);
+            MOQ_TEST_CHECK(HAS(buf, "groups=1 records=1"));
+            MOQ_TEST_CHECK(HAS(buf, retained));
+            MOQ_TEST_CHECK(HAS(buf, "start_before_retention=1"));
+        }
+        if (state == 1) {
+            (void)snprintf(frontier, sizeof(frontier), "lag_groups=1 frontier=%llu",
+                           (unsigned long long)group);
+            MOQ_TEST_CHECK(HAS(buf, frontier));
+            MOQ_TEST_CHECK(HAS(buf, "skip_pending=0"));
+        } else {
+            MOQ_TEST_CHECK(HAS(buf, "lag_groups=0 frontier=null"));
+        }
+    }
+done:
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    printf("ORACLE route_dump_group_presence group=%llu failures=%d\n",
+           (unsigned long long)group, failures);
+    if (failures == 0) {
+        MOQ_TEST_PASS("route_dump_group_presence");
+    }
+    return failures;
+}
+
 int
 main(void)
 {
     int failures = 0;
+    const uint64_t groups[] = { 7, UINT64_MAX - 1, UINT64_MAX };
+    for (size_t i = 0; i < sizeof(groups) / sizeof(groups[0]); i++) {
+        failures += test_route_dump_group_presence(groups[i]);
+    }
     failures += test_route_dump_empty();
     failures += test_route_dump_escaping();
     failures += test_route_dump_before_retention();

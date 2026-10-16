@@ -34,7 +34,7 @@ moq_result_t moq_d18_decode_envelope(moq_buf_reader_t *r,
 
 moq_result_t moq_d18_encode_setup(moq_buf_writer_t *w)
 {
-    return moq_d18_encode_setup_opts(w, NULL);
+    return moq_d18_encode_setup_opts(w, NULL, 0);
 }
 
 /* -- vi64 field helpers (draft-18 uses vi64 for these lengths/counts) - */
@@ -570,11 +570,15 @@ static moq_result_t d18_validate_props_inner(const uint8_t *data, size_t len,
     return MOQ_OK;
 }
 
-/* Encode-side strict validation: reject malformed structure and mandatory. */
-static moq_result_t d18_validate_track_properties(const uint8_t *data,
-                                                  size_t len)
+/* Encode-side strict validation: reject malformed structure and mandatory.
+ * Also the profile's local check of a Track Property set this side states
+ * (moq_profile_check_track_properties). */
+moq_result_t moq_d18_validate_track_properties(const uint8_t *data, size_t len)
 {
-    return d18_validate_props_inner(data, len, false, NULL, NULL, false);
+    moq_result_t rc = d18_validate_props_inner(data, len, false, NULL, NULL, false);
+    if (rc < 0) return rc;
+    uint8_t priority;
+    return moq_d18_scan_default_publisher_priority(data, len, &priority);
 }
 
 /* §9.8: pure per-profile timeout scanner. Extracts OBJECT_DELIVERY_TIMEOUT
@@ -586,10 +590,11 @@ static moq_result_t d18_validate_track_properties(const uint8_t *data,
  * IMMUTABLE_PROPERTIES or any structural failure. Unknown properties
  * (including mandatory ones) pass through untouched -- this is an extractor,
  * not a validator; callers layer their own strictness. */
-static moq_result_t d18_scan_timeouts_inner(const uint8_t *data, size_t len,
+static moq_result_t d18_scan_track_defaults_inner(const uint8_t *data, size_t len,
                                             bool nested,
                                             bool *has_obj, uint64_t *obj_ms,
-                                            bool *has_sub, uint64_t *sub_ms)
+                                            bool *has_sub, uint64_t *sub_ms,
+                                            uint8_t *priority)
 {
     moq_buf_reader_t r;
     moq_buf_reader_init(&r, data, len);
@@ -607,21 +612,24 @@ static moq_result_t d18_scan_timeouts_inner(const uint8_t *data, size_t len,
             if (vlen > moq_buf_reader_remaining(&r)) return MOQ_ERR_PROTO;
             if (type == D18_PROP_IMMUTABLE) {
                 if (nested) return MOQ_ERR_PROTO;
-                moq_result_t rc = d18_scan_timeouts_inner(
+                moq_result_t rc = d18_scan_track_defaults_inner(
                     moq_buf_reader_ptr(&r), (size_t)vlen, true,
-                    has_obj, obj_ms, has_sub, sub_ms);
+                    has_obj, obj_ms, has_sub, sub_ms, priority);
                 if (rc < 0) return rc;
             }
             r.pos += (size_t)vlen;
         } else {
             uint64_t v;
             if (moq_buf_read_vi64(&r, &v) < 0) return MOQ_ERR_PROTO;
-            if (type == 0x02u) {               /* OBJECT_DELIVERY_TIMEOUT */
+            if (type == 0x02u && has_obj) {     /* OBJECT_DELIVERY_TIMEOUT */
                 if (*has_obj) return MOQ_ERR_PROTO;   /* duplicate */
                 *has_obj = true; *obj_ms = v;
-            } else if (type == 0x06u) {        /* SUBGROUP_DELIVERY_TIMEOUT */
+            } else if (type == 0x06u && has_sub) { /* SUBGROUP_DELIVERY_TIMEOUT */
                 if (*has_sub) return MOQ_ERR_PROTO;
                 *has_sub = true; *sub_ms = v;
+            } else if (type == 0x0Eu && priority) {
+                if (v > UINT8_MAX) return MOQ_ERR_PROTO;
+                *priority = (uint8_t)v;
             }
         }
     }
@@ -637,9 +645,21 @@ moq_result_t moq_d18_scan_delivery_timeouts(const uint8_t *props, size_t len,
     *out_has_object = false;   *out_object_ms = 0;
     *out_has_subgroup = false; *out_subgroup_ms = 0;
     if (!props || len == 0) return MOQ_OK;
-    return d18_scan_timeouts_inner(props, len, false,
+    return d18_scan_track_defaults_inner(props, len, false,
                                    out_has_object, out_object_ms,
-                                   out_has_subgroup, out_subgroup_ms);
+                                   out_has_subgroup, out_subgroup_ms, NULL);
+}
+
+moq_result_t moq_d18_scan_default_publisher_priority(const uint8_t *props,
+                                                     size_t len, uint8_t *out)
+{
+    if (!out || (!props && len)) return MOQ_ERR_INVAL;
+    uint8_t priority = 128;
+    moq_result_t rc = d18_scan_track_defaults_inner(props, len, false,
+                                                    NULL, NULL, NULL, NULL,
+                                                    &priority);
+    if (rc == MOQ_OK) *out = priority;
+    return rc;
 }
 
 /* Decode-side scan: structurally valid; *out_mandatory reports whether any
@@ -651,13 +671,115 @@ static moq_result_t d18_scan_track_properties(const uint8_t *data, size_t len,
 {
     *out_mandatory = false;
     if (out_dynamic_groups) *out_dynamic_groups = false;
-    return d18_validate_props_inner(data, len, false, out_mandatory,
-                                    out_dynamic_groups, true);
+    moq_result_t rc = d18_validate_props_inner(data, len, false, out_mandatory,
+                                               out_dynamic_groups, true);
+    if (rc < 0) return rc;
+    uint8_t priority;
+    return moq_d18_scan_default_publisher_priority(data, len, &priority);
 }
 
 moq_result_t moq_d18_validate_properties(const uint8_t *data, size_t len)
 {
     return d18_validate_props_inner(data, len, false, NULL, NULL, false);
+}
+
+#define D18_PROP_PRIOR_GROUP_GAP  0x3Cu   /* §10.8 */
+#define D18_PROP_PRIOR_OBJECT_GAP 0x3Eu   /* §10.9 */
+
+static void d18_obj_props_note(moq_obj_props_scan_t *out, uint8_t violation)
+{
+    if (out->malformed == MOQ_OBJ_PROPS_OK) out->malformed = violation;
+}
+
+/* One level of an Object Property block. A pair that overruns the block ends
+ * the walk: nothing after it can be located. */
+static moq_result_t d18_scan_object_props_inner(const uint8_t *data, size_t len,
+                                                bool nested, bool *seen_immutable,
+                                                bool *seen_group_gap,
+                                                bool *seen_object_gap,
+                                                moq_obj_props_scan_t *out)
+{
+    moq_buf_reader_t r;
+    moq_buf_reader_init(&r, data, len);
+    uint64_t prev = 0;
+    while (moq_buf_reader_remaining(&r) > 0) {
+        uint64_t delta;
+        if (moq_buf_read_vi64(&r, &delta) < 0) {
+            d18_obj_props_note(out, MOQ_OBJ_PROPS_UNPARSEABLE);
+            return MOQ_OK;
+        }
+        if (delta > UINT64_MAX - prev) return MOQ_ERR_PROTO;   /* §8.3 */
+        uint64_t type = prev + delta;
+        prev = type;
+        if (type >= 0x4000 && type <= 0x7FFF)
+            d18_obj_props_note(out, MOQ_OBJ_PROPS_MANDATORY);
+        if (type & 1) {
+            uint64_t vlen;
+            if (moq_buf_read_vi64(&r, &vlen) < 0) {
+                d18_obj_props_note(out, MOQ_OBJ_PROPS_UNPARSEABLE);
+                return MOQ_OK;
+            }
+            if (vlen > 0xFFFFu) return MOQ_ERR_PROTO;          /* §8.3 */
+            if (vlen > moq_buf_reader_remaining(&r)) {
+                d18_obj_props_note(out, MOQ_OBJ_PROPS_UNPARSEABLE);
+                return MOQ_OK;
+            }
+            if (type == D18_PROP_IMMUTABLE) {
+                if (nested) {
+                    d18_obj_props_note(out, MOQ_OBJ_PROPS_NESTED_IMMUTABLE);
+                } else {
+                    if (*seen_immutable)
+                        d18_obj_props_note(out, MOQ_OBJ_PROPS_DUPLICATE_IMMUTABLE);
+                    *seen_immutable = true;
+                    moq_result_t rc = d18_scan_object_props_inner(
+                        moq_buf_reader_ptr(&r), (size_t)vlen, true, seen_immutable,
+                        seen_group_gap, seen_object_gap, out);
+                    if (rc < 0) return rc;
+                }
+            }
+            r.pos += (size_t)vlen;
+        } else {
+            uint64_t v;
+            if (moq_buf_read_vi64(&r, &v) < 0) {
+                d18_obj_props_note(out, MOQ_OBJ_PROPS_UNPARSEABLE);
+                return MOQ_OK;
+            }
+            if (type == D18_PROP_DYNAMIC_GROUPS && v > 1) return MOQ_ERR_PROTO;
+            if (type == D18_PROP_PRIOR_GROUP_GAP) {
+                if (*seen_group_gap)
+                    d18_obj_props_note(out, MOQ_OBJ_PROPS_DUPLICATE_GAP);
+                *seen_group_gap = true;
+                out->prior_group_gap = v;
+            } else if (type == D18_PROP_PRIOR_OBJECT_GAP) {
+                if (*seen_object_gap)
+                    d18_obj_props_note(out, MOQ_OBJ_PROPS_DUPLICATE_GAP);
+                *seen_object_gap = true;
+                out->prior_object_gap = v;
+            }
+        }
+    }
+    return MOQ_OK;
+}
+
+moq_result_t moq_d18_scan_object_properties(const uint8_t *props, size_t len,
+                                            moq_obj_props_scan_t *out)
+{
+    if (!out || (!props && len)) return MOQ_ERR_INVAL;
+    memset(out, 0, sizeof(*out));
+    bool seen_immutable = false, seen_group_gap = false, seen_object_gap = false;
+    moq_result_t rc = d18_scan_object_props_inner(props, len, false,
+        &seen_immutable, &seen_group_gap, &seen_object_gap, out);
+    if (rc < 0) {
+        memset(out, 0, sizeof(*out));
+        return rc;
+    }
+    if (out->malformed != MOQ_OBJ_PROPS_OK) {
+        out->prior_group_gap = out->prior_object_gap = 0;
+        return MOQ_OK;
+    }
+    out->has_prior_group_gap = seen_group_gap;
+    out->has_prior_object_gap = seen_object_gap;
+    return MOQ_OK;
 }
 
 /* Lenient DYNAMIC_GROUPS extraction for the profile's outbound latch: walks
@@ -684,8 +806,18 @@ moq_result_t moq_d18_decode_object_datagram(
     const uint8_t *data, size_t len,
     moq_d18_object_datagram_t *out)
 {
-    if (!data || !out) return MOQ_ERR_INVAL;
+    moq_obj_props_scan_t scan;
+    return moq_d18_decode_object_datagram_scan(data, len, false, out, &scan);
+}
+
+moq_result_t moq_d18_decode_object_datagram_scan(const uint8_t *data, size_t len,
+                                                 bool track_scoped,
+                                                 moq_d18_object_datagram_t *out,
+                                                 moq_obj_props_scan_t *scan)
+{
+    if (!data || !out || !scan) return MOQ_ERR_INVAL;
     memset(out, 0, sizeof(*out));
+    memset(scan, 0, sizeof(*scan));
 
     moq_buf_reader_t r;
     moq_buf_reader_init(&r, data, len);
@@ -693,12 +825,8 @@ moq_result_t moq_d18_decode_object_datagram(
     uint64_t type = 0;
     if (moq_buf_read_vi64(&r, &type) < 0) return MOQ_ERR_PROTO;
     if (type == MOQ_D18_PADDING_DATAGRAM) {
-        /* §11.5.2: the padding bytes MUST all be zero; any non-zero byte is
-         * malformed (caller closes), otherwise discard. */
-        size_t rem = moq_buf_reader_remaining(&r);
-        const uint8_t *p = moq_buf_reader_ptr(&r);
-        for (size_t i = 0; i < rem; i++)
-            if (p[i] != 0) return MOQ_ERR_PROTO;
+        /* D18/D22 §11.5.2: senders MUST use zero bytes; receivers MUST
+         * discard all padding data, without validating its contents. */
         return MOQ_DONE;
     }
     /* Object datagram Type form 0b00X0XXXX: 0x00-0x0F / 0x20-0x2F. */
@@ -735,8 +863,13 @@ moq_result_t moq_d18_decode_object_datagram(
         if (props_len == 0) return MOQ_ERR_PROTO;   /* PROPERTIES bit set, length 0 */
         if (props_len > moq_buf_reader_remaining(&r)) return MOQ_ERR_PROTO;
         const uint8_t *pp = moq_buf_reader_ptr(&r);
-        moq_result_t prc = moq_d18_validate_properties(pp, (size_t)props_len);
-        if (prc < 0) return prc;
+        if (!track_scoped) {
+            moq_result_t prc = moq_d18_validate_properties(pp, (size_t)props_len);
+            if (prc < 0) return prc;
+        }
+        moq_result_t src = moq_d18_scan_object_properties(pp, (size_t)props_len,
+                                                          scan);
+        if (src < 0) return src;
         out->properties = pp;
         out->properties_len = (size_t)props_len;
         r.pos += (size_t)props_len;
@@ -755,9 +888,8 @@ moq_result_t moq_d18_decode_object_datagram(
         out->payload = NULL;
         out->payload_len = 0;
     } else {
-        /* No STATUS bit ⇒ payload present; the rest of the datagram is the payload.
-         * Mirror D16: a non-status object carries a non-empty payload. */
-        if (moq_buf_reader_remaining(&r) == 0) return MOQ_ERR_PROTO;
+        /* D18 §11.3.1 / D22 §11.2.1: the rest is the payload, including zero
+         * bytes. STATUS remains the explicit discriminator for status objects. */
         out->payload = moq_buf_reader_ptr(&r);
         out->payload_len = moq_buf_reader_remaining(&r);
     }
@@ -779,7 +911,6 @@ moq_result_t moq_d18_encode_object_datagram(
         dg->object_status != MOQ_OBJECT_STATUS_END_OF_GROUP &&
         dg->object_status != MOQ_OBJECT_STATUS_END_OF_TRACK)
         return MOQ_ERR_INVAL;
-    if (!dg->is_status && dg->payload_len == 0) return MOQ_ERR_INVAL;
     if (dg->has_properties && dg->properties_len == 0) return MOQ_ERR_INVAL;
 
     size_t saved = w->pos;
@@ -822,7 +953,7 @@ moq_result_t moq_d18_encode_object_datagram(
         rc = moq_buf_write_vi64(w, dg->object_status);
         if (rc < 0) { w->pos = saved; return rc; }
     } else {
-        if (!dg->payload) { w->pos = saved; return MOQ_ERR_INVAL; }
+        if (!dg->payload && dg->payload_len) { w->pos = saved; return MOQ_ERR_INVAL; }
         rc = moq_buf_write_raw(w, dg->payload, dg->payload_len);
         if (rc < 0) { w->pos = saved; return rc; }
     }
@@ -844,7 +975,7 @@ moq_result_t moq_d18_encode_subscribe_ok(moq_buf_writer_t *w,
     if (!d18_params_within_mask(params, D18_SUBSCRIBE_OK_PARAM_MASK))
         return MOQ_ERR_INVAL;
     if (track_properties.len > 0 &&
-        d18_validate_track_properties(track_properties.data,
+        moq_d18_validate_track_properties(track_properties.data,
                                       track_properties.len) < 0)
         return MOQ_ERR_INVAL;
     size_t saved = w->pos, len_off;
@@ -906,7 +1037,7 @@ moq_result_t moq_d18_encode_publish(moq_buf_writer_t *w,
         MOQ_D18_MAX_FULL_TRACK)
         return MOQ_ERR_INVAL;
     if (p->track_properties.len > 0 &&
-        d18_validate_track_properties(p->track_properties.data,
+        moq_d18_validate_track_properties(p->track_properties.data,
                                       p->track_properties.len) < 0)
         return MOQ_ERR_INVAL;
     size_t saved = w->pos, len_off;
@@ -1113,7 +1244,7 @@ moq_result_t moq_d18_encode_track_status_ok(moq_buf_writer_t *w,
     if (!d18_params_within_mask(params, D18_TRACK_STATUS_OK_PARAM_MASK))
         return MOQ_ERR_INVAL;
     if (track_properties.len > 0 &&
-        d18_validate_track_properties(track_properties.data,
+        moq_d18_validate_track_properties(track_properties.data,
                                       track_properties.len) < 0)
         return MOQ_ERR_INVAL;
     size_t saved = w->pos, len_off;
@@ -1457,12 +1588,20 @@ static moq_result_t d18_read_auth_token(moq_buf_reader_t *r,
  * skipped per §10.3 (duplicates of unknown options allowed); a duplicate known
  * non-repeatable option closes; AUTHORIZATION_TOKEN may repeat. */
 
-moq_result_t moq_d18_decode_setup_opts(const uint8_t *payload, size_t len,
-                                       moq_d18_setup_opts_t *out)
+void moq_d18_setup_opts_init_sized(moq_d18_setup_opts_t *opts, size_t size)
 {
-    if (!out || (len > 0 && !payload)) return MOQ_ERR_INVAL;
-    memset(out, 0, sizeof(*out));
+    /* A record that cannot hold its own size is not written at all: a
+     * cleared but unstamped prefix would claim nothing yet change bytes. */
+    if (!opts || size < sizeof(opts->struct_size)) return;
+    size_t n = size < sizeof(*opts) ? size : sizeof(*opts);
+    memset(opts, 0, n);
+    opts->struct_size = (uint32_t)n;
+}
 
+/* The option walk into a complete, cleared record. */
+static moq_result_t d18_decode_setup_walk(const uint8_t *payload, size_t len,
+                                          moq_d18_setup_opts_t *out)
+{
     moq_buf_reader_t r;
     moq_buf_reader_init(&r, payload, len);
     uint64_t prev_type = 0;
@@ -1515,9 +1654,13 @@ moq_result_t moq_d18_decode_setup_opts(const uint8_t *payload, size_t len,
         if (type == MOQ_D18_SETUP_OPT_PATH) {
             if (out->has_path) return MOQ_ERR_PROTO;   /* non-repeatable */
             out->has_path = true;
+            out->path.data = moq_buf_reader_ptr(&r);
+            out->path.len = (size_t)vlen;
         } else if (type == MOQ_D18_SETUP_OPT_AUTHORITY) {
             if (out->has_authority) return MOQ_ERR_PROTO;
             out->has_authority = true;
+            out->authority.data = moq_buf_reader_ptr(&r);
+            out->authority.len = (size_t)vlen;
         }
         /* Unknown odd option: skip its value; duplicates allowed. */
         r.pos += (size_t)vlen;
@@ -1525,15 +1668,49 @@ moq_result_t moq_d18_decode_setup_opts(const uint8_t *payload, size_t len,
     return MOQ_OK;
 }
 
+moq_result_t moq_d18_decode_setup_opts(const uint8_t *payload, size_t len,
+                                       moq_d18_setup_opts_t *out, size_t out_size)
+{
+    if (!out || out_size < MOQ_D18_SETUP_OPTS_V0_SIZE || (len > 0 && !payload))
+        return MOQ_ERR_INVAL;
+    /* Decode into a complete local record, then hand over exactly the
+     * caller's prefix: nothing is written past out_size, and a failure
+     * leaves a cleared record rather than a partial one. */
+    moq_d18_setup_opts_t full;
+    memset(&full, 0, sizeof(full));
+    moq_result_t rc = d18_decode_setup_walk(payload, len, &full);
+    if (rc < 0) memset(&full, 0, sizeof(full));
+    size_t n = out_size < sizeof(full) ? out_size : sizeof(full);
+    full.struct_size = (uint32_t)n;
+    memcpy(out, &full, n);
+    return rc;
+}
+
 moq_result_t moq_d18_encode_setup_opts(moq_buf_writer_t *w,
-                                       const moq_d18_setup_opts_t *opts)
+                                       const moq_d18_setup_opts_t *caller_opts,
+                                       size_t opts_size)
 {
     if (!w) return MOQ_ERR_INVAL;
-    /* PATH and AUTHORITY are not sourced on this profile; refuse silently
-     * dropping them. SETUP tokens carry a value (§10.3.1.4: nothing is
-     * registered before the peer's first message, so no alias reference). */
-    if (opts && (opts->has_path || opts->has_authority ||
-                 opts->auth_token_count > MOQ_D18_MAX_AUTH_TOKENS))
+    /* Read only the fields the caller's record completely provides. */
+    moq_d18_setup_opts_t full;
+    const moq_d18_setup_opts_t *opts = NULL;
+    if (caller_opts) {
+        if (opts_size < MOQ_D18_SETUP_OPTS_V0_SIZE ||
+            caller_opts->struct_size < MOQ_D18_SETUP_OPTS_V0_SIZE ||
+            caller_opts->struct_size > opts_size)
+            return MOQ_ERR_INVAL;
+        size_t n = caller_opts->struct_size < sizeof(full)
+                 ? caller_opts->struct_size : sizeof(full);
+        memset(&full, 0, sizeof(full));
+        memcpy(&full, caller_opts, n);
+        opts = &full;
+    }
+    /* SETUP tokens carry a value (§10.3.1.4: nothing is registered before the
+     * peer's first message, so no alias reference). */
+    if (opts && (opts->auth_token_count > MOQ_D18_MAX_AUTH_TOKENS ||
+                 (opts->has_path && opts->path.len && !opts->path.data) ||
+                 (opts->has_authority && opts->authority.len &&
+                  !opts->authority.data)))
         return MOQ_ERR_INVAL;
     for (size_t i = 0; opts && i < opts->auth_token_count; i++) {
         const moq_d18_auth_token_t *t = &opts->auth_tokens[i];
@@ -1547,8 +1724,18 @@ moq_result_t moq_d18_encode_setup_opts(moq_buf_writer_t *w,
     moq_result_t rc = d18_write_header(w, MOQ_D18_STREAM_SETUP, &len_off);
     if (rc < 0) { w->pos = saved; return rc; }
     uint64_t prev = 0;
-    /* AUTHORIZATION_TOKEN (0x03) repeats: the first as a delta from 0, the
-     * rest as a zero delta; odd type => length-prefixed Token structure. */
+    /* Options go out in ascending type order, each type a delta from the
+     * previous one (§1.4.3). PATH (0x01) leads: odd type => vi64 Length +
+     * bytes. */
+    if (opts && opts->has_path) {
+        if ((rc = moq_buf_write_vi64(w, MOQ_D18_SETUP_OPT_PATH - prev)) < 0 ||
+            (rc = d18_write_span(w, opts->path)) < 0)
+            goto fail;
+        prev = MOQ_D18_SETUP_OPT_PATH;
+    }
+    /* AUTHORIZATION_TOKEN (0x03) repeats: the first as a delta from the
+     * previous type, the rest as a zero delta; odd type => length-prefixed
+     * Token structure. */
     for (size_t i = 0; opts && i < opts->auth_token_count; i++) {
         if ((rc = moq_buf_write_vi64(w,
                 MOQ_D18_SETUP_OPT_AUTHORIZATION_TOKEN - prev)) < 0)
@@ -1562,6 +1749,12 @@ moq_result_t moq_d18_encode_setup_opts(moq_buf_writer_t *w,
                 w, MOQ_D18_SETUP_OPT_MAX_AUTH_TOKEN_CACHE_SIZE - prev)) < 0)
             goto fail;
         if ((rc = moq_buf_write_vi64(w, opts->max_auth_token_cache_size)) < 0)
+            goto fail;
+        prev = MOQ_D18_SETUP_OPT_MAX_AUTH_TOKEN_CACHE_SIZE;
+    }
+    if (opts && opts->has_authority) {
+        if ((rc = moq_buf_write_vi64(w, MOQ_D18_SETUP_OPT_AUTHORITY - prev)) < 0 ||
+            (rc = d18_write_span(w, opts->authority)) < 0)
             goto fail;
     }
     if ((rc = d18_patch_len(w, len_off)) < 0) goto fail;
@@ -2174,7 +2367,7 @@ moq_result_t moq_d18_encode_fetch_ok(moq_buf_writer_t *w, bool end_of_track,
 {
     if (!w) return MOQ_ERR_INVAL;
     if (track_properties.len > 0 &&
-        d18_validate_track_properties(track_properties.data,
+        moq_d18_validate_track_properties(track_properties.data,
                                       track_properties.len) < 0)
         return MOQ_ERR_INVAL;
     size_t saved = w->pos, len_off;

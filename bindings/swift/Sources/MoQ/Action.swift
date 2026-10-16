@@ -8,6 +8,11 @@ public struct StreamRef: Sendable, Hashable {
     internal init(_ ref: moq_stream_ref_t) {
         self.rawValue = ref._v
     }
+
+    /// A ref the caller's transport chose for an inbound stream.
+    public init(rawValue: UInt64) {
+        self.rawValue = rawValue
+    }
 }
 
 /// Outbound transport action produced by a session.
@@ -24,13 +29,66 @@ public enum Action {
     case sendDatagram(Data)
 }
 
+/// Complete transport output, including reliable resets and request half-close
+/// operations. Transport drivers using these operations must poll this view.
+public enum ExtendedAction {
+    case sendControl(Data)
+    case closeSession(code: UInt64, reason: String)
+    case sendData(stream: StreamRef, header: Data, payload: Buffer?, fin: Bool)
+    /// Reset a data stream. `reliableSize` is how many leading bytes (the
+    /// stream header) the reset must still deliver: a transport that
+    /// negotiated RESET_STREAM_AT sends it with that size. Otherwise the
+    /// driver waits for that prefix to be acknowledged before a plain reset,
+    /// when its transport can provide that guarantee. Zero needs no wait.
+    case resetData(stream: StreamRef, errorCode: UInt64, reliableSize: UInt64)
+    case stopData(stream: StreamRef, errorCode: UInt64)
+    case openBidiStream(stream: StreamRef, data: Data, fin: Bool)
+    case sendBidiStream(stream: StreamRef, data: Data, fin: Bool)
+    case closeBidiStream(stream: StreamRef)
+    case sendDatagram(Data)
+    /// Control bytes on a unidirectional control stream this side opens
+    /// (drafts 18 and 22); the peer feeds them to `receiveControlBytes`.
+    case openUniControl(stream: StreamRef, data: Data)
+    case sendUniControl(stream: StreamRef, data: Data, fin: Bool)
+    /// Request-stream teardown: reset the local send half, ask the peer to
+    /// stop sending, or abort both halves with one code.
+    case resetBidiStream(stream: StreamRef, errorCode: UInt64)
+    case stopBidiStream(stream: StreamRef, errorCode: UInt64)
+    case abortBidiStream(stream: StreamRef, errorCode: UInt64)
+    case unknown(UInt32)
+}
+
 extension Action {
+    internal static func from(_ cAction: inout moq_action_t) -> Action? {
+        switch ExtendedAction.from(&cAction) {
+        case .sendControl(let data): return .sendControl(data)
+        case .closeSession(let code, let reason): return .closeSession(code: code, reason: reason)
+        case .sendData(let stream, let header, let payload, let fin):
+            return .sendData(stream: stream, header: header, payload: payload, fin: fin)
+        case .resetData(let stream, let code, _): return .resetData(stream: stream, errorCode: code)
+        case .stopData(let stream, let code): return .stopData(stream: stream, errorCode: code)
+        case .openBidiStream(let stream, let data, let fin):
+            return .openBidiStream(stream: stream, data: data, fin: fin)
+        case .sendBidiStream(let stream, let data, let fin):
+            return .sendBidiStream(stream: stream, data: data, fin: fin)
+        case .closeBidiStream(let stream): return .closeBidiStream(stream: stream)
+        case .sendDatagram(let data): return .sendDatagram(data)
+        case .openUniControl(_, let data), .sendUniControl(_, let data, _):
+            return .sendControl(data)
+        case .resetBidiStream, .stopBidiStream, .abortBidiStream:
+            preconditionFailure("Request half-close actions require pollActionsExtended()")
+        case .unknown: return nil
+        }
+    }
+}
+
+extension ExtendedAction {
     /// Convert a C action to Swift, taking ownership of any owned refs.
     /// The caller must have already polled this action from the session.
     /// This function calls moq_action_cleanup on the C action.
-    internal static func from(_ cAction: inout moq_action_t) -> Action? {
+    internal static func from(_ cAction: inout moq_action_t) -> ExtendedAction {
         let kind = cAction.kind
-        let result: Action
+        let result: ExtendedAction
 
         switch kind {
         case MOQ_ACTION_SEND_CONTROL:
@@ -78,9 +136,17 @@ extension Action {
 
         case MOQ_ACTION_RESET_DATA:
             let rd = cAction.u.reset_data
+            // Read only when the producer's detail covers the field.
+            var reliable: UInt64 = 0
+            if let off = MemoryLayout<moq_reset_data_action_t>.offset(
+                   of: \moq_reset_data_action_t.reliable_size),
+               Int(cAction.detail_size) >= off + MemoryLayout<UInt64>.size {
+                reliable = rd.reliable_size
+            }
             result = .resetData(
                 stream: StreamRef(rd.stream_ref),
-                errorCode: rd.error_code
+                errorCode: rd.error_code,
+                reliableSize: reliable
             )
 
         case MOQ_ACTION_STOP_DATA:
@@ -117,9 +183,35 @@ extension Action {
             )
             result = .sendDatagram(data)
 
+        case MOQ_ACTION_OPEN_UNI_CONTROL:
+            let uc = cAction.u.open_uni_control
+            result = .openUniControl(
+                stream: StreamRef(uc.stream_ref),
+                data: Data(bytes: uc.data, count: uc.len))
+
+        case MOQ_ACTION_SEND_UNI_CONTROL:
+            let uc = cAction.u.send_uni_control
+            result = .sendUniControl(
+                stream: StreamRef(uc.stream_ref),
+                data: Data(bytes: uc.data, count: uc.len), fin: uc.fin)
+
+        case MOQ_ACTION_RESET_BIDI_STREAM:
+            let rb = cAction.u.reset_bidi_stream
+            result = .resetBidiStream(
+                stream: StreamRef(rb.stream_ref), errorCode: rb.error_code)
+
+        case MOQ_ACTION_STOP_BIDI_STREAM:
+            let sb = cAction.u.stop_bidi_stream
+            result = .stopBidiStream(
+                stream: StreamRef(sb.stream_ref), errorCode: sb.error_code)
+
+        case MOQ_ACTION_ABORT_BIDI_STREAM:
+            let ab = cAction.u.abort_bidi_stream
+            result = .abortBidiStream(
+                stream: StreamRef(ab.stream_ref), errorCode: ab.error_code)
+
         default:
-            moq_action_cleanup(&cAction)
-            return nil
+            result = .unknown(UInt32(kind))
         }
 
         moq_action_cleanup(&cAction)

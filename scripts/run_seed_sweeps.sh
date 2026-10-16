@@ -39,6 +39,8 @@ Options:
   --fault-permille N            Fault rate for scenario_faults / scenario_transport_faults
   --alloc-fault-permille N      Allocation fault rate for scenario_combined_faults
   --transport-fault-permille N  Transport fault rate for scenario_combined_faults
+  --version N                   Run every runner under protocol version N
+                                (sets MOQ_SIM_VERSION; default: session default)
   --fail-fast                   Stop on first failure
   --dry-run                     Print commands without executing
   --verbose                     Print each runner invocation
@@ -59,6 +61,7 @@ ASAN_DIR=""
 FAULT_PERMILLE=""
 ALLOC_FAULT_PERMILLE=""
 TRANSPORT_FAULT_PERMILLE=""
+VERSION=""
 FAIL_FAST=false
 DRY_RUN=false
 VERBOSE=false
@@ -74,6 +77,7 @@ while [[ $# -gt 0 ]]; do
         --fault-permille)           FAULT_PERMILLE="$2"; shift 2 ;;
         --alloc-fault-permille)     ALLOC_FAULT_PERMILLE="$2"; shift 2 ;;
         --transport-fault-permille) TRANSPORT_FAULT_PERMILLE="$2"; shift 2 ;;
+        --version)                  VERSION="$2"; shift 2 ;;
         --fail-fast)                FAIL_FAST=true; shift ;;
         --dry-run)                  DRY_RUN=true; shift ;;
         --verbose)                  VERBOSE=true; shift ;;
@@ -158,6 +162,7 @@ run_entry() {
         "MOQ_SCENARIO_STEPS=$STEPS"
     )
     env_vars+=("${extra_env[@]}")
+    if [[ -n "$VERSION" ]]; then env_vars+=("MOQ_SIM_VERSION=$VERSION"); fi
 
     if $DRY_RUN; then
         echo "  ${env_vars[*]} $binary"

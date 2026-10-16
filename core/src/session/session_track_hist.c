@@ -173,6 +173,7 @@ moq_result_t track_hist_reserve_selected(moq_session_t *s,
     slot->key_len = key_len;
     slot->largest_group = 0;
     slot->largest_object = 0;
+    slot->pending_subs = 0;
     *out = slot;
     return MOQ_OK;
 }
@@ -207,6 +208,7 @@ moq_track_hist_t *track_hist_reserve(moq_session_t *s,
     slot->key_len = key_len;
     slot->largest_group = 0;
     slot->largest_object = 0;
+    slot->pending_subs = 0;
     return slot;
 }
 
@@ -272,10 +274,35 @@ bool moq_loc_successor(uint64_t group, uint64_t object, uint64_t ceiling,
     return true;
 }
 
+moq_result_t moq_filter_window_out(const moq_resolved_window_t *w,
+                                   moq_filter_window_t *out, size_t out_size)
+{
+    if (!out || out_size < offsetof(moq_filter_window_t, end_object) +
+                           sizeof(out->end_object))
+        return MOQ_ERR_INVAL;
+    moq_filter_window_t v;
+    memset(&v, 0, sizeof(v));
+    v.resolved = w->has_window;
+    if (w->has_window) {
+        v.empty = w->unsatisfiable;
+        v.has_end = w->has_end;
+        v.has_end_object = w->has_end && w->has_end_object;
+        v.start_group = w->start_group;
+        v.start_object = w->start_object;
+        v.end_group = w->has_end ? w->end_group : 0;
+        v.end_object = v.has_end_object ? w->end_object : 0;
+    }
+    size_t n = out_size < sizeof(v) ? out_size : sizeof(v);
+    v.struct_size = (uint32_t)n;
+    memcpy(out, &v, n);
+    return MOQ_OK;
+}
+
 void moq_resolve_filter_window(moq_subscribe_filter_t filter,
                                uint64_t raw_start_group,
                                uint64_t raw_start_object,
                                uint64_t raw_end_group,
+                               uint64_t raw_end_object,
                                bool has_snap,
                                uint64_t snap_group, uint64_t snap_object,
                                uint64_t ceiling,
@@ -317,6 +344,30 @@ void moq_resolve_filter_window(moq_subscribe_filter_t filter,
         out->start_object = raw_start_object;
         out->has_end = true;
         out->end_group = raw_end_group;
+        break;
+    case MOQ_SUBSCRIBE_FILTER_OBJECT_END_INTERNAL:
+        out->start_group = raw_start_group;
+        out->start_object = raw_start_object;
+        out->has_end = true;
+        out->end_group = raw_end_group;
+        out->has_end_object = true;
+        out->end_object = raw_end_object;
+        break;
+    case MOQ_SUBSCRIBE_FILTER_RELATIVE_GROUP_INTERNAL:
+        /* raw_start_group groups before the next group: 1 is the current
+         * group, 2 the one before it. Clamped at the origin. */
+        if (!has_snap) {
+            out->start_group = 0;
+            out->start_object = 0;
+        } else if (raw_start_group == 0) {
+            /* D22 section9.20.9 clamps the relative result. Legacy NextGroup
+             * above instead represents a successor beyond the last group. */
+            out->start_group = snap_group == UINT64_MAX ? UINT64_MAX : snap_group + 1;
+        } else {
+            uint64_t back = raw_start_group - 1;
+            out->start_group = back > snap_group ? 0 : snap_group - back;
+            out->start_object = 0;
+        }
         break;
     case MOQ_SUBSCRIBE_FILTER_NONE:
     default:
@@ -375,4 +426,102 @@ moq_result_t moq_session_note_object_published(
 
     if (key) s->alloc.free(key, key_len, s->alloc.ctx);
     return rc;
+}
+
+void moq_location_filter_from_core(uint32_t filter_type, uint64_t start_group,
+                                   uint64_t start_object, uint64_t end_group,
+                                   uint64_t end_object,
+                                   moq_location_filter_cfg_t *out,
+                                   size_t out_size)
+{
+    moq_location_filter_cfg_t v;
+    moq_location_filter_cfg_init(&v);
+    switch (filter_type) {
+    case MOQ_SUBSCRIBE_FILTER_NEXT_GROUP:
+        v.kind = MOQ_LOCATION_FILTER_RELATIVE_GROUP;
+        v.relative_group_offset = 0;
+        break;
+    case MOQ_SUBSCRIBE_FILTER_RELATIVE_GROUP_INTERNAL:
+        v.kind = MOQ_LOCATION_FILTER_RELATIVE_GROUP;
+        v.relative_group_offset = start_group;
+        break;
+    case MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT:
+        v.kind = MOQ_LOCATION_FILTER_NEXT_OBJECT;
+        break;
+    case MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START:
+        v.kind = MOQ_LOCATION_FILTER_ABSOLUTE_START;
+        v.start_group = start_group;
+        v.start_object = start_object;
+        break;
+    case MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE:
+        v.kind = MOQ_LOCATION_FILTER_GROUP_END;
+        v.start_group = start_group;
+        v.start_object = start_object;
+        v.end_group = end_group;
+        break;
+    case MOQ_SUBSCRIBE_FILTER_OBJECT_END_INTERNAL:
+        v.kind = MOQ_LOCATION_FILTER_OBJECT_END;
+        v.start_group = start_group;
+        v.start_object = start_object;
+        v.end_group = end_group;
+        v.end_object = end_object;
+        break;
+    default:
+        v.kind = MOQ_LOCATION_FILTER_NONE;
+        break;
+    }
+    /* The caller's storage ends at out_size: never write past it. */
+    size_t n = out_size < sizeof(v) ? out_size : sizeof(v);
+    v.struct_size = (uint32_t)n;
+    memcpy(out, &v, n);
+}
+
+void moq_local_filter_normalize(const moq_session_t *s, uint32_t *filter_type,
+                                uint64_t *start_group)
+{
+    if (*filter_type == MOQ_SUBSCRIBE_FILTER_NEXT_GROUP &&
+        s->profile->relative_group_clamps) {
+        *filter_type = MOQ_SUBSCRIBE_FILTER_RELATIVE_GROUP_INTERNAL;
+        *start_group = 0;
+    }
+}
+
+moq_result_t moq_location_filter_to_core(const moq_location_filter_cfg_t *cfg,
+                                         uint32_t *filter_type, uint64_t *start_group,
+                                         uint64_t *start_object, uint64_t *end_group,
+                                         uint64_t *end_object)
+{
+    if (!cfg) return MOQ_ERR_INVAL;
+    if (cfg->struct_size < MOQ_LOCATION_FILTER_CFG_V0_SIZE) return MOQ_ERR_ABI_MISMATCH;
+    *start_group = 0; *start_object = 0; *end_group = 0; *end_object = 0;
+    switch (cfg->kind) {
+    case MOQ_LOCATION_FILTER_NONE:
+        *filter_type = MOQ_SUBSCRIBE_FILTER_NONE; break;
+    case MOQ_LOCATION_FILTER_RELATIVE_GROUP:
+        if (cfg->relative_group_offset == 0) {
+            *filter_type = MOQ_SUBSCRIBE_FILTER_NEXT_GROUP;
+        } else {
+            *filter_type = MOQ_SUBSCRIBE_FILTER_RELATIVE_GROUP_INTERNAL;
+            *start_group = cfg->relative_group_offset;
+        }
+        break;
+    case MOQ_LOCATION_FILTER_NEXT_OBJECT:
+        *filter_type = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT; break;
+    case MOQ_LOCATION_FILTER_ABSOLUTE_START:
+        *filter_type = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
+        *start_group = cfg->start_group; *start_object = cfg->start_object; break;
+    case MOQ_LOCATION_FILTER_GROUP_END:
+        if (cfg->end_group < cfg->start_group) return MOQ_ERR_INVAL;
+        *filter_type = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE;
+        *start_group = cfg->start_group; *start_object = cfg->start_object;
+        *end_group = cfg->end_group; break;
+    case MOQ_LOCATION_FILTER_OBJECT_END:
+        if (cfg->end_group < cfg->start_group) return MOQ_ERR_INVAL;
+        *filter_type = MOQ_SUBSCRIBE_FILTER_OBJECT_END_INTERNAL;
+        *start_group = cfg->start_group; *start_object = cfg->start_object;
+        *end_group = cfg->end_group; *end_object = cfg->end_object; break;
+    default:
+        return MOQ_ERR_INVAL;
+    }
+    return MOQ_OK;
 }

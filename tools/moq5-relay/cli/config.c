@@ -48,6 +48,62 @@ cfg_err_at(char *err, size_t err_len, const char *msg, size_t index)
     }
 }
 
+/* The MoQ drafts a listener may offer, by their draft numbers as configured.
+ * The ALPN / WebTransport subprotocol token for each is "moqt-<number>".
+ * Without a configured list, both listeners offer cfg_default_versions. */
+static const struct {
+    unsigned number;
+    moq_version_t version;
+} cfg_drafts[] = {
+    { 16, MOQ_VERSION_DRAFT_16 },
+    { 18, MOQ_VERSION_DRAFT_18 },
+    { 22, MOQ_VERSION_DRAFT_22 },
+};
+
+static bool
+cfg_known_draft(uint64_t v, moq_version_t *out)
+{
+    for (size_t i = 0; i < sizeof(cfg_drafts) / sizeof(cfg_drafts[0]); i++) {
+        if (cfg_drafts[i].number == v) {
+            *out = cfg_drafts[i].version;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The draft number of a known version (0 for one this table does not name). */
+static unsigned
+cfg_draft_number(moq_version_t v)
+{
+    for (size_t i = 0; i < sizeof(cfg_drafts) / sizeof(cfg_drafts[0]); i++) {
+        if (cfg_drafts[i].version == v) {
+            return cfg_drafts[i].number;
+        }
+    }
+    return 0;
+}
+
+/*
+ * A listener's default offer: every draft this build supports, newest first.
+ * Returns the number written (at most cap), in preference order.
+ */
+static size_t
+cfg_default_versions(moq_version_t *out, size_t cap)
+{
+    const moq_version_t defaults[] = {
+        MOQR_CLI_DEFAULT_PREFERRED_VERSION, MOQ_VERSION_DRAFT_18,
+        MOQ_VERSION_DRAFT_16
+    };
+    size_t k = 0;
+    for (size_t i = 0; i < sizeof(defaults) / sizeof(defaults[0]) && k < cap; i++) {
+        if (moq_version_supported(defaults[i])) {
+            out[k++] = defaults[i];
+        }
+    }
+    return k;
+}
+
 static bool
 num_u64(struct json_value_s *v, uint64_t *out)
 {
@@ -188,13 +244,12 @@ parse_listener(struct json_object_s *o, moqr_cli_config_t *out,
             for (struct json_array_element_s *ae = arr->start; ae != NULL;
                  ae = ae->next) {
                 uint64_t v = 0;
-                if (!num_u64(ae->value, &v) || (v != 16 && v != 18)) {
+                moq_version_t mv;
+                if (!num_u64(ae->value, &v) || !cfg_known_draft(v, &mv)) {
                     cfg_err(err, err_len,
-                            "listener.versions: only 16 and 18 are known");
+                            "listener.versions: only 16, 18 and 22 are known");
                     return MOQR_ERR_INVAL;
                 }
-                moq_version_t mv = (v == 16) ? MOQ_VERSION_DRAFT_16
-                                             : MOQ_VERSION_DRAFT_18;
                 for (size_t j = 0; j < n; j++) {
                     if (out->versions[j] == mv) {
                         cfg_err(err, err_len,
@@ -1050,13 +1105,13 @@ parse_webtransport(struct json_object_s *o, moqr_cli_config_t *out, char *err,
             for (struct json_array_element_s *ae = arr->start; ae != NULL;
                  ae = ae->next) {
                 uint64_t v = 0;
-                if (!num_u64(ae->value, &v) || (v != 16 && v != 18)) {
+                moq_version_t mv;
+                if (!num_u64(ae->value, &v) || !cfg_known_draft(v, &mv)) {
                     cfg_err(err, err_len,
-                            "webtransport.versions: only 16 and 18 are known");
+                            "webtransport.versions: only 16, 18 and 22 are "
+                            "known");
                     return MOQR_ERR_INVAL;
                 }
-                moq_version_t mv = (v == 16) ? MOQ_VERSION_DRAFT_16
-                                             : MOQ_VERSION_DRAFT_18;
                 for (size_t j = 0; j < n; j++) {
                     if (out->wt.versions[j] == mv) {
                         cfg_err(err, err_len,
@@ -1216,17 +1271,15 @@ parse_webtransport(struct json_object_s *o, moqr_cli_config_t *out, char *err,
         return MOQR_ERR_INVAL;
     }
     if (!have_versions) {
-        /* the facade default, stated here so the offered set is always
+        /* the default offer, stated here so the offered set is always
          * explicit in the resolved config rather than implied downstream */
-        out->wt.versions[0] = MOQ_VERSION_DRAFT_18;
-        out->wt.versions[1] = MOQ_VERSION_DRAFT_16;
-        snprintf(out->wt.subproto_buf[0], sizeof(out->wt.subproto_buf[0]),
-                 "moqt-18");
-        snprintf(out->wt.subproto_buf[1], sizeof(out->wt.subproto_buf[1]),
-                 "moqt-16");
-        out->wt.subprotos[0] = out->wt.subproto_buf[0];
-        out->wt.subprotos[1] = out->wt.subproto_buf[1];
-        out->wt.version_count = 2;
+        size_t n = cfg_default_versions(out->wt.versions, MOQR_CLI_MAX_VERSIONS);
+        for (size_t i = 0; i < n; i++) {
+            snprintf(out->wt.subproto_buf[i], sizeof(out->wt.subproto_buf[i]),
+                     "moqt-%u", cfg_draft_number(out->wt.versions[i]));
+            out->wt.subprotos[i] = out->wt.subproto_buf[i];
+        }
+        out->wt.version_count = n;
     }
     /* The ordered set label, joined in preference order exactly as written. */
     size_t alpn_len = 0;
@@ -1489,13 +1542,22 @@ moqr_cli_config_parse(const char *json, size_t len, moqr_cli_config_t *out,
         rc = MOQR_ERR_INVAL;
     }
     if (rc == MOQR_OK && out->alpn_count == 0) {
-        /* Default: exactly the newest draft, a single offer. */
-        snprintf(out->alpn_buf[0], sizeof(out->alpn_buf[0]), "moqt-18");
-        out->alpns[0] = out->alpn_buf[0];
-        out->alpn_count = 1;
-        out->version = 18;
-        out->versions[0] = MOQ_VERSION_DRAFT_18;
-        out->version_count = 1;
+        /* Default: every supported draft, newest first, one ALPN each. A
+         * single supported draft makes this an exact-version listener. */
+        size_t n = cfg_default_versions(out->versions, MOQR_CLI_MAX_VERSIONS);
+        if (n == 0) {
+            cfg_err(err, err_len, "listener.versions: no supported draft");
+            free(root);
+            return MOQR_ERR_INVAL;
+        }
+        for (size_t i = 0; i < n; i++) {
+            snprintf(out->alpn_buf[i], sizeof(out->alpn_buf[i]), "moqt-%u",
+                     cfg_draft_number(out->versions[i]));
+            out->alpns[i] = out->alpn_buf[i];
+        }
+        out->alpn_count = n;
+        out->version_count = n;
+        out->version = cfg_draft_number(out->versions[0]);
     }
     if (rc == MOQR_OK) {
         /* One deterministic label for the whole offered set: the single ALPN
@@ -1612,8 +1674,8 @@ moqr_cli_build_shards_cfg(const moqr_cli_config_t *cfg,
         }
     }
     /* Production admission is automatically ON exactly when the relay runs
-     * multiple lanes: a single-lane relay is the direct M1 path with no
-     * cross-shard plane to admit into (and no manager at K == 1), while a
+     * multiple lanes: a single-lane relay uses the direct single-lane path,
+     * with no cross-shard plane to admit into (and no manager at K == 1), while a
      * multi-lane relay must forward remote-owned demand across the shard
      * boundary for a subscriber to reach a publisher on another lane. This
      * is the ONE place the rule lives — capacity and serve both consume

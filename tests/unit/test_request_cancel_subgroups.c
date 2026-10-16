@@ -6,14 +6,18 @@
  * same way -- it ends the subscription with UNSUBSCRIBED and releases it -- so
  * the subscription's open data streams are reset on that route as well.
  *
- * The publisher's action and event queues each hold one record, so the
- * cancellation cannot complete in one call: a refused signal is delivered
- * again, as the transport binding does, once queued records are polled.
+ * The publisher's action and event queues each hold one record. A delivery
+ * that finds room for its own record (the UNSUBSCRIBED event, a STOP's drain
+ * reference) completes at once: the subscription is released, the resets
+ * that fit are queued and the rest are owed by their subgroup entries, which
+ * keep their stream and code and are issued as actions are polled, with no
+ * further peer input. A delivery without that room is refused before any
+ * output and is delivered again, as the transport binding does.
  * Pinned:
  * - the subscription is cancelled from the first delivery, whatever capacity
  *   that delivery finds (event queue full, action queue full, no room for the
- *   STOP's drain reference) and after a delivery that queued only part of the
- *   resets: from then on every production call under it -- a new subgroup,
+ *   STOP's drain reference): while a refused cancellation is pending, every
+ *   production call under it -- a new subgroup,
  *   whole-object, status-object, begin, continuation and end writes, a FIN,
  *   object and status datagrams -- and every local terminal (PUBLISH_DONE,
  *   GOAWAY, and for a pending subscription accept, reject and redirect) is
@@ -24,11 +28,17 @@
  *   the cancellation, or a delivery-timeout reset, stands in for the
  *   cancellation's own reset of that stream, a FIN never does;
  * - no refused delivery has the terminal event queued; when UNSUBSCRIBED is
- *   read -- events polled first -- every owed reset is already queued or
- *   consumed; it is surfaced exactly once;
+ *   read -- events polled first -- and when the subscription is released,
+ *   every live subgroup's reset is consumed, queued or owed by its entry; it
+ *   is surfaced exactly once;
+ * - A's slot is reused by a new subscription while A's resets are still
+ *   owed: the owed entries keep A's streams and code, a subgroup for the new
+ *   subscription waits (retryable) for their pool slots, and polling actions
+ *   alone issues every owed reset exactly once and frees them;
  * - a subgroup already FIN-closed and another subscription's open subgroup
- *   are never reset, and the other subscription keeps writing while the
- *   cancellation is pending;
+ *   are never reset by the cancellation -- the FIN-closed one only by its own
+ *   subgroup delivery timer, which draft-18 §8 starts at the FIN -- and the
+ *   other subscription keeps writing while the cancellation is pending;
  * - repeated and crossed STOP/RESET deliveries reset nothing twice, and a
  *   RESET ends the peer's direction for good: no later STOP makes the session
  *   keep an identity for it; request bytes and a FIN arriving while the
@@ -39,9 +49,10 @@
  *   resets under the same rules, and the cancellation completes without an
  *   event. Only that ending is pinned here;
  * - a STOP leaves the subscriber's direction open, so the request stream's
- *   identity is kept as an ordinary drain reference, with or without
+ *   identity is kept as a peer-stopped drain reference, with or without
  *   subgroups and with or without a GOAWAY: a trailing FIN is absorbed by
- *   it, a FIN or RESET retires it, and no later STOP brings it back;
+ *   it, only the subscriber's FIN or RESET retires it -- never another
+ *   STOP -- and no later STOP brings it back;
  * - a subscriber-role subscription is never marked cancelled;
  * - once settled, nothing remains under the cancelled subscription, its slot
  *   and its subgroup slots are reused by a new subscription that a late
@@ -69,7 +80,7 @@ static int failures;
 
 /* The subgroups the fixture opens, by role. The first SG_A_LIVE belong to the
  * cancelled subscription and are live when the cancellation arrives: two of
- * each live shape, so whichever one a first partial pass resets, one of each
+ * each live shape, so whichever one is reset first, one of each
  * shape is still left for an operation to try. */
 enum {
     SG_A_OPEN,        /* whole object written */
@@ -125,6 +136,7 @@ typedef struct fx_opts {
     bool     pending;       /* A is left pending: no accept, no subgroups */
     bool     no_subgroups;  /* A is accepted but opens no subgroup */
     uint64_t sg_timeout_ms; /* A's subgroup delivery timeout, 0 for none */
+    uint64_t obj_timeout_ms; /* A's object delivery timeout, 0 for none */
     bool     goaway;        /* we sent A's request GOAWAY (A established) */
     /* Session pools, 0 for the fixture's own sizes. Only the setup-failure
      * controls shrink them. */
@@ -245,8 +257,8 @@ static int drain_writes_on(moq_session_t *s, moq_stream_ref_t ref)
 /* The subscriber's SUBSCRIBE for `name` arrives on `ref` and is surfaced;
  * unless `pending`, it is accepted. Returns the publisher-side handle. */
 static moq_subscription_t subscribe(fixture_t *f, moq_stream_ref_t ref,
-                                    const char *name, uint64_t timeout_ms,
-                                    bool pending)
+                                    const char *name, uint64_t sg_timeout_ms,
+                                    uint64_t obj_timeout_ms, bool pending)
 {
     uint8_t msg[128];
     moq_buf_writer_t w;
@@ -258,9 +270,13 @@ static moq_subscription_t subscribe(fixture_t *f, moq_stream_ref_t ref,
     /* LARGEST_OBJECT, so a Joining FETCH may name the subscription. */
     p.has_filter = true;
     p.filter_type = 2;
-    if (timeout_ms) {
+    if (sg_timeout_ms) {
         p.has_subgroup_delivery_timeout = true;
-        p.subgroup_delivery_timeout_ms = timeout_ms;
+        p.subgroup_delivery_timeout_ms = sg_timeout_ms;
+    }
+    if (obj_timeout_ms) {
+        p.has_object_delivery_timeout = true;
+        p.object_delivery_timeout_ms = obj_timeout_ms;
     }
     MOQ_TEST_CHECK_EQ_INT(
         (int)moq_d18_encode_subscribe(&w, f->next_rid, &ns,
@@ -443,7 +459,8 @@ static bool fixture_open(fixture_t *f, fx_opts_t o)
     f->ref_a = moq_stream_ref_from_u64(0x90000);
     f->ref_b = moq_stream_ref_from_u64(0x90004);
     f->rid_a = f->next_rid;
-    f->sub_a = subscribe(f, f->ref_a, "a", o.sg_timeout_ms, o.pending);
+    f->sub_a = subscribe(f, f->ref_a, "a", o.sg_timeout_ms,
+                         o.obj_timeout_ms, o.pending);
     f->slot_a = sub_resolve_handle(f->s, f->sub_a);
     FX_REQUIRE(FX_STEP_SUBSCRIBE_A, 0, f->slot_a >= 0);
     if (o.expect.step == FX_STEP_SUBSCRIBE_B) {
@@ -452,7 +469,7 @@ static bool fixture_open(fixture_t *f, fx_opts_t o)
             return false;
         FX_REQUIRE(FX_STEP_SUBSCRIBE_B, 0, false);
     }
-    f->sub_b = subscribe(f, f->ref_b, "b", 0, false);
+    f->sub_b = subscribe(f, f->ref_b, "b", 0, 0, false);
     FX_REQUIRE(FX_STEP_SUBSCRIBE_B, 0, sub_resolve_handle(f->s, f->sub_b) >= 0);
     FX_REQUIRE(FX_STEP_A_STATE, 0, f->s->subs[f->slot_a].state ==
                (o.pending ? MOQ_SUB_PENDING_PUBLISHER : MOQ_SUB_ESTABLISHED));
@@ -579,6 +596,23 @@ static bool reset_queued_for(const fixture_t *f, int i)
     return false;
 }
 
+/* Whether the fixture's subgroup `i` owes its reset (an entry that keeps the
+ * stream and code until the action is issued). */
+static bool reset_owed_for(const fixture_t *f, int i)
+{
+    return sg_state(f, i) == MOQ_SG_RESET_OWED;
+}
+
+/* A's live subgroups whose reset is consumed, queued or owed. */
+static int accounted(const fixture_t *f, const tally_t *t)
+{
+    int n = 0;
+    for (int i = 0; i < live_count(f); i++)
+        if (t->resets[i] > 0 || reset_queued_for(f, i) || reset_owed_for(f, i))
+            n++;
+    return n;
+}
+
 /* Whether A's UNSUBSCRIBED sits in the event queue. */
 static bool unsubscribed_queued(const fixture_t *f)
 {
@@ -618,12 +652,9 @@ static void record_event(const fixture_t *f, tally_t *t, const moq_event_t *e)
     if (e->kind == MOQ_EVENT_UNSUBSCRIBED &&
         moq_subscription_eq(e->u.unsubscribed.sub, f->sub_a)) {
         t->unsubscribed_a++;
-        /* Read before the actions queued with it: each owed reset must be
-         * consumed already or still queued. */
-        t->committed_at_unsubscribed = 0;
-        for (int i = 0; i < live_count(f); i++)
-            if (t->resets[i] > 0 || reset_queued_for(f, i))
-                t->committed_at_unsubscribed++;
+        /* Read before the actions queued with it: each reset must be
+         * consumed already, queued or owed. */
+        t->committed_at_unsubscribed = accounted(f, t);
         return;
     }
     if (e->kind == MOQ_EVENT_SUBSCRIBE_UPDATED &&
@@ -686,15 +717,12 @@ static int live_under(const moq_session_t *s, moq_subscription_t sub)
     return n;
 }
 
-/* A was just released: record how many of its owed resets were committed --
- * consumed already or still queued -- at that moment. */
+/* A was just released: record how many of its resets were accounted for --
+ * consumed already, queued or owed -- at that moment. */
 static void note_released(const fixture_t *f, tally_t *t)
 {
     MOQ_TEST_CHECK(sub_resolve_handle(f->s, f->sub_a) < 0);
-    t->committed_at_release = 0;
-    for (int i = 0; i < live_count(f); i++)
-        if (t->resets[i] > 0 || reset_queued_for(f, i))
-            t->committed_at_release++;
+    t->committed_at_release = accounted(f, t);
 }
 
 /* Given the result of a delivery already made, deliver `reset`'s signal again
@@ -723,12 +751,13 @@ static int redeliver_until_taken(fixture_t *f, tally_t *t, bool reset,
     note_released(f, t);
     poll_all(f, t);
     /* A STOP leaves the subscriber's direction open, so its identity is kept
-     * -- an ordinary drain reference -- until the subscriber's FIN or RESET. */
+     * -- a peer-stopped drain reference -- until the subscriber's FIN or
+     * RESET. */
     bool keep = !reset && !f->peer_fin;
     MOQ_TEST_CHECK(drain_ref_contains(f->s, f->ref_a) == keep);
     if (keep)
         MOQ_TEST_CHECK_EQ_INT((int)drain_ref_reason(f->s, f->ref_a),
-                              (int)MOQ_DRAIN_NORMAL);
+                              (int)MOQ_DRAIN_PEER_STOPPED);
     /* The subscriber's signal on the other direction changes nothing, and
      * then no identity of the request stream remains. */
     MOQ_TEST_CHECK_EQ_INT((int)deliver(f, !reset), (int)MOQ_OK);
@@ -738,7 +767,10 @@ static int redeliver_until_taken(fixture_t *f, tally_t *t, bool reset,
 }
 
 /* The settled outcome every row shares. `code[i]` is the reset code A's live
- * subgroup `i` is owed: CANCELLED unless something else reset it first. */
+ * subgroup `i` is owed: CANCELLED unless something else reset it first. The
+ * FIN-closed subgroup is never reset by the cancellation; with a subgroup
+ * delivery timeout its FIN-started timer resets it once with
+ * DELIVERY_TIMEOUT, since this fixture never reports the stream committed. */
 static void expect_settled(fixture_t *f, const tally_t *t, int updated_b,
                            const uint64_t *code)
 {
@@ -747,14 +779,16 @@ static void expect_settled(fixture_t *f, const tally_t *t, int updated_b,
         MOQ_TEST_CHECK_EQ_U64(t->reset_code[i], code ? code[i] : 0x1);
         MOQ_TEST_CHECK_EQ_INT(t->writes[i], 0);
     }
-    MOQ_TEST_CHECK_EQ_INT(t->resets[SG_A_FIN], 0);
+    MOQ_TEST_CHECK_EQ_INT(t->resets[SG_A_FIN], f->o.sg_timeout_ms ? 1 : 0);
+    if (f->o.sg_timeout_ms)
+        MOQ_TEST_CHECK_EQ_U64(t->reset_code[SG_A_FIN], 0x2);
     MOQ_TEST_CHECK_EQ_INT(t->writes[SG_A_FIN], 0);
     MOQ_TEST_CHECK_EQ_INT(t->resets[SG_B_OPEN], 0);
     MOQ_TEST_CHECK_EQ_INT(t->writes[SG_B_OPEN], 0);
     MOQ_TEST_CHECK_EQ_INT(t->other_actions, 0);
     /* A migrated request completes silently; any other cancellation surfaces
-     * exactly one UNSUBSCRIBED. Either way A is released only once every
-     * owed reset is committed. */
+     * exactly one UNSUBSCRIBED. Either way every reset is accounted for when
+     * A is released. */
     MOQ_TEST_CHECK_EQ_INT(t->unsubscribed_a, f->o.goaway ? 0 : 1);
     if (!f->o.goaway)
         MOQ_TEST_CHECK_EQ_INT(t->committed_at_unsubscribed, live_count(f));
@@ -993,17 +1027,27 @@ static void test_cancel(bool reset, pressure_t pressure, bool goaway)
     }
     if (pressure == PRESSURE_DRAIN) f.s->drain_ref_cap = f.s->drain_ref_count;
 
+    /* Only a missing record of the signal's own refuses it: the UNSUBSCRIBED
+     * event a migrated request does not owe, or a STOP's drain reference. */
+    bool refused = (pressure == PRESSURE_EVENTS && !goaway) ||
+                   pressure == PRESSURE_DRAIN;
     moq_result_t rc = deliver(&f, reset);
-    if (silent_events) {
-        /* The first delivery queues a reset at once despite the full event
-         * queue. */
-        MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_ERR_WOULD_BLOCK);
-        MOQ_TEST_CHECK_EQ_SIZE(actions_queued(f.s), (size_t)1);
-        MOQ_TEST_CHECK_EQ_SIZE(events_queued(f.s), (size_t)1);
-        MOQ_TEST_CHECK(owner_kept(&f));
-        poll_one_action(&f, &t);
-        expect_all_refused(&f, &t);
-    } else if (pressure != PRESSURE_NONE) {
+    if (!refused) {
+        /* Taken at once: A is released, the reset that fits is queued and
+         * the rest are owed by their entries; B is untouched. */
+        MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
+        MOQ_TEST_CHECK(sub_resolve_handle(f.s, f.sub_a) < 0);
+        MOQ_TEST_CHECK(unsubscribed_queued(&f) == !goaway);
+        MOQ_TEST_CHECK_EQ_INT(live_under(f.s, f.sub_a), 0);
+        MOQ_TEST_CHECK_EQ_INT(accounted(&f, &t), live_count(&f));
+        MOQ_TEST_CHECK(sg_state(&f, SG_B_OPEN) == MOQ_SG_OPEN);
+        if (pressure == PRESSURE_ACTIONS) {
+            /* B's write is ahead of every reset in the queue. */
+            poll_one_action(&f, &t);
+            MOQ_TEST_CHECK_EQ_INT(t.writes[SG_B_OPEN], 1);
+            t.writes[SG_B_OPEN] = 0;
+        }
+    } else {
         /* Refused before any of the cancellation's output: nothing of it
          * queued, owner and subgroups in place -- but already cancelled. */
         MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_ERR_WOULD_BLOCK);
@@ -1018,17 +1062,15 @@ static void test_cancel(bool reset, pressure_t pressure, bool goaway)
         expect_all_refused(&f, &t);
         f.s->drain_ref_cap = saved_cap;
     }
-    /* One reset per delivery, as one action slot allows, plus the refused
-     * delivery when the first one found no room. */
+    /* One delivery, plus the refused one when the first found no room. */
     int deliveries = redeliver_until_taken(&f, &t, reset, rc);
-    MOQ_TEST_CHECK_EQ_INT(deliveries,
-        SG_A_LIVE + (pressure == PRESSURE_NONE || silent_events ? 0 : 1));
+    MOQ_TEST_CHECK_EQ_INT(deliveries, refused ? 2 : 1);
     expect_settled(&f, &t, pressure == PRESSURE_EVENTS ? 1 : 0, NULL);
 
     /* A new subscription takes over A's slot under a new handle and opens as
      * many subgroups as A held: A's subgroup slots were all released. */
     moq_stream_ref_t ref_c = moq_stream_ref_from_u64(0x90008);
-    moq_subscription_t sub_c = subscribe(&f, ref_c, "c", 0, false);
+    moq_subscription_t sub_c = subscribe(&f, ref_c, "c", 0, 0, false);
     MOQ_TEST_CHECK_EQ_INT(sub_resolve_handle(f.s, sub_c), f.slot_a);
     MOQ_TEST_CHECK(!moq_subscription_eq(sub_c, f.sub_a));
     for (int i = 0; i <= SG_A_FIN; i++) {
@@ -1065,35 +1107,51 @@ static void test_cancel(bool reset, pressure_t pressure, bool goaway)
     moq_session_destroy(f.s);
 }
 
-/* -- Rows: one operation between a partial pass and the next -------- */
+/* -- Rows: one operation while a cancellation is pending ------------ */
 
-/* The first delivery queues one CANCELLED reset and asks to be delivered
- * again, the owner kept and nothing surfaced. Exactly that reset is then
- * polled, so the next call has the action slot it needs. */
-static void partial_pass(fixture_t *f, tally_t *t, bool reset)
+/* A cancellation left pending: the first delivery finds no room for its own
+ * record -- for a RESET the UNSUBSCRIBED event (an unrelated event fills the
+ * queue), for a STOP the drain reference -- and is refused before any output,
+ * the owner kept and already cancelled. Returns the drain capacity to restore
+ * before the signal is delivered again (SIZE_MAX when none was taken). In
+ * this fixture a migrated RESET owes neither record (and no fill or join), so
+ * it cannot be left pending here. */
+static size_t pending_pass(fixture_t *f, tally_t *t, bool reset)
 {
+    (void)t;
+    size_t saved = SIZE_MAX;
+    if (reset) {
+        fill_event_queue(f);
+    } else {
+        saved = f->s->drain_ref_cap;
+        f->s->drain_ref_cap = f->s->drain_ref_count;
+    }
     moq_result_t rc = deliver(f, reset);
     MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_ERR_WOULD_BLOCK);
-    MOQ_TEST_CHECK_EQ_SIZE(actions_queued(f->s), (size_t)1);
-    MOQ_TEST_CHECK(!unsubscribed_queued(f));
-    MOQ_TEST_CHECK_EQ_SIZE(events_queued(f->s), (size_t)0);
-    MOQ_TEST_CHECK(owner_kept(f));
-    poll_one_action(f, t);
-    int partial = 0;
-    for (int i = 0; i < SG_A_LIVE; i++) {
-        partial += t->resets[i];
-        if (t->resets[i]) MOQ_TEST_CHECK_EQ_U64(t->reset_code[i], 0x1);
-    }
-    MOQ_TEST_CHECK_EQ_INT(partial, 1);
-    MOQ_TEST_CHECK_EQ_INT(t->other_actions, 0);
     MOQ_TEST_CHECK_EQ_SIZE(actions_queued(f->s), (size_t)0);
+    MOQ_TEST_CHECK(!unsubscribed_queued(f));
+    MOQ_TEST_CHECK(owner_kept(f));
+    MOQ_TEST_CHECK(sub_cancel_pending(f->s, f->sub_a));
+    MOQ_TEST_CHECK_EQ_INT(live_under(f->s, f->sub_a), live_count(f));
+    return saved;
+}
+
+static void pending_restore(fixture_t *f, size_t saved)
+{
+    if (saved != SIZE_MAX) f->s->drain_ref_cap = saved;
 }
 
 static void test_partial_op(bool reset, op_t op, bool goaway)
 {
     char what[96];
-    snprintf(what, sizeof(what), "%s%s, partial pass, %s", migrated(goaway),
+    snprintf(what, sizeof(what), "%s%s, pending, %s", migrated(goaway),
              reset ? "RESET" : "STOP", k_op_names[op]);
+    /* In this fixture a migrated RESET owes no event, drain reference, fill
+     * or join, so nothing can leave it pending; that is a property of the
+     * fixture, not a guarantee that a migrated cancellation never blocks
+     * (joins: test_join_against_cancelled here; fills:
+     * tests/unit/test_teardown_capacity.c). */
+    if (reset && goaway) return;
     int before = failures;
     fixture_t f;
     fx_opts_t o = { 0 };
@@ -1101,12 +1159,13 @@ static void test_partial_op(bool reset, op_t op, bool goaway)
     if (!open_row(&f, what, o)) return;
     tally_t t;
     memset(&t, 0, sizeof(t));
-    partial_pass(&f, &t, reset);
+    size_t saved = pending_pass(&f, &t, reset);
     expect_refused(&f, &t, op);
     expect_b_writes(&f);
+    pending_restore(&f, saved);
     int deliveries = redeliver_until_taken(&f, &t, reset, MOQ_ERR_WOULD_BLOCK);
-    MOQ_TEST_CHECK_EQ_INT(deliveries, SG_A_LIVE);
-    expect_settled(&f, &t, 0, NULL);
+    MOQ_TEST_CHECK_EQ_INT(deliveries, 2);
+    expect_settled(&f, &t, reset ? 1 : 0, NULL);
     if (failures != before) fprintf(stderr, "  in %s\n", what);
     moq_session_destroy(f.s);
 }
@@ -1142,8 +1201,9 @@ static void test_ops_uncancelled(void)
 
 /* -- Rows: pressure and signals between passes ---------------------- */
 
-/* The event queue fills between two partial passes: the next delivery is
- * refused with nothing new queued, and resumes once the event is read. */
+/* A STOP is pending for want of a drain reference, and the event queue then
+ * fills: the next delivery is refused with nothing queued, and resumes once
+ * the event is read. (A pending RESET already waits on the event queue.) */
 static void test_event_pressure_between(bool reset)
 {
     char what[64];
@@ -1155,21 +1215,23 @@ static void test_event_pressure_between(bool reset)
     if (!open_row(&f, what, o)) return;
     tally_t t;
     memset(&t, 0, sizeof(t));
-    partial_pass(&f, &t, reset);
+    size_t saved = pending_pass(&f, &t, reset);
     fill_event_queue(&f);
+    pending_restore(&f, saved);
     MOQ_TEST_CHECK_EQ_INT((int)deliver(&f, reset), (int)MOQ_ERR_WOULD_BLOCK);
     MOQ_TEST_CHECK_EQ_SIZE(actions_queued(f.s), (size_t)0);
     MOQ_TEST_CHECK(!unsubscribed_queued(&f));
     expect_refused(&f, &t, OP_CLOSE);
     int deliveries = redeliver_until_taken(&f, &t, reset, MOQ_ERR_WOULD_BLOCK);
-    MOQ_TEST_CHECK_EQ_INT(deliveries, SG_A_LIVE);
+    MOQ_TEST_CHECK_EQ_INT(deliveries, 2);
     expect_settled(&f, &t, 1, NULL);
     if (failures != before) fprintf(stderr, "  in %s\n", what);
     moq_session_destroy(f.s);
 }
 
-/* The same signal again before the queued reset is read: refused, nothing
- * reset twice. */
+/* The same signal again before the queued reset is read: the first took the
+ * cancellation, the second finds nothing more to do, nothing is reset twice
+ * and nothing is surfaced twice. */
 static void test_duplicate_without_room(bool reset, bool goaway)
 {
     char what[64];
@@ -1182,12 +1244,13 @@ static void test_duplicate_without_room(bool reset, bool goaway)
     if (!open_row(&f, what, o)) return;
     tally_t t;
     memset(&t, 0, sizeof(t));
-    MOQ_TEST_CHECK_EQ_INT((int)deliver(&f, reset), (int)MOQ_ERR_WOULD_BLOCK);
-    MOQ_TEST_CHECK_EQ_INT((int)deliver(&f, reset), (int)MOQ_ERR_WOULD_BLOCK);
+    MOQ_TEST_CHECK_EQ_INT((int)deliver(&f, reset), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)deliver(&f, reset), (int)MOQ_OK);
     MOQ_TEST_CHECK_EQ_SIZE(actions_queued(f.s), (size_t)1);
-    MOQ_TEST_CHECK(!unsubscribed_queued(&f));
-    int deliveries = redeliver_until_taken(&f, &t, reset, MOQ_ERR_WOULD_BLOCK);
-    MOQ_TEST_CHECK_EQ_INT(deliveries, SG_A_LIVE);
+    MOQ_TEST_CHECK_EQ_SIZE(events_queued(f.s), (size_t)(goaway ? 0 : 1));
+    MOQ_TEST_CHECK_EQ_INT(accounted(&f, &t), live_count(&f));
+    int deliveries = redeliver_until_taken(&f, &t, reset, MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(deliveries, 1);
     expect_settled(&f, &t, 0, NULL);
     if (failures != before) fprintf(stderr, "  in %s\n", what);
     moq_session_destroy(f.s);
@@ -1202,6 +1265,7 @@ static void test_crossed(bool reset_first, bool goaway)
     char what[64];
     snprintf(what, sizeof(what), "%s%s, then %s while pending", migrated(goaway),
              reset_first ? "RESET" : "STOP", reset_first ? "STOP" : "RESET");
+    if (reset_first && goaway) return;   /* see test_partial_op */
     int before = failures;
     fixture_t f;
     fx_opts_t o = { 0 };
@@ -1209,21 +1273,27 @@ static void test_crossed(bool reset_first, bool goaway)
     if (!open_row(&f, what, o)) return;
     tally_t t;
     memset(&t, 0, sizeof(t));
-    partial_pass(&f, &t, reset_first);
-    size_t saved_cap = f.s->drain_ref_cap;
+    size_t pending_cap = pending_pass(&f, &t, reset_first);
+    size_t saved_cap = pending_cap != SIZE_MAX ? pending_cap : f.s->drain_ref_cap;
     if (reset_first) f.s->drain_ref_cap = f.s->drain_ref_count;
     moq_result_t rc = deliver(&f, !reset_first);
     int deliveries = 1;
     while (rc == MOQ_ERR_WOULD_BLOCK && deliveries < 32) {
         MOQ_TEST_CHECK(owner_kept(&f));
         MOQ_TEST_CHECK(!unsubscribed_queued(&f));
-        MOQ_TEST_CHECK_EQ_SIZE(actions_queued(f.s), (size_t)1);
-        poll_one_action(&f, &t);
+        MOQ_TEST_CHECK_EQ_SIZE(actions_queued(f.s), (size_t)0);
+        moq_event_t e;
+        if (moq_session_poll_events(f.s, &e, 1) > 0) {
+            record_event(&f, &t, &e);
+            moq_event_cleanup(&e);
+        }
         rc = deliver(&f, !reset_first);
         deliveries++;
     }
     MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
-    MOQ_TEST_CHECK_EQ_INT(deliveries, SG_A_LIVE - 1);
+    /* A STOP after a pending RESET waits only for the event the RESET was
+     * refused for; a RESET after a pending STOP needs no drain reference. */
+    MOQ_TEST_CHECK_EQ_INT(deliveries, reset_first ? 2 : 1);
     note_released(&f, &t);
     poll_all(&f, &t);
     f.s->drain_ref_cap = saved_cap;
@@ -1235,7 +1305,7 @@ static void test_crossed(bool reset_first, bool goaway)
     MOQ_TEST_CHECK_EQ_INT((int)deliver(&f, !reset_first), (int)MOQ_OK);
     poll_all(&f, &t);
     MOQ_TEST_CHECK_EQ_SIZE(f.s->drain_ref_count, (size_t)0);
-    expect_settled(&f, &t, 0, NULL);
+    expect_settled(&f, &t, reset_first ? 1 : 0, NULL);
     if (failures != before) fprintf(stderr, "  in %s\n", what);
     moq_session_destroy(f.s);
 }
@@ -1254,7 +1324,7 @@ static void test_late_request_bytes(void)
     if (!open_row(&f, what, o)) return;
     tally_t t;
     memset(&t, 0, sizeof(t));
-    partial_pass(&f, &t, false);
+    size_t pending_cap = pending_pass(&f, &t, false);
     const moq_sub_entry_t *e = &f.s->subs[f.slot_a];
     bool forward = e->forward;
     uint8_t priority = e->subscriber_priority;
@@ -1277,27 +1347,26 @@ static void test_late_request_bytes(void)
     MOQ_TEST_CHECK_EQ_SIZE(actions_queued(f.s), (size_t)0);
     MOQ_TEST_CHECK(e->forward == forward);
     MOQ_TEST_CHECK_EQ_INT((int)e->subscriber_priority, (int)priority);
-    MOQ_TEST_CHECK_EQ_SIZE(e->req_recv_len, (size_t)0);
+    MOQ_TEST_CHECK_EQ_SIZE(e->rs.recv_len, (size_t)0);
     MOQ_TEST_CHECK_EQ_INT(
         (int)moq_session_on_bidi_stream_bytes(f.s, f.ref_a, NULL, 0, true, f.now),
         (int)MOQ_OK);
-    MOQ_TEST_CHECK(e->req_recv_fin);
+    MOQ_TEST_CHECK(e->rs.recv_fin);
     f.peer_fin = true;
     MOQ_TEST_CHECK(owner_kept(&f));
     MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(f.s), (int)MOQ_SESS_ESTABLISHED);
     expect_refused(&f, &t, OP_WRITE);
-    size_t saved_cap = f.s->drain_ref_cap;
-    f.s->drain_ref_cap = f.s->drain_ref_count;
+    /* Still no drain room: after the FIN the STOP needs none. */
     int deliveries = redeliver_until_taken(&f, &t, false, MOQ_ERR_WOULD_BLOCK);
-    f.s->drain_ref_cap = saved_cap;
-    MOQ_TEST_CHECK_EQ_INT(deliveries, SG_A_LIVE);
+    pending_restore(&f, pending_cap);
+    MOQ_TEST_CHECK_EQ_INT(deliveries, 2);
     MOQ_TEST_CHECK_EQ_SIZE(f.s->drain_ref_count, (size_t)0);
     expect_settled(&f, &t, 0, NULL);
     if (failures != before) fprintf(stderr, "  in %s\n", what);
     moq_session_destroy(f.s);
 }
 
-/* After a partial pass of a STOP, the subscriber's FIN arrives -- empty, or
+/* While a STOP is pending, the subscriber's FIN arrives -- empty, or
  * riding a last message. It records that the subscriber's direction ended
  * and nothing more: the owner and every reset still owed survive it, nothing
  * is read from the bytes, and the redelivered STOP finishes the cancellation
@@ -1314,9 +1383,9 @@ static void test_late_fin(bool goaway, bool with_bytes)
     if (!open_row(&f, what, o)) return;
     tally_t t;
     memset(&t, 0, sizeof(t));
-    partial_pass(&f, &t, false);
+    size_t pending_cap = pending_pass(&f, &t, false);
     int live = live_under(f.s, f.sub_a);
-    MOQ_TEST_CHECK_EQ_INT(live, SG_A_LIVE - 1);
+    MOQ_TEST_CHECK_EQ_INT(live, SG_A_LIVE);
     uint8_t msg[64];
     size_t n = 0;
     if (with_bytes) {
@@ -1337,14 +1406,16 @@ static void test_late_fin(bool goaway, bool with_bytes)
         (int)MOQ_OK);
     f.peer_fin = true;
     MOQ_TEST_CHECK(owner_kept(&f));
-    MOQ_TEST_CHECK(f.s->subs[f.slot_a].req_recv_fin);
+    MOQ_TEST_CHECK(f.s->subs[f.slot_a].rs.recv_fin);
     MOQ_TEST_CHECK_EQ_INT(live_under(f.s, f.sub_a), live);
     MOQ_TEST_CHECK_EQ_SIZE(actions_queued(f.s), (size_t)0);
     MOQ_TEST_CHECK_EQ_SIZE(events_queued(f.s), (size_t)0);
     MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(f.s), (int)MOQ_SESS_ESTABLISHED);
     expect_refused(&f, &t, OP_CLOSE);
+    /* Still no drain room: after the FIN the STOP needs none. */
     int deliveries = redeliver_until_taken(&f, &t, false, MOQ_ERR_WOULD_BLOCK);
-    MOQ_TEST_CHECK_EQ_INT(deliveries, SG_A_LIVE);
+    pending_restore(&f, pending_cap);
+    MOQ_TEST_CHECK_EQ_INT(deliveries, 2);
     MOQ_TEST_CHECK_EQ_SIZE(f.s->drain_ref_count, (size_t)0);
     expect_settled(&f, &t, 0, NULL);
     if (failures != before) fprintf(stderr, "  in %s\n", what);
@@ -1352,11 +1423,11 @@ static void test_late_fin(bool goaway, bool with_bytes)
 }
 
 /* With no subgroup open, a STOP ends A at once, leaving the subscriber's
- * direction open: its identity stays as an ordinary drain reference. A
- * repeated STOP changes nothing. The subscriber's trailing FIN -- or its
- * RESET -- is absorbed by that reference and retires it, never read as a new
- * request and never closing the session; a STOP after that brings nothing
- * back. */
+ * direction open: its identity stays as a peer-stopped drain reference until
+ * the subscriber's FIN or RESET. A repeated STOP changes nothing. The
+ * subscriber's trailing FIN -- or its RESET -- is absorbed by that reference
+ * and retires it, never read as a new request and never closing the session;
+ * a STOP after that brings nothing back. */
 static void test_stop_keeps_identity(bool goaway, bool end_with_reset)
 {
     char what[96];
@@ -1381,7 +1452,7 @@ static void test_stop_keeps_identity(bool goaway, bool end_with_reset)
         (int)MOQ_REQ_NONE);
     MOQ_TEST_CHECK(drain_ref_contains(f.s, f.ref_a));
     MOQ_TEST_CHECK_EQ_INT((int)drain_ref_reason(f.s, f.ref_a),
-                          (int)MOQ_DRAIN_NORMAL);
+                          (int)MOQ_DRAIN_PEER_STOPPED);
     MOQ_TEST_CHECK_EQ_SIZE(f.s->drain_ref_count, (size_t)1);
 
     MOQ_TEST_CHECK_EQ_INT((int)deliver(&f, false), (int)MOQ_OK);
@@ -1426,7 +1497,7 @@ static void test_app_reset(bool reset)
     if (!open_row(&f, what, o)) return;
     tally_t t;
     memset(&t, 0, sizeof(t));
-    partial_pass(&f, &t, reset);
+    size_t pending_cap = pending_pass(&f, &t, reset);
     int target = untouched(&f, &t, SHAPE_PARTIAL);
     MOQ_TEST_CHECK(target >= 0);
     uint64_t code[SG_A_LIVE];
@@ -1439,14 +1510,19 @@ static void test_app_reset(bool reset)
         MOQ_TEST_CHECK_EQ_SIZE(actions_queued(f.s), (size_t)1);
         poll_one_action(&f, &t);
     }
+    pending_restore(&f, pending_cap);
     (void)redeliver_until_taken(&f, &t, reset, MOQ_ERR_WOULD_BLOCK);
-    expect_settled(&f, &t, 0, code);
+    expect_settled(&f, &t, reset ? 1 : 0, code);
     if (failures != before) fprintf(stderr, "  in %s\n", what);
     moq_session_destroy(f.s);
 }
 
-/* Delivery timeouts expire while the cancellation is pending: each stream is
- * reset exactly once, by whichever reaches it first. */
+/* A subgroup delivery timeout expires while the cancellation is pending.
+ * Draft-18 §8 starts that timer once every object of the subgroup is
+ * published, so only the FIN-closed subgroup has one: it is reset exactly
+ * once, with DELIVERY_TIMEOUT, and the cancellation does not reset it again.
+ * The live subgroups have no subgroup timer and are each reset exactly once
+ * with CANCELLED. */
 static void test_timeout_reset(bool reset)
 {
     char what[64];
@@ -1459,21 +1535,72 @@ static void test_timeout_reset(bool reset)
     if (!open_row(&f, what, o)) return;
     tally_t t;
     memset(&t, 0, sizeof(t));
-    partial_pass(&f, &t, reset);
+    size_t pending_cap = pending_pass(&f, &t, reset);
     f.now = T_NOW + 6000;
     moq_result_t trc = moq_session_tick(f.s, f.now);
     MOQ_TEST_CHECK(trc == MOQ_OK || trc == MOQ_ERR_WOULD_BLOCK);
     poll_all(&f, &t);
+    pending_restore(&f, pending_cap);
     (void)redeliver_until_taken(&f, &t, reset, MOQ_ERR_WOULD_BLOCK);
-    int timed_out = 0;
-    uint64_t code[SG_A_LIVE];
-    for (int i = 0; i < SG_A_LIVE; i++) {
-        MOQ_TEST_CHECK(t.reset_code[i] == 0x1 || t.reset_code[i] == 0x2);
-        code[i] = t.reset_code[i];
-        if (t.reset_code[i] == 0x2) timed_out++;
+    expect_settled(&f, &t, reset ? 1 : 0, NULL);
+    if (failures != before) fprintf(stderr, "  in %s\n", what);
+    moq_session_destroy(f.s);
+}
+
+/* An object delivery timeout on a live subgroup races the pending
+ * cancellation. Draft-18 §8 checks an object's age before passing it to the
+ * transport, so the timer acts on a write still queued: one whole object on
+ * A's first open subgroup is queued and left unpolled, the cancellation is
+ * refused, and the object expires. The expired write becomes that stream's
+ * DELIVERY_TIMEOUT reset, which stands in for the cancellation's own: the
+ * stream is reset exactly once and never written, and every other live
+ * subgroup is reset exactly once with CANCELLED. */
+static void test_object_timeout_race(bool reset)
+{
+    char what[64];
+    snprintf(what, sizeof(what), "%s, object timeout on a queued write",
+             reset ? "RESET" : "STOP");
+    int before = failures;
+    fixture_t f;
+    fx_opts_t o = { 0 };
+    o.obj_timeout_ms = 5;
+    if (!open_row(&f, what, o)) return;
+    tally_t t;
+    memset(&t, 0, sizeof(t));
+    size_t saved = SIZE_MAX;
+    if (reset) {
+        fill_event_queue(&f);
+    } else {
+        saved = f.s->drain_ref_cap;
+        f.s->drain_ref_cap = f.s->drain_ref_count;
     }
-    MOQ_TEST_CHECK(timed_out >= 1);
-    expect_settled(&f, &t, 0, code);
+    MOQ_TEST_CHECK_EQ_INT((int)write_whole(&f, f.sg[SG_A_OPEN], 1), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_SIZE(actions_queued(f.s), (size_t)1);
+    MOQ_TEST_CHECK_EQ_INT((int)deliver(&f, reset), (int)MOQ_ERR_WOULD_BLOCK);
+    MOQ_TEST_CHECK_EQ_SIZE(actions_queued(f.s), (size_t)1);
+    MOQ_TEST_CHECK(!unsubscribed_queued(&f));
+    MOQ_TEST_CHECK(owner_kept(&f));
+    MOQ_TEST_CHECK(sub_cancel_pending(f.s, f.sub_a));
+    MOQ_TEST_CHECK_EQ_INT(live_under(f.s, f.sub_a), live_count(&f));
+
+    f.now = T_NOW + 6000;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_tick(f.s, f.now), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_SIZE(actions_queued(f.s), (size_t)1);
+    MOQ_TEST_CHECK(reset_queued_for(&f, SG_A_OPEN));
+    MOQ_TEST_CHECK(owner_kept(&f));
+    poll_all(&f, &t);
+    MOQ_TEST_CHECK_EQ_INT(t.resets[SG_A_OPEN], 1);
+    MOQ_TEST_CHECK_EQ_U64(t.reset_code[SG_A_OPEN], 0x2);
+    MOQ_TEST_CHECK_EQ_INT(t.writes[SG_A_OPEN], 0);
+    for (int i = 0; i < SG_COUNT; i++)
+        if (i != SG_A_OPEN) MOQ_TEST_CHECK_EQ_INT(t.resets[i], 0);
+
+    pending_restore(&f, saved);
+    (void)redeliver_until_taken(&f, &t, reset, MOQ_ERR_WOULD_BLOCK);
+    uint64_t code[SG_A_LIVE];
+    for (int i = 0; i < SG_A_LIVE; i++) code[i] = 0x1;
+    code[SG_A_OPEN] = 0x2;
+    expect_settled(&f, &t, reset ? 1 : 0, code);
     if (failures != before) fprintf(stderr, "  in %s\n", what);
     moq_session_destroy(f.s);
 }
@@ -1656,10 +1783,10 @@ static void test_subscriber_role(bool reset)
  * provoke exactly one named setup refusal without hiding any other failure.
  * With room for two subgroups, A's third subgroup open is refused with
  * WOULD_BLOCK; with room for one subscription, B's SUBSCRIBE is turned away
- * with REQUEST_ERROR (INTERNAL_ERROR). The fixture stops at that step and
- * reports failure without counting it, leaving the session for the caller to
- * destroy. Every step before it must have gone cleanly: any failed check on
- * the way is counted as usual. */
+ * with REQUEST_ERROR (EXCESSIVE_LOAD, the local-capacity code of draft-18
+ * §10.6). The fixture stops at that step and reports failure without counting
+ * it, leaving the session for the caller to destroy. Every step before it
+ * must have gone cleanly: any failed check on the way is counted as usual. */
 static void test_setup_refusal(bool subscriptions)
 {
     const char *what = subscriptions ? "setup refusal: no room for B"
@@ -1669,7 +1796,8 @@ static void test_setup_refusal(bool subscriptions)
     fx_opts_t o = { 0 };
     if (subscriptions) {
         o.max_subscriptions = 1;
-        o.expect = (fx_refusal_t){ FX_STEP_SUBSCRIBE_B, 0, 0x0 };
+        o.expect = (fx_refusal_t){ FX_STEP_SUBSCRIBE_B, 0,
+                                   MOQ_REQUEST_ERROR_EXCESSIVE_LOAD };
     } else {
         o.max_open_subgroups = 2;
         o.expect = (fx_refusal_t){ FX_STEP_A_OPEN, 2, MOQ_ERR_WOULD_BLOCK };
@@ -1874,21 +2002,26 @@ static void test_bridge(bool reset, bool goaway)
     fake_endpoint_clear_ops(&b.sep);
 
     /* The subscriber's signal, delivered once by the transport. The session
-     * cannot finish it at once: the bridge reports WOULD_BLOCK and keeps the
-     * signal pending itself, and the subscription is already cancelled. */
+     * takes it at once (its event and any drain reference fit): the
+     * subscription is released, one reset is queued and the others are owed
+     * by their entries. If the bridge is ever refused instead, it keeps the
+     * signal pending itself, the subscription already cancelled. */
     moq_result_t rc = reset
         ? held_bridge_reset(b.sb, sid, 0x1, T_NOW)
         : moq_transport_bridge_on_peer_stop_sending(b.sb, sid, 0x1, T_NOW);
-    MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_ERR_WOULD_BLOCK);
-    {
+    MOQ_TEST_CHECK(rc == MOQ_OK || rc == MOQ_ERR_WOULD_BLOCK);
+    if (rc == MOQ_ERR_WOULD_BLOCK) {
         const bridge_stream_entry_t *e = bridge_find_by_id(b.sb, sid);
         MOQ_TEST_CHECK(e != NULL);
         if (e) MOQ_TEST_CHECK(reset ? e->pending_reset : e->pending_stop);
+        MOQ_TEST_CHECK(sub_cancel_pending(b.sv, ssub));
+    } else {
+        MOQ_TEST_CHECK(sub_resolve_handle(b.sv, ssub) < 0);
     }
-    MOQ_TEST_CHECK(sub_cancel_pending(b.sv, ssub));
 
     /* Only the bridge's own servicing from here: the application reads its
-     * events and delivers nothing. */
+     * events and delivers nothing; the owed resets go out as the bridge takes
+     * actions. */
     int unsubscribed = 0, other_events = 0;
     for (int i = 0; i < 64; i++) {
         (void)held_bridge_service(b.sb, T_NOW);
@@ -1938,6 +2071,145 @@ static void test_bridge(bool reset, bool goaway)
     moq_session_destroy(b.sv);
 }
 
+/* -- Row: A's slot reused while its resets are owed ------------------ */
+
+/* With B's write filling the action queue, the cancellation is taken at once
+ * and every reset of A is owed. A new SUBSCRIBE then takes A's slot under a
+ * new handle while those resets are still owed: the owed entries keep A's
+ * handle, streams and code, and the subgroup allocator never selects them as
+ * free. B's next subgroup is refused retryably meanwhile. Polling actions
+ * alone -- no further peer input -- issues every owed reset exactly once, on
+ * A's streams; then C is accepted and A's subgroup slots are free again. */
+static void test_reuse_while_owed(bool reset)
+{
+    char what[80];
+    snprintf(what, sizeof(what), "%s, A's slot reused while resets are owed",
+             reset ? "RESET" : "STOP");
+    int before = failures;
+    fixture_t f;
+    fx_opts_t o = { 0 };
+    if (!open_row(&f, what, o)) return;
+    tally_t t;
+    memset(&t, 0, sizeof(t));
+    MOQ_TEST_CHECK_EQ_INT((int)write_whole(&f, f.sg[SG_B_OPEN], 1), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_SIZE(actions_queued(f.s), (size_t)1);
+    MOQ_TEST_CHECK_EQ_INT((int)deliver(&f, reset), (int)MOQ_OK);
+    MOQ_TEST_CHECK(sub_resolve_handle(f.s, f.sub_a) < 0);
+    for (int i = 0; i < live_count(&f); i++)
+        MOQ_TEST_CHECK(reset_owed_for(&f, i));
+    /* Events only: UNSUBSCRIBED is read, no action is polled. */
+    moq_event_t e;
+    while (moq_session_poll_events(f.s, &e, 1) > 0) {
+        record_event(&f, &t, &e);
+        moq_event_cleanup(&e);
+    }
+    MOQ_TEST_CHECK_EQ_INT(t.unsubscribed_a, 1);
+    MOQ_TEST_CHECK_EQ_INT(t.committed_at_unsubscribed, live_count(&f));
+
+    /* C's SUBSCRIBE takes A's slot, left pending so it needs no action. */
+    uint8_t msg[128];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, msg, sizeof(msg));
+    moq_bytes_t parts[] = { MOQ_BYTES_LITERAL("live") };
+    moq_namespace_t ns = { parts, 1 };
+    moq_d18_msg_params_t p;
+    memset(&p, 0, sizeof(p));
+    p.has_filter = true;
+    p.filter_type = 2;
+    MOQ_TEST_CHECK_EQ_INT(
+        (int)moq_d18_encode_subscribe(&w, f.next_rid, &ns,
+                                      MOQ_BYTES_LITERAL("c"), &p), (int)MOQ_OK);
+    f.next_rid += 2;
+    moq_stream_ref_t ref_c = moq_stream_ref_from_u64(0x90008);
+    MOQ_TEST_CHECK_EQ_INT(
+        (int)moq_session_on_bidi_stream_bytes(f.s, ref_c, msg,
+            moq_buf_writer_offset(&w), false, f.now), (int)MOQ_OK);
+    moq_subscription_t sub_c = MOQ_SUBSCRIPTION_INVALID;
+    while (moq_session_poll_events(f.s, &e, 1) > 0) {
+        if (e.kind == MOQ_EVENT_SUBSCRIBE_REQUEST) sub_c = e.u.subscribe_request.sub;
+        moq_event_cleanup(&e);
+    }
+    MOQ_TEST_CHECK_EQ_INT(sub_resolve_handle(f.s, sub_c), f.slot_a);
+    MOQ_TEST_CHECK(!moq_subscription_eq(sub_c, f.sub_a));
+    /* The owed entries still belong to A, not to the slot's new owner. */
+    for (size_t k = 0; k < f.s->sg_cap; k++)
+        if (f.s->subgroups[k].state == MOQ_SG_RESET_OWED) {
+            MOQ_TEST_CHECK(moq_subscription_eq(f.s->subgroups[k].sub, f.sub_a));
+            MOQ_TEST_CHECK(sg_index(&f, f.s->subgroups[k].stream_ref) >= 0);
+        }
+    MOQ_TEST_CHECK(!sub_cancel_pending(f.s, sub_c));
+
+    /* The pool never selects an owed entry as free. With one action slot the
+     * queue is refilled from the owed resets at every poll, so an open's
+     * refusal cannot isolate the pool; the allocator is asked directly, with
+     * every other free slot hidden for the probe. */
+    {
+        bool owed_slot[64] = { false }, hidden[64] = { false };
+        size_t owed_n = 0;
+        MOQ_TEST_CHECK(f.s->sg_cap <= 64);
+        for (size_t k = 0; k < f.s->sg_cap && k < 64; k++)
+            if (f.s->subgroups[k].state == MOQ_SG_RESET_OWED) {
+                owed_slot[k] = true;
+                owed_n++;
+            }
+        MOQ_TEST_CHECK_EQ_SIZE(owed_n, (size_t)live_count(&f));
+        int fr = sg_find_free(f.s);
+        MOQ_TEST_CHECK(fr < 0 || (fr < 64 && !owed_slot[fr]));
+        for (size_t k = 0; k < f.s->sg_cap && k < 64; k++)
+            if (f.s->subgroups[k].state == MOQ_SG_FREE) {
+                hidden[k] = true;
+                f.s->subgroups[k].state = MOQ_SG_RESETTING;
+            }
+        MOQ_TEST_CHECK_EQ_INT(sg_find_free(f.s), -1);
+        for (size_t k = 0; k < f.s->sg_cap && k < 64; k++)
+            if (hidden[k]) f.s->subgroups[k].state = MOQ_SG_FREE;
+    }
+    /* B's next subgroup is refused, retryably, while they are owed (the
+     * action queue alone would refuse it too). */
+    moq_subgroup_cfg_t sc;
+    moq_subgroup_cfg_init(&sc);
+    sc.group_id = 50;
+    moq_subgroup_handle_t hb = MOQ_SUBGROUP_INVALID;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_open_subgroup(f.s, f.sub_b, &sc,
+                                                         f.now, &hb),
+                          (int)MOQ_ERR_WOULD_BLOCK);
+
+    /* Polling alone issues every owed reset, once each, on A's streams. */
+    moq_action_t a;
+    while (moq_session_poll_actions(f.s, &a, 1) > 0) {
+        record_action(&f, &t, &a);
+        moq_action_cleanup(&a);
+    }
+    MOQ_TEST_CHECK_EQ_INT(t.writes[SG_B_OPEN], 1);
+    t.writes[SG_B_OPEN] = 0;
+    for (int i = 0; i < live_count(&f); i++) {
+        MOQ_TEST_CHECK_EQ_INT(t.resets[i], 1);
+        MOQ_TEST_CHECK_EQ_U64(t.reset_code[i], 0x1);
+    }
+    MOQ_TEST_CHECK_EQ_INT(t.resets[SG_A_FIN], 0);
+    MOQ_TEST_CHECK_EQ_INT(t.resets[SG_B_OPEN], 0);
+    MOQ_TEST_CHECK_EQ_INT(t.other_actions, 0);
+    for (size_t k = 0; k < f.s->sg_cap; k++)
+        MOQ_TEST_CHECK(f.s->subgroups[k].state != MOQ_SG_RESET_OWED);
+
+    /* C is accepted and opens as many subgroups as A held. */
+    moq_accept_subscribe_cfg_t acc;
+    moq_accept_subscribe_cfg_init(&acc);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_accept_subscribe(f.s, sub_c, &acc, f.now),
+                          (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(drain_count(f.s), 1);
+    for (int i = 0; i <= SG_A_FIN; i++) {
+        moq_subgroup_handle_t h = MOQ_SUBGROUP_INVALID;
+        moq_stream_ref_t r = moq_stream_ref_from_u64(0);
+        MOQ_TEST_CHECK_EQ_INT((int)open_sg(&f, sub_c, (uint64_t)(10 + i), &h, &r),
+                              (int)MOQ_OK);
+        if (moq_subgroup_is_valid(h)) MOQ_TEST_CHECK_EQ_INT(sg_index(&f, r), -1);
+    }
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(f.s), (int)MOQ_SESS_ESTABLISHED);
+    if (failures != before) fprintf(stderr, "  in %s\n", what);
+    moq_session_destroy(f.s);
+}
+
 int main(void)
 {
     for (int r = 0; r < 2; r++) {
@@ -1960,9 +2232,11 @@ int main(void)
                 test_stop_keeps_identity(goaway, true);
             }
         }
-        test_event_pressure_between(reset);
+        if (!reset) test_event_pressure_between(reset);
+        test_reuse_while_owed(reset);
         test_app_reset(reset);
         test_timeout_reset(reset);
+        test_object_timeout_race(reset);
         test_terminal_race(reset, false);
         test_terminal_race(reset, true);
         test_subscriber_role(reset);

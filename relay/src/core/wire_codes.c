@@ -2,9 +2,9 @@
 #include <moq/relay/relay.h>
 
 /*
- * The two registries, transcribed per draft. Codes absent from a draft are
- * marked so encoding falls back deliberately instead of colliding with the
- * meaning that draft gives the same number.
+ * The two registries, transcribed per draft (16, 18, 22). Codes absent from a
+ * draft are marked so encoding falls back deliberately instead of colliding
+ * with the meaning that draft gives the same number.
  */
 
 #define NA UINT64_MAX   /* this draft assigns no code for this meaning */
@@ -19,48 +19,59 @@ typedef struct code_row {
     int      semantic;
     uint64_t d16;
     uint64_t d18;
+    uint64_t d22;
 } code_row_t;
 
 static const code_row_t PD_ROWS[] = {
-    { MOQR_PD_INTERNAL_ERROR,     0x0u,  0x0u  },
-    { MOQR_PD_UNAUTHORIZED,       0x1u,  0x1u  },
-    { MOQR_PD_TRACK_ENDED,        0x2u,  0x2u  },
-    { MOQR_PD_SUBSCRIPTION_ENDED, 0x3u,  0x3u  },
-    { MOQR_PD_GOING_AWAY,         0x4u,  0x4u  },
-    /* the swap: the same two meanings trade numbers between drafts */
-    { MOQR_PD_EXPIRED,            0x5u,  0x6u  },
-    { MOQR_PD_TOO_FAR_BEHIND,     0x6u,  0x5u  },
-    { MOQR_PD_UPDATE_FAILED,      0x8u,  0x8u  },
-    { MOQR_PD_EXCESSIVE_LOAD,     NA,    0x9u  },
-    { MOQR_PD_MALFORMED_TRACK,    0x12u, 0x12u },
+    { MOQR_PD_INTERNAL_ERROR,     0x0u,  0x0u,  0x0u  },
+    { MOQR_PD_UNAUTHORIZED,       0x1u,  0x1u,  0x1u  },
+    { MOQR_PD_TRACK_ENDED,        0x2u,  0x2u,  0x2u  },
+    /* draft-22 removed this status: a subscription there does not end when
+     * Largest Object passes the end of its Location Filter, so the meaning
+     * has no number and 0x3 is unassigned in that registry. */
+    { MOQR_PD_SUBSCRIPTION_ENDED, 0x3u,  0x3u,  NA    },
+    { MOQR_PD_GOING_AWAY,         0x4u,  0x4u,  0x4u  },
+    /* the swap: the same two meanings trade numbers between draft-16 and the
+     * later drafts */
+    { MOQR_PD_EXPIRED,            0x5u,  0x6u,  0x6u  },
+    { MOQR_PD_TOO_FAR_BEHIND,     0x6u,  0x5u,  0x5u  },
+    { MOQR_PD_UPDATE_FAILED,      0x8u,  0x8u,  0x8u  },
+    { MOQR_PD_EXCESSIVE_LOAD,     NA,    0x9u,  0x9u  },
+    { MOQR_PD_MALFORMED_TRACK,    0x12u, 0x12u, 0x12u },
 };
 
 static const code_row_t RS_ROWS[] = {
-    { MOQR_RESET_INTERNAL_ERROR,        0x0u,  0x0u  },
-    { MOQR_RESET_CANCELLED,             0x1u,  0x1u  },
-    { MOQR_RESET_DELIVERY_TIMEOUT,      0x2u,  0x2u  },
-    { MOQR_RESET_SESSION_CLOSED,        0x3u,  0x3u  },
-    /* draft-16 numbers this 0x4, which draft-18 gives to GOING_AWAY */
-    { MOQR_RESET_UNKNOWN_OBJECT_STATUS, 0x4u,  0x6u  },
-    { MOQR_RESET_GOING_AWAY,            NA,    0x4u  },
-    { MOQR_RESET_TOO_FAR_BEHIND,        NA,    0x5u  },
-    { MOQR_RESET_EXPIRED_AUTH_TOKEN,    NA,    0x7u  },
-    { MOQR_RESET_EXCESSIVE_LOAD,        NA,    0x9u  },
-    { MOQR_RESET_MALFORMED_TRACK,       0x12u, 0x12u },
+    { MOQR_RESET_INTERNAL_ERROR,        0x0u,  0x0u,  0x0u  },
+    { MOQR_RESET_CANCELLED,             0x1u,  0x1u,  0x1u  },
+    { MOQR_RESET_DELIVERY_TIMEOUT,      0x2u,  0x2u,  0x2u  },
+    { MOQR_RESET_SESSION_CLOSED,        0x3u,  0x3u,  0x3u  },
+    /* draft-16 numbers this 0x4, which the later drafts give to GOING_AWAY */
+    { MOQR_RESET_UNKNOWN_OBJECT_STATUS, 0x4u,  0x6u,  0x6u  },
+    { MOQR_RESET_GOING_AWAY,            NA,    0x4u,  0x4u  },
+    { MOQR_RESET_TOO_FAR_BEHIND,        NA,    0x5u,  0x5u  },
+    { MOQR_RESET_EXPIRED_AUTH_TOKEN,    NA,    0x7u,  0x7u  },
+    { MOQR_RESET_EXCESSIVE_LOAD,        NA,    0x9u,  0x9u  },
+    { MOQR_RESET_MALFORMED_TRACK,       0x12u, 0x12u, 0x12u },
 };
 
-/* Exactly the two drafts this relay speaks. Anything else — including the
+/* Exactly the drafts this relay speaks. Anything else — including the
  * unattached sentinel 0 — selects no table at all. */
 static bool
 version_ok(moq_version_t version)
 {
-    return version == MOQ_VERSION_DRAFT_16 || version == MOQ_VERSION_DRAFT_18;
+    return version == MOQ_VERSION_DRAFT_16 || version == MOQ_VERSION_DRAFT_18 ||
+           version == MOQ_VERSION_DRAFT_22;
 }
 
-static bool
-is_d18(moq_version_t version)
+/* The row's number in `version`'s registry; the caller has validated it. */
+static uint64_t
+row_code(const code_row_t *row, moq_version_t version)
 {
-    return version == MOQ_VERSION_DRAFT_18;
+    switch (version) {
+    case MOQ_VERSION_DRAFT_22: return row->d22;
+    case MOQ_VERSION_DRAFT_18: return row->d18;
+    default:                   return row->d16;
+    }
 }
 
 static int
@@ -71,7 +82,7 @@ decode_row(const code_row_t *rows, size_t n, moq_version_t version,
         return 0;   /* *_UNKNOWN: an unsupported draft has no registry here */
     }
     for (size_t i = 0; i < n; i++) {
-        uint64_t code = is_d18(version) ? rows[i].d18 : rows[i].d16;
+        uint64_t code = row_code(&rows[i], version);
 
         if (code != NA && code == wire) {
             return rows[i].semantic;
@@ -88,7 +99,7 @@ encode_row(const code_row_t *rows, size_t n, moq_version_t version,
         if (rows[i].semantic != semantic) {
             continue;
         }
-        uint64_t code = is_d18(version) ? rows[i].d18 : rows[i].d16;
+        uint64_t code = row_code(&rows[i], version);
         return code != NA ? code : fallback;
     }
     return fallback;
@@ -117,7 +128,10 @@ moqr_pd_encode(moq_version_t version, moqr_pd_status_t status, uint64_t *out)
         return MOQR_ERR_INVAL;
     }
     /* A meaning this draft never assigned degrades to INTERNAL_ERROR: truthful
-     * and inert, where a neighbouring number would assert something else. */
+     * and inert, where a neighbouring number would assert something else.
+     * That covers draft-16's EXCESSIVE_LOAD and draft-22's SUBSCRIPTION_ENDED;
+     * the relay itself never ends a draft-22 subscription for its range, so
+     * the latter is only ever a foreign status crossing into draft-22. */
     *out = encode_row(PD_ROWS, sizeof(PD_ROWS) / sizeof(PD_ROWS[0]),
                       version, (int)status, 0x0u);
     return MOQR_OK;
@@ -212,15 +226,21 @@ moqr_reset_encode_internal(moq_version_t version, uint64_t internal,
 static moqr_code_tag_t
 tag_of(moq_version_t origin)
 {
-    return origin == MOQ_VERSION_DRAFT_18 ? MOQR_CODE_WIRE_D18
-                                          : MOQR_CODE_WIRE_D16;
+    switch (origin) {
+    case MOQ_VERSION_DRAFT_22: return MOQR_CODE_WIRE_D22;
+    case MOQ_VERSION_DRAFT_18: return MOQR_CODE_WIRE_D18;
+    default:                   return MOQR_CODE_WIRE_D16;
+    }
 }
 
 static moq_version_t
 origin_of(moqr_code_tag_t tag)
 {
-    return tag == MOQR_CODE_WIRE_D18 ? MOQ_VERSION_DRAFT_18
-                                     : MOQ_VERSION_DRAFT_16;
+    switch (tag) {
+    case MOQR_CODE_WIRE_D22: return MOQ_VERSION_DRAFT_22;
+    case MOQR_CODE_WIRE_D18: return MOQ_VERSION_DRAFT_18;
+    default:                 return MOQ_VERSION_DRAFT_16;
+    }
 }
 
 moqr_result_t
@@ -294,10 +314,10 @@ reset_semantic_ok(uint64_t value)
 }
 
 /* A relay-authored extension number is safe to emit unchanged only while it
- * means nothing in either draft. Anything registered in either registry, inside
- * draft-18's GREASE reservation, or beyond the common wire ceiling is refused:
- * such a value would either assert a meaning we did not choose or fail to
- * encode on one of the two profiles. */
+ * means nothing in any draft. Anything registered in any registry, inside the
+ * GREASE reservation, or beyond the common wire ceiling is refused: such a
+ * value would either assert a meaning we did not choose or fail to encode on
+ * one of the profiles. */
 static bool
 pd_extension_ok(uint64_t code)
 {
@@ -305,10 +325,12 @@ pd_extension_ok(uint64_t code)
         return false;
     }
     if (moqr_pd_decode(MOQ_VERSION_DRAFT_16, code) != MOQR_PD_UNKNOWN ||
-        moqr_pd_decode(MOQ_VERSION_DRAFT_18, code) != MOQR_PD_UNKNOWN) {
+        moqr_pd_decode(MOQ_VERSION_DRAFT_18, code) != MOQR_PD_UNKNOWN ||
+        moqr_pd_decode(MOQ_VERSION_DRAFT_22, code) != MOQR_PD_UNKNOWN) {
         return false;
     }
-    /* draft-18 Section 14: 0x7f * N + 0x9D is reserved for greasing. */
+    /* draft-18 Section 14 / draft-22 Section 13: 0x7f * N + 0x9D is reserved
+     * for greasing. */
     if (code >= 0x9Du && ((code - 0x9Du) % 0x7Fu) == 0) {
         return false;
     }
@@ -387,6 +409,7 @@ moqr_pd_desc_valid(moqr_pd_desc_t desc)
     switch (desc.tag) {
     case MOQR_CODE_WIRE_D16:
     case MOQR_CODE_WIRE_D18:
+    case MOQR_CODE_WIRE_D22:
         return desc.value <= WIRE_CODE_MAX;   /* extensible, but well-formed */
     case MOQR_CODE_LOCAL:
         return pd_semantic_ok(desc.value);
@@ -403,6 +426,7 @@ moqr_reset_desc_valid(moqr_reset_desc_t desc)
     switch (desc.tag) {
     case MOQR_CODE_WIRE_D16:
     case MOQR_CODE_WIRE_D18:
+    case MOQR_CODE_WIRE_D22:
         return desc.value <= WIRE_CODE_MAX;
     case MOQR_CODE_LOCAL:
         return reset_semantic_ok(desc.value);
@@ -420,6 +444,7 @@ moqr_pd_desc_emit(moqr_pd_desc_t desc, moq_version_t target, uint64_t *out)
     switch (desc.tag) {
     case MOQR_CODE_WIRE_D16:
     case MOQR_CODE_WIRE_D18:
+    case MOQR_CODE_WIRE_D22:
         if (desc.value > WIRE_CODE_MAX) {
             return MOQR_ERR_INVAL;
         }
@@ -436,7 +461,7 @@ moqr_pd_desc_emit(moqr_pd_desc_t desc, moq_version_t target, uint64_t *out)
         if (!pd_extension_ok(desc.value)) {
             return MOQR_ERR_INVAL;
         }
-        *out = desc.value;   /* unchanged in either draft, by construction */
+        *out = desc.value;   /* unchanged in every draft, by construction */
         return MOQR_OK;
     case MOQR_CODE_NONE:
     default:
@@ -454,6 +479,7 @@ moqr_reset_desc_emit(moqr_reset_desc_t desc, moq_version_t target,
     switch (desc.tag) {
     case MOQR_CODE_WIRE_D16:
     case MOQR_CODE_WIRE_D18:
+    case MOQR_CODE_WIRE_D22:
         if (desc.value > WIRE_CODE_MAX) {
             return MOQR_ERR_INVAL;
         }

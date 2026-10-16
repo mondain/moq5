@@ -19,8 +19,9 @@
 #include <moq/picoquic_verify.h>   /* moq_picoquic_set_cert_verifier (default) */
 #include <picoquic_packet_loop.h>
 
-#include "../common/moq_setup_tokens.h"
 #include "../common/moq_alpn.h"
+#include "../common/moq_setup_tokens.h"
+#include "../common/moq_adapter_binding.h"
 #include "../common/moq_pq_stream_backlog.h"
 #include "picoquic_endpoint.h"   /* moq_pq_send_stats_t + per-conn getter */
 
@@ -120,7 +121,13 @@ struct moq_pq_threaded {
     size_t              alpn_array_bytes;
     bool                client_deferred;  /* client session awaits the
                                            * negotiated-ALPN readback */
-    moq_setup_tokens_t  setup_tokens;     /* presented in each SETUP */
+    /* The connection target each session is bound with when its profile
+     * requires a binding: the client's authority and path/query (copied
+     * into target_bytes) or the server's URI policy. */
+    moq_setup_tokens_t  setup_tokens;   /* presented in each SETUP */
+    moq_connection_target_t target;
+    uint8_t            *target_bytes;
+    size_t              target_bytes_len;
 
     /* Resources (owned) */
     picoquic_quic_t    *quic;
@@ -331,6 +338,9 @@ static void server_conn_after_callback(moq_pq_conn_t *conn, void *user_ctx)
     }
 }
 
+static moq_result_t pq_bind_session(moq_pq_threaded_t *t, moq_session_t *session,
+                                    picoquic_cnx_t *cnx);
+
 /* Accept one new server connection: create its session + adapter at the
  * negotiated ALPN version, start it, and append a heap-owned record. Returns
  * the record or NULL (caller returns -1 so picoquic closes the cnx). Network
@@ -383,9 +393,18 @@ static struct moq_pq_threaded_conn *server_accept(moq_pq_threaded_t *t,
     }
     c->conn = conn;
 
-    /* Start the server session (draft-18 sends its own SETUP; draft-16 is a
-     * WRONG_STATE no-op). */
-    moq_result_t src = moq_session_start(session, now);
+    /* A profile that must be told how it is carried is bound first; a
+     * connection whose facts it refuses is not accepted. Then start the
+     * server session (uni-control profiles send their own SETUP; draft-16 is
+     * a WRONG_STATE no-op). */
+    moq_result_t src = pq_bind_session(t, session, cnx);
+    if (src != MOQ_OK) {
+        moq_pq_conn_destroy(conn);
+        moq_session_destroy(session);
+        t->alloc.free(c, sizeof(*c), t->alloc.ctx);
+        return NULL;
+    }
+    src = moq_session_start(session, now);
     if (src != MOQ_OK && src != MOQ_ERR_WRONG_STATE) {
         moq_pq_conn_destroy(conn);
         moq_session_destroy(session);
@@ -576,6 +595,39 @@ static void server_prune(moq_pq_threaded_t *t)
 /* Picoquic client callback                                            */
 /* ------------------------------------------------------------------ */
 
+static void free_target(moq_pq_threaded_t *t)
+{
+    if (t->target_bytes)
+        t->alloc.free(t->target_bytes, t->target_bytes_len, t->alloc.ctx);
+    t->target_bytes = NULL;
+    t->target_bytes_len = 0;
+    memset(&t->target, 0, sizeof(t->target));
+    moq_setup_tokens_free(&t->alloc, &t->setup_tokens);
+}
+
+/* The transport facts of a connection whose handshake has completed: QUIC
+ * DATAGRAM support is what each side's transport parameters say, so sending
+ * follows the peer's and receiving the local advertisement. */
+static uint32_t pq_binding_facts(picoquic_cnx_t *cnx)
+{
+    picoquic_tp_t const *local = picoquic_get_transport_parameters(cnx, 1);
+    picoquic_tp_t const *remote = picoquic_get_transport_parameters(cnx, 0);
+    uint32_t supported = MOQ_BINDING_HANDSHAKE_COMPLETE;
+    if (local && local->max_datagram_frame_size > 0)
+        supported |= MOQ_BINDING_LOCAL_QUIC_DATAGRAM | MOQ_BINDING_DATAGRAM_RECEIVE;
+    if (remote && remote->max_datagram_frame_size > 0)
+        supported |= MOQ_BINDING_PEER_QUIC_DATAGRAM | MOQ_BINDING_DATAGRAM_SEND;
+    return supported;
+}
+
+static moq_result_t pq_bind_session(moq_pq_threaded_t *t, moq_session_t *session,
+                                    picoquic_cnx_t *cnx)
+{
+    return moq_adapter_bind_session(session, MOQ_BINDING_RAW_QUIC,
+                                    MOQ_BINDING_FACTS_ALL,
+                                    pq_binding_facts(cnx), &t->target);
+}
+
 static void free_alpn_list(moq_pq_threaded_t *t)
 {
     if (!t->alpn_list) return;
@@ -700,7 +752,11 @@ static int client_callback(picoquic_cnx_t *cnx,
             moq_session_destroy(session);
             return client_fail_deferred(t);
         }
-        if (moq_session_start(session, now) != MOQ_OK ||
+        /* Bound (when the profile requires it) before the first SETUP byte
+         * leaves: the handshake is complete here and the DATAGRAM facts are
+         * final. */
+        if (pq_bind_session(t, session, cnx) != MOQ_OK ||
+            moq_session_start(session, now) != MOQ_OK ||
             moq_pq_service(conn, now) < 0) {
             moq_pq_conn_destroy(conn);
             moq_session_destroy(session);
@@ -1191,6 +1247,14 @@ _Static_assert(offsetof(moq_pq_threaded_cfg_t, setup_auth_tokens) >=
                 ~(size_t)(_Alignof(moq_pq_threaded_cfg_t) - 1u)),
                "setup_auth_tokens must start past the previous sizeof");
 
+/* target starts at or past the sizeof of the layout that ended at
+ * setup_auth_token_count, so an old caller's tail padding is never read. */
+_Static_assert(offsetof(moq_pq_threaded_cfg_t, target) >=
+               ((offsetof(moq_pq_threaded_cfg_t, setup_auth_token_count) + sizeof(size_t) +
+                 _Alignof(moq_pq_threaded_cfg_t) - 1u) &
+                ~(size_t)(_Alignof(moq_pq_threaded_cfg_t) - 1u)),
+               "target must start past the previous sizeof");
+
 void moq_pq_threaded_cfg_init_sized(moq_pq_threaded_cfg_t *cfg, size_t cfg_size)
 {
     if (!cfg) return;
@@ -1347,23 +1411,69 @@ moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
             t->alpn_count = i + 1;
         }
     }
+#if !defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) || PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION < 1
+    /* Draft-22 needs exact STOP and ACK-through-FIN stream outcomes, which
+     * this picoquic does not report, so the attach would refuse its session.
+     * An offer naming it is refused here instead of being negotiated and then
+     * closed without a reason. */
+    for (size_t i = 0; i < t->alpn_count; i++) {
+        moq_version_t v;
+        if (moq_alpn_to_version(t->alpn_list[i], strlen(t->alpn_list[i]), &v) &&
+            v == MOQ_VERSION_DRAFT_22) {
+            free_alpn_list(t);
+            pthread_cond_destroy(&t->cond);
+            pthread_mutex_destroy(&t->mutex);
+            t->alloc.free(t, sizeof(*t), t->alloc.ctx);
+            return MOQ_ERR_UNSUPPORTED;
+        }
+    }
+#endif
+    const char *sni = (CFG_HAS(cfg, sni) && cfg->sni) ? cfg->sni : cfg->host;
+
+    /* ---- Connection target (ABI-appended cfg field) ---- */
+
+    {
+        const moq_connection_target_t *target =
+            CFG_HAS(cfg, target) ? cfg->target : NULL;
+        moq_connection_target_t derived;
+        char derived_buf[1024];
+        if (!target && persp == MOQ_PERSPECTIVE_CLIENT) {
+            /* No URI was named: the dial parameters are the identity. */
+            if (!moq_adapter_target_from_dial(derived_buf, sizeof(derived_buf),
+                                              cfg->host, port, NULL, &derived))
+                goto fail_cfg_strings;
+            target = &derived;
+        }
+        moq_result_t trc = moq_adapter_target_copy(&t->alloc, target, &t->target,
+                                                   &t->target_bytes,
+                                                   &t->target_bytes_len);
+        if (trc != MOQ_OK) {
+            free_alpn_list(t);
+            pthread_cond_destroy(&t->cond);
+            pthread_mutex_destroy(&t->mutex);
+            t->alloc.free(t, sizeof(*t), t->alloc.ctx);
+            return trc;
+        }
+        if (persp == MOQ_PERSPECTIVE_SERVER && !t->target.accept_uri)
+            t->target.accept_uri = moq_adapter_accept_any_uri;
+    }
     if (CFG_HAS(cfg, setup_auth_token_count) && cfg->setup_auth_token_count > 0) {
         size_t arena = (CFG_HAS(cfg, send_buffer_size) && cfg->send_buffer_size)
             ? cfg->send_buffer_size : MOQ_SETUP_TOKENS_DEFAULT_ARENA;
         moq_result_t src = moq_setup_tokens_fit(cfg->setup_auth_tokens,
-                cfg->setup_auth_token_count, 0, arena)
+                cfg->setup_auth_token_count, t->target_bytes_len, arena)
             ? moq_setup_tokens_copy(&t->alloc, cfg->setup_auth_tokens,
                                     cfg->setup_auth_token_count, &t->setup_tokens)
             : MOQ_ERR_INVAL;
         if (src != MOQ_OK) {
             free_alpn_list(t);
+            free_target(t);
             pthread_cond_destroy(&t->cond);
             pthread_mutex_destroy(&t->mutex);
             t->alloc.free(t, sizeof(*t), t->alloc.ctx);
             return src;
         }
     }
-    const char *sni = (CFG_HAS(cfg, sni) && cfg->sni) ? cfg->sni : cfg->host;
 
     /* ---- Common: create picoquic context ---- */
 
@@ -1402,6 +1512,12 @@ moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
      * and may change it. */
     picoquic_set_default_tp_value(t->quic, picoquic_tp_max_datagram_frame_size,
                                   PICOQUIC_MAX_PACKET_SIZE);
+
+    /* Advertise reset_stream_at: where the peer advertises it too, a data
+     * stream reset keeps its stream header (RESET_STREAM_AT) so the receiver
+     * can still tell which subscription, fetch or fill ended. Without it the
+     * adapter resets plainly. */
+    picoquic_set_default_tp_value(t->quic, picoquic_tp_reset_stream_at, 1);
 
     /* Advertise enough inbound QUIC receive credit for large MoQ objects. MoQ
      * subgroup objects arrive on unidirectional streams; picoquic's defaults
@@ -1618,7 +1734,7 @@ fail_configure:
 fail_quic:
 fail_cfg_strings:
     free_alpn_list(t);
-    moq_setup_tokens_free(&t->alloc, &t->setup_tokens);
+    free_target(t);
     pthread_cond_destroy(&t->cond);
     pthread_mutex_destroy(&t->mutex);
     t->alloc.free(t, sizeof(*t), t->alloc.ctx);
@@ -1772,7 +1888,7 @@ void moq_pq_threaded_destroy(moq_pq_threaded_t *t)
     if (t->quic)
         picoquic_free(t->quic);
     free_alpn_list(t);
-    moq_setup_tokens_free(&t->alloc, &t->setup_tokens);
+    free_target(t);
 
     pthread_cond_destroy(&t->cond);
     pthread_mutex_destroy(&t->mutex);

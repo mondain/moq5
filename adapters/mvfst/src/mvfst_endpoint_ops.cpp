@@ -15,6 +15,7 @@
 #include <folly/ScopeGuard.h>
 #include <folly/io/IOBuf.h>
 #include <quic/QuicConstants.h>
+#include <quic/state/StateData.h>
 
 namespace moq::mvfst {
 
@@ -120,6 +121,23 @@ static moq_transport_result_t ep_open_bidi(void *ctx, uint64_t *out_id)
     });
 }
 
+/* Local unidirectional stream (QUIC stream id bit 1): a data stream the
+ * session may later reset reliably. */
+static bool is_uni(uint64_t stream_id) { return (stream_id & 0x2u) != 0; }
+
+/* After an accepted write: a stream's first write is its header, the reliable
+ * size of a later reset; a FIN ends the stream's record. */
+static void note_written(mvfst_endpoint_ctx_t *ep, uint64_t stream_id,
+                         size_t len, bool fin)
+{
+    if (!is_uni(stream_id)) return;
+    if (fin) { ep->reliable_checkpoint.erase(stream_id); return; }
+    if (len == 0 || ep->reliable_checkpoint.count(stream_id)) return;
+    if (ep->socket->updateReliableDeliveryCheckpoint(stream_id).hasError())
+        return;
+    ep->reliable_checkpoint.emplace(stream_id, len);
+}
+
 static moq_transport_result_t ep_write(void *ctx, uint64_t stream_id,
                                         const uint8_t *data, size_t len,
                                         bool fin)
@@ -134,6 +152,7 @@ static moq_transport_result_t ep_write(void *ctx, uint64_t stream_id,
         auto result = ep->socket->writeChain(stream_id, std::move(buf), fin);
         if (result.hasError())
             return map_local_error(result.error());
+        note_written(ep, stream_id, len, fin);
         ep->wrote_since_pump_arm = true;
         ep->last_write_stream = stream_id;
         return MOQ_TRANSPORT_OK;
@@ -172,6 +191,7 @@ static moq_transport_result_t ep_write_payload(void *ctx,
         auto result = ep->socket->writeChain(stream_id, std::move(iobuf), fin);
         if (result.hasError())
             return map_local_error(result.error());
+        note_written(ep, stream_id, len, fin);
         ep->wrote_since_pump_arm = true;
         ep->last_write_stream = stream_id;
         return MOQ_TRANSPORT_OK;
@@ -183,9 +203,51 @@ static moq_transport_result_t ep_reset(void *ctx, uint64_t stream_id,
 {
     return guard([&]() {
         auto *ep = static_cast<mvfst_endpoint_ctx_t *>(ctx);
+        ep->reliable_checkpoint.erase(stream_id);
         auto result = ep->socket->resetStream(stream_id, error_code);
         if (result.hasError())
             return MOQ_TRANSPORT_ERROR;
+        return MOQ_TRANSPORT_OK;
+    });
+}
+
+/* Reliable reset: both ends advertised reliable stream reset, and the size
+ * asked for is one mvfst can express -- the checkpointed header, or every
+ * byte written so far (checkpointed now). Anything else is DROPPED and the
+ * bridge resets plainly.
+ *
+ * The adapter itself never advertises reliable stream reset: the mvfst
+ * revision it builds against sends RESET_STREAM_AT but closes the connection
+ * (PROTOCOL_VIOLATION, "Reliable resets not supported") when one ARRIVES, so
+ * advertising would invite frames it cannot take. A caller that enables
+ * TransportSettings::advertisedReliableResetStreamSupport on an mvfst that
+ * receives them gets reliable resets through this op unchanged. */
+static moq_transport_result_t ep_reset_at(void *ctx, uint64_t stream_id,
+                                          uint64_t error_code,
+                                          uint64_t reliable_size)
+{
+    return guard([&]() {
+        auto *ep = static_cast<mvfst_endpoint_ctx_t *>(ctx);
+        const quic::QuicConnectionStateBase *st = ep->socket->getState();
+        if (!ep->socket->getTransportSettings().advertisedReliableResetStreamSupport ||
+            !st || !st->peerAdvertisedReliableStreamResetSupport)
+            return MOQ_TRANSPORT_DROPPED;
+        auto cp = ep->reliable_checkpoint.find(stream_id);
+        bool at_checkpoint = cp != ep->reliable_checkpoint.end() &&
+                             cp->second == reliable_size;
+        if (!at_checkpoint) {
+            auto off = ep->socket->getStreamWriteOffset(stream_id);
+            auto buffered = ep->socket->getStreamWriteBufferedBytes(stream_id);
+            if (off.hasError() || buffered.hasError() ||
+                (uint64_t)*off + (uint64_t)*buffered != reliable_size ||
+                ep->socket->updateReliableDeliveryCheckpoint(stream_id).hasError())
+                return MOQ_TRANSPORT_DROPPED;
+        }
+        auto result = ep->socket->resetStreamReliably(stream_id, error_code);
+        if (result.hasError())
+            return MOQ_TRANSPORT_DROPPED;
+        ep->reliable_checkpoint.erase(stream_id);
+        ep->reliable_resets.fetch_add(1, std::memory_order_relaxed);
         return MOQ_TRANSPORT_OK;
     });
 }
@@ -253,7 +315,8 @@ void mvfst_endpoint_ops_init(moq_transport_endpoint_ops_t *ops,
      * again; see the held-input handling in mvfst_adapter.cpp. */
     ops->capabilities = MOQ_TRANSPORT_CAP_DATAGRAM |
                          MOQ_TRANSPORT_CAP_WRITE_PAYLOAD |
-                         MOQ_TRANSPORT_CAP_HOLD_INPUT;
+                         MOQ_TRANSPORT_CAP_HOLD_INPUT |
+                         MOQ_TRANSPORT_CAP_RELIABLE_RESET;
 #ifdef MOQ_MVFST_TESTING
     if (g_test_hold_input == 1)
         ops->capabilities |= MOQ_TRANSPORT_CAP_HOLD_INPUT;
@@ -268,6 +331,7 @@ void mvfst_endpoint_ops_init(moq_transport_endpoint_ops_t *ops,
     ops->stop_sending    = ep_stop_sending;
     ops->send_datagram   = ep_send_datagram;
     ops->close_transport = ep_close;
+    ops->reset_stream_at = ep_reset_at;
 
     ctx->socket = std::move(socket);
     ctx->on_bidi_opened = on_bidi_opened;

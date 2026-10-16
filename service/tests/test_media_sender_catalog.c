@@ -1,3 +1,7 @@
+#if defined(__linux__) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 /*
  * White-box tests for the sender's catalog-content model: the catalog the
  * sender would publish after post-ready add/remove mutations. Deterministic,
@@ -53,6 +57,9 @@ void moq_media_sender_test_mark_registered(moq_media_sender_t *s);
 void moq_media_sender_test_set_clock_ms(moq_media_sender_t *s,
                                         bool set, uint64_t ms);
 moq_result_t moq_media_sender_test_validate_cfg(const moq_media_sender_cfg_t *cfg);
+void moq_media_sender_test_set_companion(moq_media_sender_t *s,
+                                         moq_media_companion_profile_t profile);
+uint64_t moq_media_sender_test_catalog_group(const moq_media_sender_t *s);
 /* Lock-order regression seams (media_sender.c + endpoint.c, _TESTING). */
 void moq_media_sender_test_set_ep(moq_media_sender_t *s, moq_endpoint_t *ep);
 void moq_media_sender_test_set_fatal(moq_media_sender_t *s, bool fatal);
@@ -312,6 +319,69 @@ static void check_mt_catalog(moq_media_sender_t *s, const char *name,
     }
     moq_msf_catalog_cleanup(al, &c);
     moq_rcbuf_decref(j);
+}
+
+/* -- draft-22 companion catalog (MSF-01) ------------------------------- */
+
+#define W6_D22_CATALOG \
+    "{\"version\":\"draft-01\",\"generatedAt\":1700000000000,\"tracks\":[" \
+    "{\"name\":\"v\",\"packaging\":\"loc\",\"isLive\":true,\"role\":\"video\"," \
+    "\"codec\":\"av01\",\"bitrate\":64000,\"timescale\":1000000," \
+    "\"initRef\":\"v\"}," \
+    "{\"name\":\"c\",\"packaging\":\"cmaf\",\"isLive\":true,\"role\":\"audio\"," \
+    "\"codec\":\"mp4a.40.2\",\"samplerate\":48000,\"bitrate\":64000," \
+    "\"timescale\":1000000,\"channelConfig\":\"2\",\"initRef\":\"c\"}," \
+    "{\"name\":\"v2\",\"packaging\":\"loc\",\"isLive\":true,\"role\":\"video\"," \
+    "\"codec\":\"av01\",\"bitrate\":64000,\"timescale\":1000000," \
+    "\"initRef\":\"v\"}]," \
+    "\"initDataList\":[{\"id\":\"v\",\"type\":\"inline\",\"data\":\"AULgHg==\"}," \
+    "{\"id\":\"c\",\"type\":\"inline\",\"data\":\"AAAAGA==\"}]}"
+#define W6_LEGACY_CATALOG \
+    "{\"version\":\"1\",\"generatedAt\":1700000000000,\"tracks\":[" \
+    "{\"name\":\"v\",\"packaging\":\"loc\",\"isLive\":true,\"role\":\"video\"," \
+    "\"codec\":\"av01\",\"initData\":\"AULgHg==\",\"bitrate\":64000," \
+    "\"timescale\":1000000}]}"
+
+static const uint8_t w6_init_v[] = { 0x01, 0x42, 0xe0, 0x1e };   /* "AULgHg==" */
+static const uint8_t w6_init_c[] = { 0x00, 0x00, 0x00, 0x18 };   /* "AAAAGA==" */
+
+/* A track with initialization data: RAW ("v", video) or CMAF ("c", audio). */
+static moq_media_track_t *w6_add(moq_media_sender_t *s, const char *name,
+                                 moq_media_packaging_t packaging,
+                                 const uint8_t *init, size_t init_len)
+{
+    moq_media_track_cfg_t tc;
+    moq_media_track_cfg_init(&tc);
+    tc.name = (moq_bytes_t){ (const uint8_t *)name, strlen(name) };
+    tc.packaging = packaging;
+    tc.bitrate = 64000;
+    tc.is_live = true;
+    if (packaging == MOQ_MEDIA_PACKAGING_CMAF) {
+        tc.media_type = MOQ_MEDIA_TYPE_AUDIO;
+        tc.codec = (moq_bytes_t){ (const uint8_t *)"mp4a.40.2", 9 };
+        tc.samplerate = 48000;
+        tc.channel_config = (moq_bytes_t){ (const uint8_t *)"2", 1 };
+    } else {
+        tc.media_type = MOQ_MEDIA_TYPE_VIDEO;
+        tc.codec = (moq_bytes_t){ (const uint8_t *)"av01", 4 };
+    }
+    tc.init_data = (moq_bytes_t){ init, init_len };
+    moq_media_track_t *t = NULL;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_add_track(s, &tc, &t),
+                          (int)MOQ_OK);
+    return t;
+}
+
+/* Compare an encoded catalog with an exact expected JSON text. */
+static void w6_expect_json(const moq_rcbuf_t *j, const char *want)
+{
+    size_t n = j ? moq_rcbuf_len(j) : 0;
+    bool same = j && n == strlen(want) &&
+                memcmp(moq_rcbuf_data(j), want, n) == 0;
+    if (!same)
+        fprintf(stderr, "catalog: %.*s\nwanted:  %s\n", (int)n,
+                j ? (const char *)moq_rcbuf_data(j) : "", want);
+    MOQ_TEST_CHECK(same);
 }
 
 int main(void)
@@ -1285,6 +1355,141 @@ int main(void)
         moq_media_sender_test_free(s);
         moq_endpoint_test_free_bare(ep);
         MOQ_TEST_PASS("sender_catalog.wait_terminal_beats_level");
+    }
+
+    /* -- draft-22 companion: the literal MSF-01 catalog ------------------ *
+     * 5.1.1 version "draft-01"; 5.1.7 the root initDataList after the tracks
+     * array, one inline entry per distinct init payload, with the id of the
+     * track that introduced it; 5.2.13 each track's initRef; no per-track
+     * initData. RAW and CMAF tracks alike. */
+    {
+        moq_media_sender_t *s = moq_media_sender_test_new();
+        moq_media_sender_test_set_companion(s,
+            MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC);
+        moq_media_sender_test_set_clock_ms(s, true, 1700000000000ull);
+        (void)w6_add(s, "v", MOQ_MEDIA_PACKAGING_RAW, w6_init_v,
+                     sizeof(w6_init_v));
+        (void)w6_add(s, "c", MOQ_MEDIA_PACKAGING_CMAF, w6_init_c,
+                     sizeof(w6_init_c));
+        (void)w6_add(s, "v2", MOQ_MEDIA_PACKAGING_RAW, w6_init_v,
+                     sizeof(w6_init_v));   /* shares v's entry */
+        moq_rcbuf_t *j = NULL;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_test_build_catalog(s, &j),
+                              (int)MOQ_OK);
+        w6_expect_json(j, W6_D22_CATALOG);
+        moq_msf_catalog_t cat;
+        memset(&cat, 0, sizeof(cat));
+        if (j) {
+            moq_bytes_t b = { moq_rcbuf_data(j), moq_rcbuf_len(j) };
+            MOQ_TEST_CHECK_EQ_INT((int)moq_msf_catalog_parse(
+                moq_alloc_default(), b, &cat), (int)MOQ_OK);
+            MOQ_TEST_CHECK(cat.version_form == MOQ_MSF_VERSION_FORM_DRAFT_NAME);
+            MOQ_TEST_CHECK(cat.init_data_count == 2);
+            moq_msf_catalog_cleanup(moq_alloc_default(), &cat);
+            moq_rcbuf_decref(j);
+        }
+        moq_media_sender_test_free(s);
+        MOQ_TEST_PASS("sender_catalog.d22_msf01_literal");
+    }
+
+    /* -- legacy companion: the catalog is unchanged ---------------------- *
+     * Version "1", and a RAW track's init data inline as initData. */
+    {
+        moq_media_sender_t *s = moq_media_sender_test_new();
+        moq_media_sender_test_set_clock_ms(s, true, 1700000000000ull);
+        (void)w6_add(s, "v", MOQ_MEDIA_PACKAGING_RAW, w6_init_v,
+                     sizeof(w6_init_v));
+        moq_rcbuf_t *j = NULL;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_test_build_catalog(s, &j),
+                              (int)MOQ_OK);
+        w6_expect_json(j, W6_LEGACY_CATALOG);
+        if (j) moq_rcbuf_decref(j);
+        moq_media_sender_test_free(s);
+        MOQ_TEST_PASS("sender_catalog.legacy_catalog_unchanged");
+    }
+
+    /* -- draft-22 companion: an init-bearing add is a full generation ----- *
+     * A deltaUpdate add cannot carry the root initDataList/initRef shape, so
+     * a post-ready add with init data -- RAW included -- stages one
+     * independent catalog, never base + delta. An add without init data still
+     * goes out as a delta. */
+    {
+        moq_media_sender_t *s = moq_media_sender_test_new();
+        moq_media_sender_test_set_companion(s,
+            MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC);
+        (void)add_trk(s, "base", false);
+        moq_media_sender_test_set_ready(s);
+        moq_media_sender_test_mark_registered(s);
+        moq_media_sender_test_mark_published(s);
+        (void)w6_add(s, "late", MOQ_MEDIA_PACKAGING_RAW, w6_init_v,
+                     sizeof(w6_init_v));
+        moq_media_sender_test_mark_registered(s);
+        moq_rcbuf_t *objs[3] = { NULL, NULL, NULL };
+        size_t nobj = moq_media_sender_test_stage(s, objs, 3);
+        MOQ_TEST_CHECK_EQ_INT((int)nobj, 1);
+        if (nobj >= 1 && objs[0]) {
+            char tmp[1024];
+            size_t n = moq_rcbuf_len(objs[0]);
+            MOQ_TEST_CHECK(n < sizeof(tmp));
+            if (n < sizeof(tmp)) {
+                memcpy(tmp, moq_rcbuf_data(objs[0]), n); tmp[n] = '\0';
+                MOQ_TEST_CHECK(strncmp(tmp, "{\"version\":\"draft-01\",", 22) == 0);
+                MOQ_TEST_CHECK(strstr(tmp, "\"initRef\":\"late\"") != NULL);
+                MOQ_TEST_CHECK(strstr(tmp, "\"initDataList\":[{\"id\":\"late\","
+                                           "\"type\":\"inline\","
+                                           "\"data\":\"AULgHg==\"}]") != NULL);
+                MOQ_TEST_CHECK(strstr(tmp, "\"initData\":") == NULL);
+                MOQ_TEST_CHECK(strstr(tmp, "deltaUpdate") == NULL);
+            }
+        }
+        for (size_t i = 0; i < nobj; i++) moq_rcbuf_decref(objs[i]);
+        moq_media_sender_test_mark_published(s);
+
+        (void)add_trk(s, "plain", false);   /* no init data */
+        moq_media_sender_test_mark_registered(s);
+        memset(objs, 0, sizeof(objs));
+        nobj = moq_media_sender_test_stage(s, objs, 3);
+        MOQ_TEST_CHECK_EQ_INT((int)nobj, 2);   /* base + one ADD delta */
+        if (nobj == 2 && objs[1]) {
+            MOQ_TEST_CHECK(moq_rcbuf_len(objs[1]) > 27 &&
+                memcmp(moq_rcbuf_data(objs[1]), "{\"deltaUpdate\":[{\"op\":\"add\"",
+                       27) == 0);
+        }
+        for (size_t i = 0; i < nobj; i++) moq_rcbuf_decref(objs[i]);
+        moq_media_sender_test_free(s);
+        MOQ_TEST_PASS("sender_catalog.d22_init_add_full_generation");
+    }
+
+    /* -- draft-22 companion: CMSF-01 3.1 CMAF needs initialization -------- *
+     * Refused without init data on the draft-22 companion; the legacy
+     * companion's acceptance is unchanged. */
+    {
+        moq_media_track_cfg_t tc;
+        moq_media_track_cfg_init(&tc);
+        tc.name = (moq_bytes_t){ (const uint8_t *)"c", 1 };
+        tc.media_type = MOQ_MEDIA_TYPE_VIDEO;
+        tc.packaging = MOQ_MEDIA_PACKAGING_CMAF;
+        tc.codec = (moq_bytes_t){ (const uint8_t *)"avc1.42c01e", 11 };
+        tc.bitrate = 1000000;
+        tc.is_live = true;
+        moq_media_track_t *t = NULL;
+
+        moq_media_sender_t *s = moq_media_sender_test_new();
+        moq_media_sender_test_set_companion(s,
+            MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_add_track(s, &tc, &t),
+                              (int)MOQ_ERR_INVAL);
+        tc.init_data = (moq_bytes_t){ w6_init_c, sizeof(w6_init_c) };
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_add_track(s, &tc, &t),
+                              (int)MOQ_OK);
+        moq_media_sender_test_free(s);
+
+        tc.init_data = (moq_bytes_t){ NULL, 0 };
+        s = moq_media_sender_test_new();
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_add_track(s, &tc, &t),
+                              (int)MOQ_OK);
+        moq_media_sender_test_free(s);
+        MOQ_TEST_PASS("sender_catalog.d22_cmaf_requires_init_data");
     }
 
     printf("%s: %d failures\n", failures ? "FAIL" : "PASS", failures);

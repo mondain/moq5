@@ -2,7 +2,7 @@
 
 Direct MoQ-over-QUIC transport adapter on
 [MsQuic](https://github.com/microsoft/msquic): the MoQ wire protocol
-straight over raw QUIC streams (ALPN `moqt-16`) — no HTTP/3, no
+straight over raw QUIC streams (ALPNs `moqt-16`, `moqt-18`, `moqt-22`) — no HTTP/3, no
 WebTransport, no wtquic dependency. The raw-QUIC counterpart to the
 picoquic and mvfst adapters, built to exploit MsQuic's architecture:
 direct push sends with zero-copy `moq_rcbuf_t` payloads borrowed until
@@ -95,6 +95,16 @@ the callback context and are safe there. `stop()` quiesces every lane's
 transport before any blocking MsQuic close runs, and never holds a lane
 mutex across them.
 
+`moq_msquic_lane_wake()` never waits for a lane mutex, from any thread: a
+wake from anywhere other than the lane's own callback sets a lock-free flag
+and rings the lane's bell, so it returns while the lane is mid-pump, and a
+caller holding locks of its own (another lane's, or another facade's) cannot
+deadlock against it. Application deadlines (`app_deadline_us`, and the
+per-lane `app_lane_deadline_us`, which each lane asks for itself only) earn
+one pump per instant: once a pump of the lane has run at or after it, the
+same instant no longer wakes the lane. A deadline pass releases the lane
+mutex before the next one.
+
 `moq_msquic_managed_session()` is a CLIENT-only convenience (NULL on a
 server); server code reaches its sessions through lane iteration.
 
@@ -110,14 +120,25 @@ server); server code reaches its sessions through lane iteration.
   `moq_msquic_lane_next_conn()`; a closed connection's slot is
   reclaimed and can be reused. `stop()` shuts all live connections
   down, drains every pending send/datagram, and closes the listener.
-- Exact-version negotiation: each endpoint offers exactly one MoQ ALPN
-  chosen by `cfg.version` (default draft-16); a client/server mismatch
-  fails the handshake with a bounded fatal terminal and no MoQ setup.
-  Deferred multi-version offers (a real ALPN list) are a planned
-  addition.
+- Version negotiation: a client offers exactly one MoQ ALPN, chosen by
+  `cfg.version` (default draft-16). A server either offers that one ALPN
+  or a preference-ordered list in `cfg.versions`/`cfg.version_count`, and
+  creates each accepted connection's session at the version MsQuic
+  negotiated. A client/server mismatch fails the handshake with a bounded
+  fatal terminal and no MoQ setup.
+- Draft-22 sessions are bound to their connection at CONNECTED, before the
+  session starts: the handshake and QUIC DATAGRAM facts come from MsQuic's
+  connection parameters, a client's connection target from `cfg.target` or
+  its dial host and port, a server's URI policy from `cfg.target`
+  (accept-all when none is set). A refused binding fails the connection.
+- Resets: a data-stream reset that should keep its stream header waits until
+  the header bytes are acknowledged and is then sent as a plain
+  RESET_STREAM; RESET_STREAM_AT is not used over MsQuic (see
+  `docs/adapters.md`).
 - No idle deadline tick in attach mode (the managed facade's doorbell
   services session deadlines).
-- Service-tier (moq-service endpoint) wiring is deferred.
+- The service endpoint uses this facade for its raw-QUIC backend
+  (`MOQ_TRANSPORT_BACKEND_MSQUIC`).
 
 ## Receive admission (held input)
 

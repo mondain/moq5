@@ -224,7 +224,12 @@ typedef struct moq_simpair_cfg {
     uint32_t           max_actions;  /* 0 = default */
     uint32_t           max_events;   /* 0 = default */
 
-    /* Protocol version for both sessions. 0 (absent) uses the session default. */
+    /* Protocol version for both sessions. 0 (absent) uses the session default;
+     * environment variables never select it. Scenario runners select another
+     * supported profile by setting this field explicitly.
+     * MOQ_SIM_TRACE_HASH=1 additionally prints one TRACE_HASH line per pair on
+     * destroy: the FNV-1a prefix hash over every trace record (the same
+     * computation the twin-run suites use), keyed by seed and version. */
     moq_version_t      version;
 
     /* Server subscription pool size (0 = session default). */
@@ -260,6 +265,27 @@ typedef struct moq_simpair_cfg {
      * exercised deterministically. Read via cfg_has_field; 0 keeps the session
      * default (64). */
     uint32_t           server_max_open_subgroups;
+
+    /* Appended (struct_size append-only ABI). Forwarded into each session's
+     * defer_subscription_updates: that side surfaces a subscriber's update
+     * of a subscription it publishes with answer_owed and leaves the answer
+     * to the caller. Read via cfg_has_field, so an older caller whose
+     * struct_size is below a field's offset leaves that side answering
+     * updates itself. */
+    bool               server_defer_subscription_updates;
+    bool               client_defer_subscription_updates;
+
+    /* Never read. Keeps the field after it at or past the sizeof of the
+     * layout that ends at client_defer_subscription_updates, so a caller
+     * built against that layout never has its tail padding read as a new
+     * field. */
+    uint32_t           _reserved_cfg_tail;
+
+    /* Appended (struct_size append-only ABI). Client-session receive-stream
+     * pool (moq_session_cfg_t.max_data_streams), so a peer stream the
+     * session cannot admit yet is exercised deterministically. Read via
+     * cfg_has_field; 0 keeps the session default. */
+    uint32_t           client_max_data_streams;
 } moq_simpair_cfg_t;
 
 #ifdef __cplusplus
@@ -291,6 +317,20 @@ MOQ_SIM_API moq_result_t moq_simpair_start(moq_simpair_t *sp);
  *   client actions -> server inputs, then server actions -> client inputs.
  *
  * out_delivered receives the number of actions handled when non-NULL.
+ *
+ * A receiving session that refuses an input with MOQ_ERR_WOULD_BLOCK (its
+ * event queue is full, or it cannot admit a new stream yet) applies
+ * backpressure; it is not an error, and SimPair handles each input kind as
+ * the transport bridge does. Control bytes, data-stream bytes and
+ * request-stream bytes are reliable and ordered: the refused input's later
+ * inputs are held in order, as a transport pauses a stream's reads, and
+ * every step first resumes what the session accepts again -- so a caller
+ * drains events between steps and nothing written is lost. On a
+ * unidirectional control pair a blocked control channel also pauses the
+ * session's other unidirectional inputs. A refused RESET or STOP_SENDING is
+ * delivered again with its code; a peer RESET interrupts a held stream and
+ * the data still held for it is discarded (RFC 9000 §3.2). A refused
+ * datagram is dropped. A refusal never discards any other input or action.
  */
 MOQ_SIM_API moq_result_t moq_simpair_step(moq_simpair_t *sp,
                                        size_t *out_delivered);

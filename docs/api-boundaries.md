@@ -47,6 +47,13 @@ messages.
 
 Includes `moq.h` plus: `wire.h`, `buf.h`, `kvp.h`, `control.h`.
 
+Codec records that grow are sized like application config: a leading
+`struct_size`, an initializer, and an explicit caller allocation size on every
+call that reads or writes the record. `moq_d18_setup_opts_t` follows this
+form; it replaced an unsized record of the same name, and binaries built
+against that earlier header must be rebuilt (the transition is not
+binary-compatible).
+
 ## Simulation API — `<moq/sim.h>`
 
 For deterministic testing, conformance harnesses, and seed-replayable

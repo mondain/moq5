@@ -7,9 +7,10 @@
  * The endpoint-offer/AUTO half of the drift gate needs the service tier and
  * lives in service/tests/test_negotiated_profile_offer.c.
  *
- * There are NO service closures here: LOC-01 cells carry closure waivers in
- * place of the shared send/receive functions.
- * Nothing in this file calls a LOC, KVP or integer-codec product API.
+ * This declaration test does not run service closures. Each supported cell
+ * names its separately registered service tests; those must also pass.
+ * The 79-record wire corpus remains specifically D16/D18 LOC-01, not D22
+ * LOC-04 coverage. Nothing here calls a LOC, KVP or integer-codec product API.
  */
 #include "np_oracle.h"
 #include "np_tables.h"
@@ -49,38 +50,51 @@ static void t_tables(void)
     size_t nt = 0, nm = 0, nc = 0, np_ = 0;
     (void)np_transports(&nt); (void)np_medias(&nm);
     (void)np_cells(&nc);      (void)np_pairs(&np_);
-    MOQ_TEST_CHECK_EQ_SIZE(nt, 2);
-    MOQ_TEST_CHECK_EQ_SIZE(nm, 2);
+    MOQ_TEST_CHECK_EQ_SIZE(nt, 3);
+    MOQ_TEST_CHECK_EQ_SIZE(nm, 3);
     MOQ_TEST_CHECK_EQ_SIZE(nc, nt * nm);
     MOQ_TEST_CHECK_EQ_SIZE(np_, 1);
 
     /* the reviewed transport facts, asserted as literals */
     const np_transport_row_t *d16 = np_transport_by_draft(16);
     const np_transport_row_t *d18 = np_transport_by_draft(18);
-    MOQ_TEST_CHECK(d16 && d18);
-    if (d16 && d18) {
+    const np_transport_row_t *d22 = np_transport_by_draft(22);
+    MOQ_TEST_CHECK(d16 && d18 && d22);
+    if (d16 && d18 && d22) {
         MOQ_TEST_CHECK(strcmp(d16->alpn, "moqt-16") == 0);
         MOQ_TEST_CHECK(strcmp(d18->alpn, "moqt-18") == 0);
+        MOQ_TEST_CHECK(strcmp(d22->alpn, "moqt-22") == 0);
         MOQ_TEST_CHECK(d16->enc == NP_ENC_QUIC_VARINT);
         MOQ_TEST_CHECK(d18->enc == NP_ENC_VI64);
+        MOQ_TEST_CHECK(d22->enc == NP_ENC_VI64);
         MOQ_TEST_CHECK_EQ_U64(d16->int_max, NP_QUIC_VARINT_MAX);
         MOQ_TEST_CHECK_EQ_U64(d18->int_max, NP_VI64_MAX);
-        /* AUTO offers the NEWEST draft first */
-        MOQ_TEST_CHECK_EQ_INT(d18->auto_rank, 1);
-        MOQ_TEST_CHECK_EQ_INT(d16->auto_rank, 2);
+        MOQ_TEST_CHECK_EQ_U64(d22->int_max, NP_VI64_MAX);
+        /* AUTO offers every available draft, newest first. */
+        MOQ_TEST_CHECK_EQ_INT(d22->auto_rank, 1);
+        MOQ_TEST_CHECK(d22->endpoint_offered);
+        MOQ_TEST_CHECK(d22->unusable_reason == NULL);
+        MOQ_TEST_CHECK_EQ_INT(d18->auto_rank, 2);
+        MOQ_TEST_CHECK_EQ_INT(d16->auto_rank, 3);
     }
 
     /* the reviewed media facts, including the id collision that motivates
      * the whole arc */
     const np_media_row_t *l1 = np_media_by_id("loc01");
     const np_media_row_t *l2 = np_media_by_id("loc02");
-    MOQ_TEST_CHECK(l1 && l2);
+    const np_media_row_t *l4 = np_media_by_id("loc04");
+    MOQ_TEST_CHECK(l1 && l2 && l4);
     if (l1 && l2) {
         MOQ_TEST_CHECK(l1->state == NP_M_IMPLEMENTED);
         MOQ_TEST_CHECK(l2->state == NP_M_RESERVED);
         MOQ_TEST_CHECK_EQ_U64(l1->timestamp_property_id, 2);
         MOQ_TEST_CHECK_EQ_U64(l2->timestamp_property_id, 6);
         MOQ_TEST_CHECK(l2->reason && l2->reason[0]);
+    }
+    if (l4) {
+        MOQ_TEST_CHECK(l4->state == NP_M_IMPLEMENTED);
+        MOQ_TEST_CHECK_EQ_U64(l4->timestamp_property_id, 0x10);
+        MOQ_TEST_CHECK(l4->reason == NULL);
     }
 
     /* every LOC-01 cell is SUPPORTED-with-waiver and BOTH callbacks absent;
@@ -101,6 +115,27 @@ static void t_tables(void)
             MOQ_TEST_CHECK(c2->waiver == NULL);
             MOQ_TEST_CHECK(c2->send_closure == NULL);
             MOQ_TEST_CHECK(c2->recv_closure == NULL);
+        }
+    }
+
+    const uint32_t drafts[] = { 16, 18, 22 };
+    const char *media[] = { "loc01", "loc02", "loc04" };
+    for (size_t d = 0; d < sizeof(drafts) / sizeof(*drafts); d++) {
+        for (size_t m = 0; m < sizeof(media) / sizeof(*media); m++) {
+            const np_cell_row_t *cell = np_cell(drafts[d], media[m]);
+            bool supported = (drafts[d] != 22 && m == 0) ||
+                             (drafts[d] == 22 && m == 2);
+            MOQ_TEST_CHECK(cell != NULL);
+            if (!cell) continue;
+            MOQ_TEST_CHECK(cell->state == (supported ? NP_C_SUPPORTED : NP_C_UNSUPPORTED));
+            MOQ_TEST_CHECK(cell->send_closure == NULL && cell->recv_closure == NULL);
+            if (supported) {
+                MOQ_TEST_CHECK(cell->reason == NULL);
+                MOQ_TEST_CHECK(cell->waiver && cell->waiver[0]);
+            } else {
+                MOQ_TEST_CHECK(cell->reason && cell->reason[0]);
+                MOQ_TEST_CHECK(cell->waiver == NULL);
+            }
         }
     }
 
@@ -208,15 +243,16 @@ static void t_topology_negatives(void)
     /* AUTO ranks */
     scratch_from_declared(&s); s.t[0].auto_rank = 1;
     expect_refused("duplicate_auto_rank", &s);
-    scratch_from_declared(&s); s.t[0].auto_rank = 3;     /* 1 and 3, no 2 */
+    scratch_from_declared(&s); s.t[0].auto_rank = 4;     /* 1, 2 and 4, no 3 */
     expect_refused("non_contiguous_auto_rank", &s);
     /* an endpoint-offered AVAILABLE row that is missing from AUTO */
     scratch_from_declared(&s); s.t[0].auto_rank = NP_AUTO_RANK_NONE;
     expect_refused("offered_but_unranked", &s);
-    /* ... and dropping BOTH leaves an empty AUTO list, also refused */
+    /* ... and dropping EVERY row leaves an empty AUTO list, also refused */
     scratch_from_declared(&s);
     s.t[0].auto_rank = NP_AUTO_RANK_NONE; s.t[0].endpoint_offered = false;
     s.t[1].auto_rank = NP_AUTO_RANK_NONE; s.t[1].endpoint_offered = false;
+    s.t[2].auto_rank = NP_AUTO_RANK_NONE; s.t[2].endpoint_offered = false;
     expect_refused("auto_empty", &s);
     scratch_from_declared(&s); s.t[0].state = NP_T_ABSENT;
     expect_refused("absent_transport_ranked", &s);
@@ -241,7 +277,7 @@ static void t_topology_negatives(void)
     s.c[0].state = NP_C_UNSUPPORTED;
     s.c[0].reason = "no draft-16 profile in this hypothetical";
     s.c[0].waiver = NULL;
-    s.t[1].auto_rank = 1;
+    s.t[1].auto_rank = 2;   /* the remaining defaults: draft 22, then 18 */
     s.view.n_pairs = 0;
     MOQ_TEST_CHECK_EQ_INT(np_topology_validate(&s.view, true), 0);
     /* a ranked row that is not offered disagrees too */
@@ -295,26 +331,29 @@ static void t_topology_negatives(void)
     /* a REGISTERED-BUT-UNAVAILABLE row is representable, and must say why:
      * an ALPN registered upstream with no profile built here. */
     scratch_from_declared(&s);
-    s.t[2] = s.t[0];
-    s.t[2].draft = 20;
-    s.t[2].alpn = "moqt-20";
-    s.t[2].alpn_len = 7;
-    s.t[2].state = NP_T_ABSENT;
-    s.t[2].endpoint_offered = false;
-    s.t[2].auto_rank = NP_AUTO_RANK_NONE;
-    s.t[2].unusable_reason = "registered ALPN; the draft-20 profile is not "
+    s.t[3] = s.t[0];
+    s.t[3].draft = 20;
+    s.t[3].alpn = "moqt-20";
+    s.t[3].alpn_len = 7;
+    s.t[3].state = NP_T_ABSENT;
+    s.t[3].endpoint_offered = false;
+    s.t[3].auto_rank = NP_AUTO_RANK_NONE;
+    s.t[3].unusable_reason = "registered ALPN; the draft-20 profile is not "
                             "built in this configuration";
-    s.view.n_transports = 3;
+    s.view.n_transports = 4;
     /* its cells must still exist -- one per transport x media */
-    s.c[4] = s.c[2]; s.c[4].draft = 20; s.c[4].media = "loc01";
-    s.c[4].state = NP_C_UNSUPPORTED;
-    s.c[4].reason = "no draft-20 profile in this build";
-    s.c[4].waiver = NULL;
-    s.c[5] = s.c[2]; s.c[5].draft = 20;
-    s.view.n_cells = 6;
+    for (size_t m = 0; m < s.view.n_medias; m++) {
+        np_cell_row_t *cell = &s.c[s.view.n_cells++];
+        *cell = s.c[2];
+        cell->draft = 20;
+        cell->media = s.m[m].id;
+        cell->state = NP_C_UNSUPPORTED;
+        cell->reason = "no draft-20 profile in this build";
+        cell->waiver = NULL;
+    }
     MOQ_TEST_CHECK_EQ_INT(np_topology_validate(&s.view, true), 0);
     /* ... and dropping its reason is refused */
-    s.t[2].unusable_reason = NULL;
+    s.t[3].unusable_reason = NULL;
     expect_refused("absent_row_without_reason", &s);
     /* ... and with the pair row left behind it is refused */
     scratch_from_declared(&s);
@@ -635,17 +674,26 @@ static void t_drift_gate(void)
         moq_version_t ver = (moq_version_t)v;
         const np_transport_row_t *row = np_transport_by_draft(v);
         bool product_has_profile = (moq_profile_lookup(ver) != NULL);
+        bool product_available = moq_version_supported(ver);
 
-        /* declared AVAILABLE <=> the core has a profile for it */
+        /* Availability is registry eligibility, not a default offer or a
+         * declaration that every path has completed qualification. */
         if (row && row->state == NP_T_AVAILABLE) {
-            if (!product_has_profile) {
+            if (!product_available) {
                 fprintf(stderr, "FAIL: drift: draft %u declared AVAILABLE but "
-                                "core has no profile\n", v);
+                                "core does not register it as available\n", v);
+                failures++;
+            }
+        } else if (row && row->state == NP_T_PENDING) {
+            if (!product_has_profile || product_available) {
+                fprintf(stderr, "FAIL: drift: draft %u declared PENDING but "
+                                "core %s\n", v,
+                        product_available ? "registers it as available" : "has no profile");
                 failures++;
             }
         } else if (product_has_profile) {
             fprintf(stderr, "FAIL: drift: core has a profile for draft %u but "
-                            "no row declares it AVAILABLE\n", v);
+                            "no row declares it\n", v);
             failures++;
         }
 

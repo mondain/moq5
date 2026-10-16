@@ -5,9 +5,16 @@
  * moq-adapter-wtquic-network-managed: the managed MoQ client over
  * wtquic's Network.framework backend. APPLE ONLY (macOS 13 / iOS 16+).
  *
+ * CURRENT AVAILABILITY: valid configurations return MOQ_ERR_UNSUPPORTED
+ * from create() on every draft, before allocation or network startup and
+ * without callbacks. Network provides DELIVERY_ONLY receive pause; the
+ * LibMoQ adapter requires admission-qualified FLOW_CONTROLLED support.
+ * The negotiation, binding and lifecycle descriptions below document
+ * retained implementation only, not an available connection path.
+ *
  * SCOPE — WebTransport over Network.framework, ONE client connection,
  * ONE managed lane. This is not raw QUIC, not a listener/server
- * facade, and not the (separate, future) MsQuic-backed wtquic server
+ * facade, and not the separate MsQuic-backed wtquic server
  * facade. The lane interface exists so the managed API matches the
  * shared lane shape across adapters (picoquic-threaded, mvfst,
  * MsQuic-managed): exactly one lane owning exactly one connection.
@@ -38,7 +45,7 @@
  *     return NULL off-domain. "On the serial domain" is deliberately
  *     broader than "inside the lane pump".
  *
- * NEGOTIATION IS REAL
+ * RETAINED NEGOTIATION (unreachable under the current receive policy)
  *   With a multi-token offer the MoQ session is NOT pre-created: the
  *   facade proxies the wtquic events until on_established, validates
  *   that the selected WT-Protocol token is recognized AND was offered,
@@ -82,6 +89,7 @@
  */
 
 #include <moq/wtquic.h>
+#include <moq/connection_target.h>
 
 #include <wtquic/wtquic_network.h>
 
@@ -130,18 +138,19 @@ typedef struct moq_wtquic_network_managed_cfg {
     const char        *host;       /* required: remote host / TLS name */
     int                port;       /* required: 1..65535 */
     const char        *path;       /* WT path; default "/moq" */
-    const char        *authority;  /* :authority; default = host */
+    const char        *authority;  /* CONNECT :authority; default = the
+                                      target's authority as spelled, else
+                                      "host:port" (never the bare host) */
 
     /*
-     * WebTransport MoQ version offer, comma-separated in PREFERENCE
-     * ORDER (e.g. "moqt-18, moqt-16"); copied. NULL = legacy draft-16
-     * (no WT-Available-Protocols offer). The list is STRICTLY
-     * validated before anything dials: single commas (optional spaces
-     * around them), every token a recognized MoQ WT-Protocol, no
-     * empties or duplicates, at most 8 — anything else is
-     * MOQ_ERR_INVAL, never a silently weakened offer. The selected
-     * token decides the MoQ session version — see NEGOTIATION IS REAL
-     * above.
+     * WebTransport MoQ version offer for the retained negotiation code,
+     * comma-separated in PREFERENCE ORDER (e.g. "moqt-18, moqt-16").
+     * NULL denotes legacy draft-16 (no WT-Available-Protocols offer).
+     * The list is STRICTLY validated before the policy refusal: single
+     * commas (optional spaces around them), every token a recognized MoQ
+     * WT-Protocol, no empties or duplicates, at most 8 — anything else is
+     * MOQ_ERR_INVAL, never a silently weakened offer. Validating an offer
+     * does not start negotiation or enable any draft; see CURRENT AVAILABILITY.
      */
     const char        *wt_protocols;
 
@@ -171,7 +180,7 @@ typedef struct moq_wtquic_network_managed_cfg {
 
     /* This facade is a CLIENT: 0 (default) or MOQ_PERSPECTIVE_CLIENT
      * are accepted; MOQ_PERSPECTIVE_SERVER is refused with
-     * MOQ_ERR_UNSUPPORTED (a server needs the future MsQuic-backed
+     * MOQ_ERR_UNSUPPORTED (a server needs the separate MsQuic-backed
      * wtquic facade); any other value is MOQ_ERR_INVAL. */
     moq_perspective_t  perspective;
     /* This facade has ONE lane: 0 (default) or 1 are accepted;
@@ -204,11 +213,23 @@ typedef struct moq_wtquic_network_managed_cfg {
      */
     uint64_t         (*app_deadline_us)(void *ctx);
     void              *app_deadline_ctx;
+
+    /* Appended -- connection target (struct_size append-only ABI).
+     *
+     * Retained connection-target configuration for profiles that require a
+     * binding (see <moq/connection_target.h>). Current receive policy refuses
+     * create() before reading/copying this target, validating its URI, or
+     * creating a session. No draft, including draft-22, reaches binding;
+     * setting this field does not bypass that refusal. */
+    const moq_connection_target_t *target;
 } moq_wtquic_network_managed_cfg_t;
 
-/* Pointer initializer: clears and stamps the FULL current struct, so a
- * current-header caller can set any field, including the appended
- * app_deadline block, directly afterward. */
+/* Pointer initializer. A caller built against this header gets the FULL
+ * current struct cleared and stamped -- the function-like macro below passes
+ * its sizeof to moq_wtquic_network_managed_cfg_init_sized() -- so it can set
+ * any field directly afterward. The symbol itself, which a caller built
+ * before `target` was appended calls, clears and stamps the layout through
+ * app_deadline_ctx and never writes past that caller's storage. */
 MOQ_API void moq_wtquic_network_managed_cfg_init(
     moq_wtquic_network_managed_cfg_t *cfg);
 
@@ -217,16 +238,15 @@ MOQ_API void moq_wtquic_network_managed_cfg_init(
  * reads each optional tail only when struct_size covers it. */
 MOQ_API void moq_wtquic_network_managed_cfg_init_sized(
     moq_wtquic_network_managed_cfg_t *cfg, size_t cfg_size);
+#define moq_wtquic_network_managed_cfg_init(cfg) \
+    moq_wtquic_network_managed_cfg_init_sized((cfg), sizeof(*(cfg)))
 
-/*
- * Dial. Returns as soon as the attempt is underway; establishment,
- * negotiation, session creation, and every event happen on the
- * domain. On failure nothing is running and destroy() is not needed.
- */
 /* Current receive policy requires FLOW_CONTROLLED. Network is DELIVERY_ONLY:
- * valid configurations return MOQ_ERR_UNSUPPORTED with NULL output, before
- * allocation/network startup and without callbacks. Malformed configurations
- * still return MOQ_ERR_INVAL. This is a LibMoQ policy restriction. */
+ * valid configurations on every draft return MOQ_ERR_UNSUPPORTED with NULL
+ * output, before allocation/network startup and without callbacks. Invalid
+ * required fields or version offers return MOQ_ERR_INVAL during preliminary
+ * validation; target URI validation is not reached. Nothing is running and
+ * destroy() is not needed. This is a LibMoQ policy restriction. */
 MOQ_API moq_result_t moq_wtquic_network_managed_create(
     const moq_wtquic_network_managed_cfg_t *cfg,
     moq_wtquic_network_managed_t **out);

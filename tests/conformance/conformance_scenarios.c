@@ -34,6 +34,34 @@ static bool has_event(moq_session_t *s, uint32_t kind)
     return found;
 }
 
+/* Start the client, and the server too on profiles whose control channel is
+ * a unidirectional stream per side: there the server must open its own
+ * stream before it can answer, instead of reacting on the client's. The
+ * simulator applies the same rule in moq_simpair_start(). */
+static bool pair_uses_uni_control(moq_adapter_pair_t *pair)
+{
+    return moq_pair_has_cap(pair, MOQ_ADAPTER_PAIR_CAP_UNI_CONTROL);
+}
+
+/* Whether a requester FIN that arrives before the response cancels the
+ * request. Draft-18 reads it as a graceful cancel; draft-22 reads it as
+ * the requester having nothing more to send, so the response still flows. */
+static bool requester_fin_cancels(moq_adapter_pair_t *pair)
+{
+    return moq_session_version(moq_pair_server(pair)) == MOQ_VERSION_DRAFT_18;
+}
+
+static moq_result_t pair_start(moq_adapter_pair_t *pair, uint64_t now)
+{
+    moq_session_t *client = moq_pair_client(pair);
+    moq_session_t *server = moq_pair_server(pair);
+    moq_result_t rc = moq_session_start(client, now);
+    if (rc < 0) return rc;
+    if (pair_uses_uni_control(pair))
+        rc = moq_session_start(server, now);
+    return rc;
+}
+
 /* ================================================================== */
 /* 1. Setup handshake                                                  */
 /* ================================================================== */
@@ -44,7 +72,7 @@ int conformance_setup_handshake(moq_adapter_pair_t *pair)
     moq_session_t *client = moq_pair_client(pair);
     moq_session_t *server = moq_pair_server(pair);
 
-    CFAIL(moq_session_start(client, pair->ops->now_us(pair->ctx)) >= 0);
+    CFAIL(pair_start(pair, pair->ops->now_us(pair->ctx)) >= 0);
 
     moq_adapter_pair_pump_result_t r = moq_pair_pump(pair);
     CFAIL(r == MOQ_ADAPTER_PAIR_QUIESCENT);
@@ -68,7 +96,7 @@ int conformance_subscribe_and_object(moq_adapter_pair_t *pair)
     moq_session_t *client = moq_pair_client(pair);
     moq_session_t *server = moq_pair_server(pair);
 
-    CFAIL(moq_session_start(client, pair->ops->now_us(pair->ctx)) >= 0);
+    CFAIL(pair_start(pair, pair->ops->now_us(pair->ctx)) >= 0);
     moq_pair_pump(pair);
     drain_events(client);
     drain_events(server);
@@ -167,7 +195,7 @@ int conformance_datagram_object(moq_adapter_pair_t *pair)
     moq_session_t *client = moq_pair_client(pair);
     moq_session_t *server = moq_pair_server(pair);
 
-    CFAIL(moq_session_start(client, pair->ops->now_us(pair->ctx)) >= 0);
+    CFAIL(pair_start(pair, pair->ops->now_us(pair->ctx)) >= 0);
     moq_pair_pump(pair);
     drain_events(client);
     drain_events(server);
@@ -246,7 +274,7 @@ int conformance_single_control_stream(moq_adapter_pair_t *pair)
 
     moq_session_t *client = moq_pair_client(pair);
 
-    CFAIL(moq_session_start(client, pair->ops->now_us(pair->ctx)) >= 0);
+    CFAIL(pair_start(pair, pair->ops->now_us(pair->ctx)) >= 0);
     moq_pair_pump(pair);
     drain_events(client);
     drain_events(moq_pair_server(pair));
@@ -258,10 +286,12 @@ int conformance_single_control_stream(moq_adapter_pair_t *pair)
         pair->ctx, MOQ_ADAPTER_PAIR_SERVER);
     CFAIL(server_bidi == 0);
 
-    /* Client opened exactly one bidi (the control stream). */
+    /* Client opened exactly one bidi (the control stream), or none at all
+     * on a profile whose control channel is a unidirectional stream per
+     * side: setup must not open a bidi stream there. */
     size_t client_bidi = pair->ops->opened_bidi_count(
         pair->ctx, MOQ_ADAPTER_PAIR_CLIENT);
-    CFAIL(client_bidi == 1);
+    CFAIL(client_bidi == (pair_uses_uni_control(pair) ? 0u : 1u));
 
     CFAIL(!pair->ops->has_error(pair->ctx));
     return failures;
@@ -285,7 +315,7 @@ int conformance_close_not_fatal(moq_adapter_pair_t *pair)
     moq_session_t *server = moq_pair_server(pair);
     uint64_t now = pair->ops->now_us(pair->ctx);
 
-    CFAIL(moq_session_start(client, now) >= 0);
+    CFAIL(pair_start(pair, now) >= 0);
     moq_pair_pump(pair);
     drain_events(client);
     drain_events(server);
@@ -327,7 +357,7 @@ int conformance_session_timer_goaway(moq_adapter_pair_t *pair)
     moq_session_t *server = moq_pair_server(pair);
     uint64_t now = pair->ops->now_us(pair->ctx);
 
-    CFAIL(moq_session_start(client, now) >= 0);
+    CFAIL(pair_start(pair, now) >= 0);
     moq_pair_pump(pair);
     drain_events(client);
     drain_events(server);
@@ -369,13 +399,14 @@ int conformance_bidi_halfclose_accept(moq_adapter_pair_t *pair)
     moq_session_t *server = moq_pair_server(pair);
     uint64_t now = pair->ops->now_us(pair->ctx);
 
-    CFAIL(moq_session_start(client, now) >= 0);
+    CFAIL(pair_start(pair, now) >= 0);
     moq_pair_pump(pair);
     drain_events(client);
     drain_events(server);
 
     moq_subscribe_namespace_cfg_t nscfg;
     moq_subscribe_namespace_cfg_init(&nscfg);
+    nscfg.namespace_interest = MOQ_NAMESPACE_INTEREST_NAMESPACE_STATE;
     moq_bytes_t ns[] = {{(const uint8_t *)"hc", 2}};
     nscfg.track_namespace_prefix.parts = ns;
     nscfg.track_namespace_prefix.count = 1;
@@ -407,6 +438,18 @@ int conformance_bidi_halfclose_accept(moq_adapter_pair_t *pair)
 
     moq_accept_ns_sub_cfg_t acfg;
     moq_accept_ns_sub_cfg_init(&acfg);
+    bool fin_injected =
+        moq_pair_has_cap(pair, MOQ_ADAPTER_PAIR_CAP_INJECT_BIDI_FIN);
+    if (fin_injected && requester_fin_cancels(pair)) {
+        /* The publisher retires the request on the cancel, so the handle is
+         * stale and no NS_SUB_OK follows. */
+        CFAIL(moq_session_accept_ns_sub(server, server_nsub, &acfg, now) ==
+              MOQ_ERR_STALE_HANDLE);
+        moq_pair_pump(pair);
+        CFAIL(!has_event(client, MOQ_EVENT_NS_SUB_OK));
+        CFAIL(!pair->ops->has_error(pair->ctx));
+        return failures;
+    }
     CFAIL(moq_session_accept_ns_sub(server, server_nsub, &acfg, now) >= 0);
     moq_pair_pump(pair);
 
@@ -434,13 +477,14 @@ int conformance_bidi_halfclose_reject_late_fin(moq_adapter_pair_t *pair)
     moq_session_t *server = moq_pair_server(pair);
     uint64_t now = pair->ops->now_us(pair->ctx);
 
-    CFAIL(moq_session_start(client, now) >= 0);
+    CFAIL(pair_start(pair, now) >= 0);
     moq_pair_pump(pair);
     drain_events(client);
     drain_events(server);
 
     moq_subscribe_namespace_cfg_t nscfg;
     moq_subscribe_namespace_cfg_init(&nscfg);
+    nscfg.namespace_interest = MOQ_NAMESPACE_INTEREST_NAMESPACE_STATE;
     moq_bytes_t ns[] = {{(const uint8_t *)"rj", 2}};
     nscfg.track_namespace_prefix.parts = ns;
     nscfg.track_namespace_prefix.count = 1;
@@ -471,7 +515,22 @@ int conformance_bidi_halfclose_reject_late_fin(moq_adapter_pair_t *pair)
     bool got_err = has_event(client, MOQ_EVENT_NS_SUB_ERROR);
     CFAIL(got_err);
 
-    /* After reject+pump, the server should have tombstoned the
+    /* After reject+pump the server has sent its FIN but not received the
+     * peer's. Draft-16 tombstones the bidi stream for that window; a
+     * request-stream profile instead keeps the stream as a drain reference
+     * that owns the receive half until the peer's FIN arrives. Either way a
+     * late client FIN must be absorbed without error. */
+    if (pair_uses_uni_control(pair)) {
+        size_t sc = pair->ops->stream_count(pair->ctx, MOQ_ADAPTER_PAIR_SERVER);
+        CFAIL(sc > 0);
+        if (moq_pair_has_cap(pair, MOQ_ADAPTER_PAIR_CAP_INJECT_BIDI_FIN)) {
+            CFAIL(pair->ops->inject_bidi_fin(
+                pair->ctx, MOQ_ADAPTER_PAIR_CLIENT) == 0);
+            moq_pair_pump(pair);
+            size_t sc2 = pair->ops->stream_count(pair->ctx, MOQ_ADAPTER_PAIR_SERVER);
+            CFAIL(sc2 < sc);
+        }
+    } else /* After reject+pump, the server should have tombstoned the
      * bidi stream (local FIN sent, peer FIN not yet received). */
     if (moq_pair_has_cap(pair, MOQ_ADAPTER_PAIR_CAP_TOMBSTONES)) {
         size_t tc = pair->ops->tombstone_count(
@@ -508,13 +567,14 @@ int conformance_crossed_cancel(moq_adapter_pair_t *pair)
     moq_session_t *server = moq_pair_server(pair);
     uint64_t now = pair->ops->now_us(pair->ctx);
 
-    CFAIL(moq_session_start(client, now) >= 0);
+    CFAIL(pair_start(pair, now) >= 0);
     moq_pair_pump(pair);
     drain_events(client);
     drain_events(server);
 
     moq_subscribe_namespace_cfg_t nscfg;
     moq_subscribe_namespace_cfg_init(&nscfg);
+    nscfg.namespace_interest = MOQ_NAMESPACE_INTEREST_NAMESPACE_STATE;
     moq_bytes_t ns[] = {{(const uint8_t *)"cx", 2}};
     nscfg.track_namespace_prefix.parts = ns;
     nscfg.track_namespace_prefix.count = 1;
@@ -566,7 +626,7 @@ int conformance_reset_propagation(moq_adapter_pair_t *pair)
     moq_session_t *server = moq_pair_server(pair);
     uint64_t now = pair->ops->now_us(pair->ctx);
 
-    CFAIL(moq_session_start(client, now) >= 0);
+    CFAIL(pair_start(pair, now) >= 0);
     moq_pair_pump(pair);
     drain_events(client);
     drain_events(server);
@@ -675,7 +735,7 @@ int conformance_would_block_ordering(moq_adapter_pair_t *pair)
     moq_session_t *server = moq_pair_server(pair);
     uint64_t now = pair->ops->now_us(pair->ctx);
 
-    CFAIL(moq_session_start(client, now) >= 0);
+    CFAIL(pair_start(pair, now) >= 0);
     moq_pair_pump(pair);
     drain_events(client);
     drain_events(server);
@@ -781,7 +841,7 @@ int conformance_dropped_datagram_unblocks(moq_adapter_pair_t *pair)
     moq_session_t *server = moq_pair_server(pair);
     uint64_t now = pair->ops->now_us(pair->ctx);
 
-    CFAIL(moq_session_start(client, now) >= 0);
+    CFAIL(pair_start(pair, now) >= 0);
     moq_pair_pump(pair);
     drain_events(client);
     drain_events(server);
@@ -895,7 +955,7 @@ int conformance_blocked_ns_reject_tombstone(moq_adapter_pair_t *pair)
     moq_session_t *server = moq_pair_server(pair);
     uint64_t now = pair->ops->now_us(pair->ctx);
 
-    CFAIL(moq_session_start(client, now) >= 0);
+    CFAIL(pair_start(pair, now) >= 0);
     moq_pair_pump(pair);
     drain_events(client);
     drain_events(server);
@@ -903,6 +963,7 @@ int conformance_blocked_ns_reject_tombstone(moq_adapter_pair_t *pair)
     /* Client subscribes to a namespace. */
     moq_subscribe_namespace_cfg_t nscfg;
     moq_subscribe_namespace_cfg_init(&nscfg);
+    nscfg.namespace_interest = MOQ_NAMESPACE_INTEREST_NAMESPACE_STATE;
     moq_bytes_t ns[] = {{(const uint8_t *)"blk", 3}};
     nscfg.track_namespace_prefix.parts = ns;
     nscfg.track_namespace_prefix.count = 1;
@@ -942,14 +1003,23 @@ int conformance_blocked_ns_reject_tombstone(moq_adapter_pair_t *pair)
     pair->ops->block_writes(pair->ctx, MOQ_ADAPTER_PAIR_SERVER, false);
     moq_pair_pump(pair);
 
-    /* Server must have tombstoned the bidi stream. */
-    size_t tc = pair->ops->tombstone_count(
-        pair->ctx, MOQ_ADAPTER_PAIR_SERVER);
-    CFAIL(tc > 0);
-
-    /* Inject late client FIN — tombstone should absorb it. */
-    CFAIL(pair->ops->inject_bidi_fin(
-        pair->ctx, MOQ_ADAPTER_PAIR_CLIENT) == 0);
+    /* Server has sent its FIN; draft-16 tombstones the stream, a
+     * request-stream profile keeps a drain reference. A late client FIN
+     * must be absorbed either way. */
+    if (pair_uses_uni_control(pair)) {
+        size_t sc = pair->ops->stream_count(pair->ctx, MOQ_ADAPTER_PAIR_SERVER);
+        CFAIL(sc > 0);
+        CFAIL(pair->ops->inject_bidi_fin(
+            pair->ctx, MOQ_ADAPTER_PAIR_CLIENT) == 0);
+        moq_pair_pump(pair);
+        CFAIL(pair->ops->stream_count(pair->ctx, MOQ_ADAPTER_PAIR_SERVER) < sc);
+    } else {
+        size_t tc = pair->ops->tombstone_count(
+            pair->ctx, MOQ_ADAPTER_PAIR_SERVER);
+        CFAIL(tc > 0);
+        CFAIL(pair->ops->inject_bidi_fin(
+            pair->ctx, MOQ_ADAPTER_PAIR_CLIENT) == 0);
+    }
 
     /* No fatal error — tombstone absorbed the late FIN. */
     CFAIL(!pair->ops->has_error(pair->ctx));

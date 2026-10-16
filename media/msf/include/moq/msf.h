@@ -29,6 +29,22 @@ extern "C" {
 
 #define MOQ_MSF_VERSION 1
 
+/* How the root "version" (MSF-01 5.1.1) is spelled on the wire. Fixed-width
+ * for ABI stability. Values are never renumbered.
+ *   NUMERAL     (0) the JSON String "1": a compatibility form, not the
+ *               MSF-01 draft convention -- the form this encoder has always
+ *               emitted and that existing receivers accept. Zero, so an
+ *               absent or zeroed field selects it.
+ *   DRAFT_NAME  (1) the JSON String "draft-01": 5.1.1's convention for
+ *               catalogs against an Internet-Draft release.
+ * The parser accepts both, and for compatibility the MSF-00 numeric 1
+ * (reported as NUMERAL), and reports which one it read; a reader of a parsed
+ * catalog must tolerate forms it does not know. The encoder accepts only the forms defined here and
+ * rejects any other value with MOQ_ERR_INVAL. */
+typedef uint32_t moq_msf_version_form_t;
+#define MOQ_MSF_VERSION_FORM_NUMERAL    UINT32_C(0)
+#define MOQ_MSF_VERSION_FORM_DRAFT_NAME UINT32_C(1)
+
 #define MOQ_MSF_CATALOG_TRACK_NAME     "catalog"
 #define MOQ_MSF_CATALOG_TRACK_NAME_LEN 7
 
@@ -420,6 +436,13 @@ typedef struct moq_msf_catalog {
     /* Internal: freed by cleanup. */
     void             *_dom;
     size_t            _dom_size;
+
+    /* Appended after `_dom_size`; read by the encoder only when struct_size
+     * covers it (absent = NUMERAL). A value other than NUMERAL or DRAFT_NAME
+     * is rejected with MOQ_ERR_INVAL. The parser sets it to the form it read
+     * (NUMERAL for the MSF-00 numeric 1); apply_delta carries the base's form
+     * to the applied catalog. Not written for a delta, which has no version. */
+    moq_msf_version_form_t version_form;
 } moq_msf_catalog_t;
 
 /*

@@ -33,6 +33,7 @@
 #include <wtquic/wtquic_msquic.h>
 
 #include "wtquic_contract_pair.h"   /* wtqc_payload_fill */
+#include "wtq_loopback_port.h"
 
 #include <pthread.h>
 #include <stdbool.h>
@@ -317,14 +318,13 @@ static int rig_up(struct rig *r, struct sub_side *sub, const char *cert,
     serve.require_subprotocol = true;
     wtq_msquic_listener_cfg_t lcfg = WTQ_MSQUIC_LISTENER_CFG_INIT;
     lcfg.bind_address = "127.0.0.1";
-    lcfg.port = 0;
     lcfg.cert_file = cert;
     lcfg.key_file = key;
     lcfg.paths = &serve;
     lcfg.path_count = 1;
     lcfg.events = wtq_test_attach_events();
     lcfg.user = &r->pub.attach;
-    if (wtq_msquic_listener_start(r->senv, &lcfg, &r->listener) != WTQ_OK) return -1;
+    if (wtqt_listener_start(r->senv, &lcfg, &r->listener) != WTQ_OK) return -1;
     uint16_t port = wtq_msquic_listener_port(r->listener);
 
     /* managed client facade (subscriber under test) */

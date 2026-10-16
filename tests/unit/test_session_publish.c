@@ -377,7 +377,10 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT(alloc_state.balance, 0);
     }
 
-    /* == Duplicate track alias from PUBLISH closes session ============ */
+    /* == PUBLISH reusing an alias the receiver assigned is valid ======= *
+     * A Track Alias is chosen by the publisher of the track: the server's
+     * alias 42 on what it publishes does not collide with the client's own
+     * alias 42 on what the client publishes. */
     {
         test_alloc_state_t alloc_state = {0};
         moq_alloc_t alloc = test_allocator(&alloc_state);
@@ -427,7 +430,15 @@ int main(void)
         moq_session_on_control_bytes(sv, pub_buf,
             moq_buf_writer_offset(&w), 2000);
 
-        MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(sv), (int)MOQ_SESS_CLOSED);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(sv), (int)MOQ_SESS_ESTABLISHED);
+        bool saw_publish = false;
+        while (moq_session_poll_events(sv, &ev, 1) > 0) {
+            if (ev.kind == MOQ_EVENT_PUBLISH_REQUEST &&
+                ev.u.publish_request.track_alias == 42)
+                saw_publish = true;
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK(saw_publish);
 
         moq_session_destroy(c);
         moq_session_destroy(sv);
@@ -3843,14 +3854,15 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT(alloc_state.balance, 0);
     }
 
-    /* == Stale binding: a FIN arriving with the refused STOP is kept ====== *
+    /* == Rejecting a PUBLISH: a FIN arriving with the owed STOP is kept === *
      * A subgroup stream bound (§9.4, early objects) to a still-pending
-     * inbound PUBLISH; the app rejects the PUBLISH, which frees the
-     * publication while the stream is open. The next delivery on that stream
-     * finds its binding gone: its FIN is latched before the STOP is tried;
-     * the STOP is refused (the action queue holds the PUBLISH_ERROR); draining
-     * the queue issues exactly one STOP and the latched FIN releases the entry
-     * at once with nothing retained -- not a completion. */
+     * inbound PUBLISH; the app rejects the PUBLISH while the stream is open.
+     * The reject abandons the stream with STOP_SENDING (draft-16 §9.13), but
+     * the 1-deep action queue holds the PUBLISH_ERROR, so the STOP is owed
+     * and the reject still succeeds. The next delivery on that stream latches
+     * its FIN before the STOP is tried again and refused; draining the queue
+     * issues exactly one STOP (CANCELLED) and the latched FIN releases the
+     * entry at once with nothing retained -- not a completion. */
     {
         test_alloc_state_t alloc_state = {0};
         moq_alloc_t alloc = test_allocator(&alloc_state);
@@ -3917,9 +3929,13 @@ int main(void)
         rej.error_code = MOQ_REQUEST_ERROR_UNAUTHORIZED;
         MOQ_TEST_CHECK_EQ_INT((int)moq_session_reject_publish(sv, sv_pub, &rej, 1001), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_SIZE(moq_session_action_capacity(sv), (size_t)0);
+        MOQ_TEST_CHECK(sv->rx_streams[slot].active &&
+                       sv->rx_streams[slot].parse_state == MOQ_RX_NEED_STOP);
+        MOQ_TEST_CHECK_EQ_SIZE(sv->recv_input_bytes, (size_t)0);   /* released at the reject */
+        MOQ_TEST_CHECK_EQ_SIZE(sv->recv_payload_bytes, (size_t)0);
 
-        /* The next object arrives WITH the FIN: binding gone, STOP refused,
-         * the FIN latched on the retained entry. */
+        /* The next object arrives WITH the FIN: the owed STOP is refused
+         * again, the FIN latched on the retained entry. */
         uint8_t more[64];
         moq_buf_writer_t mw;
         moq_buf_writer_init(&mw, more, sizeof(more));
@@ -3944,8 +3960,10 @@ int main(void)
         size_t n;
         while ((n = moq_session_poll_actions(sv, acts, 4)) > 0) {
             for (size_t i = 0; i < n; i++) {
-                if (acts[i].kind == MOQ_ACTION_STOP_DATA && acts[i].u.stop_data.stream_ref._v == REF) stops++;
-                else others++;
+                if (acts[i].kind == MOQ_ACTION_STOP_DATA && acts[i].u.stop_data.stream_ref._v == REF) {
+                    stops++;
+                    MOQ_TEST_CHECK_EQ_U64(acts[i].u.stop_data.error_code, 0x1);
+                } else others++;
                 moq_action_cleanup(&acts[i]);
             }
         }

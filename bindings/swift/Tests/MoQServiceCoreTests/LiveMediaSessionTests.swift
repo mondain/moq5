@@ -22,6 +22,8 @@ final class FactoryEndpointBackend: EndpointBackend, ReceiverBackendFactory,
                                     @unchecked Sendable {
     let inner: ScriptedEndpointBackend
     private let receiverBackend: ScriptedReceiverBackend
+    private let configurationLock = NSLock()
+    private var attachedConfigurations: [MediaReceiver.Configuration] = []
 
     init(inner: ScriptedEndpointBackend, receiverBackend: ScriptedReceiverBackend) {
         self.inner = inner
@@ -30,6 +32,7 @@ final class FactoryEndpointBackend: EndpointBackend, ReceiverBackendFactory,
 
     var state: MoQEndpoint.State { inner.state }
     var negotiatedVersion: MoQVersion? { inner.negotiatedVersion }
+    var negotiatedWireVersion: WireVersion? { inner.negotiatedWireVersion }
     var isFatal: Bool { inner.isFatal }
     var fatalCode: UInt64 { inner.fatalCode }
     var terminalFailure: TerminalFailure { inner.terminalFailure }
@@ -46,7 +49,15 @@ final class FactoryEndpointBackend: EndpointBackend, ReceiverBackendFactory,
 
     func makeReceiverBackend(
         configuration: MediaReceiver.Configuration) throws -> any ReceiverBackend {
-        receiverBackend
+        configurationLock.lock()
+        attachedConfigurations.append(configuration)
+        configurationLock.unlock()
+        return receiverBackend
+    }
+
+    var receiverConfigurations: [MediaReceiver.Configuration] {
+        configurationLock.lock(); defer { configurationLock.unlock() }
+        return attachedConfigurations
     }
 }
 
@@ -290,6 +301,59 @@ private func liveConfig(namespace: MediaNamespace = "live/cam1",
 
 @Suite("LiveMediaSession")
 struct LiveMediaSessionTests {
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("Receiver attach forwards the companion as configured; the default is automatic",
+          arguments: [nil, .automatic, .legacyMSF01LOC01, .draft22MSF01LOC04Public]
+            as [MediaCompanionProfile?])
+    func receiverCompanionProfileForwarded(_ profile: MediaCompanionProfile?) async throws {
+        let factory = WatchFactory(onCreate: { _, watch in
+            watch.endpointBackend.setWireVersion(.draft22)
+            watch.endpointBackend.script(state: .established)
+            watch.receiverBackend.scriptEvents([.added(1, name: "video"), .catalogReady])
+            watch.endpointBackend.wake()
+        })
+        let session = LiveMediaSession(endpointFactory: factory.make)
+        let collector = StateCollector(session)
+        defer { collector.cancel() }
+
+        let endpoint = MoQEndpoint.Configuration(
+            url: URL(string: "moqt://relay.test:4443")!, wireVersions: .list([.draft22]))
+        let configuration: LiveMediaSession.Configuration
+        if let profile {
+            configuration = .init(endpoint: endpoint, namespace: "live/profile",
+                                  companionProfile: profile)
+        } else {
+            // Original call shape: the default is automatic, resolved natively.
+            configuration = .init(endpoint: endpoint, namespace: "live/profile")
+        }
+        session.start(configuration)
+        let ready = await collector.awaitStates {
+            hasCase($0) { if case .awaitingFirstObject = $0 { true } else { false } }
+        }
+        let receiverAttached = session.receiver != nil
+        let negotiated = session.endpoint?.negotiatedWireVersion
+        await session.stop()
+
+        try #require(ready, "profile fixture reached discovery after the real attach")
+        #expect(receiverAttached)
+        #expect(negotiated == .draft22)
+        #expect(factory.watches.count == 1)
+        let watch = try #require(factory.watches.first)
+        let received = watch.backend.receiverConfigurations
+        #expect(received.count == 1)
+        let attached = try #require(received.first)
+        #expect(attached.companionProfile == (profile ?? .automatic),
+                "actual receiver factory must receive the requested companion profile")
+        #expect(attached.namespace == configuration.namespace)
+        #expect(attached.autoSubscribe)
+        let receiverSnapshot = watch.receiverBackend.snapshot()
+        let endpointSnapshot = watch.endpointBackend.snapshot()
+        #expect(receiverSnapshot.detachCalls == 1)
+        #expect(endpointSnapshot.destroyCount == 1)
+        #expect(receiverSnapshot.violations.isEmpty)
+        #expect(endpointSnapshot.violations.isEmpty)
+    }
 
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
     @Test("Happy path: connecting -> established -> awaitingCatalog -> awaitingFirstObject -> receiving")

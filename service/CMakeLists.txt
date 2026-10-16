@@ -4,6 +4,7 @@
 
 add_library(moq-service
     src/endpoint.c
+    src/endpoint_uri.c
     src/media_receiver.c
     src/media_sender.c
 )
@@ -240,7 +241,7 @@ if(MOQ_BUILD_TESTS)
     # not installed); tests compile the sources directly so the internal
     # symbols stay un-exported in the shared library (same pattern as
     # moq-core-test-internals).
-    add_library(moq-service-test-internals OBJECT src/endpoint.c)
+    add_library(moq-service-test-internals OBJECT src/endpoint.c src/endpoint_uri.c)
     target_include_directories(moq-service-test-internals
         PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_link_libraries(moq-service-test-internals PUBLIC moq::core
@@ -257,16 +258,16 @@ if(MOQ_BUILD_TESTS)
     # authorities compared against it.
     add_executable(test_negotiated_profile_offer
         tests/test_negotiated_profile_offer.c
-        ${CMAKE_SOURCE_DIR}/tests/support/np/np_tables.c
-        ${CMAKE_SOURCE_DIR}/tests/support/np/np_oracle.c)
+        ${PROJECT_SOURCE_DIR}/tests/support/np/np_tables.c
+        ${PROJECT_SOURCE_DIR}/tests/support/np/np_oracle.c)
     target_link_libraries(test_negotiated_profile_offer PRIVATE
         moq-service-test-internals)
     target_compile_definitions(test_negotiated_profile_offer PRIVATE
         ${_MOQ_SERVICE_FACADE_DEFS})
     target_include_directories(test_negotiated_profile_offer PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_SOURCE_DIR}/tests/unit
-        ${CMAKE_SOURCE_DIR}/tests/support/np)
+        ${PROJECT_SOURCE_DIR}/tests/unit
+        ${PROJECT_SOURCE_DIR}/tests/support/np)
     add_test(NAME negotiated_profile_offer
              COMMAND test_negotiated_profile_offer)
 
@@ -284,8 +285,35 @@ if(MOQ_BUILD_TESTS)
         ${_MOQ_SERVICE_FACADE_DEFS})
     target_include_directories(test_endpoint_resolve PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_SOURCE_DIR}/tests/unit)
+        ${PROJECT_SOURCE_DIR}/tests/unit)
     add_test(NAME endpoint_resolve COMMAND test_endpoint_resolve)
+
+    add_executable(test_endpoint_uri tests/test_endpoint_uri.c)
+    target_link_libraries(test_endpoint_uri PRIVATE moq-service-test-internals)
+    target_compile_definitions(test_endpoint_uri PRIVATE ${_MOQ_SERVICE_FACADE_DEFS})
+    target_include_directories(test_endpoint_uri PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/tests/unit)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(test_endpoint_uri PRIVATE -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME endpoint_uri COMMAND test_endpoint_uri)
+
+    # This fixture includes endpoint.c with a typed managed-backend recorder in
+    # place of a real transport provider; no service internals are linked.
+    add_executable(test_endpoint_uri_effects
+        tests/test_endpoint_uri_effects.c src/endpoint_uri.c)
+    target_link_libraries(test_endpoint_uri_effects PRIVATE moq::core Threads::Threads)
+    target_include_directories(test_endpoint_uri_effects PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/adapters/proxygen/include)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(test_endpoint_uri_effects PRIVATE -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME endpoint_uri_effects COMMAND test_endpoint_uri_effects)
 
     # Handshake-bound propagation (picoquic only): prove the resolved value
     # reaches the QUIC context through the real connect path. endpoint.c is
@@ -293,7 +321,7 @@ if(MOQ_BUILD_TESTS)
     # defines, so the seam exists only in this binary -- the shipping library
     # never sees it. Own object set for exactly that reason.
     if(MOQ_BUILD_PQ_THREADED OR MOQ_BUILD_PICO_WT_MANAGED)
-        add_library(moq-service-hs-test-internals OBJECT src/endpoint.c)
+        add_library(moq-service-hs-test-internals OBJECT src/endpoint.c src/endpoint_uri.c)
         target_include_directories(moq-service-hs-test-internals
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -312,7 +340,7 @@ if(MOQ_BUILD_TESTS)
             ${_MOQ_SERVICE_FACADE_DEFS})
         target_include_directories(test_endpoint_handshake_timeout PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src
-            ${CMAKE_SOURCE_DIR}/tests/unit)
+            ${PROJECT_SOURCE_DIR}/tests/unit)
         add_test(NAME endpoint_handshake_timeout
                  COMMAND test_endpoint_handshake_timeout)
 
@@ -321,7 +349,7 @@ if(MOQ_BUILD_TESTS)
             # endpoint create path. Private recorders observe verifier install
             # and select the existing eager raw-QUIC session for the lane
             # retirement test; shipping objects never see these renames.
-            add_library(moq-service-cert-test-internals OBJECT src/endpoint.c)
+            add_library(moq-service-cert-test-internals OBJECT src/endpoint.c src/endpoint_uri.c)
             target_include_directories(moq-service-cert-test-internals
                 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -343,7 +371,7 @@ if(MOQ_BUILD_TESTS)
                 ${_MOQ_SERVICE_FACADE_DEFS})
             target_include_directories(test_endpoint_certificate_verify PRIVATE
                 ${CMAKE_CURRENT_SOURCE_DIR}/src
-                ${CMAKE_SOURCE_DIR}/tests/unit)
+                ${PROJECT_SOURCE_DIR}/tests/unit)
             add_test(NAME endpoint_certificate_verify
                      COMMAND test_endpoint_certificate_verify)
         endif()
@@ -356,7 +384,7 @@ if(MOQ_BUILD_TESTS)
     # this binary -- the shipping library never sees it. Own object set for
     # exactly that reason.
     if(MOQ_BUILD_PQ_THREADED)
-        add_library(moq-service-ka-test-internals OBJECT src/endpoint.c)
+        add_library(moq-service-ka-test-internals OBJECT src/endpoint.c src/endpoint_uri.c)
         target_include_directories(moq-service-ka-test-internals
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -376,13 +404,13 @@ if(MOQ_BUILD_TESTS)
             ${_MOQ_SERVICE_FACADE_DEFS})
         target_include_directories(test_endpoint_keepalive_default PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src
-            ${CMAKE_SOURCE_DIR}/tests/unit)
+            ${PROJECT_SOURCE_DIR}/tests/unit)
         add_test(NAME endpoint_keepalive_default
                  COMMAND test_endpoint_keepalive_default)
     endif()
 
     if(MOQ_BUILD_PICO_WT_MANAGED)
-        add_library(moq-service-pico-wt-ka-test-internals OBJECT src/endpoint.c)
+        add_library(moq-service-pico-wt-ka-test-internals OBJECT src/endpoint.c src/endpoint_uri.c)
         target_include_directories(moq-service-pico-wt-ka-test-internals
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -401,7 +429,7 @@ if(MOQ_BUILD_TESTS)
             ${_MOQ_SERVICE_FACADE_DEFS})
         target_include_directories(test_endpoint_pico_wt_keepalive_default PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src
-            ${CMAKE_SOURCE_DIR}/tests/unit)
+            ${PROJECT_SOURCE_DIR}/tests/unit)
         add_test(NAME endpoint_pico_wt_keepalive_default
                  COMMAND test_endpoint_pico_wt_keepalive_default)
 
@@ -410,12 +438,12 @@ if(MOQ_BUILD_TESTS)
             moq-service-pico-wt-ka-test-internals)
         target_include_directories(test_endpoint_wt_target PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src
-            ${CMAKE_SOURCE_DIR}/tests/unit)
+            ${PROJECT_SOURCE_DIR}/tests/unit)
         add_test(NAME endpoint_wt_target COMMAND test_endpoint_wt_target)
     endif()
 
     if(MOQ_BUILD_MSQUIC_MANAGED)
-        add_library(moq-service-msquic-ka-test-internals OBJECT src/endpoint.c)
+        add_library(moq-service-msquic-ka-test-internals OBJECT src/endpoint.c src/endpoint_uri.c)
         target_include_directories(moq-service-msquic-ka-test-internals
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -434,7 +462,7 @@ if(MOQ_BUILD_TESTS)
             ${_MOQ_SERVICE_FACADE_DEFS})
         target_include_directories(test_endpoint_msquic_keepalive_default PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src
-            ${CMAKE_SOURCE_DIR}/tests/unit)
+            ${PROJECT_SOURCE_DIR}/tests/unit)
         add_test(NAME endpoint_msquic_keepalive_default
                  COMMAND test_endpoint_msquic_keepalive_default)
     endif()
@@ -443,7 +471,7 @@ if(MOQ_BUILD_TESTS)
     # with the bare-endpoint + pump seam so ep_pump_cycle can be driven with a
     # controlled session (NULL pre-establishment, then a live IDLE session). Own
     # object set so the testing define never leaks into the shipping library.
-    add_library(moq-service-endpoint-test-internals OBJECT src/endpoint.c)
+    add_library(moq-service-endpoint-test-internals OBJECT src/endpoint.c src/endpoint_uri.c)
     target_include_directories(moq-service-endpoint-test-internals
         PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
         PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -452,21 +480,60 @@ if(MOQ_BUILD_TESTS)
     target_compile_definitions(moq-service-endpoint-test-internals
         PRIVATE MOQ_MEDIA_SENDER_TESTING=1 ${_MOQ_SERVICE_FACADE_DEFS})
     target_compile_features(moq-service-endpoint-test-internals PUBLIC c_std_11)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(moq-service-endpoint-test-internals PRIVATE -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
 
     add_executable(test_endpoint_post_contract tests/test_endpoint_post_contract.c)
     target_link_libraries(test_endpoint_post_contract PRIVATE
         moq-service-endpoint-test-internals)
     target_include_directories(test_endpoint_post_contract PRIVATE
-        ${CMAKE_SOURCE_DIR}/tests/unit)
+        ${PROJECT_SOURCE_DIR}/tests/unit)
     add_test(NAME endpoint_post_contract COMMAND test_endpoint_post_contract)
+
+    add_executable(test_endpoint_negotiated_publication
+        tests/test_endpoint_negotiated_publication.c)
+    target_link_libraries(test_endpoint_negotiated_publication PRIVATE
+        moq-service-endpoint-test-internals)
+    target_include_directories(test_endpoint_negotiated_publication PRIVATE
+        ${PROJECT_SOURCE_DIR}/tests/unit)
+    add_test(NAME endpoint_negotiated_publication
+             COMMAND test_endpoint_negotiated_publication)
+
+    # The offer the picoquic family can carry, for raw QUIC and WebTransport.
+    if(MOQ_BUILD_PQ_THREADED AND MOQ_BUILD_PICO_WT_MANAGED)
+        add_executable(test_endpoint_backend_capability
+            tests/test_endpoint_backend_capability.c)
+        target_link_libraries(test_endpoint_backend_capability PRIVATE
+            moq-service-endpoint-test-internals)
+        target_include_directories(test_endpoint_backend_capability PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/tests/unit)
+        target_compile_definitions(test_endpoint_backend_capability PRIVATE
+            ${_MOQ_SERVICE_FACADE_DEFS})
+        add_test(NAME endpoint_backend_capability
+                 COMMAND test_endpoint_backend_capability)
+    endif()
 
     # White-box catalog-update test: compile the receiver (+ endpoint) with the
     # test seam so the catalog ingest/reconcile path can be driven with crafted
     # objects, no network. Built as its own object set (the testing define would
     # otherwise leak into the shipping receiver).
     if(TARGET moq::msf)
+        add_executable(test_media_receiver_init tests/test_media_receiver_init.c)
+        target_link_libraries(test_media_receiver_init PRIVATE moq::service)
+        target_include_directories(test_media_receiver_init PRIVATE
+            ${PROJECT_SOURCE_DIR}/tests/unit)
+        if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(test_media_receiver_init PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME media_receiver_init COMMAND test_media_receiver_init)
+        set_tests_properties(media_receiver_init PROPERTIES TIMEOUT 30)
+
         add_library(moq-service-receiver-test-internals OBJECT
-            src/media_receiver.c src/endpoint.c)
+            src/media_receiver.c src/endpoint.c src/endpoint_uri.c)
         target_include_directories(moq-service-receiver-test-internals
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -478,13 +545,17 @@ if(MOQ_BUILD_TESTS)
             PUBLIC ${_MOQ_SERVICE_FACADE_LIBS})
         target_compile_features(moq-service-receiver-test-internals
             PUBLIC c_std_11)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(moq-service-receiver-test-internals PRIVATE -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
 
         add_executable(test_media_catalog_update
             tests/test_media_catalog_update.c)
         target_link_libraries(test_media_catalog_update PRIVATE
             moq-service-receiver-test-internals)
         target_include_directories(test_media_catalog_update PRIVATE
-            ${CMAKE_SOURCE_DIR}/tests/unit)
+            ${PROJECT_SOURCE_DIR}/tests/unit)
         add_test(NAME media_catalog_update COMMAND test_media_catalog_update)
 
         # Publication-race test (MOQ-MEDIA-CP-LOOKUP-RACE): deterministic
@@ -495,7 +566,7 @@ if(MOQ_BUILD_TESTS)
         target_link_libraries(test_media_catalog_publication_race PRIVATE
             moq-service-receiver-test-internals)
         target_include_directories(test_media_catalog_publication_race PRIVATE
-            ${CMAKE_SOURCE_DIR}/tests/unit)
+            ${PROJECT_SOURCE_DIR}/tests/unit)
         add_test(NAME media_catalog_publication_race
             COMMAND test_media_catalog_publication_race)
 
@@ -506,18 +577,18 @@ if(MOQ_BUILD_TESTS)
         target_link_libraries(test_media_receiver_construct_arith PRIVATE
             moq-service-receiver-test-internals)
         target_include_directories(test_media_receiver_construct_arith PRIVATE
-            ${CMAKE_SOURCE_DIR}/tests/unit)
+            ${PROJECT_SOURCE_DIR}/tests/unit)
         add_test(NAME media_receiver_construct_arith
             COMMAND test_media_receiver_construct_arith)
         # API/export contract for the description copy operation: typed
         # declaration + floor by the configured compiler, exact symbol by nm.
         set(_moq_desc_copy_api_includes
             ${CMAKE_CURRENT_SOURCE_DIR}/include
-            ${CMAKE_SOURCE_DIR}/core/include
-            ${CMAKE_SOURCE_DIR}/media/msf/include
-            ${CMAKE_SOURCE_DIR}/media/object/include
-            ${CMAKE_SOURCE_DIR}/media/loc/include
-            ${CMAKE_SOURCE_DIR}/media/cmaf/include)
+            ${PROJECT_SOURCE_DIR}/core/include
+            ${PROJECT_SOURCE_DIR}/media/msf/include
+            ${PROJECT_SOURCE_DIR}/media/object/include
+            ${PROJECT_SOURCE_DIR}/media/loc/include
+            ${PROJECT_SOURCE_DIR}/media/cmaf/include)
         add_test(NAME media_receiver_desc_copy_api
             COMMAND ${CMAKE_COMMAND}
                 -DHEADER=${CMAKE_CURRENT_SOURCE_DIR}/include/moq/media_receiver.h
@@ -545,6 +616,146 @@ if(MOQ_BUILD_TESTS)
         # receiver_hook with a simpair client session and inject crafted moqx
         # control + subgroup data bytes. Requires moq-sim.
         if(TARGET moq::sim)
+            # This fixture includes the production receiver conversion, so link
+            # endpoint-only support rather than a second receiver object.
+            add_executable(test_media_receiver_companion
+                tests/test_media_receiver_companion.c)
+            target_link_libraries(test_media_receiver_companion PRIVATE
+                moq-service-endpoint-test-internals moq::msf moq::sim)
+            target_include_directories(test_media_receiver_companion PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit)
+            if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+                target_compile_options(test_media_receiver_companion PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME media_receiver_companion
+                COMMAND test_media_receiver_companion)
+            set_tests_properties(media_receiver_companion PROPERTIES TIMEOUT 30)
+
+            add_executable(test_media_receiver_track_options
+                tests/test_media_receiver_track_options.c)
+            target_link_libraries(test_media_receiver_track_options PRIVATE
+                moq-service-endpoint-test-internals moq::msf moq::sim)
+            target_include_directories(test_media_receiver_track_options PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit)
+            if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+                target_compile_options(test_media_receiver_track_options PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME media_receiver_track_options
+                COMMAND test_media_receiver_track_options)
+            set_tests_properties(media_receiver_track_options PROPERTIES TIMEOUT 30)
+
+            add_executable(test_media_receiver_ack_failure
+                tests/test_media_receiver_ack_failure.c)
+            target_link_libraries(test_media_receiver_ack_failure PRIVATE
+                moq-service-endpoint-test-internals moq::msf moq::sim)
+            target_include_directories(test_media_receiver_ack_failure PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit)
+            if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+                target_compile_options(test_media_receiver_ack_failure PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME media_receiver_ack_failure
+                COMMAND test_media_receiver_ack_failure)
+            set_tests_properties(media_receiver_ack_failure PROPERTIES TIMEOUT 30)
+
+            add_executable(test_media_receiver_delivery_failure
+                tests/test_media_receiver_delivery_failure.c)
+            target_link_libraries(test_media_receiver_delivery_failure PRIVATE
+                moq-service-endpoint-test-internals moq::msf moq::sim)
+            target_include_directories(test_media_receiver_delivery_failure PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit)
+            if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+                target_compile_options(test_media_receiver_delivery_failure PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME media_receiver_delivery_failure
+                COMMAND test_media_receiver_delivery_failure)
+            set_tests_properties(media_receiver_delivery_failure PROPERTIES TIMEOUT 30)
+
+            add_executable(test_media_receiver_metadata_copy
+                tests/test_media_receiver_metadata_copy.c)
+            target_link_libraries(test_media_receiver_metadata_copy PRIVATE
+                moq-service-endpoint-test-internals moq::msf moq::sim)
+            target_include_directories(test_media_receiver_metadata_copy PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit)
+            if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+                target_compile_options(test_media_receiver_metadata_copy PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME media_receiver_metadata_copy
+                COMMAND test_media_receiver_metadata_copy)
+            set_tests_properties(media_receiver_metadata_copy PROPERTIES TIMEOUT 30)
+
+            add_executable(test_media_receiver_origin
+                tests/test_media_receiver_origin.c)
+            target_link_libraries(test_media_receiver_origin PRIVATE
+                moq-service-endpoint-test-internals moq::msf moq::sim)
+            target_include_directories(test_media_receiver_origin PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit)
+            if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+                target_compile_options(test_media_receiver_origin PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME media_receiver_origin COMMAND test_media_receiver_origin)
+            set_tests_properties(media_receiver_origin PROPERTIES TIMEOUT 30)
+
+            add_executable(test_media_receiver_fill_control
+                tests/test_media_receiver_fill_control.c)
+            target_link_libraries(test_media_receiver_fill_control PRIVATE
+                moq-service-endpoint-test-internals moq::msf moq::sim)
+            target_include_directories(test_media_receiver_fill_control PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit)
+            if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+                target_compile_options(test_media_receiver_fill_control PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME media_receiver_fill_control COMMAND test_media_receiver_fill_control)
+            set_tests_properties(media_receiver_fill_control PROPERTIES TIMEOUT 30)
+
+            # Fills of an MPEG2TS track: per-fill delivery domains, the
+            # terminal after the fill's Objects and its loss summary.
+            if(TARGET moq::mpeg2ts)
+                add_executable(test_media_receiver_ts_fill
+                    tests/test_media_receiver_ts_fill.c)
+                target_link_libraries(test_media_receiver_ts_fill PRIVATE
+                    moq-service-endpoint-test-internals moq::msf moq::mpeg2ts)
+                target_include_directories(test_media_receiver_ts_fill PRIVATE
+                    ${PROJECT_SOURCE_DIR}/tests/unit
+                    ${PROJECT_SOURCE_DIR}/media/mpeg2ts/tests)
+                target_compile_definitions(test_media_receiver_ts_fill PRIVATE
+                    ${_MOQ_SERVICE_TS_DEFS})
+                if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+                    target_compile_options(test_media_receiver_ts_fill PRIVATE
+                        -Wall -Wextra -Wpedantic
+                        $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+                endif()
+                add_test(NAME media_receiver_ts_fill COMMAND test_media_receiver_ts_fill)
+                set_tests_properties(media_receiver_ts_fill PROPERTIES TIMEOUT 30)
+            endif()
+
+            add_executable(test_media_catalog_bootstrap
+                tests/test_media_catalog_bootstrap.c)
+            target_link_libraries(test_media_catalog_bootstrap PRIVATE
+                moq-service-receiver-test-internals moq::msf moq::sim)
+            target_include_directories(test_media_catalog_bootstrap PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit)
+            if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+                target_compile_options(test_media_catalog_bootstrap PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME media_catalog_bootstrap COMMAND test_media_catalog_bootstrap)
+            set_tests_properties(media_catalog_bootstrap PROPERTIES TIMEOUT 30)
+
             # Description copy contract: writer/reader lock phase oracle,
             # functional oracle over the public function, and a production
             # description through the real pump hook with a scripted peer.
@@ -553,7 +764,7 @@ if(MOQ_BUILD_TESTS)
             target_link_libraries(test_media_receiver_desc_copy PRIVATE
                 moq-service-receiver-test-internals moq::sim)
             target_include_directories(test_media_receiver_desc_copy PRIVATE
-                ${CMAKE_SOURCE_DIR}/tests/unit)
+                ${PROJECT_SOURCE_DIR}/tests/unit)
             add_test(NAME media_receiver_desc_copy
                 COMMAND test_media_receiver_desc_copy)
             add_executable(test_media_receiver_scripted
@@ -561,15 +772,33 @@ if(MOQ_BUILD_TESTS)
             target_link_libraries(test_media_receiver_scripted PRIVATE
                 moq-service-receiver-test-internals moq::sim)
             target_include_directories(test_media_receiver_scripted PRIVATE
-                ${CMAKE_SOURCE_DIR}/tests/unit)
+                ${PROJECT_SOURCE_DIR}/tests/unit)
             add_test(NAME media_receiver_scripted
                 COMMAND test_media_receiver_scripted)
+            add_executable(test_media_receiver_malformed
+                tests/test_media_receiver_malformed.c)
+            target_link_libraries(test_media_receiver_malformed PRIVATE
+                moq-service-receiver-test-internals moq::sim)
+            target_include_directories(test_media_receiver_malformed PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit)
+            add_test(NAME media_receiver_malformed
+                COMMAND test_media_receiver_malformed)
+            add_executable(test_service_goaway_dispatch_receiver
+                tests/test_service_goaway_dispatch.c)
+            target_link_libraries(test_service_goaway_dispatch_receiver PRIVATE
+                moq-service-receiver-test-internals moq::sim)
+            target_compile_definitions(test_service_goaway_dispatch_receiver PRIVATE
+                SERVICE_GOAWAY_RECEIVER=1)
+            target_include_directories(test_service_goaway_dispatch_receiver PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit)
+            add_test(NAME service_goaway_dispatch_receiver
+                COMMAND test_service_goaway_dispatch_receiver)
             add_executable(test_media_receiver_wire_identity
                 tests/test_media_receiver_wire_identity.c)
             target_link_libraries(test_media_receiver_wire_identity PRIVATE
                 moq-service-receiver-test-internals moq::sim)
             target_include_directories(test_media_receiver_wire_identity PRIVATE
-                ${CMAKE_SOURCE_DIR}/tests/unit)
+                ${PROJECT_SOURCE_DIR}/tests/unit)
             add_test(NAME media_receiver_wire_identity
                 COMMAND test_media_receiver_wire_identity)
             add_executable(test_media_receiver_update_ack
@@ -577,7 +806,7 @@ if(MOQ_BUILD_TESTS)
             target_link_libraries(test_media_receiver_update_ack PRIVATE
                 moq-service-receiver-test-internals moq::sim)
             target_include_directories(test_media_receiver_update_ack PRIVATE
-                ${CMAKE_SOURCE_DIR}/tests/unit)
+                ${PROJECT_SOURCE_DIR}/tests/unit)
             add_test(NAME media_receiver_update_ack
                 COMMAND test_media_receiver_update_ack)
 
@@ -591,7 +820,7 @@ if(MOQ_BUILD_TESTS)
             target_link_libraries(test_media_receiver_largeobj PRIVATE
                 moq-service-receiver-test-internals moq::sim)
             target_include_directories(test_media_receiver_largeobj PRIVATE
-                ${CMAKE_SOURCE_DIR}/tests/unit)
+                ${PROJECT_SOURCE_DIR}/tests/unit)
             add_test(NAME media_receiver_largeobj
                 COMMAND test_media_receiver_largeobj)
 
@@ -602,7 +831,7 @@ if(MOQ_BUILD_TESTS)
             target_link_libraries(test_media_receiver_fetch_catalog PRIVATE
                 moq-service-receiver-test-internals moq::sim)
             target_include_directories(test_media_receiver_fetch_catalog PRIVATE
-                ${CMAKE_SOURCE_DIR}/tests/unit)
+                ${PROJECT_SOURCE_DIR}/tests/unit)
             add_test(NAME media_receiver_fetch_catalog
                 COMMAND test_media_receiver_fetch_catalog)
 
@@ -613,7 +842,7 @@ if(MOQ_BUILD_TESTS)
             target_link_libraries(test_media_receiver_fetch_catalog_reset PRIVATE
                 moq-service-receiver-test-internals moq::sim)
             target_include_directories(test_media_receiver_fetch_catalog_reset PRIVATE
-                ${CMAKE_SOURCE_DIR}/tests/unit)
+                ${PROJECT_SOURCE_DIR}/tests/unit)
             add_test(NAME media_receiver_fetch_catalog_reset
                 COMMAND test_media_receiver_fetch_catalog_reset)
 
@@ -625,7 +854,7 @@ if(MOQ_BUILD_TESTS)
             target_link_libraries(test_media_receiver_fetch_catalog_rejected PRIVATE
                 moq-service-receiver-test-internals moq::sim)
             target_include_directories(test_media_receiver_fetch_catalog_rejected PRIVATE
-                ${CMAKE_SOURCE_DIR}/tests/unit)
+                ${PROJECT_SOURCE_DIR}/tests/unit)
             add_test(NAME media_receiver_fetch_catalog_rejected
                 COMMAND test_media_receiver_fetch_catalog_rejected)
 
@@ -635,7 +864,7 @@ if(MOQ_BUILD_TESTS)
             target_link_libraries(test_media_receiver_roleless PRIVATE
                 moq-service-receiver-test-internals moq::sim)
             target_include_directories(test_media_receiver_roleless PRIVATE
-                ${CMAKE_SOURCE_DIR}/tests/unit)
+                ${PROJECT_SOURCE_DIR}/tests/unit)
             add_test(NAME media_receiver_roleless
                 COMMAND test_media_receiver_roleless)
 
@@ -648,7 +877,7 @@ if(MOQ_BUILD_TESTS)
             target_link_libraries(test_media_receiver_teardown PRIVATE
                 moq-service-receiver-test-internals moq::sim)
             target_include_directories(test_media_receiver_teardown PRIVATE
-                ${CMAKE_SOURCE_DIR}/tests/unit)
+                ${PROJECT_SOURCE_DIR}/tests/unit)
             add_test(NAME media_receiver_teardown
                 COMMAND test_media_receiver_teardown)
 
@@ -659,7 +888,7 @@ if(MOQ_BUILD_TESTS)
             target_link_libraries(test_media_receiver_teardown_retry PRIVATE
                 moq-service-receiver-test-internals moq::sim)
             target_include_directories(test_media_receiver_teardown_retry PRIVATE
-                ${CMAKE_SOURCE_DIR}/tests/unit)
+                ${PROJECT_SOURCE_DIR}/tests/unit)
             add_test(NAME media_receiver_teardown_retry
                 COMMAND test_media_receiver_teardown_retry)
         endif()
@@ -668,7 +897,7 @@ if(MOQ_BUILD_TESTS)
         # the sender would publish after add/remove, to pin coalescing and the
         # no-op dedup deterministically.
         add_library(moq-service-sender-test-internals OBJECT
-            src/media_sender.c src/endpoint.c)
+            src/media_sender.c src/endpoint.c src/endpoint_uri.c)
         target_include_directories(moq-service-sender-test-internals
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -680,13 +909,17 @@ if(MOQ_BUILD_TESTS)
             PUBLIC ${_MOQ_SERVICE_FACADE_LIBS})
         target_compile_features(moq-service-sender-test-internals
             PUBLIC c_std_11)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(moq-service-sender-test-internals PRIVATE -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
 
         add_executable(test_media_sender_catalog
             tests/test_media_sender_catalog.c)
         target_link_libraries(test_media_sender_catalog PRIVATE
             moq-service-sender-test-internals)
         target_include_directories(test_media_sender_catalog PRIVATE
-            ${CMAKE_SOURCE_DIR}/tests/unit)
+            ${PROJECT_SOURCE_DIR}/tests/unit)
         add_test(NAME media_sender_catalog COMMAND test_media_sender_catalog)
 
         add_executable(test_media_track_cfg_init tests/test_media_track_cfg_init.c)
@@ -701,10 +934,48 @@ if(MOQ_BUILD_TESTS)
             target_link_libraries(test_media_sender_priority PRIVATE
                 moq-service-sender-test-internals moq::sim)
             target_include_directories(test_media_sender_priority PRIVATE
-                ${CMAKE_SOURCE_DIR}/tests/unit)
+                ${PROJECT_SOURCE_DIR}/tests/unit)
             target_compile_options(test_media_sender_priority PRIVATE
                 $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
             add_test(NAME media_sender_priority COMMAND test_media_sender_priority)
+        endif()
+
+        add_executable(test_service_surfaces tests/test_service_surfaces.c)
+        target_link_libraries(test_service_surfaces PRIVATE
+            moq-service-sender-test-internals)
+        target_compile_definitions(test_service_surfaces PRIVATE
+            ${_MOQ_SERVICE_FACADE_DEFS})
+        target_include_directories(test_service_surfaces PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${PROJECT_SOURCE_DIR}/tests/unit)
+        add_test(NAME service_surfaces COMMAND test_service_surfaces)
+
+        if(TARGET moq::sim)
+            add_executable(test_service_goaway_dispatch_sender
+                tests/test_service_goaway_dispatch.c)
+            target_link_libraries(test_service_goaway_dispatch_sender PRIVATE
+                moq-service-sender-test-internals moq::sim)
+            target_include_directories(test_service_goaway_dispatch_sender PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit)
+            add_test(NAME service_goaway_dispatch_sender
+                COMMAND test_service_goaway_dispatch_sender)
+
+            add_executable(test_sender_companion tests/test_sender_companion.c)
+            target_link_libraries(test_sender_companion PRIVATE
+                moq-service-sender-test-internals moq::sim)
+            add_test(NAME sender_companion COMMAND test_sender_companion)
+
+            add_executable(test_media_sender_namespace_terminated
+                tests/test_media_sender_namespace_terminated.c)
+            target_link_libraries(test_media_sender_namespace_terminated PRIVATE
+                moq-service-sender-test-internals moq::sim Threads::Threads)
+            if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+                target_compile_options(test_media_sender_namespace_terminated PRIVATE
+                    -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME media_sender_namespace_terminated
+                COMMAND test_media_sender_namespace_terminated)
+            set_tests_properties(media_sender_namespace_terminated PROPERTIES TIMEOUT 30)
         endif()
 
         # MSF 5.1.2 generatedAt must not decide no-op dedup. Deterministic:
@@ -721,7 +992,7 @@ if(MOQ_BUILD_TESTS)
             target_link_libraries(test_media_sender_catalog_generatedat PRIVATE
                 moq-service-sender-test-internals moq::sim Threads::Threads)
             target_include_directories(test_media_sender_catalog_generatedat
-                PRIVATE ${CMAKE_SOURCE_DIR}/tests/unit)
+                PRIVATE ${PROJECT_SOURCE_DIR}/tests/unit)
             add_test(NAME media_sender_catalog_generatedat
                 COMMAND test_media_sender_catalog_generatedat)
         endif()
@@ -733,7 +1004,7 @@ if(MOQ_BUILD_TESTS)
         target_link_libraries(test_media_sender_lifecycle PRIVATE
             moq-service-sender-test-internals)
         target_include_directories(test_media_sender_lifecycle PRIVATE
-            ${CMAKE_SOURCE_DIR}/tests/unit)
+            ${PROJECT_SOURCE_DIR}/tests/unit)
         add_test(NAME media_sender_lifecycle
             COMMAND test_media_sender_lifecycle)
         # Checked construction arithmetic: ledger allocator, real result and
@@ -743,7 +1014,7 @@ if(MOQ_BUILD_TESTS)
         target_link_libraries(test_media_sender_construct_arith PRIVATE
             moq-service-sender-test-internals)
         target_include_directories(test_media_sender_construct_arith PRIVATE
-            ${CMAKE_SOURCE_DIR}/tests/unit)
+            ${PROJECT_SOURCE_DIR}/tests/unit)
         target_compile_options(test_media_sender_construct_arith PRIVATE
             -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
         add_test(NAME media_sender_construct_arith
@@ -756,7 +1027,7 @@ if(MOQ_BUILD_TESTS)
         target_link_libraries(test_media_sender_terminal_boundary PRIVATE
             moq-service-sender-test-internals)
         target_include_directories(test_media_sender_terminal_boundary PRIVATE
-            ${CMAKE_SOURCE_DIR}/tests/unit)
+            ${PROJECT_SOURCE_DIR}/tests/unit)
         target_compile_options(test_media_sender_terminal_boundary PRIVATE
             -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
         add_test(NAME media_sender_terminal_boundary
@@ -772,7 +1043,7 @@ if(MOQ_BUILD_TESTS)
         target_link_libraries(test_media_sender_track_arith PRIVATE
             moq-service-sender-test-internals)
         target_include_directories(test_media_sender_track_arith PRIVATE
-            ${CMAKE_SOURCE_DIR}/tests/unit)
+            ${PROJECT_SOURCE_DIR}/tests/unit)
         target_compile_options(test_media_sender_track_arith PRIVATE
             -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
         add_test(NAME media_sender_track_arith COMMAND test_media_sender_track_arith)
@@ -783,7 +1054,7 @@ if(MOQ_BUILD_TESTS)
         target_link_libraries(test_media_sender_deadline PRIVATE
             moq-service-sender-test-internals)
         target_include_directories(test_media_sender_deadline PRIVATE
-            ${CMAKE_SOURCE_DIR}/tests/unit)
+            ${PROJECT_SOURCE_DIR}/tests/unit)
         target_compile_options(test_media_sender_deadline PRIVATE
             -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
         add_test(NAME media_sender_deadline COMMAND test_media_sender_deadline)
@@ -796,39 +1067,67 @@ if(MOQ_BUILD_TESTS)
         set_tests_properties(media_sender_deadline_ceiling PROPERTIES TIMEOUT 30)
         # Pacing attribution: one production sender_hook == one drain pass,
         # driven against a real SimPair subscriber. Deterministic pump units.
-        add_executable(test_media_sender_pacing
-            tests/test_media_sender_pacing.c)
-        target_link_libraries(test_media_sender_pacing PRIVATE
-            moq-service-sender-test-internals moq::sim)
-        target_include_directories(test_media_sender_pacing PRIVATE
-            ${CMAKE_SOURCE_DIR}/tests/unit)
-        add_test(NAME media_sender_pacing
-            COMMAND test_media_sender_pacing)
+        # The SimPair-driven tests below need moq-sim (MOQ_BUILD_SIM).
+        if(TARGET moq::sim)
+            add_executable(test_media_sender_pacing
+                tests/test_media_sender_pacing.c)
+            target_link_libraries(test_media_sender_pacing PRIVATE
+                moq-service-sender-test-internals moq::sim)
+            target_include_directories(test_media_sender_pacing PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit)
+            if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+                target_compile_options(test_media_sender_pacing PRIVATE -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME media_sender_pacing
+                COMMAND test_media_sender_pacing)
+        endif()
 
         add_executable(test_media_sender_mpeg2ts
             tests/test_media_sender_mpeg2ts.c)
         target_link_libraries(test_media_sender_mpeg2ts PRIVATE
             moq-service-sender-test-internals Threads::Threads)
         target_include_directories(test_media_sender_mpeg2ts PRIVATE
-            ${CMAKE_SOURCE_DIR}/tests/unit
-            ${CMAKE_SOURCE_DIR}/media/mpeg2ts/tests)
+            ${PROJECT_SOURCE_DIR}/tests/unit
+            ${PROJECT_SOURCE_DIR}/media/mpeg2ts/tests)
         if(TARGET moq::mpeg2ts)
             target_compile_definitions(test_media_sender_mpeg2ts PRIVATE
                 MOQ_TEST_HAVE_MPEG2TS)
+        endif()
+        # The companion-refusal rows latch real sessions.
+        if(TARGET moq::sim)
+            target_link_libraries(test_media_sender_mpeg2ts PRIVATE moq::sim)
+            target_compile_definitions(test_media_sender_mpeg2ts PRIVATE
+                MOQ_TEST_HAVE_SIM)
         endif()
         target_compile_options(test_media_sender_mpeg2ts PRIVATE
             -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
         add_test(NAME media_sender_mpeg2ts COMMAND test_media_sender_mpeg2ts)
         set_tests_properties(media_sender_mpeg2ts PROPERTIES TIMEOUT 60)
 
-        add_executable(test_media_sender_reject
-            tests/test_media_sender_reject.c)
-        target_link_libraries(test_media_sender_reject PRIVATE
-            moq-service-sender-test-internals moq::sim)
-        target_include_directories(test_media_sender_reject PRIVATE
-            ${CMAKE_SOURCE_DIR}/tests/unit)
-        add_test(NAME media_sender_reject
-            COMMAND test_media_sender_reject)
+        if(TARGET moq::sim)
+            add_executable(test_media_sender_reject
+                tests/test_media_sender_reject.c)
+            target_link_libraries(test_media_sender_reject PRIVATE
+                moq-service-sender-test-internals moq::sim)
+            target_include_directories(test_media_sender_reject PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit)
+            add_test(NAME media_sender_reject
+                COMMAND test_media_sender_reject)
+        endif()
+
+        # TRACK_STATUS, unserved requests, Track Properties and new-group
+        # requests through the production sender hook.
+        if(TARGET moq::sim)
+            add_executable(test_media_sender_track_status
+                tests/test_media_sender_track_status.c)
+            target_link_libraries(test_media_sender_track_status PRIVATE
+                moq-service-sender-test-internals moq::sim)
+            target_include_directories(test_media_sender_track_status PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit)
+            add_test(NAME media_sender_track_status
+                COMMAND test_media_sender_track_status)
+        endif()
 
         # Automatic catalog-refresh test. Needs BOTH the sender and
         # receiver seams (a real sender publishes periodic catalogs; a real
@@ -838,7 +1137,7 @@ if(MOQ_BUILD_TESTS)
         # duplicate endpoint.c. Requires moq::msf and moq::sim.
         if(TARGET moq::sim)
             add_library(moq-service-refresh-test-internals OBJECT
-                src/media_sender.c src/media_receiver.c src/endpoint.c)
+                src/media_sender.c src/media_receiver.c src/endpoint.c src/endpoint_uri.c)
             target_include_directories(moq-service-refresh-test-internals
                 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -852,24 +1151,28 @@ if(MOQ_BUILD_TESTS)
                 PUBLIC ${_MOQ_SERVICE_FACADE_LIBS})
             target_compile_features(moq-service-refresh-test-internals
                 PUBLIC c_std_11)
+            if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+                target_compile_options(moq-service-refresh-test-internals PRIVATE -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
 
             add_executable(test_media_sender_refresh
                 tests/test_media_sender_refresh.c)
             target_link_libraries(test_media_sender_refresh PRIVATE
                 moq-service-refresh-test-internals moq::sim)
             target_include_directories(test_media_sender_refresh PRIVATE
-                ${CMAKE_SOURCE_DIR}/tests/unit)
+                ${PROJECT_SOURCE_DIR}/tests/unit)
             add_test(NAME media_sender_refresh
                 COMMAND test_media_sender_refresh)
 
             add_executable(test_media_mpeg2ts tests/test_media_mpeg2ts.c
-                ${CMAKE_SOURCE_DIR}/tests/support/media_builders.c)
+                ${PROJECT_SOURCE_DIR}/tests/support/media_builders.c)
             target_link_libraries(test_media_mpeg2ts PRIVATE
                 moq-service-refresh-test-internals moq::sim)
             target_include_directories(test_media_mpeg2ts PRIVATE
-                ${CMAKE_SOURCE_DIR}/tests/unit
-                ${CMAKE_SOURCE_DIR}/tests/support
-                ${CMAKE_SOURCE_DIR}/media/mpeg2ts/tests)
+                ${PROJECT_SOURCE_DIR}/tests/unit
+                ${PROJECT_SOURCE_DIR}/tests/support
+                ${PROJECT_SOURCE_DIR}/media/mpeg2ts/tests)
             if(TARGET moq::mpeg2ts)
                 target_compile_definitions(test_media_mpeg2ts PRIVATE
                     MOQ_TEST_HAVE_MPEG2TS)
@@ -879,6 +1182,23 @@ if(MOQ_BUILD_TESTS)
                 $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
             add_test(NAME media_mpeg2ts COMMAND test_media_mpeg2ts)
             set_tests_properties(media_mpeg2ts PROPERTIES TIMEOUT 120)
+
+            # Late joiner on draft 22: the catalog bootstrap is the section
+            # 3.5 join at the current group (SUBSCRIBE at the Next Object plus
+            # a fill of the current group), rebuilt from the fill alone, and a
+            # finite track ends with the fill counted in the Stream Count.
+            add_executable(test_media_late_joiner_fill
+                tests/test_media_late_joiner_fill.c)
+            target_link_libraries(test_media_late_joiner_fill PRIVATE
+                moq-service-refresh-test-internals moq::sim)
+            target_include_directories(test_media_late_joiner_fill PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit)
+            if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+                target_compile_options(test_media_late_joiner_fill PRIVATE -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME media_late_joiner_fill
+                COMMAND test_media_late_joiner_fill)
 
             # Negotiated-profile closure tests. Two independent directions
             # over the SAME substrate: a real sender's LOC-01 property bytes
@@ -898,8 +1218,8 @@ if(MOQ_BUILD_TESTS)
                 moq-service-refresh-test-internals moq::sim
                 np_runner_obj np_builder_obj np_oracle_obj)
             target_include_directories(test_np_closure_sender PRIVATE
-                ${CMAKE_SOURCE_DIR}/tests/unit
-                ${CMAKE_SOURCE_DIR}/tests/support/np)
+                ${PROJECT_SOURCE_DIR}/tests/unit
+                ${PROJECT_SOURCE_DIR}/tests/support/np)
             add_test(NAME np_closure_sender COMMAND test_np_closure_sender)
 
             add_executable(test_np_closure_receiver
@@ -908,10 +1228,21 @@ if(MOQ_BUILD_TESTS)
                 moq-service-refresh-test-internals moq::sim
                 np_runner_obj np_builder_obj np_oracle_obj)
             target_include_directories(test_np_closure_receiver PRIVATE
-                ${CMAKE_SOURCE_DIR}/tests/unit
-                ${CMAKE_SOURCE_DIR}/tests/support/np)
+                ${PROJECT_SOURCE_DIR}/tests/unit
+                ${PROJECT_SOURCE_DIR}/tests/support/np)
             add_test(NAME np_closure_receiver COMMAND test_np_closure_receiver)
         endif()
+
+        # Run the installed-package C consumer against the shipping target too.
+        add_executable(test_service_consumer_c tests/consumer/main.c)
+        target_link_libraries(test_service_consumer_c PRIVATE moq::service)
+        target_compile_features(test_service_consumer_c PRIVATE c_std_11)
+        if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(test_service_consumer_c PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME service_consumer_c COMMAND test_service_consumer_c)
 
         # C++17 public-header consumer: the service headers must compile,
         # link, and run from plain C++ (extern "C" surface only). Init-only,
@@ -944,7 +1275,28 @@ if(MOQ_BUILD_TESTS)
         target_link_libraries(test_endpoint_lifecycle PRIVATE
             moq::service moq::adapter-picoquic-threaded Threads::Threads)
         target_include_directories(test_endpoint_lifecycle PRIVATE
-            ${CMAKE_SOURCE_DIR}/tests/unit)
+            ${PROJECT_SOURCE_DIR}/tests/unit)
+        # endpoint_offer_expect.h reads the provider's draft-22 capability
+        # under the facade definitions the service was built with.
+        target_compile_definitions(test_endpoint_lifecycle PRIVATE
+            ${_MOQ_SERVICE_FACADE_DEFS})
+        if(MOQ_BUILD_PICO_WT_MANAGED)
+            # The offer actually sent, raw QUIC ALPN and WT-Available-Protocols,
+            # recorded by a plain picoquic/h3zero server on loopback.
+            add_executable(test_endpoint_offer_wire tests/test_endpoint_offer_wire.c)
+            target_link_libraries(test_endpoint_offer_wire PRIVATE
+                moq::service moq::adapter-picoquic-threaded
+                moq::adapter-pico-wt-managed picoquic::picohttp-core
+                Threads::Threads)
+            target_include_directories(test_endpoint_offer_wire PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit)
+            add_test(NAME endpoint_offer_wire
+                COMMAND test_endpoint_offer_wire
+                    --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                    --key "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+            set_tests_properties(endpoint_offer_wire PROPERTIES
+                LABELS "network" TIMEOUT 120 RESOURCE_LOCK service_network)
+        endif()
         add_test(NAME endpoint_lifecycle
             COMMAND test_endpoint_lifecycle
                 --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
@@ -965,7 +1317,7 @@ if(MOQ_BUILD_TESTS)
             moq::service moq::adapter-picoquic-threaded moq::msf
             Threads::Threads)
         target_include_directories(test_media_sender_demand_refresh PRIVATE
-            ${CMAKE_SOURCE_DIR}/tests/unit)
+            ${PROJECT_SOURCE_DIR}/tests/unit)
         add_test(NAME media_sender_demand_refresh
             COMMAND test_media_sender_demand_refresh
                 --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
@@ -977,7 +1329,7 @@ if(MOQ_BUILD_TESTS)
             moq::service moq::adapter-picoquic-threaded moq::msf
             Threads::Threads)
         target_include_directories(test_media_sender_idle_refresh PRIVATE
-            ${CMAKE_SOURCE_DIR}/tests/unit)
+            ${PROJECT_SOURCE_DIR}/tests/unit)
         add_test(NAME media_sender_idle_refresh
             COMMAND test_media_sender_idle_refresh
                 --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
@@ -987,13 +1339,13 @@ if(MOQ_BUILD_TESTS)
 
         add_executable(test_media_receiver
             tests/test_media_receiver.c
-            ${CMAKE_SOURCE_DIR}/tests/support/media_builders.c)
+            ${PROJECT_SOURCE_DIR}/tests/support/media_builders.c)
         target_link_libraries(test_media_receiver PRIVATE
             moq::service moq::adapter-picoquic-threaded moq::msf
             Threads::Threads)
         target_include_directories(test_media_receiver PRIVATE
-            ${CMAKE_SOURCE_DIR}/tests/unit
-            ${CMAKE_SOURCE_DIR}/tests/support)
+            ${PROJECT_SOURCE_DIR}/tests/unit
+            ${PROJECT_SOURCE_DIR}/tests/support)
         add_test(NAME media_receiver
             COMMAND test_media_receiver
                 --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
@@ -1011,8 +1363,8 @@ if(MOQ_BUILD_TESTS)
                 moq::service moq::adapter-picoquic-threaded moq::msf
                 moq::mpeg2ts Threads::Threads)
             target_include_directories(test_media_mpeg2ts_loopback PRIVATE
-                ${CMAKE_SOURCE_DIR}/tests/unit
-                ${CMAKE_SOURCE_DIR}/media/mpeg2ts/tests)
+                ${PROJECT_SOURCE_DIR}/tests/unit
+                ${PROJECT_SOURCE_DIR}/media/mpeg2ts/tests)
             target_compile_options(test_media_mpeg2ts_loopback PRIVATE
                 -Wall -Wextra -Wpedantic
                 $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
@@ -1030,7 +1382,7 @@ if(MOQ_BUILD_TESTS)
             moq::service moq::adapter-picoquic-threaded moq::msf
             Threads::Threads)
         target_include_directories(test_media_receiver_subscribe PRIVATE
-            ${CMAKE_SOURCE_DIR}/tests/unit)
+            ${PROJECT_SOURCE_DIR}/tests/unit)
         add_test(NAME media_receiver_subscribe
             COMMAND test_media_receiver_subscribe
                 --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
@@ -1040,13 +1392,15 @@ if(MOQ_BUILD_TESTS)
 
         add_executable(test_media_sender
             tests/test_media_sender.c
-            ${CMAKE_SOURCE_DIR}/tests/support/media_builders.c)
+            ${PROJECT_SOURCE_DIR}/tests/support/media_builders.c)
         target_link_libraries(test_media_sender PRIVATE
             moq::service moq::adapter-picoquic-threaded moq::msf
             Threads::Threads)
         target_include_directories(test_media_sender PRIVATE
-            ${CMAKE_SOURCE_DIR}/tests/unit
-            ${CMAKE_SOURCE_DIR}/tests/support)
+            ${PROJECT_SOURCE_DIR}/tests/unit
+            ${PROJECT_SOURCE_DIR}/tests/support)
+        target_compile_definitions(test_media_sender PRIVATE
+            ${_MOQ_SERVICE_FACADE_DEFS})
         # Dedicated internals-linked cursor test: the ONLY network binary on
         # the MOQ_MEDIA_SENDER_TESTING rail (the production suite above links
         # the shipping moq::service). Narrowly scoped: one push-mode consumer,
@@ -1058,7 +1412,7 @@ if(MOQ_BUILD_TESTS)
             moq::adapter-picoquic-threaded moq::msf
             Threads::Threads)
         target_include_directories(test_media_sender_push_cursor PRIVATE
-            ${CMAKE_SOURCE_DIR}/tests/unit)
+            ${PROJECT_SOURCE_DIR}/tests/unit)
         add_test(NAME media_sender_push_cursor
             COMMAND test_media_sender_push_cursor
                 --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
@@ -1096,7 +1450,7 @@ if(MOQ_BUILD_TESTS)
             moq_write_consumer_abi_context("${_svc_abi_context}")
             add_test(NAME service_pkgconfig_consumer
                 COMMAND bash
-                    "${CMAKE_SOURCE_DIR}/adapters/pico_wt/tests/run_pkgconfig_consumer.sh"
+                    "${PROJECT_SOURCE_DIR}/adapters/pico_wt/tests/run_pkgconfig_consumer.sh"
                     "${CMAKE_COMMAND}"
                     "libmoq-service"
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer/main.c"
@@ -1120,20 +1474,36 @@ if(MOQ_BUILD_TESTS)
     # endpoint client (backend = MSQUIC) against a managed MsQuic server peer,
     # one SUBSCRIBE + object + clean close. Self-signed certs into the build
     # dir (its own fixture -- the adapter's msquic_gen_certs lives in a
-    # different tree). Port 0 (ephemeral) on both sides, so no port lock.
+    # different tree). The server listens on port 0, which the facade picks
+    # so IPv4 clients reach it (adapters/common/moq_listen_port.h), so no
+    # port lock.
     if(MOQ_BUILD_MSQUIC_MANAGED)
         add_executable(test_endpoint_msquic_smoke
             tests/test_endpoint_msquic_smoke.c)
         target_link_libraries(test_endpoint_msquic_smoke PRIVATE
             moq::service moq::adapter-msquic-managed Threads::Threads)
         target_include_directories(test_endpoint_msquic_smoke PRIVATE
-            ${CMAKE_SOURCE_DIR}/tests/unit)
+            ${PROJECT_SOURCE_DIR}/tests/unit
+            ${PROJECT_SOURCE_DIR}/tests/support
+            ${PROJECT_SOURCE_DIR}/adapters/msquic/tests)
+        add_executable(test_endpoint_target_setup
+            tests/test_endpoint_target_setup.c)
+        target_link_libraries(test_endpoint_target_setup PRIVATE
+            moq::service moq::adapter-msquic-managed Threads::Threads)
+        target_compile_definitions(test_endpoint_target_setup PRIVATE
+            ${_MOQ_SERVICE_FACADE_DEFS})
+        target_include_directories(test_endpoint_target_setup PRIVATE
+            ${PROJECT_SOURCE_DIR}/tests/unit
+            ${PROJECT_SOURCE_DIR}/tests/support
+            ${PROJECT_SOURCE_DIR}/adapters/msquic/tests)
         add_executable(test_endpoint_msquic_sender_teardown
             tests/test_endpoint_msquic_sender_teardown.c)
         target_link_libraries(test_endpoint_msquic_sender_teardown PRIVATE
             moq::service moq::adapter-msquic-managed Threads::Threads)
         target_include_directories(test_endpoint_msquic_sender_teardown PRIVATE
-            ${CMAKE_SOURCE_DIR}/tests/unit)
+            ${PROJECT_SOURCE_DIR}/tests/unit
+            ${PROJECT_SOURCE_DIR}/tests/support
+            ${PROJECT_SOURCE_DIR}/adapters/msquic/tests)
         find_program(MOQ_OPENSSL openssl)
         if(MOQ_OPENSSL)
             add_test(NAME service_msquic_gen_certs
@@ -1152,6 +1522,28 @@ if(MOQ_BUILD_TESTS)
             set_tests_properties(endpoint_msquic_smoke PROPERTIES
                 FIXTURES_REQUIRED service_msquic_certs
                 LABELS "network;msquic" TIMEOUT 120)
+            # The same smoke while IPv4-only sockets hold much of the
+            # ephemeral range (tests/support/port_shadow.c).
+            if(NOT WIN32)
+                add_test(NAME endpoint_msquic_smoke_port_shadow
+                    COMMAND $<TARGET_FILE:moq_port_shadow> --
+                        $<TARGET_FILE:test_endpoint_msquic_smoke>
+                        --cert ${CMAKE_CURRENT_BINARY_DIR}/msquic_cert.pem
+                        --key ${CMAKE_CURRENT_BINARY_DIR}/msquic_key.pem)
+                # Every port-shadow test holds thousands of IPv4 ports for its run; two at
+                # once can exhaust the ephemeral range, so they share one resource lock.
+                set_tests_properties(endpoint_msquic_smoke_port_shadow PROPERTIES
+                    FIXTURES_REQUIRED service_msquic_certs
+                    LABELS "network;msquic" TIMEOUT 180
+                    RESOURCE_LOCK ipv4_port_shadow)
+            endif()
+            add_test(NAME endpoint_target_setup
+                COMMAND test_endpoint_target_setup
+                    --cert ${CMAKE_CURRENT_BINARY_DIR}/msquic_cert.pem
+                    --key ${CMAKE_CURRENT_BINARY_DIR}/msquic_key.pem)
+            set_tests_properties(endpoint_target_setup PROPERTIES
+                FIXTURES_REQUIRED service_msquic_certs
+                LABELS "network;msquic" TIMEOUT 180)
             add_test(NAME endpoint_msquic_sender_teardown
                 COMMAND test_endpoint_msquic_sender_teardown
                     --cert ${CMAKE_CURRENT_BINARY_DIR}/msquic_cert.pem
@@ -1166,7 +1558,9 @@ if(MOQ_BUILD_TESTS)
     # endpoint client (backend = WTQUIC_MSQUIC) against the same facade in server
     # mode, one SUBSCRIBE + object + clean close, run once per draft with real
     # WT-Protocol negotiation. Cross-platform (wherever wtquic's MsQuic component
-    # builds). Self-signed certs into the build dir; port 0 (ephemeral).
+    # builds). Self-signed certs into the build dir; the server listens on port
+    # 0, which the facade picks so IPv4 clients reach it
+    # (adapters/common/moq_listen_port.h).
     if(MOQ_BUILD_WTQUIC_MSQUIC_MANAGED)
         add_executable(test_endpoint_wtquic_msquic_smoke
             tests/test_endpoint_wtquic_msquic_smoke.c)
@@ -1174,7 +1568,9 @@ if(MOQ_BUILD_TESTS)
             moq::service moq::adapter-wtquic-msquic-managed
             moq::adapter-wtquic wtq::msquic Threads::Threads)
         target_include_directories(test_endpoint_wtquic_msquic_smoke PRIVATE
-            ${CMAKE_SOURCE_DIR}/tests/unit)
+            ${PROJECT_SOURCE_DIR}/tests/unit
+            ${PROJECT_SOURCE_DIR}/tests/support
+            ${PROJECT_SOURCE_DIR}/adapters/wtquic/tests)
         find_program(MOQ_OPENSSL openssl)
         if(MOQ_OPENSSL)
             add_test(NAME service_wtquic_msquic_gen_certs
@@ -1267,7 +1663,7 @@ if(MOQ_BUILD_TESTS)
             moq::service moq::adapter-wtquic-network-managed
             moq::adapter-wtquic Threads::Threads)
         target_include_directories(test_endpoint_wtquic_network_smoke PRIVATE
-            ${CMAKE_SOURCE_DIR}/tests/unit)
+            ${PROJECT_SOURCE_DIR}/tests/unit)
         find_program(MOQ_OPENSSL openssl)
         if(MOQ_OPENSSL)
             add_test(NAME service_wtquic_network_gen_certs
@@ -1303,7 +1699,9 @@ if(MOQ_BUILD_TESTS)
             target_link_libraries(wtquic_network_smoke_server PRIVATE
                 moq::adapter-wtquic moq::loc wtq::msquic Threads::Threads)
             target_include_directories(wtquic_network_smoke_server PRIVATE
-                ${PROJECT_SOURCE_DIR}/media/msf/include)
+                ${PROJECT_SOURCE_DIR}/media/msf/include
+                ${PROJECT_SOURCE_DIR}/tests/support
+                ${PROJECT_SOURCE_DIR}/adapters/wtquic/tests)
         endif()
 
         # NF-only installed packaging: CMake COMPONENTS service consumer

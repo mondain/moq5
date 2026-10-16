@@ -21,7 +21,8 @@
 
 _Static_assert(MOQ_MEDIA_OBJECT_PARSE_CFG_V0_SIZE == 8,
                "config floor through companion_profile must remain eight bytes");
-_Static_assert(MOQ_MEDIA_PARSED_OBJECT_V0_SIZE == sizeof(moq_media_parsed_object_t),
+_Static_assert(MOQ_MEDIA_PARSED_OBJECT_V0_SIZE ==
+                   offsetof(moq_media_parsed_object_t, metadata),
                "parsed output floor must include original tail padding");
 
 /*
@@ -38,14 +39,37 @@ static bool track_transport_version(const moq_media_track_info_t *track,
         *out = MOQ_VERSION_DRAFT_16;
         return true;
     }
-    switch (track->transport_version) {
-    case MOQ_VERSION_DRAFT_16:
-    case MOQ_VERSION_DRAFT_18:
-        *out = track->transport_version;
-        return true;
-    default:
+    if (track->transport_version != MOQ_VERSION_DRAFT_16 &&
+        track->transport_version != MOQ_VERSION_DRAFT_18 &&
+        track->transport_version != MOQ_VERSION_DRAFT_22)
         return false;
+    *out = track->transport_version;
+    return true;
+}
+
+/* Exact floor(ticks * 1e6 / scale), without a wide-integer target dependency.
+ * The fractional loop tracks quotient/remainder of a binary multiplier prefix;
+ * subtract-before-add keeps each remainder below scale even near UINT64_MAX. */
+static bool loc_time_us(uint64_t ticks, uint64_t scale, uint64_t *out_us)
+{
+    if (scale == 0) return false;
+    const uint64_t whole = ticks / scale;
+    const uint64_t rem = ticks % scale;
+    if (whole > UINT64_MAX / 1000000u) return false;
+    uint64_t us = whole * 1000000u;
+    uint64_t frac = 0, r = 0;
+    for (uint32_t bit = UINT32_C(1) << 19; bit != 0; bit >>= 1) {
+        frac *= 2;
+        if (r >= scale - r) { r -= scale - r; ++frac; }
+        else r += r;
+        if (UINT32_C(1000000) & bit) {
+            if (r >= scale - rem) { r -= scale - rem; ++frac; }
+            else r += rem;
+        }
     }
+    if (frac > UINT64_MAX - us) return false;
+    *out_us = us + frac;
+    return true;
 }
 
 
@@ -84,9 +108,83 @@ void moq_media_object_input_init(moq_media_object_input_t *in)
 void moq_media_parsed_object_init(moq_media_parsed_object_t *out)
 {
     if (!out) return;
-    memset(out, 0, sizeof(*out));
-    out->struct_size = sizeof(*out);
+    memset(out, 0, MOQ_MEDIA_PARSED_OBJECT_V0_SIZE);
+    out->struct_size = (uint32_t)MOQ_MEDIA_PARSED_OBJECT_V0_SIZE;
     out->sap_type = MOQ_SAP_UNKNOWN;  /* NONE (0) means "known not a SAP" */
+}
+
+void moq_media_parsed_object_init_sized(moq_media_parsed_object_t *out,
+                                       size_t out_size)
+{
+    if (!out || out_size < sizeof(out->struct_size)) return;
+    size_t n = out_size < sizeof(*out) ? out_size : sizeof(*out);
+    memset(out, 0, n);
+    out->struct_size = (uint32_t)n;
+    if (n >= offsetof(moq_media_parsed_object_t, sap_type) + sizeof(out->sap_type))
+        out->sap_type = MOQ_SAP_UNKNOWN;
+    if (n >= MOQ_MEDIA_PARSED_OBJECT_METADATA_SIZE) {
+        out->metadata.struct_size = (uint32_t)sizeof(out->metadata);
+        moq_loc_metadata_init_sized(&out->metadata.loc, sizeof(out->metadata.loc));
+    }
+}
+
+_Static_assert(MOQ_MEDIA_METADATA_V0_SIZE == sizeof(moq_media_metadata_t),
+               "complete media metadata v0 floor");
+
+static moq_result_t media_track_metadata_validate(const moq_loc_metadata_t *track,
+                                                  bool d22)
+{
+    if (!track) return MOQ_OK;
+    if (track->struct_size < MOQ_LOC_METADATA_V0_SIZE ||
+        (track->present & ~MOQ_LOC_METADATA_PRESENT_MASK) ||
+        track->reserved[0] || track->reserved[1]) return MOQ_ERR_INVAL;
+    if (((track->present & MOQ_LOC_METADATA_HAS_VIDEO_CONFIG) &&
+         track->video_config.len && !track->video_config.data) ||
+        ((track->present & MOQ_LOC_METADATA_HAS_AUDIO_CONFIG) &&
+         track->audio_config.len && !track->audio_config.data)) return MOQ_ERR_INVAL;
+    if (!d22 && (track->present & (MOQ_LOC_METADATA_HAS_TIMESCALE |
+                                  MOQ_LOC_METADATA_HAS_AUDIO_CONFIG)))
+        return MOQ_ERR_UNSUPPORTED;
+    return MOQ_OK;
+}
+
+static moq_result_t media_metadata_parse(moq_version_t version,
+    moq_loc_profile_t profile, moq_bytes_t properties,
+    const moq_loc_metadata_t *track,
+    moq_media_metadata_t *out)
+{
+    moq_result_t rc = moq_loc_parse_metadata(version, profile, properties,
+                                             &out->loc, sizeof(out->loc));
+    if (rc != MOQ_OK) return rc;
+    if (track) {
+        uint32_t inherited = track->present & ~out->loc.present &
+            (MOQ_LOC_METADATA_HAS_TIMESCALE | MOQ_LOC_METADATA_HAS_VIDEO_CONFIG |
+             MOQ_LOC_METADATA_HAS_AUDIO_CONFIG);
+        if (inherited & MOQ_LOC_METADATA_HAS_TIMESCALE)
+            out->loc.timescale = track->timescale;
+        if (inherited & MOQ_LOC_METADATA_HAS_VIDEO_CONFIG)
+            out->loc.video_config = track->video_config;
+        if (inherited & MOQ_LOC_METADATA_HAS_AUDIO_CONFIG)
+            out->loc.audio_config = track->audio_config;
+        out->loc.present |= inherited;
+    }
+    out->struct_size = (uint32_t)sizeof(*out);
+    if (out->loc.present & MOQ_LOC_METADATA_HAS_TIMESTAMP) {
+        if (out->loc.present & MOQ_LOC_METADATA_HAS_TIMESCALE) {
+            out->time_domain = MOQ_MEDIA_TIME_DOMAIN_APPLICATION_MEDIA;
+            out->has_time_us = loc_time_us(out->loc.timestamp, out->loc.timescale, &out->time_us);
+        } else {
+            out->time_domain = MOQ_MEDIA_TIME_DOMAIN_UNIX_US;
+            out->has_time_us = 1;
+            out->time_us = out->loc.timestamp;
+        }
+    }
+    if ((out->loc.present & MOQ_LOC_METADATA_HAS_MARKING) &&
+        out->loc.marking_len <= (profile == MOQ_LOC_PROFILE_04 ? 3 : 2)) {
+        out->independence_known = 1;
+        out->independent = (out->loc.marking[0] & 0x20u) != 0;
+    }
+    return MOQ_OK;
 }
 
 /* -- Checked timestamp scaling --------------------------------------- */
@@ -207,6 +305,8 @@ static moq_result_t media_object_parse_into(
     size_t sample_cap,
     moq_media_parsed_object_t *out,
     moq_media_drop_reason_t *drop_reason,
+    bool metadata,
+    const moq_loc_metadata_t *track_metadata,
     uint32_t packet_size)
 {
     if (drop_reason) *drop_reason = 0;
@@ -220,6 +320,8 @@ static moq_result_t media_object_parse_into(
      * not depend on whether a LOC block happens to be present. */
     moq_version_t transport_version;
     if (!track_transport_version(track, &transport_version))
+        return MOQ_ERR_INVAL;
+    if (!metadata && transport_version == MOQ_VERSION_DRAFT_22)
         return MOQ_ERR_INVAL;
 
     if (track->media_type != MOQ_MEDIA_TYPE_VIDEO &&
@@ -269,9 +371,22 @@ static moq_result_t media_object_parse_into(
             props.len = moq_rcbuf_len(in->properties);
         }
 
-        if (props.len > 0 || track->packaging == MOQ_MEDIA_PACKAGING_RAW) {
+        if (metadata) {
+            moq_loc_profile_t profile = transport_version == MOQ_VERSION_DRAFT_22 ?
+                MOQ_LOC_PROFILE_04 : MOQ_LOC_PROFILE_01;
+            moq_result_t lr = media_metadata_parse(transport_version,
+                profile, props, track_metadata, &out->metadata);
+            if (lr == MOQ_ERR_PROTO && drop_reason)
+                *drop_reason = MOQ_MEDIA_DROP_MALFORMED_LOC;
+            if (lr != MOQ_OK) return lr;
+            if (out->metadata.time_domain == MOQ_MEDIA_TIME_DOMAIN_UNIX_US &&
+                out->metadata.has_time_us) {
+                out->has_capture_time = true;
+                out->capture_time_us = out->metadata.time_us;
+            }
+        } else if (props.len > 0 || track->packaging == MOQ_MEDIA_PACKAGING_RAW) {
             moq_result_t lr = moq_loc_parse(transport_version,
-                                            MOQ_LOC_PROFILE_01, props, &loc);
+                MOQ_LOC_PROFILE_01, props, &loc);
             if (lr == MOQ_ERR_PROTO) {
                 if (drop_reason) *drop_reason = MOQ_MEDIA_DROP_MALFORMED_LOC;
                 return MOQ_ERR_PROTO;
@@ -282,8 +397,8 @@ static moq_result_t media_object_parse_into(
     }
 
     if (loc_parsed && loc.has_timestamp) {
-        out->has_capture_time = true;
         out->capture_time_us = loc.timestamp;
+        out->has_capture_time = true;
     }
 
     /* LOC video frame marking is authoritative for keyframe/independence when
@@ -294,6 +409,9 @@ static moq_result_t media_object_parse_into(
     bool keyframe_from_loc = false;
     if (track->media_type == MOQ_MEDIA_TYPE_AUDIO) {
         out->keyframe = true;
+    } else if (metadata && out->metadata.independence_known) {
+        out->keyframe = out->metadata.independent != 0;
+        keyframe_from_loc = true;
     } else if (loc_parsed && loc.has_video_frame_marking) {
         out->keyframe = loc.video_frame_marking.independent;
         keyframe_from_loc = true;
@@ -310,7 +428,11 @@ static moq_result_t media_object_parse_into(
          * stricter per-frame timing requirement belongs to playback-level code,
          * which sees has_capture_time. When the timestamp IS present it drives
          * decode/presentation time as before. */
-        if (out->has_capture_time) {
+        if (metadata && out->metadata.has_time_us) {
+            out->decode_time_us = out->metadata.time_us;
+            out->composition_offset_us = 0;
+            out->presentation_time_us = out->metadata.time_us;
+        } else if (out->has_capture_time) {
             out->decode_time_us = out->capture_time_us;
             out->composition_offset_us = 0;
             out->presentation_time_us = out->capture_time_us;
@@ -430,51 +552,59 @@ static moq_result_t media_object_parse_into(
 moq_result_t moq_media_object_parse(
     const moq_media_track_info_t *track,
     const moq_media_object_input_t *in,
-    moq_cmaf_sample_t *samples, size_t sample_cap,
-    moq_media_parsed_object_t *out, moq_media_drop_reason_t *drop_reason)
+    moq_cmaf_sample_t *samples,
+    size_t sample_cap,
+    moq_media_parsed_object_t *out,
+    moq_media_drop_reason_t *drop_reason)
 {
     return media_object_parse_into(track, in, samples, sample_cap, out,
-                                   drop_reason, 0);
+                                   drop_reason, false, NULL, 0);
 }
 
 moq_result_t moq_media_object_parse_sized(
     const moq_media_track_info_t *track,
     const moq_media_object_input_t *in,
     const moq_media_object_parse_cfg_t *cfg,
-    moq_cmaf_sample_t *samples, size_t sample_cap,
-    moq_media_parsed_object_t *out, size_t out_size,
+    moq_cmaf_sample_t *samples,
+    size_t sample_cap,
+    moq_media_parsed_object_t *out,
+    size_t out_size,
     moq_media_drop_reason_t *drop_reason)
 {
     if (!track || !in || !out || track->struct_size < TRACK_INFO_MIN_SIZE ||
-        in->struct_size < OBJECT_INPUT_MIN_SIZE ||
-        out_size < MOQ_MEDIA_PARSED_OBJECT_V0_SIZE)
-        return MOQ_ERR_INVAL;
+        in->struct_size < OBJECT_INPUT_MIN_SIZE) return MOQ_ERR_INVAL;
     if (cfg && cfg->struct_size < MOQ_MEDIA_OBJECT_PARSE_CFG_V0_SIZE)
         return MOQ_ERR_INVAL;
-    uint32_t profile = cfg ? cfg->companion_profile :
+    moq_media_companion_profile_t companion_profile = cfg ? cfg->companion_profile :
         MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01;
-    if (profile != MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01 &&
-        profile != MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC)
-        return MOQ_ERR_INVAL;
-    if (profile == MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC)
-        return MOQ_ERR_UNSUPPORTED;
     moq_version_t version;
-    if (!track_transport_version(track, &version)) return MOQ_ERR_INVAL;
+    if (!track_transport_version(track, &version) ||
+        (companion_profile != MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01 &&
+         companion_profile != MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC))
+        return MOQ_ERR_INVAL;
+    bool d22 = companion_profile == MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC;
+    if (d22 != (version == MOQ_VERSION_DRAFT_22)) return MOQ_ERR_UNSUPPORTED;
+    if (d22 && out_size < MOQ_MEDIA_PARSED_OBJECT_METADATA_SIZE)
+        return MOQ_ERR_UNSUPPORTED;
+    if (out_size < MOQ_MEDIA_PARSED_OBJECT_V0_SIZE) return MOQ_ERR_INVAL;
 #define PARSE_CFG_HAS(field) \
     (cfg && cfg->struct_size >= offsetof(moq_media_object_parse_cfg_t, field) + \
                                sizeof(cfg->field))
-    if (PARSE_CFG_HAS(track_loc_metadata) && cfg->track_loc_metadata)
-        return MOQ_ERR_UNSUPPORTED;
+    const moq_loc_metadata_t *track_metadata =
+        PARSE_CFG_HAS(track_loc_metadata) ? cfg->track_loc_metadata : NULL;
     uint32_t packet_size = PARSE_CFG_HAS(mpeg2ts_packet_size) ?
         cfg->mpeg2ts_packet_size : 0;
 #undef PARSE_CFG_HAS
+    moq_result_t rc = media_track_metadata_validate(track_metadata, d22);
+    if (rc != MOQ_OK) return rc;
     if (track->packaging == MOQ_MEDIA_PACKAGING_MPEG2TS &&
         packet_size != 188 && packet_size != 192)
         return MOQ_ERR_INVAL;
     moq_media_parsed_object_t tmp;
-    moq_media_parsed_object_init(&tmp);
-    moq_result_t rc = media_object_parse_into(track, in, samples, sample_cap,
-                                             &tmp, drop_reason, packet_size);
+    moq_media_parsed_object_init_sized(&tmp, sizeof(tmp));
+    rc = media_object_parse_into(track, in, samples, sample_cap,
+                                 &tmp, drop_reason, true, track_metadata,
+                                 packet_size);
     if (rc == MOQ_OK || rc == MOQ_ERR_BUFFER) {
         size_t n = out_size < sizeof(tmp) ? out_size : sizeof(tmp);
         tmp.struct_size = (uint32_t)n;

@@ -13,6 +13,7 @@
 #include <moq/loc.h>
 #include <moq/wire.h>   /* MOQ_QUIC_VARINT_MAX */
 #include "test_support.h"
+#include "endpoint_offer_expect.h"
 #include "media_builders.h"  /* shared CENC-protected init builder */
 
 #include <pthread.h>
@@ -88,6 +89,11 @@ typedef struct {
     bool         push_fetch;      /* enable the bootstrap FETCH */
     bool         push_join;       /* issue it as a Joining FETCH(offset 0) */
     bool         offer_d18;       /* server ALPN list carries moqt-18 first */
+    bool         offer_d22;       /* server ALPN list carries moqt-22, then
+                                     moqt-18 and moqt-16, so the client's
+                                     single exact offer decides the draft */
+    atomic_uint  session_version; /* the established session's draft,
+                                     latched by the pump (0 until then) */
     /* Deterministic ordering barrier for the publication-keyed join: one
      * benign REQUEST_UPDATE on the PUBLISH request bidi, whose ACK proves the
      * remote publisher processed our PUBLISH_OK. */
@@ -230,6 +236,10 @@ static int server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
     moq_session_t *session = moq_pq_threaded_session(t);
     if (!session) return 0;
     if (moq_session_state(session) != MOQ_SESS_ESTABLISHED) return 0;
+    /* Delivered LOC properties are parsed in the codec and revision of the
+     * draft this session actually negotiated. */
+    const moq_version_t sess_ver = moq_session_version(session);
+    atomic_store(&st->session_version, (unsigned)sess_ver);
 
     moq_event_t ev;
     while (moq_session_poll_events(session, &ev, 1) == 1) {
@@ -330,13 +340,26 @@ static int server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
                     r->priority = o->publisher_priority;
                     if (o->payload && moq_rcbuf_len(o->payload) > 0)
                         r->first_byte = moq_rcbuf_data(o->payload)[0];
-                    if (o->properties) {
+                    if (o->properties && sess_ver == MOQ_VERSION_DRAFT_22) {
+                        /* Draft 22 carries LOC-04 metadata. */
+                        moq_loc_metadata_t md;
+                        moq_bytes_t pb = { moq_rcbuf_data(o->properties),
+                                           moq_rcbuf_len(o->properties) };
+                        if (moq_loc_parse_metadata(sess_ver,
+                                moq_loc_profile_for_version(sess_ver), pb,
+                                &md, sizeof(md)) == MOQ_OK) {
+                            r->has_ts = (md.present &
+                                         MOQ_LOC_METADATA_HAS_TIMESTAMP) != 0;
+                            r->ts = md.timestamp;
+                        }
+                    } else if (o->properties) {
                         moq_loc_headers_t h;
                         moq_loc_headers_init(&h);
                         moq_bytes_t pb = { moq_rcbuf_data(o->properties),
                                            moq_rcbuf_len(o->properties) };
-                        if (moq_loc_parse(MOQ_VERSION_DRAFT_16, MOQ_LOC_PROFILE_01, pb, &h)
-                            == MOQ_OK) {
+                        if (moq_loc_parse(sess_ver,
+                                          moq_loc_profile_for_version(sess_ver),
+                                          pb, &h) == MOQ_OK) {
                             r->has_ts = h.has_timestamp;
                             r->ts = h.timestamp;
                             r->keyframe = h.has_video_frame_marking &&
@@ -642,9 +665,14 @@ static moq_pq_threaded_t *start_server(const char *cert, const char *key,
          * A test that needs draft-18 opts in; the server then picks the first
          * of this list the client offers, so a draft-16 client is unaffected. */
         static const char *const alpn18[] = { "moqt-18", "moqt-16" };
+        static const char *const alpn22[] = { "moqt-22", "moqt-18", "moqt-16" };
         if (st->offer_d18) {
             cfg.alpn_list = alpn18;
             cfg.alpn_count = 2;
+        }
+        if (st->offer_d22) {
+            cfg.alpn_list = alpn22;
+            cfg.alpn_count = 3;
         }
         moq_pq_threaded_t *srv = NULL;
         if (moq_pq_threaded_create(&cfg, &srv) == MOQ_OK) {
@@ -1364,6 +1392,233 @@ static moq_result_t try_cmaf_write_sap(bool validate, bool starts_group,
     return rc;
 }
 
+/* Index of the delivered "v" object whose payload starts with `marker`, or -1
+ * if none arrives within the polling window. */
+static int srv_wait_marker(srv_state_t *st, uint8_t marker)
+{
+    for (int i = 0; i < 200; i++) {
+        int cnt = srv_count(st);
+        pthread_mutex_lock(&st->mu);
+        for (int j = 0; j < cnt; j++) {
+            if (st->objs[j].first_byte == marker) {
+                pthread_mutex_unlock(&st->mu);
+                return j;
+            }
+        }
+        pthread_mutex_unlock(&st->mu);
+        usleep(50000);
+    }
+    return -1;
+}
+
+/* Write one RAW keyframe group carrying LOC timestamp `ts` (as
+ * capture_time_us, or as the presentation_time_us fallback) and payload
+ * marker `marker`. Ownership of the payload stays with this helper unless the
+ * sender took it. */
+static moq_result_t write_ts(moq_media_sender_t *s, moq_media_track_t *v,
+                             uint8_t marker, bool as_capture, uint64_t ts)
+{
+    moq_rcbuf_t *b = mkbuf(16, marker);
+    moq_media_send_object_t o = mkobj(b, true, true, true);
+    if (as_capture) {
+        o.has_capture_time = true;
+        o.capture_time_us = ts;
+        o.presentation_time_us = 1000u;
+    } else {
+        o.presentation_time_us = ts;
+    }
+    moq_result_t rc = moq_media_sender_write(s, v, &o);
+    if (rc != MOQ_OK) moq_rcbuf_decref(b);
+    return rc;
+}
+
+/* Draft 22 (LOC-04 companion): write one RAW keyframe group whose metadata
+ * carries the LOC Timestamp `ts` in UNIX microseconds. */
+static moq_result_t write_ts_d22(moq_media_sender_t *s, moq_media_track_t *v,
+                                 uint8_t marker, uint64_t ts)
+{
+    moq_rcbuf_t *b = mkbuf(16, marker);
+    moq_media_send_object_t o = mkobj(b, true, true, true);
+    moq_media_metadata_t m;
+    memset(&m, 0, sizeof(m));
+    m.struct_size = sizeof(m);
+    moq_loc_metadata_init_sized(&m.loc, sizeof(m.loc));
+    m.loc.present = MOQ_LOC_METADATA_HAS_TIMESTAMP;
+    m.loc.timestamp = ts;
+    o.metadata = &m;
+    moq_result_t rc = moq_media_sender_write(s, v, &o);
+    if (rc != MOQ_OK) moq_rcbuf_decref(b);
+    return rc;
+}
+
+/* The delivered "v" object carrying `marker` has LOC timestamp `want`. */
+static void check_delivered_ts(uint8_t marker, uint64_t want)
+{
+    int idx = srv_wait_marker(&g_srv, marker);
+    MOQ_TEST_CHECK(idx >= 0);
+    if (idx < 0) return;
+    pthread_mutex_lock(&g_srv.mu);
+    MOQ_TEST_CHECK(g_srv.objs[idx].has_ts);
+    MOQ_TEST_CHECK_EQ_U64(g_srv.objs[idx].ts, want);
+    pthread_mutex_unlock(&g_srv.mu);
+}
+
+/* == RAW LOC timestamp bound on an ESTABLISHED session ================ *
+ * Once the session's draft is known, moq_media_sender_write() admits exactly
+ * the LOC timestamps that draft's property codec can encode. Draft 16 writes
+ * its properties in the QUIC variable-length integer, so a value above
+ * MOQ_QUIC_VARINT_MAX is MOQ_ERR_INVAL (payload not taken, sender not fatal)
+ * and MOQ_QUIC_VARINT_MAX itself is delivered. Draft 18 writes vi64, which
+ * carries the whole uint64 range, so UINT64_MAX is admitted and reaches the
+ * subscriber as that exact timestamp -- through capture_time_us and through
+ * the presentation_time_us fallback alike. Draft 22 is served by the LOC-04
+ * companion, whose RAW objects carry the timestamp in their metadata record:
+ * the same full range is admitted and delivered there. The client offers
+ * exactly `ver`; the server accepts any of the three. Without picoquic's
+ * stream terminal contract the draft-22 case checks the refusal instead: a
+ * server offering moqt-22 and a sender whose endpoint offers exactly draft
+ * 22 are refused with MOQ_ERR_UNSUPPORTED; the server of the other cases then
+ * offers {18, 16}. */
+static void loc_ts_bound_case(const char *cert, const char *key,
+                              moq_version_t ver)
+{
+    int port = 0;
+    memset(&g_srv, 0, sizeof(g_srv));
+#if !TEST_DEFAULT_BACKEND_HOSTS_D22
+    if (ver == MOQ_VERSION_DRAFT_22) {
+        moq_pq_threaded_cfg_t sc;
+        moq_pq_threaded_cfg_init_sized(&sc, sizeof(sc));
+        static const char *const alpn22[] = { "moqt-22", "moqt-18", "moqt-16" };
+        sc.alloc = moq_alloc_default();
+        sc.perspective = MOQ_PERSPECTIVE_SERVER;
+        sc.cert_path = cert;
+        sc.key_path = key;
+        sc.port = 18899;
+        sc.on_lane_pump = server_pump;
+        sc.on_lane_pump_ctx = &g_srv;
+        sc.alpn_list = alpn22;
+        sc.alpn_count = 3;
+        moq_pq_threaded_t *refused = (moq_pq_threaded_t *)(uintptr_t)1;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_pq_threaded_create(&sc, &refused),
+                              (int)MOQ_ERR_UNSUPPORTED);
+        MOQ_TEST_CHECK(refused == NULL);
+        char url[64];
+        moq_endpoint_cfg_t ec = ep_cfg(url, sizeof(url), 18899);
+        const moq_version_t offer = ver;
+        ec.versions.struct_size = sizeof(moq_version_offer_t);
+        ec.versions.policy = MOQ_VERSION_POLICY_EXACT;
+        ec.versions.versions = &offer;
+        ec.versions.version_count = 1;
+        moq_bytes_t parts[2];
+        moq_media_sender_cfg_t cfg;
+        fill_cfg(&cfg, parts);
+        cfg.endpoint = &ec;
+        cfg.companion_profile = MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC;
+        moq_media_sender_t *s = (moq_media_sender_t *)(uintptr_t)1;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_create(&cfg, &s),
+                              (int)MOQ_ERR_UNSUPPORTED);
+        MOQ_TEST_CHECK(s == NULL);
+        return;
+    }
+    g_srv.offer_d18 = true;
+#else
+    g_srv.offer_d22 = true;
+#endif
+    moq_pq_threaded_t *srv = start_server(cert, key, &g_srv, &port);
+    MOQ_TEST_CHECK(srv != NULL);
+    if (!srv) return;
+    char url[64];
+    moq_endpoint_cfg_t ec = ep_cfg(url, sizeof(url), port);
+    const moq_version_t offer = ver;
+    ec.versions.struct_size = sizeof(moq_version_offer_t);
+    ec.versions.policy = MOQ_VERSION_POLICY_EXACT;
+    ec.versions.versions = &offer;
+    ec.versions.version_count = 1;
+    moq_bytes_t parts[2];
+    moq_media_sender_cfg_t cfg;
+    fill_cfg(&cfg, parts);
+    cfg.endpoint = &ec;
+    if (ver == MOQ_VERSION_DRAFT_22)
+        cfg.companion_profile = MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC;
+    moq_media_sender_t *s = NULL;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_create(&cfg, &s), (int)MOQ_OK);
+    if (!s) {
+        moq_pq_threaded_stop(srv);
+        moq_pq_threaded_destroy(srv);
+        return;
+    }
+    moq_media_track_t *v = NULL;
+    add_video_track(s, &v);
+
+    MOQ_TEST_CHECK(wait_ready(s, 300));
+    MOQ_TEST_CHECK_EQ_U64(atomic_load(&g_srv.session_version), (uint64_t)ver);
+
+    if (ver == MOQ_VERSION_DRAFT_22) {
+        /* An ordinary timestamp first, then the full range. */
+        MOQ_TEST_CHECK_EQ_INT((int)write_ts_d22(s, v, 0x41, 5000u), (int)MOQ_OK);
+        check_delivered_ts(0x41, 5000u);
+        MOQ_TEST_CHECK_EQ_INT((int)write_ts_d22(s, v, 0x47, UINT64_MAX),
+                              (int)MOQ_OK);
+        check_delivered_ts(0x47, UINT64_MAX);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)write_ts_d22(s, v, 0x49, MOQ_QUIC_VARINT_MAX + 1), (int)MOQ_OK);
+        check_delivered_ts(0x49, MOQ_QUIC_VARINT_MAX + 1);
+        MOQ_TEST_CHECK(!moq_media_sender_is_fatal(s));
+        moq_media_sender_destroy(s);
+        moq_pq_threaded_stop(srv);
+        moq_pq_threaded_destroy(srv);
+        return;
+    }
+
+    /* An ordinary timestamp first: once it arrives, the subscription is in
+     * place and every later probe is a fresh group on a live track. */
+    MOQ_TEST_CHECK_EQ_INT((int)write_ts(s, v, 0x41, true, 5000u), (int)MOQ_OK);
+    check_delivered_ts(0x41, 5000u);
+
+    if (ver == MOQ_VERSION_DRAFT_16) {
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)write_ts(s, v, 0x42, true, MOQ_QUIC_VARINT_MAX + 1),
+            (int)MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(!moq_media_sender_is_fatal(s));
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)write_ts(s, v, 0x43, false, MOQ_QUIC_VARINT_MAX + 1),
+            (int)MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(!moq_media_sender_is_fatal(s));
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)write_ts(s, v, 0x44, true, UINT64_MAX), (int)MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)write_ts(s, v, 0x45, true, MOQ_QUIC_VARINT_MAX), (int)MOQ_OK);
+        check_delivered_ts(0x45, MOQ_QUIC_VARINT_MAX);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)write_ts(s, v, 0x46, false, MOQ_QUIC_VARINT_MAX), (int)MOQ_OK);
+        check_delivered_ts(0x46, MOQ_QUIC_VARINT_MAX);
+        /* No refused probe reached the wire: each was refused before
+         * enqueue, so by the time the later accepted probes have arrived
+         * none of them can still be in flight. */
+        pthread_mutex_lock(&g_srv.mu);
+        for (int j = 0; j < g_srv.n; j++)
+            MOQ_TEST_CHECK(g_srv.objs[j].first_byte < 0x42 ||
+                           g_srv.objs[j].first_byte > 0x44);
+        pthread_mutex_unlock(&g_srv.mu);
+    } else {
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)write_ts(s, v, 0x47, true, UINT64_MAX), (int)MOQ_OK);
+        check_delivered_ts(0x47, UINT64_MAX);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)write_ts(s, v, 0x48, false, UINT64_MAX), (int)MOQ_OK);
+        check_delivered_ts(0x48, UINT64_MAX);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)write_ts(s, v, 0x49, true, MOQ_QUIC_VARINT_MAX + 1),
+            (int)MOQ_OK);
+        check_delivered_ts(0x49, MOQ_QUIC_VARINT_MAX + 1);
+    }
+    MOQ_TEST_CHECK(!moq_media_sender_is_fatal(s));
+
+    moq_media_sender_destroy(s);
+    moq_pq_threaded_stop(srv);
+    moq_pq_threaded_destroy(srv);
+}
+
 int main(int argc, char **argv)
 {
     const char *cert = NULL, *key = NULL;
@@ -1377,8 +1632,10 @@ int main(int argc, char **argv)
     }
 
     /* == RAW LOC timestamp range validation (no network) ===============
-     * A capture/presentation timestamp beyond the QUIC varint range cannot be
-     * LOC-encoded; moq_media_sender_write() must reject it SYNCHRONOUSLY with
+     * Before the session's draft is known the narrowest draft codec bounds
+     * the LOC timestamp: a capture/presentation timestamp beyond the QUIC
+     * varint range is not encodable on every draft, so
+     * moq_media_sender_write() must reject it SYNCHRONOUSLY with
      * MOQ_ERR_INVAL -- before enqueue / payload-ownership transfer -- rather
      * than queue it and fatal the sender at drain time. */
     {
@@ -1431,6 +1688,65 @@ int main(int argc, char **argv)
 
         moq_media_sender_destroy(s);
     }
+
+    /* == The LOC value bound the sender reads is the encoder's own ======== *
+     * moq_loc_value_max_for_version reports, per draft, the largest value
+     * that draft's LOC encoder accepts as a timestamp (moq_loc_encode for
+     * LOC-01 on drafts 16 and 18, moq_loc_encode_metadata for LOC-04 on
+     * draft 22): that value encodes, one above it (where one exists) is
+     * refused, and an unregistered version reports 0. */
+    {
+        static const moq_version_t drafts[] = {
+            MOQ_VERSION_DRAFT_16, MOQ_VERSION_DRAFT_18, MOQ_VERSION_DRAFT_22,
+        };
+        static const uint64_t want[] = {
+            MOQ_QUIC_VARINT_MAX, UINT64_MAX, UINT64_MAX,
+        };
+        for (size_t i = 0; i < sizeof(drafts) / sizeof(drafts[0]); i++) {
+            const uint64_t max = moq_loc_value_max_for_version(drafts[i]);
+            MOQ_TEST_CHECK_EQ_U64(max, want[i]);
+            if (drafts[i] == MOQ_VERSION_DRAFT_22) {
+                moq_loc_metadata_t md;
+                moq_loc_metadata_init_sized(&md, sizeof(md));
+                md.present = MOQ_LOC_METADATA_HAS_TIMESTAMP;
+                md.timestamp = max;
+                moq_rcbuf_t *props = NULL;
+                MOQ_TEST_CHECK_EQ_INT(
+                    (int)moq_loc_encode_metadata(moq_alloc_default(), drafts[i],
+                        moq_loc_profile_for_version(drafts[i]), &md, &props),
+                    (int)MOQ_OK);
+                if (props) moq_rcbuf_decref(props);
+                continue;
+            }
+            moq_loc_headers_t h;
+            moq_loc_headers_init(&h);
+            h.has_timestamp = true;
+            h.timestamp = max;
+            moq_rcbuf_t *props = NULL;
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_loc_encode(moq_alloc_default(), drafts[i],
+                                    moq_loc_profile_for_version(drafts[i]),
+                                    &h, &props),
+                (int)MOQ_OK);
+            if (props) moq_rcbuf_decref(props);
+            if (max != UINT64_MAX) {
+                h.timestamp = max + 1;
+                props = NULL;
+                MOQ_TEST_CHECK_EQ_INT(
+                    (int)moq_loc_encode(moq_alloc_default(), drafts[i],
+                                        moq_loc_profile_for_version(drafts[i]),
+                                        &h, &props),
+                    (int)MOQ_ERR_INVAL);
+                MOQ_TEST_CHECK(props == NULL);
+            }
+        }
+        MOQ_TEST_CHECK_EQ_U64(moq_loc_value_max_for_version((moq_version_t)0),
+                              0);
+    }
+
+    loc_ts_bound_case(cert, key, MOQ_VERSION_DRAFT_16);
+    loc_ts_bound_case(cert, key, MOQ_VERSION_DRAFT_18);
+    loc_ts_bound_case(cert, key, MOQ_VERSION_DRAFT_22);
 
     /* == cfg validation (no network) =================================== */
     {

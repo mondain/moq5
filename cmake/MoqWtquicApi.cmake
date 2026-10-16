@@ -3,7 +3,7 @@
 # to the caller. Qualification drivers must inspect the complete CMake output.
 function(moq_check_wtquic_api result reason)
     set(${result} FALSE PARENT_SCOPE)
-    set(_why "wtquic public API compile/link contract requires wtq_session_receive_contract and wtq_session_service_stream_admission (wtquic_DIR='${wtquic_DIR}').")
+    set(_why "wtquic public API compile/link contract requires wtq_session_receive_contract, wtq_session_service_stream_admission, wtq_session_local_flush_mode and wtq_session_local_flush (wtquic_DIR='${wtquic_DIR}').")
     if(NOT TARGET wtq::wtquic)
         set(${reason} "${_why} Imported target wtq::wtquic is unavailable." PARENT_SCOPE)
         return()
@@ -25,7 +25,14 @@ static wtq_result_t (*volatile receive_contract)(const wtq_session_t *,
     size_t *, wtq_receive_pause_mode_t *) = wtq_session_receive_contract;
 static wtq_result_t (*volatile service_admission)(wtq_session_t *) =
     wtq_session_service_stream_admission;
-int main(void) { return receive_contract == 0 || service_admission == 0; }
+static wtq_local_flush_mode_t (*volatile local_flush_mode)(const wtq_session_t *) =
+    wtq_session_local_flush_mode;
+static wtq_result_t (*volatile local_flush)(const wtq_session_t *) =
+    wtq_session_local_flush;
+int main(void) {
+    return receive_contract == 0 || service_admission == 0 ||
+           local_flush_mode == 0 || local_flush == 0;
+}
 ]=])
     # Function scope restores caller state, including a STATIC_LIBRARY override.
     # Always relink: cached success must not survive replacement of the SDK.
@@ -77,7 +84,7 @@ macro(moq_wtquic_component_preflight component)
         moq_check_wtquic_api(_libmoq_wt_api_ok _libmoq_wt_api_reason)
         if(NOT wtquic_FOUND)
             set(_libmoq_wt_api_ok FALSE)
-            set(_libmoq_wt_api_reason "wtquic public API compile/link contract requires wtq_session_receive_contract and wtq_session_service_stream_admission; package lookup failed (wtquic_DIR='${wtquic_DIR}'). ${wtquic_NOT_FOUND_MESSAGE}")
+            set(_libmoq_wt_api_reason "wtquic public API compile/link contract requires wtq_session_receive_contract, wtq_session_service_stream_admission, wtq_session_local_flush_mode and wtq_session_local_flush; package lookup failed (wtquic_DIR='${wtquic_DIR}'). ${wtquic_NOT_FOUND_MESSAGE}")
         endif()
         if(NOT _libmoq_wt_api_ok)
             set(${CMAKE_FIND_PACKAGE_NAME}_${component}_FOUND FALSE)

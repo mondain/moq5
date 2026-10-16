@@ -2,11 +2,16 @@
 #define MOQ_SESSION_INTERNAL_H
 
 #include "moq/session.h"
+#include "request_lifetime_internal.h"
 #include "moq/buf.h"
 #include "moq/rcbuf.h"
 #include "moq/wire.h"
 #include "profile.h"
+#include "transport_binding_internal.h"
 #include "session_transport.h"
+#include "fill_owner_internal.h"
+#include "fill_input_internal.h"
+#include "publisher_fill_receipt.h"
 #include <string.h>
 
 /* -- Defaults ------------------------------------------------------ */
@@ -18,6 +23,7 @@
 #define MOQ_DEFAULT_MAX_SUBS         64
 #define MOQ_DEFAULT_OUTPUT_SCRATCH   65536
 #define MOQ_DEFAULT_MAX_SUBGROUPS    64
+#define MOQ_DEFAULT_MAX_FILLS        16
 #define MOQ_DEFAULT_MAX_DATA_STREAMS 64
 #define MOQ_DEFAULT_MAX_ANNOUNCEMENTS 64
 #define MOQ_DEFAULT_MAX_OBJ_PAYLOAD  (4u * 1024 * 1024)
@@ -102,6 +108,8 @@ typedef struct moq_setup_params {
     uint64_t max_auth_token_cache_size;
     bool     has_path;
     bool     has_authority;
+    bool        has_implementation;
+    moq_bytes_t implementation;   /* borrowed from the decoded setup */
 } moq_setup_params_t;
 
 /* Forward decl: entries hold a pointer to their reserved registry record
@@ -125,11 +133,19 @@ typedef struct moq_resolved_window {
     bool                   has_window;     /* a window has been resolved/stored */
     bool                   unsatisfiable;  /* at-ceiling: excludes everything */
     bool                   has_end;        /* finite end_group present */
+    bool                   has_end_object; /* the end is an object within end_group */
     moq_subscribe_filter_t filter;         /* filter type the window came from */
     uint64_t               start_group;
     uint64_t               start_object;
     uint64_t               end_group;      /* valid iff has_end */
+    uint64_t               end_object;     /* valid iff has_end_object; inclusive */
 } moq_resolved_window_t;
+
+/* Filter forms a wire profile can express that the public filter codes
+ * cannot. They live only in decoded records, entries and windows; an event
+ * reports the semantic location instead. */
+#define MOQ_SUBSCRIBE_FILTER_RELATIVE_GROUP_INTERNAL 0x101u /* D22 clamped relative offset, including zero */
+#define MOQ_SUBSCRIBE_FILTER_OBJECT_END_INTERNAL     0x104u /* absolute start; inclusive end_group/end_object */
 
 typedef enum moq_sub_state {
     MOQ_SUB_FREE = 0,
@@ -141,6 +157,10 @@ typedef enum moq_sub_state {
      * bidi stream and the request message is not yet complete. Used only by
      * stream-correlated request profiles. */
     MOQ_SUB_RECVING_REQUEST    = 5,
+    /* Publisher role, ended by a failed update: its REQUEST_ERROR is out and
+     * its PUBLISH_DONE(UPDATE_FAILED) is held until every subgroup reset it
+     * owes is queued (session_release_held_dones). No operation applies. */
+    MOQ_SUB_DONE_HELD          = 6,
 } moq_sub_state_t;
 
 typedef enum moq_sub_role {
@@ -148,28 +168,137 @@ typedef enum moq_sub_role {
     MOQ_SUB_ROLE_PUBLISHER  = 2,
 } moq_sub_role_t;
 
+/* Observation only: validated input has determined automatic output, but its
+ * handler may still be waiting for event/action/drain credit. */
+typedef enum moq_retained_output {
+    MOQ_RETAINED_OUTPUT_NONE = 0,
+    MOQ_RETAINED_OUTPUT_FIN,
+    MOQ_RETAINED_OUTPUT_CANCEL,
+    MOQ_RETAINED_OUTPUT_RESPONSE,
+} moq_retained_output_t;
+
+/* Per-request state for profiles that carry each request on its own
+ * bidirectional stream: the stream's identity, the receive buffer that
+ * reassembles control messages arriving on it, the peer's FIN on it, and the
+ * request's direction lifetime. Zero (an empty ref) on profiles that carry
+ * requests on the control stream. Embedded by every request entry so the
+ * request-stream engine handles each family the same way. */
+typedef struct moq_request_stream {
+    moq_stream_ref_t       ref;
+    uint8_t               *recv_buf;
+    size_t                 recv_cap;
+    size_t                 recv_len;
+    bool                   recv_fin;
+    uint8_t                retained_output; /* moq_retained_output_t */
+    moq_request_lifetime_t lifetime;
+} moq_request_stream_t;
+
+/* Original typed UPDATE processing view, retained through raw-input retries
+ * and an owed answer. Values only; never aliases mutable parent state. */
+typedef struct moq_sub_update_snapshot {
+    bool valid;
+    uint64_t request_id;
+    uint64_t processed_at_us;
+    bool has_largest;
+    uint64_t largest_group;
+    uint64_t largest_object;
+    uint8_t subscriber_priority;
+    uint8_t group_order;
+    bool forward;
+    uint32_t filter_type;
+    uint64_t start_group;
+    uint64_t start_object;
+    uint64_t end_group;
+    uint64_t end_object;
+} moq_sub_update_snapshot_t;
+
+/* The parameters of a subscriber's REQUEST_UPDATE on a subscription this
+ * side publishes to (one it accepted, or one its PUBLISH began), as the
+ * session applies them. Held on the entry while the application owes the
+ * answer; a further update before the answer is folded in, later values
+ * overriding earlier ones. */
+typedef struct moq_sub_update {
+    uint64_t request_id;          /* the newest update covered */
+    bool     has_subscriber_priority;
+    uint8_t  subscriber_priority;
+    bool     has_forward;
+    bool     forward;
+    bool     has_delivery_timeout;
+    uint64_t delivery_timeout_us;
+    bool     dt_has_object;
+    uint64_t dt_object_ms;
+    bool     dt_has_subgroup;
+    uint64_t dt_subgroup_ms;
+    bool     has_filter;
+    uint32_t filter_type;
+    uint64_t start_group;
+    uint64_t start_object;
+    uint64_t end_group;
+    uint64_t end_object;
+    bool     has_new_group_request;
+    uint64_t new_group_request;
+    /* The fill request and the update that carried it (its initiating id). */
+    uint64_t fill_request_id;
+    moq_fill_input_t fill;
+    moq_sub_update_snapshot_t snapshot;
+} moq_sub_update_t;
+
+/* Publisher role, deferred update answers: the application owes the answer
+ * to `count` REQUEST_UPDATEs whose cumulative parameters are `rec` (the
+ * newest one's id in rec.request_id). The older covered ids, in arrival
+ * order, live in the owned `prior_ids` (NULL while only one update is
+ * covered). Cleared, and `prior_ids` freed, on every answer and when the
+ * entry is freed. */
+typedef struct moq_owed_update {
+    bool              owed;
+    uint32_t          count;
+    uint32_t          prior_cap;
+    uint64_t         *prior_ids;
+    moq_sub_update_t  rec;
+} moq_owed_update_t;
+
 typedef struct moq_sub_entry {
     uint8_t           subscriber_priority;
+    /* Publisher role: the request asked for no Track Properties in its
+     * answer (draft-22 INCLUDE_PROPERTIES = 0); SUBSCRIBE_OK carries none. */
+    bool              omit_track_properties;
+    /* The subscription's group order as requested (subscriber role) or
+     * received (publisher role); MOQ_GROUP_ORDER_DEFAULT when unstated. A
+     * fill child without its own order inherits it. */
+    uint8_t           group_order;
+    /* Publisher role: the DEFAULT_PUBLISHER_GROUP_ORDER this side put in its
+     * SUBSCRIBE_OK Track Properties (DEFAULT when absent); see
+     * session_group_order(). */
+    uint8_t           track_group_order;
     moq_sub_state_t    state;
     moq_sub_role_t     role;
     uint32_t           generation;
     moq_subscription_t handle;
     uint64_t           request_id;
-    /* request_stream_ref: request bidi stream identity for stream-correlated
+    /* rs.ref: request bidi stream identity for stream-correlated
      * request profiles (profiles that open a dedicated bidi stream per request
      * and correlate responses by stream identity) -- here, the SUBSCRIBE
      * request stream. Empty (zero) under draft-16, which correlates by
      * request_id instead. */
-    moq_stream_ref_t   request_stream_ref;
+    moq_request_stream_t rs;
     /* Per-request-stream receive buffer for parsing control messages that
      * arrive (possibly fragmented) on the request's bidi stream, for
      * stream-correlated request profiles. Co-allocated in the session block;
      * unused under draft-16. */
-    uint8_t           *req_recv_buf;
-    size_t             req_recv_cap;
-    size_t             req_recv_len;
-    bool               req_recv_fin;
     uint64_t           track_alias;
+    /* Subscriber role, ESTABLISHED: the next established subscription the
+     * peer gave the same alias (a concurrent subscription to the same
+     * track), in establishment order; -1 ends the chain. The alias index
+     * holds the chain's first entry. */
+    int32_t            alias_next;
+    /* Subscriber role, pending: the newest Largest Object known here when
+     * the request was sent. The publisher resolves the filter against its
+     * own Largest, never older than this, so the window resolved against it
+     * contains the eventual one (used to hold objects for the subscription
+     * before its answer, draft-22 §3.1.3). */
+    bool               sent_has_largest;
+    uint64_t           sent_largest_group;
+    uint64_t           sent_largest_object;
     uint8_t           *track_id_buf;
     size_t             track_id_len;
     uint64_t           delivery_timeout_us;
@@ -185,11 +314,21 @@ typedef struct moq_sub_entry {
      * current acknowledged Forward state); dropped on error/retirement. */
     bool               update_has_forward;
     bool               update_forward;
+    bool               update_has_subscriber_priority;
+    uint8_t            update_subscriber_priority;
     /* a filter change pends until the ACK; the acknowledged filter TYPE
      * latches into filter_type (its requester-side consumer is the
      * Joining-FETCH eligibility gate). Cleared on REQUEST_ERROR/teardown. */
     bool               update_has_filter;
     uint32_t           update_filter_type;
+    /* The pending update's filter locations (subscriber role), latched into
+     * req_* alongside the type when the update is acknowledged, so a later
+     * fill that inherits the subscription's filter resolves the same window
+     * the publisher does. */
+    uint64_t           update_start_group;
+    uint64_t           update_start_object;
+    uint64_t           update_end_group;
+    uint64_t           update_end_object;
     /* A REQUEST_UPDATE failed (REQUEST_ERROR): the subscription is awaiting the
      * mandatory terminal PUBLISH_DONE(UPDATE_FAILED). No new update may be sent,
      * and only that PUBLISH_DONE is a valid next message. */
@@ -209,6 +348,9 @@ typedef struct moq_sub_entry {
      * FIN or RESET follows it, so no receive-side identity is owed for it.
      * Distinct from req_recv_fin, which records an observed FIN. */
     bool req_recv_reset;
+    /* Publisher role: an update answer the application owes. */
+    moq_owed_update_t  owed_update;
+    moq_sub_update_snapshot_t update_snapshot;
     /* The track supports dynamically started groups (DYNAMIC_GROUPS == 1 in
      * SUBSCRIBE_OK's track properties). Gates outbound new-group requests on
      * this subscription's updates. */
@@ -228,9 +370,36 @@ typedef struct moq_sub_entry {
     uint64_t req_start_group;
     uint64_t req_start_object;
     uint64_t req_end_group;
-    /* Resolved subscription window (publisher role), stored against the accept /
-     * REQUEST_UPDATE snapshot; reached via the package-internal accessor. */
+    uint64_t req_end_object;
+    /* Resolved subscription window. Publisher role: stored against the
+     * accept / REQUEST_UPDATE snapshot, reached via the package-internal
+     * accessor. Subscriber role: resolved against the Largest Object the
+     * SUBSCRIBE_OK (or an acknowledged filter update) carried -- the same
+     * snapshot the publisher resolved -- and used to attribute objects
+     * arriving on an alias several subscriptions share. */
     moq_resolved_window_t window;
+    /* Publisher role: the fill fetch streams the session itself opened for
+     * this subscription -- through moq_session_open_fill and for a fill it
+     * could not admit (header then RESET). Added to the application's own
+     * data-stream count in PUBLISH_DONE, saturating to the profile's unknown
+     * sentinel. */
+    uint64_t           fill_streams_opened;
+    /* Publisher role: the subgroup streams opened for this subscription,
+     * saturating; with fill_streams_opened, the Stream Count of a
+     * PUBLISH_DONE the session sends itself. */
+    uint64_t           subgroup_streams_opened;
+    /* MOQ_*_DONE_HELD: the Stream Count of the held PUBLISH_DONE. */
+    uint64_t           held_done_count;
+    /* Publisher role, pending only: the SUBSCRIBE carried a fill request the
+     * pool could not admit. The effective request (inherited values filled
+     * in) is kept so the accept can resolve its range against the accept
+     * snapshot and, when a stream would have opened, fail it on the wire with
+     * the priority it would have had. */
+    bool               fill_unserved;
+    moq_fill_input_t   fill_unserved_input;
+    /* Facade-owned parents answer updates only after reserving fill credit.
+     * Does not change the session-wide policy for unrelated raw parents. */
+    bool               facade_defer_updates;
     /* Subscriber-role Stream-Count gating (draft-16 §9.15 / draft-18 §10.11),
      * mirroring the publication machinery: the terminal done arrives on the
      * control channel / request bidi and is likely to precede late-arriving
@@ -284,6 +453,12 @@ typedef struct moq_sub_entry {
     int32_t occ_next;    /* next linked slot, -1 = end */
     int32_t occ_prev;    /* previous linked slot, -1 = head */
     bool    occ_linked;  /* membership, so link/unlink are idempotent-safe */
+    /* Response-local Track Property; retained in the existing tail padding. */
+    uint8_t default_publisher_priority;
+    /* Subscriber role: the Track this subscription carries was found
+     * malformed (draft-22 §12.1); its cancellation is owed and driven until
+     * it commits (see session_fail_malformed_track). */
+    bool    mt_failing;
 } moq_sub_entry_t;
 
 typedef enum moq_ann_state {
@@ -291,6 +466,7 @@ typedef enum moq_ann_state {
     MOQ_ANN_PENDING_ANNOUNCER  = 1,  /* we sent PUBLISH_NAMESPACE, awaiting response */
     MOQ_ANN_PENDING_RECEIVER   = 2,  /* peer sent PUBLISH_NAMESPACE, awaiting app accept/reject */
     MOQ_ANN_ESTABLISHED        = 3,
+    MOQ_ANN_DRAINING           = 4,  /* stale app identity, private receive/output owner */
 } moq_ann_state_t;
 
 typedef enum moq_ann_role {
@@ -298,38 +474,107 @@ typedef enum moq_ann_role {
     MOQ_ANN_ROLE_RECEIVER  = 2,
 } moq_ann_role_t;
 
+/* Shared framing state for a GOAWAY-received late-input owner. */
+#define MOQ_DRAIN_SCAN_HDR_MAX 11u
+typedef struct moq_drain_scan {
+    uint64_t skip;
+    uint8_t hdr_len;
+    uint8_t hdr[MOQ_DRAIN_SCAN_HDR_MAX];
+} moq_drain_scan_t;
+
+#ifndef MOQ_DECODED_MAX_TOKENS
+#define MOQ_DECODED_MAX_TOKENS 16
+#endif
+
+/* A draft-22 namespace update (§9.5) on one of the three namespace request
+ * owners (announcement, namespace subscription, track subscription). The
+ * owed half is the responder's: a peer update the application has not yet
+ * answered. The outstanding half is the requester's: this side's update
+ * awaiting the peer's answer. Each half owns its prefix and token bytes;
+ * ns_update_release frees both with the owner. At most one of each exists
+ * per request (the advertised MAX_REQUEST_UPDATES is one, and this side
+ * keeps at most one update of its own in flight). */
+typedef struct moq_ns_update {
+    bool                 owed;
+    uint32_t             owed_flags;
+    uint64_t             owed_request_id;
+    bool                 owed_forward;
+    uint8_t             *owed_prefix_buf;
+    size_t               owed_prefix_buf_len;
+    moq_bytes_t         *owed_prefix_parts;
+    size_t               owed_prefix_count;
+    uint8_t             *owed_token_bytes;
+    size_t               owed_token_bytes_len;
+    moq_resolved_token_t owed_tokens[MOQ_DECODED_MAX_TOKENS];
+    size_t               owed_token_count;
+    bool                 outstanding;
+    /* The request ended by migration -- a GOAWAY the peer sent on it, or one
+     * this side sent followed by the peer's FIN -- while the answer above was
+     * still owed. A GOAWAY does not change the request's state (draft-22
+     * §9.2) and a FIN is directional (§6.4.2.2): the answer is still given,
+     * and only then is the request retired (retire_close_half: this side's
+     * direction is finished after the answer; retire_goaway_received: the
+     * peer's GOAWAY arrived, so its later bytes are drained). */
+    bool                 retire_after_answer;
+    bool                 retire_close_half;
+    bool                 retire_goaway_received;
+    /* The peer refused this side's update; the request is ending and nothing
+     * but its close may follow on the response stream. */
+    bool                 failed;
+    uint32_t             out_flags;
+    uint64_t             out_request_id;
+    bool                 out_forward;
+    uint8_t             *out_prefix_buf;
+    size_t               out_prefix_buf_len;
+    moq_bytes_t         *out_prefix_parts;
+    size_t               out_prefix_count;
+} moq_ns_update_t;
+
 typedef struct moq_ann_entry {
     moq_ann_state_t    state;
     moq_ann_role_t     role;
     uint32_t           generation;
     moq_announcement_t handle;
     uint64_t           request_id;
-    /* request_stream_ref: request bidi stream identity for stream-correlated
+    /* rs.ref: request bidi stream identity for stream-correlated
      * request profiles (the PUBLISH_NAMESPACE request stream). Empty (zero)
      * under draft-16. */
-    moq_stream_ref_t   request_stream_ref;
+    moq_request_stream_t rs;
     uint8_t           *ns_id_buf;   /* canonical namespace blob for dup detection */
     size_t             ns_id_len;
-    /* req_recv_*: receive buffer for announce request-bidi control bytes
+    /* rs.recv_*: receive buffer for announce request-bidi control bytes
      * (stream-correlated profiles): the PUBLISH_NAMESPACE response on the
      * announcer side, REQUEST_UPDATE on the receiver side. Co-allocated in the
      * session block; the pointer/cap persist across entry reuse (only len/fin
      * reset on free). Unused under draft-16 (announce stays on the control
      * channel). */
-    uint8_t           *req_recv_buf;
-    size_t             req_recv_cap;
-    size_t             req_recv_len;
-    bool               req_recv_fin;
-    /* Transitional FIN ownership, distinct from req_recv_fin: the creating
+    /* Transitional FIN ownership, distinct from rs.recv_fin: the creating
      * PUBLISH_NAMESPACE carried the peer's FIN, and the commit that re-keyed
      * the bidi onto this entry took that FIN over with it. The announcement
-     * handler consumes it into req_recv_fin and retains the owner -- the
+     * handler consumes it into rs.recv_fin and retains the owner -- the
      * application still has to accept or reject -- so it never survives the
      * call that installed it. Cleared on every free/reuse. */
     bool               handoff_fin_pending;
     bool goaway_sent;   /* a per-request GOAWAY was emitted on this request
                          * bidi; the entry stays live until the peer tears the
                          * old stream down (FIN/RESET/STOP) or the timeout fires. */
+    /* D22 retains validated bytes in rs.recv_buf and scalar cleanup intent in
+     * this existing slot. App retirement never implies peer receive closure. */
+    bool response_validated;
+    bool response_fin;
+    bool deferred_reset;
+    bool deferred_stop;
+    bool deferred_fin;
+    bool terminal_notified;
+    bool finish_fin;
+    bool cancel_pending;
+    bool migration_committed;
+    moq_namespace_terminal_cause_t deferred_cause;
+    moq_namespace_terminal_cause_t terminal_cause;
+    uint64_t deferred_code;
+    uint64_t terminal_code;
+    moq_drain_scan_t migration_scan;
+    moq_ns_update_t update;
 } moq_ann_entry_t;
 
 /* Max resolved authorization tokens surfaced per request (also bounds the
@@ -427,46 +672,74 @@ typedef struct moq_fetch_prior_object {
 
 typedef struct moq_fetch_entry {
     uint8_t              subscriber_priority;
+    /* Publisher role: the request asked for no Track Properties in its
+     * answer (draft-22 INCLUDE_PROPERTIES = 0); FETCH_OK carries none. */
+    bool                 omit_track_properties;
     moq_fetch_state_t  state;
     moq_fetch_role_t   role;
+    moq_group_order_t    effective_group_order; /* immutable; DEFAULT -> ASCENDING */
     uint32_t           generation;
     moq_fetch_t        handle;
     uint64_t           request_id;
-    /* request_stream_ref: the FETCH *request* bidi stream identity for
+    /* rs.ref: the FETCH *request* bidi stream identity for
      * stream-correlated request profiles (the stream the FETCH request travels
      * on; FETCH_OK/REQUEST_ERROR correlate by it). Intentionally DISTINCT from
      * data_stream_ref below. Empty (zero) under draft-16. */
-    moq_stream_ref_t   request_stream_ref;
+    moq_request_stream_t rs;
     /* data_stream_ref: the *response object data* stream identity (the uni
      * stream, led by FETCH_HEADER, that carries fetched objects). Used by all
-     * profiles. Intentionally distinct from request_stream_ref. */
+     * profiles. Intentionally distinct from rs.ref. */
     moq_stream_ref_t   data_stream_ref;
     bool               data_stream_started;
     bool               data_stream_fin;
+    /* Publisher role: bytes of the FETCH_HEADER as encoded on the response
+     * data stream, the reliable size of a reset of that stream. */
+    uint8_t            data_header_len;
     bool               control_response_seen;
     bool               control_ok;
     moq_fetch_prior_object_t prior;
     uint64_t           start_group;
     uint64_t           start_object;
-    /* req_recv_*: receive buffer for request-bidi RESPONSE bytes (FETCH_OK /
+    /* Publisher role: the request was surfaced with its range unresolved
+     * (moq_session_cfg_t.defer_fetch_ranges); the accept's End is checked
+     * against the request's form. start_group/start_object above hold the
+     * request's explicit start, req_end_* its explicit end (exclusive end
+     * object, zero for the whole group) unless req_end_at_largest. */
+    bool               range_deferred;
+    bool               req_start_relative;
+    bool               req_start_next_object;
+    bool               req_end_at_largest;
+    uint64_t           req_relative_offset;
+    uint64_t           req_end_group;
+    uint64_t           req_end_object;
+    /* rs.recv_*: receive buffer for request-bidi RESPONSE bytes (FETCH_OK /
      * REQUEST_ERROR) on stream-correlated request profiles. Co-allocated in the
      * session block; NULL/zero under profiles that respond on the shared control
      * channel. Intentionally NOT used for FETCH data-uni bytes -- those travel
      * on data_stream_ref through session_receive.c. */
-    uint8_t           *req_recv_buf;
-    size_t             req_recv_cap;
-    size_t             req_recv_len;
-    bool               req_recv_fin;
-    /* Transitional FIN ownership, distinct from req_recv_fin: the creating
+    /* Transitional FIN ownership, distinct from rs.recv_fin: the creating
      * FETCH carried the peer's FIN, and the commit that re-keyed the bidi onto
      * this entry took that FIN over with it. Both publisher-role states consume
-     * it synchronously into req_recv_fin and retain the owner -- the response
+     * it synchronously into rs.recv_fin and retain the owner -- the response
      * and any data stream are still to come -- so it never survives the call
      * that installed it. Cleared on every free/reuse. */
     bool               handoff_fin_pending;
     bool goaway_sent;   /* a per-request GOAWAY was emitted on this request
                          * bidi; the entry stays live until the peer tears the
                          * old stream down (FIN/RESET/STOP) or the timeout fires. */
+    /* Publisher role: REQUEST_UPDATEs that arrived before the fetch was
+     * answered. FETCH_OK is the first message on the request stream, so their
+     * answers follow it when the fetch is accepted: upd_ok_owed REQUEST_OKs,
+     * then, if one was refused, a single REQUEST_ERROR (upd_fail_code) for it
+     * and every later one, which also ends the fetch. upd_owed counts them
+     * all against the advertised MAX_REQUEST_UPDATES. A rejected fetch drops
+     * them with the request. */
+    uint32_t upd_owed;
+    uint32_t upd_ok_owed;
+    bool     upd_failed;
+    uint64_t upd_fail_code;
+    /* Fetcher role: this side's REQUEST_UPDATE awaits its answer. */
+    bool     own_update_pending;
     /* MOQ_FETCH_PENDING_JOIN storage: a Joining FETCH buffered until its
      * associated subscription is accepted. Holds the join parameters and the
      * resolved auth tokens (ownership of any staged heap values transferred from
@@ -490,6 +763,15 @@ typedef struct moq_fetch_entry {
     int32_t occ_next;    /* next linked slot, -1 = end */
     int32_t occ_prev;    /* previous linked slot, -1 = head */
     bool    occ_linked;  /* membership, so link/unlink are idempotent-safe */
+    /* Fetcher role: the canonical full-track-name key of the Track fetched
+     * (owned; see moq_build_track_key), which ties this FETCH to the other
+     * requests for that Track when one of them finds it malformed. NULL when
+     * it could not be built. */
+    uint8_t *track_key;
+    size_t   track_key_len;
+    /* Fetcher role: the Track was found malformed; the cancellation is owed
+     * (see moq_sub_entry_t.mt_failing). */
+    bool     mt_failing;
 } moq_fetch_entry_t;
 
 typedef enum moq_pub_state {
@@ -502,6 +784,8 @@ typedef enum moq_pub_state {
      * outbound PUBLISH on the publisher side); the bidi is kept drainable until
      * the FIN. Stream-correlated profiles only. */
     MOQ_PUB_DRAINING_RESPONSE  = 4,
+    /* Publisher role, ended by a failed update: as MOQ_SUB_DONE_HELD. */
+    MOQ_PUB_DONE_HELD          = 5,
 } moq_pub_state_t;
 
 typedef enum moq_pub_role {
@@ -515,14 +799,31 @@ typedef struct moq_pub_entry {
     uint32_t           generation;
     moq_publication_t  handle;
     uint64_t           request_id;
-    /* request_stream_ref: request bidi stream identity for stream-correlated
+    /* rs.ref: request bidi stream identity for stream-correlated
      * request profiles (the PUBLISH request stream). Empty (zero) under
      * draft-16. */
-    moq_stream_ref_t   request_stream_ref;
+    moq_request_stream_t rs;
     uint64_t           track_alias;
     bool               send_allowed;
+    /* Publisher role: fill fetch streams the session opened for this
+     * publication (see moq_sub_entry_t.fill_streams_opened). */
+    uint64_t           fill_streams_opened;
+    /* Publisher role: the subgroup streams opened for this publication (see
+     * moq_sub_entry_t.subgroup_streams_opened). */
+    uint64_t           subgroup_streams_opened;
+    /* MOQ_*_DONE_HELD: the Stream Count of the held PUBLISH_DONE. */
+    uint64_t           held_done_count;
+    /* Publisher role: the Forward state this side put on its PUBLISH, the
+     * subscription's initial setting where the response carries none. */
+    bool               publish_forward;
     uint8_t            subscriber_priority;
     uint8_t            group_order;
+    /* Immutable peer D22 PUBLISH values, separate from acknowledged updates. */
+    moq_publish_initial_parameters_t d22_initial;
+    /* Publisher role: the DEFAULT_PUBLISHER_GROUP_ORDER this side put in its
+     * PUBLISH Track Properties (DEFAULT when absent). */
+    uint8_t            track_group_order;
+    uint8_t            default_publisher_priority;
     bool               has_delivery_timeout;
     uint64_t           delivery_timeout_ms;
     bool               has_expires;
@@ -534,23 +835,33 @@ typedef struct moq_pub_entry {
      * current acknowledged Forward state); dropped on error/retirement. */
     bool               update_has_forward;
     bool               update_forward;
-    /* Subscriber: awaiting DONE after a rejected update. D16 publisher:
-     * automatic rejection teardown has begun; no new output may overtake it. */
+    /* Typed UPDATE selections latch on ACK, so later fills inherit the
+     * acknowledged values rather than the initial PUBLISH parameters. */
+    bool               update_has_subscriber_priority;
+    uint8_t            update_subscriber_priority;
+    bool               update_has_filter;
+    uint32_t           update_filter_type;
+    uint64_t           update_start_group;
+    uint64_t           update_start_object;
+    uint64_t           update_end_group;
+    uint64_t           update_end_object;
+    /* A REQUEST_UPDATE was rejected. Subscriber: awaiting PUBLISH_DONE
+     * (UPDATE_FAILED); further updates are blocked. Publisher on a
+     * stream-correlated profile: its own update was refused and it owes
+     * PUBLISH_DONE(UPDATE_FAILED). Draft-16 publisher: the automatic
+     * rejection teardown has begun; no new output may overtake it. */
     bool               update_failed;
-    /* Lifetime successful subgroup opens, saturated at the D16 unknown count.
-     * Used by the automatic D16 update-rejection terminal, not caller counts. */
-    uint64_t           subgroup_streams_opened;
+    /* Publisher role: an update answer the application owes (see
+     * moq_sub_entry_t.owed_update). */
+    moq_owed_update_t  owed_update;
+    moq_sub_update_snapshot_t update_snapshot;
     /* Co-allocated request-bidi receive buffer (stream-correlated profiles): the
      * PUBLISH bidi carries the peer's response/lifecycle messages here. On the
      * publisher (opener) side: PUBLISH_OK / REQUEST_ERROR / REQUEST_UPDATE; on
      * the subscriber (responder) side: REQUEST_OK (update ack) / PUBLISH_DONE.
-     * req_recv_fin records the peer's FIN. Reset, not freed, on entry reuse; the
+     * rs.recv_fin records the peer's FIN. Reset, not freed, on entry reuse; the
      * pointer/cap are preserved. Unused under draft-16. */
-    uint8_t           *req_recv_buf;
-    size_t             req_recv_cap;
-    size_t             req_recv_len;
-    bool               req_recv_fin;
-    /* Transitional FIN ownership, distinct from req_recv_fin: the creating
+    /* Transitional FIN ownership, distinct from rs.recv_fin: the creating
      * PUBLISH carried the peer's FIN, and the commit that re-keyed the bidi
      * onto this entry took that FIN over with it. It is consumed by this
      * family's own FIN handling; a teardown that blocks on event capacity
@@ -635,6 +946,7 @@ typedef struct moq_pub_entry {
     uint64_t req_start_group;
     uint64_t req_start_object;
     uint64_t req_end_group;
+    uint64_t req_end_object;
     /* Resolved window: on the publisher role, resolved from the PUBLISH_OK
      * filter (and re-resolved on REQUEST_UPDATE snapshots) against this
      * side's registry largest. */
@@ -650,6 +962,10 @@ typedef struct moq_pub_entry {
     int32_t occ_next;    /* next linked slot, -1 = end */
     int32_t occ_prev;    /* previous linked slot, -1 = head */
     bool    occ_linked;  /* membership, so link/unlink are idempotent-safe */
+    bool facade_defer_updates;
+    /* Subscriber role: the Track was found malformed; the cancellation is
+     * owed (see moq_sub_entry_t.mt_failing). */
+    bool    mt_failing;
 } moq_pub_entry_t;
 
 typedef enum moq_ts_state {
@@ -672,28 +988,36 @@ typedef struct moq_ts_entry {
     uint32_t                    generation;
     moq_track_status_handle_t   handle;
     uint64_t                    request_id;
-    /* request_stream_ref: request bidi stream identity for stream-correlated
+    /* rs.ref: request bidi stream identity for stream-correlated
      * request profiles (the TRACK_STATUS request stream). Empty (zero) under
      * draft-16. */
-    moq_stream_ref_t            request_stream_ref;
+    moq_request_stream_t rs;
     /* Co-allocated request-bidi receive buffer (stream-correlated profiles): the
      * requester buffers the fragmentable TRACK_STATUS_OK / REQUEST_ERROR response
-     * here. req_recv_fin also records the peer's FIN on the publisher side (the
+     * here. rs.recv_fin also records the peer's FIN on the publisher side (the
      * requester sends TRACK_STATUS as its first and only message). Reset, not
      * freed, on entry reuse; the pointer/cap are preserved. Unused under draft-16. */
-    uint8_t                    *req_recv_buf;
-    size_t                      req_recv_cap;
-    size_t                      req_recv_len;
-    bool                        req_recv_fin;
-    /* Transitional FIN ownership, distinct from req_recv_fin: the creating
+    /* Transitional FIN ownership, distinct from rs.recv_fin: the creating
      * TRACK_STATUS carried the peer's FIN, and the commit that re-keyed the
      * bidi onto this entry took that FIN over with it. The publisher-side FIN
-     * handling consumes it into req_recv_fin, retaining the owner.
+     * handling consumes it into rs.recv_fin, retaining the owner.
      * Cleared on every free/reuse. */
     bool                        handoff_fin_pending;
     bool goaway_sent;   /* a per-request GOAWAY was emitted on this request
                          * bidi; the entry stays live until the peer tears the
                          * old stream down (FIN/RESET/STOP) or the timeout fires. */
+    /* D22: the existing receive buffer retains a fully validated outcome until
+     * its event commits. Later directional signals cannot replace that outcome. */
+    bool response_validated;
+    bool deferred_reset;
+    bool deferred_stop;
+    uint64_t deferred_reset_code;
+    uint64_t deferred_stop_code;
+    moq_track_status_terminal_cause_t terminal_cause;
+    uint64_t terminal_code;
+    bool terminal_notified;
+    bool migration_committed;
+    moq_drain_scan_t migration_scan;
     /* Owned canonical full-track-name key: TRACK_STATUS is the only
      * request family that did not retain the track name, but TRACK_STATUS_OK is
      * a registry merge source, so the response must be attributable to a track.
@@ -701,8 +1025,12 @@ typedef struct moq_ts_entry {
     uint8_t          *track_id_buf;
     size_t            track_id_len;
     /* Reserved registry record; released once in ts_free_entry. The
-     * inbound TRACK_STATUS_OK max-merges its Largest Object into it. */
+     * inbound TRACK_STATUS_OK max-merges its Largest Object into it; the
+     * publisher side's answer reports at least its Largest Object. */
     moq_track_hist_t *hist;
+    /* Publisher role: the request asked for no Track Properties in its
+     * answer (INCLUDE_PROPERTIES = 0); TRACK_STATUS_OK carries none. */
+    bool omit_track_properties;
 } moq_ts_entry_t;
 
 /* -- Per-track largest-location history record --------------------- */
@@ -727,6 +1055,10 @@ struct moq_track_hist {
     size_t    key_len;
     uint64_t  largest_group;
     uint64_t  largest_object;
+    /* Subscriber-role subscriptions to this track awaiting their response:
+     * while any is pending, an alias another subscription to the track holds
+     * may turn out to be shared (draft-22 §3.1.3). */
+    uint32_t  pending_subs;
 };
 
 /* -- Track-history registry internal API (session_track_hist.c) ----- */
@@ -738,6 +1070,29 @@ uint8_t *moq_build_track_key(moq_session_t *s,
                              const moq_namespace_t *ns,
                              moq_bytes_t name,
                              size_t *out_len);
+
+/* The public, semantic form of a stored subscription filter: the core's
+ * filter type and raw locations (including the internal relative-group and
+ * object-end forms) onto a moq_location_filter_cfg_t, and back. The forward
+ * mapping writes min(out_size, sizeof current) bytes of `out` and stamps that
+ * count; the caller has checked out_size against the v0 size. The inverse
+ * refuses an unknown kind or an end before the start. */
+void moq_location_filter_from_core(uint32_t filter_type, uint64_t start_group,
+                                   uint64_t start_object, uint64_t end_group,
+                                   uint64_t end_object,
+                                   moq_location_filter_cfg_t *out,
+                                   size_t out_size);
+moq_result_t moq_location_filter_to_core(const moq_location_filter_cfg_t *cfg,
+                                         uint32_t *filter_type, uint64_t *start_group,
+                                         uint64_t *start_object, uint64_t *end_group,
+                                         uint64_t *end_object);
+
+/* Normalize a local subscription filter before encoding or retaining it.
+ * Both typed relative0 and the legacy NEXT_GROUP spelling must use the
+ * negotiated profile's resolution rule; NEXT_GROUP ignores caller locations.
+ * Fill ranges have their own clamped resolver and do not use this helper. */
+void moq_local_filter_normalize(const moq_session_t *s, uint32_t *filter_type,
+                                uint64_t *start_group);
 
 /* Find the record for a canonical key, or NULL. */
 moq_track_hist_t *track_hist_find(moq_session_t *s,
@@ -840,16 +1195,23 @@ bool moq_loc_successor(uint64_t group, uint64_t object, uint64_t ceiling,
  * (max(registry, seed)); `ceiling` the profile's max Location value (see
  * moq_loc_successor). Fills *out (has_window is set true). Relative filters with
  * no snapshot resolve to an open window from the origin (never unsatisfiable);
- * at-ceiling relative filters set `unsatisfiable`.
+ * legacy successors at the ceiling set `unsatisfiable`; the internal
+ * relative-group form instead clamps to the location ceiling.
  */
 void moq_resolve_filter_window(moq_subscribe_filter_t filter,
                                uint64_t raw_start_group,
                                uint64_t raw_start_object,
                                uint64_t raw_end_group,
+                               uint64_t raw_end_object,
                                bool has_snap,
                                uint64_t snap_group, uint64_t snap_object,
                                uint64_t ceiling,
                                moq_resolved_window_t *out);
+
+/* Write a stored window as the public moq_filter_window_t (size-aware: the
+ * fields through end_object are required, struct_size is stamped). */
+moq_result_t moq_filter_window_out(const moq_resolved_window_t *w,
+                                   moq_filter_window_t *out, size_t out_size);
 
 /*
  * Package-internal accessors for the resolved window stored on a publisher-role
@@ -869,6 +1231,7 @@ typedef enum moq_ns_sub_state {
     MOQ_NS_SUB_PENDING_PUBLISHER   = 3,
     MOQ_NS_SUB_ESTABLISHED         = 4,
     MOQ_NS_SUB_CLOSING             = 5,
+    MOQ_NS_SUB_DRAINING            = 6, /* app terminal committed; physical work retained */
 } moq_ns_sub_state_t;
 
 /* -- Stream kind --------------------------------------------------- */
@@ -899,6 +1262,44 @@ typedef enum moq_request_kind {
     MOQ_REQ_SUBSCRIBE_TRACKS = 9,
 } moq_request_kind_t;
 
+/* How a request ended when a stream signal, or a FIN that failed it, ended
+ * it rather than a message. cause zero means a message did. */
+typedef struct moq_request_terminal {
+    moq_request_terminal_cause_t cause;
+    uint64_t                     error_code;
+} moq_request_terminal_t;
+
+static inline moq_request_terminal_t request_terminal_by_message(void)
+{
+    moq_request_terminal_t t = { MOQ_REQUEST_TERMINAL_NONE, 0 };
+    return t;
+}
+
+static inline moq_request_terminal_t request_terminal_signal(bool reset,
+                                                             uint64_t error_code)
+{
+    moq_request_terminal_t t;
+    t.cause = reset ? MOQ_REQUEST_TERMINAL_PEER_RESET_STREAM
+                    : MOQ_REQUEST_TERMINAL_PEER_STOP_SENDING;
+    t.error_code = error_code;
+    return t;
+}
+
+static inline moq_request_terminal_t request_terminal_fin(bool truncated)
+{
+    moq_request_terminal_t t;
+    t.cause = truncated ? MOQ_REQUEST_TERMINAL_TRUNCATED_RESPONSE
+                        : MOQ_REQUEST_TERMINAL_MISSING_RESPONSE;
+    t.error_code = 0;
+    return t;
+}
+
+/* Private dispatch to the distinct typed scalar events. The caller has checked
+ * event capacity; no generic event or family-tagged detail is public. */
+void push_request_terminated(moq_session_t *s, moq_request_family_t family,
+                             moq_request_role_t local_role,
+                             moq_request_terminal_t term, uint64_t raw_handle);
+
 typedef struct moq_request_endpoint {
     moq_request_kind_t kind;
     int                slot;
@@ -914,10 +1315,18 @@ typedef enum moq_sg_state {
     MOQ_SG_CLOSING   = 2,
     MOQ_SG_RESETTING = 3,
     MOQ_SG_STREAMING = 4,
+    /* Ended by a teardown whose action queue had no room left for the
+     * stream's reset: the reset is owed (owed_reset_code) and issued by
+     * session_retry_owed_stream_actions once capacity returns; the entry takes no more
+     * objects and is not reaped until the reset is queued. */
+    MOQ_SG_RESET_OWED = 5,
 } moq_sg_state_t;
 
 typedef struct moq_sg_entry {
     uint8_t               publisher_priority;
+    /* Bytes of the SUBGROUP_HEADER as encoded on this stream: the reliable
+     * size of every reset the session sends on it. */
+    uint8_t               header_len;
     moq_sg_state_t         state;
     uint32_t               generation;
     moq_subscription_t     sub;
@@ -931,6 +1340,22 @@ typedef struct moq_sg_entry {
     uint64_t               streaming_bytes_written;
     uint64_t               delivery_deadline_us;
     bool                   has_extensions;
+    /* The first object's OBJECT_DELIVERY_TIMEOUT / SUBGROUP_DELIVERY_TIMEOUT
+     * properties: on profiles that honour them they replace the track-level
+     * publisher values for this subgroup. */
+    bool                   ovr_has_object;
+    uint64_t               ovr_object_ms;
+    bool                   ovr_has_subgroup;
+    uint64_t               ovr_subgroup_ms;
+    /* OBJECT_DELIVERY_TIMEOUT expiry of the streamed object in progress, or
+     * UINT64_MAX: none running, or (clock at the first payload byte) not yet
+     * started. */
+    uint64_t               streaming_deadline_us;
+    /* A queued object on this stream has exceeded its OBJECT_DELIVERY_TIMEOUT;
+     * set and consumed within one expiry pass. */
+    bool                   timeout_expired;
+    /* MOQ_SG_RESET_OWED: the error code of the reset still owed. */
+    uint64_t               owed_reset_code;
     /*
      * Intrusive OCCUPANCY list, ascending slot order. A slot is linked iff it
      * is allocated (state != FREE / active). Every sweep that used to scan the
@@ -1041,6 +1466,9 @@ typedef struct moq_ns_sub_entry {
     moq_ns_sub_handle_t handle;
     uint64_t            request_id;
     moq_stream_ref_t    stream_ref;
+    bool                local_subscriber;   /* this side issued the request */
+    bool                terminal_notified;  /* REQUEST_TERMINATED already queued */
+    uint8_t             retained_output;   /* moq_retained_output_t */
     moq_request_endpoint_t request_ep;
     moq_namespace_interest_t namespace_interest;
     uint8_t            *prefix_buf;
@@ -1100,6 +1528,12 @@ typedef struct moq_ns_sub_entry {
                                    * capacity block resumes the terminal on the
                                    * next empty re-feed instead of re-decoding the
                                    * over-cap NAMESPACE. Cleared on slot free. */
+    /* D22 RESET/STOP: first application cause is independent of crossed
+     * transport facts. Lifetime is initialized from this owner at cancellation;
+     * the entry retains both event and direction obligations without allocation. */
+    moq_request_terminal_t terminal;
+    moq_request_lifetime_t cancel_lifetime;
+    moq_ns_update_t update;
 } moq_ns_sub_entry_t;
 
 void ns_sub_destroy_all(moq_session_t *s);
@@ -1134,29 +1568,31 @@ typedef struct moq_track_sub_entry {
     moq_track_sub_handle_t  handle;
     uint64_t                request_id;
     moq_request_endpoint_t  request_ep;
-    moq_stream_ref_t        request_stream_ref;
+    moq_request_stream_t rs;
     /* Stored namespace prefix (publisher side) for the independent overlap scan. */
     uint8_t                *prefix_buf;
     size_t                  prefix_buf_len;
     moq_bytes_t            *prefix_parts;
     size_t                  prefix_count;
     bool                    forward;
+    moq_subscribe_tracks_options_t options;
     /* Auth staging committed after the request event is pushed (publisher side). */
     bool                    auth_committed;
     uint64_t                auth_reject_code;
     moq_resolved_token_t    resolved_tokens[MOQ_DECODED_MAX_TOKENS];
     bool                    token_staged[MOQ_DECODED_MAX_TOKENS];
     size_t                  token_count;
-    moq_auth_txn_t          auth_txn;
+    /* Before SETUP completes this slot is inactive. Its auth transaction
+     * storage lends a typed token array to SETUP without growing the pool. */
+    union {
+        moq_auth_txn_t          auth_txn;
+        moq_decoded_auth_token_t setup_tokens[MOQ_DECODED_MAX_TOKENS];
+    };
     /* Co-allocated request-bidi receive buffer (stream-correlated): the requester
      * buffers the fragmentable REQUEST_OK / REQUEST_ERROR / PUBLISH_BLOCKED stream
-     * here. req_recv_fin records the peer's FIN. Reset, not freed, on entry reuse;
+     * here. rs.recv_fin records the peer's FIN. Reset, not freed, on entry reuse;
      * the pointer/cap are preserved. */
-    uint8_t                *req_recv_buf;
-    size_t                  req_recv_cap;
-    size_t                  req_recv_len;
-    bool                    req_recv_fin;
-    /* Transitional FIN ownership, distinct from req_recv_fin: the creating
+    /* Transitional FIN ownership, distinct from rs.recv_fin: the creating
      * SUBSCRIBE_TRACKS carried the peer's FIN, and the commit that re-keyed the
      * bidi onto this entry took that FIN over with it. Unlike the track-status,
      * fetch and announcement families, THIS consumer can block -- the
@@ -1167,7 +1603,19 @@ typedef struct moq_track_sub_entry {
     bool goaway_sent;   /* a per-request GOAWAY was emitted on this request
                          * bidi; the entry stays live until the peer tears the
                          * old stream down (FIN/RESET/STOP) or the timeout fires. */
+    moq_ns_update_t update;
 } moq_track_sub_entry_t;
+
+_Static_assert(sizeof(moq_decoded_auth_token_t) * MOQ_DECODED_MAX_TOKENS <=
+                   sizeof(moq_auth_txn_t), "SETUP tokens fit track auth storage");
+_Static_assert(_Alignof(moq_decoded_auth_token_t) <= _Alignof(moq_auth_txn_t),
+               "SETUP tokens do not increase track entry alignment");
+
+typedef struct moq_setup_workspace {
+    moq_ns_sub_entry_t    *auth;
+    moq_track_sub_entry_t *decoded;
+    size_t                count;
+} moq_setup_workspace_t;
 
 void track_sub_destroy_all(moq_session_t *s);
 
@@ -1203,11 +1651,41 @@ typedef struct moq_decoded_subgroup_header {
     uint64_t group_id;
     uint64_t subgroup_id;
     uint8_t  publisher_priority;
+    bool     default_priority;
     bool     has_extensions;
     bool     end_of_group;
     bool     subgroup_id_resolved;
     bool     subgroup_id_from_first_object;
+    bool     first_object;   /* FIRST_OBJECT bit (false on drafts without it) */
 } moq_decoded_subgroup_header_t;
+
+/* Why a received object makes its Track malformed (draft-22 §12.1, §10.7,
+ * §10.8, §10.9, §3.7); MOQ_MALFORMED_NONE when it does not. The property
+ * violations share their values with MOQ_OBJ_PROPS_* in the wire layer. */
+#define MOQ_MALFORMED_NONE                0u
+#define MOQ_MALFORMED_PROPS_UNPARSEABLE   1u
+#define MOQ_MALFORMED_NESTED_IMMUTABLE    2u
+#define MOQ_MALFORMED_DUPLICATE_IMMUTABLE 3u
+#define MOQ_MALFORMED_MANDATORY_PROPERTY  4u
+#define MOQ_MALFORMED_DUPLICATE_GAP       5u
+#define MOQ_MALFORMED_PRIORITY            16u  /* §12.1 condition 1 */
+#define MOQ_MALFORMED_PAST_SUBGROUP_END   17u  /* condition 2 */
+#define MOQ_MALFORMED_SUBGROUP_END        18u  /* condition 3 */
+#define MOQ_MALFORMED_PAST_GROUP_END      19u  /* condition 4 */
+#define MOQ_MALFORMED_PAST_TRACK_END      20u  /* condition 5 */
+#define MOQ_MALFORMED_GROUP_END           21u  /* conflicting End of Group */
+#define MOQ_MALFORMED_TRACK_END           22u  /* conflicting End of Track */
+#define MOQ_MALFORMED_ORDER               23u  /* FETCH Location not ascending */
+#define MOQ_MALFORMED_GAP                 24u  /* §10.8 / §10.9 conditions */
+#define MOQ_MALFORMED_TRACK_FAILED        25u  /* the Track already failed */
+
+/* Prior Group ID Gap (0x3C) and Prior Object ID Gap (0x3E) as received. */
+typedef struct moq_obj_gaps {
+    bool     has_group_gap;
+    bool     has_object_gap;
+    uint64_t group_gap;
+    uint64_t object_gap;
+} moq_obj_gaps_t;
 
 typedef struct moq_decoded_object_header {
     uint64_t           object_id;
@@ -1216,6 +1694,8 @@ typedef struct moq_decoded_object_header {
     const uint8_t     *properties;     /* borrowed from reader; NULL if none */
     size_t             properties_len;
     bool               has_properties;
+    uint8_t            malformed;      /* MOQ_MALFORMED_*; property violations */
+    moq_obj_gaps_t     gaps;
 } moq_decoded_object_header_t;
 
 /* -- Outbound data-plane encode args (session core → profile) ------- */
@@ -1227,6 +1707,7 @@ typedef struct moq_subgroup_header_encode_args {
     uint8_t  publisher_priority;
     bool     has_extensions;
     bool     end_of_group;
+    bool     first_object;   /* FIRST_OBJECT bit; ignored without one */
 } moq_subgroup_header_encode_args_t;
 
 typedef struct moq_object_header_encode_args {
@@ -1280,6 +1761,9 @@ typedef struct moq_subscribe_tracks_encode_args {
     bool            forward;
     const moq_auth_token_t *auth_tokens;
     size_t                  auth_token_count;
+    uint32_t options_flags;
+    moq_group_order_t group_order;
+    bool include_properties;
 } moq_subscribe_tracks_encode_args_t;
 
 /* -- Receive data stream state ------------------------------------- */
@@ -1323,14 +1807,31 @@ typedef enum moq_rx_parse_state {
      * frees the entry (neither counts as a completed stream; the FIN is still
      * noted as the transport stream's end, so later bytes on the ref are
      * data after FIN). The entry holds
-     * its receive slot meanwhile; a stream that finds no free slot is STOPped
-     * without one and its identity kept in rx_stopped_refs instead
-     * (rx_get_or_create_stream). */
+     * its receive slot meanwhile; a stream stopped because its subscription
+     * ended on this side gives the slot up and keeps only its identity, in
+     * rx_stopped_refs (rx_end_bound_streams). */
     MOQ_RX_STOPPED          = 10,
 } moq_rx_parse_state_t;
 
+/* One subscription a subgroup stream on a shared alias has delivered to
+ * (see moq_rx_stream_t.fan). */
+typedef struct moq_rx_fan {
+    moq_subscription_t sub;   /* a SUBSCRIBE-initiated subscription, or */
+    moq_publication_t  pub;   /* a PUBLISH-initiated one (exactly one valid) */
+    /* A subscription to the same track still awaiting its response: the
+     * alias may turn out to be its own (draft-22 §3.1.3), so the objects its
+     * filter would accept are held for it instead of surfaced. */
+    bool pending;
+    bool cur;      /* the current object passes this subscription's filter */
+    bool owed;     /* the current object's (or chunk's) event is still owed */
+    bool closed;   /* an object terminal (RESET chunk) already closed it */
+    bool closure;  /* its SUBGROUP_FINISHED / SUBGROUP_RESET was emitted */
+} moq_rx_fan_t;
+
 typedef struct moq_rx_stream {
     bool                   active;
+    /* Preserve omission until delivery, including deferred alias binding. */
+    bool                   default_priority;
     /* RESET_STREAM code retained while a SUBGROUP_RESET emit is parked, so a
      * re-drive cannot overwrite or lose the code the peer actually sent. */
     uint64_t               reset_error_code;
@@ -1346,13 +1847,46 @@ typedef struct moq_rx_stream {
     moq_subscription_t     sub;
     moq_fetch_t            fetch;
     moq_publication_t      pub_handle;
+    /* A subgroup stream on an alias that several subscriber-role
+     * subscriptions share (draft-22 §3.1): `sub` stays invalid and each
+     * object is attributed by re-applying every sharing subscription's
+     * filter at its admission. `fan` (owned, `fan_cap` entries) lists, in
+     * first-match order, every subscription the stream delivered to that
+     * is still live; the stream counts toward one subscription's Stream
+     * Count only when it never delivered to any other (`fan_ambiguous`
+     * records that it did, even after the others ended). */
+    bool                   fan_shared;
+    bool                   fan_ambiguous;
+    uint32_t               fan_count;
+    uint32_t               fan_cap;
+    moq_rx_fan_t          *fan;
+    /* A fetch response stream bound to a fill child (by the initiating
+     * request id in its header). Kept across a local STOP so the peer's FIN
+     * or RESET still settles the child. sub / pub_handle carry the fill's
+     * parent for stream counting only. On every bound data stream the
+     * binding survives a local STOP for the same reason: the peer's terminal
+     * on a stopped stream counts it toward the Stream Count gate. */
+    bool                   fill_bound;
+    moq_fill_ref_t         fill_ref;
     /* Set when this data uni is the late response to a locally-cancelled fetch:
      * the fetch-cancel tombstone for cancel_tomb_request_id is consumed once the
      * STOP_DATA is actually queued (which may be deferred via MOQ_RX_NEED_STOP),
      * so a retried stop still releases the tombstone. */
     bool                   stop_consumes_cancel_tomb;
+    /* The subscription or publication this stream was bound to ended on this
+     * side (rx_end_bound_streams): its STOP carries CANCELLED and, once
+     * queued, the entry gives way to an identity record in rx_stopped_refs. */
+    /* The session stops this stream because the subscription it belongs
+     * to is being deleted while its state is kept (the Stream Count wait
+     * expired): its STOP carries CANCELLED, as a binding_ended one does. */
+    bool                   stop_cancels;
+    bool                   binding_ended;
     uint64_t               cancel_tomb_request_id;
     moq_fetch_prior_object_t fetch_prior;
+    /* RX owns this snapshot across FETCH/fill owner retirement and reuse.
+     * An inherited unknown fill order waits for its authoritative ACK. */
+    moq_group_order_t       effective_fetch_group_order;
+    bool                   fetch_order_known;
     uint64_t               track_alias;
     uint64_t               group_id;
     uint64_t               subgroup_id;
@@ -1360,12 +1894,16 @@ typedef struct moq_rx_stream {
     bool                   has_extensions;
     bool                   has_prev_object;
     bool                   pending_fin;
-    bool                   resumed_deferred;  /* was DEFERRED_ALIAS, now bound;
+    bool                   resumed_deferred;  /* resolved alias or FETCH order;
                                                  re-driven on poll retry until
                                                  its buffered objects drain */
     bool                   subgroup_id_from_first_object;
     bool                   subgroup_id_resolved;
     bool                   end_of_group;
+    bool                   first_object;      /* header FIRST_OBJECT bit */
+    bool                   cur_first_object;  /* current object is the
+                                                 stream's first under that
+                                                 bit */
     uint64_t               prev_object_id;
 
     uint8_t                hdr_buf[MOQ_RX_HDR_BUF];
@@ -1428,6 +1966,21 @@ typedef struct moq_staged_datagram {
     uint64_t  alias;
     uint8_t  *bytes;
     size_t    len;
+    /* Held for a subscription still awaiting its response, under an alias
+     * another subscription to its track holds (draft-22 §3.1.3): a decoded
+     * object (`bytes` unused, `len` its charge against the ring's byte
+     * budget), surfaced only to `for_sub` if its answer names `alias`. */
+    moq_subscription_t for_sub;
+    uint64_t  group_id, subgroup_id, object_id;
+    uint8_t   publisher_priority;
+    uint8_t   status;
+    bool      end_of_group;
+    bool      datagram;
+    bool      default_priority;
+    bool      first_object;
+    bool      subgroup_properties;
+    moq_rcbuf_t *payload;      /* owned reference */
+    moq_rcbuf_t *properties;   /* owned reference */
 } moq_staged_datagram_t;
 
 /* Overwrite memory that held a credential before it is released. The stores go
@@ -1438,27 +1991,68 @@ static inline void session_wipe(void *p, size_t n)
     while (n--) *b++ = 0;
 }
 
+/* An object to hold for a pending subscription. The references stay the
+ * caller's; the ring takes its own. */
+typedef struct moq_held_object {
+    uint64_t group_id, subgroup_id, object_id;
+    uint8_t  publisher_priority;
+    uint8_t  status;
+    bool     end_of_group;
+    bool     datagram;
+    bool     default_priority;
+    bool     first_object;
+    bool     subgroup_properties;
+    moq_rcbuf_t *payload;
+    moq_rcbuf_t *properties;
+} moq_held_object_t;
+
+/* Hold `o` for the pending subscription `for_sub` in the held-object ring
+ * (MOQ_STAGED_DG_SLOTS entries and the staged byte budget, drop-oldest,
+ * counted in staged_dropped). Never fails the caller. */
+void session_stage_held_object(moq_session_t *s, moq_subscription_t for_sub,
+                               uint64_t alias, const moq_held_object_t *o);
+
+uint8_t session_resolve_publisher_priority(moq_session_t *s,
+                                           moq_subscription_t sub,
+                                           moq_publication_t pub,
+                                           bool omitted, uint8_t priority);
+/* A pending subscription got its answer or ended: objects held for it under
+ * another alias than `alias` (all of them when not `established`) are
+ * dropped, and so are its held-for entries on shared streams. */
+void session_settle_pending(moq_session_t *s, moq_subscription_t sub,
+                            bool established, uint64_t alias);
+void rx_settle_pending(moq_session_t *s, moq_subscription_t sub,
+                       bool established, uint64_t alias);
+/* Objects on `alias` are attributed by filter: several subscriptions hold
+ * it, or a subscription to its track awaits its response. */
+bool alias_attribution_shared(moq_session_t *s, uint64_t alias);
+bool sub_pending_for_track(const moq_sub_entry_t *e, const moq_track_hist_t *h);
+/* A pending subscription's filter, resolved against the newest Largest
+ * Object known here, admits {group, object} and it forwards. */
+bool sub_pending_accepts(moq_session_t *s, const moq_sub_entry_t *e,
+                         uint64_t group, uint64_t object);
+
 /* -- Peer FIN on a request bidi ------------------------------------ *
  * The peer has closed its send half when the durable latch records a wire FIN,
  * or when a same-call FIN handed over with the request still sits on the
  * destination owner as transitional ownership. A terminal that would reserve a
  * drain ref to absorb the peer's remaining send half must consult this, not
- * req_recv_fin alone: a FIN already observed leaves nothing to drain, and a
+ * rs.recv_fin alone: a FIN already observed leaves nothing to drain, and a
  * full drain ring must not block a terminal the peer has already finished. */
 static inline bool pub_peer_fin_observed(const moq_pub_entry_t *e) {
-    return e->req_recv_fin || e->handoff_fin_pending;
+    return e->rs.recv_fin || e->handoff_fin_pending;
 }
 static inline bool ts_peer_fin_observed(const moq_ts_entry_t *e) {
-    return e->req_recv_fin || e->handoff_fin_pending;
+    return e->rs.recv_fin || e->handoff_fin_pending;
 }
 static inline bool fetch_peer_fin_observed(const moq_fetch_entry_t *e) {
-    return e->req_recv_fin || e->handoff_fin_pending;
+    return e->rs.recv_fin || e->handoff_fin_pending;
 }
 static inline bool ann_peer_fin_observed(const moq_ann_entry_t *e) {
-    return e->req_recv_fin || e->handoff_fin_pending;
+    return e->rs.recv_fin || e->handoff_fin_pending;
 }
 static inline bool track_sub_peer_fin_observed(const moq_track_sub_entry_t *e) {
-    return e->req_recv_fin || e->handoff_fin_pending;
+    return e->rs.recv_fin || e->handoff_fin_pending;
 }
 /* The namespace-sub family's durable latch is `pending_fin`, and its handler
  * also sees the wire FIN of the current call, so the unified fact takes all
@@ -1513,6 +2107,39 @@ void moq_index_remove(moq_index_entry_t *tbl, size_t mask, uint64_t key);
 
 /* -- Session struct ------------------------------------------------ */
 
+/*
+ * Scheduling and timing record of a queued action, kept beside the action
+ * ring (same index). Only SEND_DATA and SEND_DATAGRAM carry one; every other
+ * kind has a zeroed record and is never reordered. The adapter's poll takes
+ * the best schedulable action rather than the oldest (design: Priorities,
+ * rules 1-4), and an object whose OBJECT_DELIVERY_TIMEOUT has elapsed is
+ * dropped instead of being handed to the transport.
+ */
+#define MOQ_SCHED_MODE_NONE     0u
+#define MOQ_SCHED_MODE_SUBGROUP 1u   /* subscription-delivered, on a subgroup stream */
+#define MOQ_SCHED_MODE_DATAGRAM 2u   /* subscription-delivered, as a datagram */
+#define MOQ_SCHED_MODE_FILL     3u   /* fill-delivered, on the fill fetch stream */
+#define MOQ_SCHED_MODE_FETCH    4u   /* a FETCH response */
+
+typedef struct moq_action_meta {
+    uint64_t deadline_us;        /* OBJECT_DELIVERY_TIMEOUT expiry; UINT64_MAX = none */
+    uint64_t owner;              /* the request the object answers (handle bits); 0 = none */
+    uint64_t group_id;
+    uint64_t subgroup_id;        /* SUBGROUP */
+    uint64_t object_id;          /* DATAGRAM / FILL */
+    uint8_t  subscriber_priority;
+    uint8_t  publisher_priority;
+    uint8_t  mode;               /* MOQ_SCHED_MODE_* */
+    uint8_t  group_order;        /* the owner's: MOQ_GROUP_ORDER_ASCENDING / DESCENDING */
+    uint8_t  fill_group_order;   /* FILL: the fill's own order */
+    bool     has_location;       /* group_id and the id field are meaningful */
+} moq_action_meta_t;
+
+typedef struct moq_state_location_cell {
+    moq_location_filter_cfg_t value;
+    size_t next;
+} moq_state_location_cell_t;
+
 struct moq_session {
     moq_alloc_t         alloc;
     size_t              alloc_size;
@@ -1524,12 +2151,37 @@ struct moq_session {
     const moq_profile_ops_t *profile;
     void                    *profile_state;
 
+    /* The transport binding, when the profile requires one (see
+     * transport_binding_internal.h); zero and unbound otherwise. */
+    moq_binding_state_t      binding;
+
+    /* The one transport owner (a transport bridge) attached to this session,
+     * or NULL. Opaque identity only; see moq_session_register_transport_owner. */
+    const void              *transport_owner;
+    /* The registered owner's own next deadline (its local hold-age expiry),
+     * folded into moq_session_next_deadline_us. moq_session_tick never
+     * consumes it: only the owner's own service rearms or clears it. */
+    bool                     has_owner_deadline;
+    uint64_t                 owner_deadline_us;
+
     moq_setup_params_t  local_setup;
     moq_setup_params_t  peer_setup;
     moq_token_cache_t   peer_token_cache;
 
     bool                send_auth_token_cache_size;
     uint64_t            auth_token_cache_size;
+    /* The application answers subscription updates it can be offered
+     * (moq_session_cfg_t.defer_subscription_updates). */
+    bool                defer_subscription_updates;
+    /* The application resolves FETCH ranges stated relative to the Largest
+     * Object (moq_session_cfg_t.defer_fetch_ranges). */
+    bool                defer_fetch_ranges;
+    /* The application answers draft-22 namespace updates
+     * (moq_session_set_defer_namespace_updates). */
+    bool                defer_namespace_updates;
+    /* The peer's implementation identifier, copied at setup completion. */
+    uint8_t            *peer_implementation;
+    size_t              peer_implementation_len;
     /* Authorization tokens this side presents in its SETUP, copied from the
      * cfg into the session arena: the values, and (on profiles with
      * encode_setup_token) each one's encoded Setup Option value. A session
@@ -1546,6 +2198,7 @@ struct moq_session {
     size_t        action_cap;
     size_t        action_head;
     size_t        action_tail;
+    moq_action_meta_t *action_meta;   /* parallel to actions */
 
     moq_event_t  *events;
     size_t        event_cap;
@@ -1624,6 +2277,30 @@ struct moq_session {
     moq_track_hist_t *track_hist;
     size_t            th_cap;
 
+    /* Malformed Track detection state (draft-22 §12.1), one record per
+     * received Track: by alias for subscription data, by fetch for a FETCH
+     * response. Allocated on first use, only on profiles that fail a
+     * malformed Track locally; see session_malformed.c. */
+    struct moq_mt_track *mt_head;
+    size_t               mt_count;
+    /* Requests whose Track was found malformed and whose cancellation has
+     * not committed yet (their mt_failing flags). */
+    size_t               mt_failing_count;
+    /* Event slots held back from every producer while a teardown that owes
+     * its own terminal event runs nested work that could emit events (a
+     * parent's fill children), so the parent's event keeps its slot. */
+    size_t               event_reserve;
+
+    /* Fill children of subscriptions (see moq_session_cfg_t.max_fills):
+     * the ownership table over a separately allocated entry array, plus a
+     * parallel per-slot record of what the table deliberately leaves out
+     * (the effective request, cached handle, terminal error, write cursor).
+     * Separately allocated so the cap never disturbs the block layout. */
+    moq_fill_table_t   fills;
+    moq_fill_entry_t  *fill_storage;
+    struct moq_fill_side *fill_side;
+    size_t             fill_cap;
+
     uint8_t      *output_scratch;       /* transient: reset every advance */
     size_t        output_scratch_cap;
     size_t        output_scratch_len;
@@ -1635,6 +2312,16 @@ struct moq_session {
     uint8_t      *event_scratch;
     size_t        event_scratch_cap;
     size_t        event_scratch_len;
+
+    /* Immutable state-notification locations, one cell per event slot on
+     * supported profiles.
+     * Queued cells stay pinned; polled cells recycle only at the next advance.
+     * Each list ends at state_location_cap. Retired tail enables O(1) recycle. */
+    moq_state_location_cell_t *state_locations;
+    size_t state_location_cap;
+    size_t state_location_free;
+    size_t state_location_retired;
+    size_t state_location_retired_tail;
 
     uint16_t      session_tag;
     bool          goaway_sent;
@@ -1667,14 +2354,16 @@ struct moq_session {
     size_t           rx_fin_head;
     size_t           rx_fin_count;
 
-    /* Streams STOPped while every receive entry was held: a STOP_DATA was
-     * queued and the stream's identity is kept here (arena-backed, bounded
-     * like rx_finished, never evicted) so every later chunk is consumed
-     * without parsing until the peer's FIN or RESET releases the record.
-     * The session owns these streams (moq_session_has_transport_stream).
-     * With the records exhausted a new stream is refused with WOULD_BLOCK
-     * and nothing retained -- no STOP, no ownership -- which the bridge
-     * treats as an unowned refusal and discards that stream itself. */
+    /* Streams STOPped without a receive entry -- those of a subscription that
+     * ended on this side (rx_end_bound_streams): a STOP_DATA was queued and
+     * the stream's identity is kept here (arena-backed, bounded like
+     * rx_finished, never evicted) so every later chunk is consumed without
+     * parsing until the peer's FIN or RESET releases the record. The session
+     * owns these streams (moq_session_has_transport_stream). With the records
+     * exhausted such a stream keeps its entry in MOQ_RX_STOPPED instead. A new
+     * stream that finds no free entry is refused with WOULD_BLOCK and nothing
+     * retained -- no STOP, no ownership -- which the bridge treats as an
+     * unowned refusal and discards that stream itself. */
     uint64_t        *rx_stopped_refs;
     size_t           rx_stopped_cap;
     size_t           rx_stopped_count;
@@ -1712,6 +2401,8 @@ struct moq_session {
      * the bidi FINs or the peer resets it. Draft-16 leaves this empty. */
     uint64_t        *drain_refs;
     uint8_t         *drain_ref_reasons;   /* parallel to drain_refs (moq_drain_reason_t) */
+    struct moq_drain_scan *drain_ref_scans; /* parallel to drain_refs: framing of a
+                                             * GOAWAY-received ref */
     size_t           drain_ref_cap;
     size_t           drain_ref_count;
 
@@ -1860,6 +2551,8 @@ typedef struct moq_decoded_object_datagram {
     size_t               properties_len;
     const uint8_t       *payload;
     size_t               payload_len;
+    uint8_t              malformed;    /* MOQ_MALFORMED_*; property violations */
+    moq_obj_gaps_t       gaps;
 } moq_decoded_object_datagram_t;
 
 /* -- Outbound datagram encode args (session core -> profile) -------- */
@@ -1937,6 +2630,17 @@ static inline uint64_t deadline_add(uint64_t now, uint64_t timeout) {
     return d;
 }
 
+/* A subscription's effective group order: the one its subscriber asked
+ * for, else the publisher's preference from the track (the
+ * DEFAULT_PUBLISHER_GROUP_ORDER Track Property), else Ascending -- the
+ * property's own default. */
+static inline uint8_t session_group_order(uint8_t requested, uint8_t track) {
+    if (requested == MOQ_GROUP_ORDER_ASCENDING ||
+        requested == MOQ_GROUP_ORDER_DESCENDING) return requested;
+    if (track == MOQ_GROUP_ORDER_DESCENDING) return MOQ_GROUP_ORDER_DESCENDING;
+    return MOQ_GROUP_ORDER_ASCENDING;
+}
+
 static inline bool session_is_active(const moq_session_t *s) {
     return s->state == MOQ_SESS_ESTABLISHED ||
            s->state == MOQ_SESS_DRAINING;
@@ -1951,6 +2655,19 @@ static inline bool session_is_active(const moq_session_t *s) {
 static inline bool session_refuses_new_requests(const moq_session_t *s) {
     return s->goaway_sent;
 }
+
+/* A Track Namespace whose first field is "." or ".session": reserved by
+ * draft-18 §3.2.1-§3.2.2 and draft-22 §2.4.3, §6.5. */
+bool session_namespace_reserved(const moq_namespace_t *ns);
+
+/* Whether the session refuses a new inbound request itself, before the
+ * application sees it, and with which REQUEST_ERROR code: after our GOAWAY
+ * (the peer SHOULD NOT start one; we refuse it rather than close), or for a
+ * session-level track or namespace this implementation does not recognize
+ * -- any under "." or ".session" (DOES_NOT_EXIST). `ns` is the request's
+ * namespace or namespace prefix, NULL when it names none. */
+bool session_refuses_request(const moq_session_t *s, const moq_namespace_t *ns,
+                             uint64_t *out_code);
 
 void session_begin_advance(moq_session_t *s, uint64_t now_us);
 
@@ -1972,12 +2689,27 @@ static inline size_t action_queue_avail(const moq_session_t *s) {
     return used < s->action_cap ? s->action_cap - used : 0;
 }
 moq_result_t push_action(moq_session_t *s, const moq_action_t *a);
+/* Queue a data action with its scheduling record. A NULL record is derived
+ * from the stream the action belongs to (subgroup, fetch or fill stream);
+ * deadline_us is the object's OBJECT_DELIVERY_TIMEOUT expiry (UINT64_MAX for
+ * none) and is stored whichever way the record came. */
+moq_result_t push_action_ex(moq_session_t *s, const moq_action_t *a,
+                            const moq_action_meta_t *meta, uint64_t deadline_us);
+/* Earliest OBJECT_DELIVERY_TIMEOUT expiry among the queued actions. */
+uint64_t session_queued_data_deadline(const moq_session_t *s);
+/* Drop every queued object whose OBJECT_DELIVERY_TIMEOUT has elapsed at
+ * last_now_us: an expired datagram is discarded; an expired subgroup object
+ * takes the rest of its stream's queued data with it and the stream is reset
+ * with DELIVERY_TIMEOUT. */
+void session_expire_queued_data(moq_session_t *s);
 bool event_queue_full(const moq_session_t *s);
 static inline size_t event_queue_avail(const moq_session_t *s) {
-    size_t used = s->event_tail - s->event_head;
+    size_t used = s->event_tail - s->event_head + s->event_reserve;
     return used < s->event_cap ? s->event_cap - used : 0;
 }
 moq_result_t push_event(moq_session_t *s, const moq_event_t *e);
+moq_location_filter_cfg_t *event_location_alloc(moq_session_t *s);
+void event_location_release(moq_session_t *s, const moq_location_filter_cfg_t *value);
 
 uint8_t *scratch_alloc(moq_session_t *s, size_t len);
 void *scratch_alloc_aligned(moq_session_t *s, size_t len, size_t align);
@@ -2022,6 +2754,12 @@ moq_event_scratch_verdict_t setup_event_scratch_classify(
     size_t token_count);
 uint8_t *scratch_copy(moq_session_t *s, const uint8_t *data, size_t len);
 
+/* queue_send_control for a request cancellation (UNSUBSCRIBE,
+ * FETCH_CANCEL): a send buffer too full now because it still holds earlier
+ * output is MOQ_ERR_WOULD_BLOCK -- the buffer is released as actions are
+ * polled, so the caller retries -- and only a message larger than the whole
+ * buffer is MOQ_ERR_BUFFER, a cancellation that can never be made. */
+moq_result_t queue_send_cancel(moq_session_t *s, const uint8_t *data, size_t len);
 moq_result_t queue_send_control(moq_session_t *s,
                                  const uint8_t *data, size_t len);
 /* Queue already-encoded bytes on a request bidi stream. Returns WOULD_BLOCK when
@@ -2054,15 +2792,20 @@ moq_result_t queue_request_error_bidi(moq_session_t *s, moq_stream_ref_t ref,
  * the given session-minted stream_ref; data is copied into the send buffer. */
 moq_result_t queue_open_uni_control(moq_session_t *s, moq_stream_ref_t ref,
                                     const uint8_t *data, size_t len);
+moq_result_t queue_open_uni_control_in_place(moq_session_t *s,
+                                             moq_stream_ref_t ref, size_t len);
 /* reason must be a string literal or NULL (stored without copy). */
 moq_result_t close_with_error(moq_session_t *s,
                                uint64_t code, const char *reason);
 
-/* Draft-neutral inbound GOAWAY: enter DRAINING, arm the drain deadline, surface
- * MOQ_EVENT_GOAWAY. The profile decodes the wire form and does the active /
- * duplicate checks before calling this. */
+/* Draft-neutral inbound GOAWAY: enter DRAINING and surface MOQ_EVENT_GOAWAY
+ * with the sender's Timeout when the wire carries one. The receiver arms no
+ * drain deadline: GOAWAY_TIMEOUT is the sender's close code. The profile
+ * decodes the wire form and does the active / duplicate checks before calling
+ * this. */
 moq_result_t session_core_on_goaway(moq_session_t *s,
-                                    const uint8_t *uri, size_t uri_len);
+                                    const uint8_t *uri, size_t uri_len,
+                                    bool has_timeout, uint64_t timeout_ms);
 
 /* Decoded REQUEST_ERROR Redirect (§10.6.1), profile → core. Spans borrow from the
  * profile's decode buffers (valid for the duration of the core call). */
@@ -2088,6 +2831,8 @@ typedef struct moq_decoded_redirect {
  *  - MOQ_ERR_WOULD_BLOCK: the arena and the request are untouched; retain the
  *    message and retry once events drain.
  *  - any other negative: propagate. */
+moq_event_scratch_verdict_t redirect_event_scratch_classify(
+    const moq_session_t *s, const moq_decoded_redirect_t *rd, size_t reason_len);
 moq_result_t session_core_emit_request_redirect(
     moq_session_t *s, moq_request_family_t family, uint64_t handle_opaque,
     const moq_decoded_redirect_t *rd, uint64_t error_code,
@@ -2139,15 +2884,69 @@ void session_retry_resumed_deferred(moq_session_t *s);
  * session_retry_owed_stops issues it once capacity returns. */
 void session_discard_deferred_streams(moq_session_t *s);
 
-/* Issue the STOP_DATA owed by every NEED_STOP receive entry that action
- * capacity now admits (called after a poll drains actions): a refused STOP
- * must progress without further peer input on its stream. */
+/*
+ * Owed stream actions. A teardown reserves only its own mandatory actions
+ * (its event, its messages, fill-stream actions, what its caller queues
+ * next). The per-stream actions it ends -- the receive side's STOP of each
+ * bound data stream (rx_end_bound_streams) and the send side's RESET of each
+ * open subgroup (sg_reset_or_owe) -- are queued while more than `keep`
+ * action slots remain and otherwise owed on the stream's own entry
+ * (MOQ_RX_NEED_STOP, MOQ_SG_RESET_OWED). A teardown therefore completes
+ * however many streams are open, an owed action never takes a slot a
+ * mandatory one needs, and none is dropped: session_retry_owed_stream_actions
+ * issues them after each poll that frees capacity.
+ */
+void session_retry_owed_stream_actions(moq_session_t *s);
+/* Queue the PUBLISH_DONE(UPDATE_FAILED) of each MOQ_SUB_DONE_HELD /
+ * MOQ_PUB_DONE_HELD entry whose subgroup resets are all queued, and free the
+ * entry; stops when the queue has no room. */
+void session_release_held_dones(moq_session_t *s);
+void pub_release_held_dones(moq_session_t *s);
+/* The peer reset or stopped the request stream of a held terminal: free the
+ * entry without it (its owed resets still go out). */
+void held_done_retire(moq_session_t *s, moq_stream_ref_t ref);
+/* The receive half: the STOP_DATA owed by every NEED_STOP receive entry that
+ * action capacity now admits. */
 void session_retry_owed_stops(moq_session_t *s);
+/* End subgroup `slot` with a reset of `code`: queued now when more than
+ * `keep` action slots are free, else owed on the entry. The stream takes no
+ * more objects either way. */
+void sg_reset_or_owe(moq_session_t *s, size_t slot, uint64_t code, size_t keep);
+/* The send half: the resets owed by MOQ_SG_RESET_OWED subgroups. */
+void sg_retry_owed_resets(moq_session_t *s);
 
 /* Index of `ref_v` among the streams stopped without a receive entry, or -1. */
 int rx_stopped_ref_find(const moq_session_t *s, uint64_t ref_v);
+
+/* A subscriber-role subscription or publication (`sub` or `pub`, the other
+ * invalid) is ending on this side; call before its entry is freed. Each
+ * inbound stream bound to it that is still open is STOPped (CANCELLED) and
+ * its buffers released; its receive entry gives way to an identity record, so
+ * its late bytes are consumed without events until the peer's FIN or RESET.
+ * STOPs are queued only while more than `keep_free` action slots remain --
+ * the caller's own later actions keep their room -- and one that cannot be
+ * queued now stays owed on the entry (MOQ_RX_NEED_STOP) and is issued once a
+ * poll drains actions, so the ending itself never waits on these stops. A stream whose FIN or RESET already
+ * arrived is dropped; one parked on its SUBGROUP_FINISHED or SUBGROUP_RESET is
+ * left to complete; fill streams are left to the fill owner. Never fails. */
+void rx_end_bound_streams(moq_session_t *s, moq_subscription_t sub,
+                          moq_publication_t pub, size_t keep_free);
 void sg_recompute_deadline(moq_session_t *s);
 int sg_find_free(moq_session_t *s);
+int sg_find_by_stream_ref(moq_session_t *s, moq_stream_ref_t ref);
+/* The subgroup's effective OBJECT_DELIVERY_TIMEOUT expiry for an object whose
+ * clock starts at now_us (UINT64_MAX when no timeout applies). */
+uint64_t sg_object_deadline_us(moq_session_t *s, const moq_sg_entry_t *e,
+                               uint64_t now_us);
+/* The subgroup's effective SUBGROUP_DELIVERY_TIMEOUT in microseconds (0 = none). */
+uint64_t sg_subgroup_timeout_us(moq_session_t *s, const moq_sg_entry_t *e);
+/* Fill the scheduling record of an action on a subgroup stream. */
+void sg_stream_meta(moq_session_t *s, const moq_sg_entry_t *e,
+                    moq_action_meta_t *out);
+/* Fill the scheduling record of an action on a fill fetch stream (no
+ * location; the object writer adds group and object). */
+void fill_stream_meta(const moq_session_t *s, const moq_fill_entry_t *f,
+                      moq_action_meta_t *out);
 moq_subgroup_handle_t sg_make_handle(moq_session_t *s, size_t slot);
 
 int sub_resolve_handle(moq_session_t *s, moq_subscription_t h);
@@ -2157,6 +2956,61 @@ bool sub_cancel_pending(moq_session_t *s, moq_subscription_t h);
 int sub_find_by_request_id(moq_session_t *s, uint64_t request_id);
 int sub_find_by_alias_subscriber(moq_session_t *s, uint64_t alias);
 bool sub_track_alias_in_use(moq_session_t *s, uint64_t alias);
+/* The established subscriber-role subscriptions the peer gave `alias`, as a
+ * chain: sub_find_by_alias_subscriber() is the first, sub_alias_next() the
+ * following one (-1 ends it). More than one only on a profile that allows
+ * concurrent subscriptions. */
+int sub_alias_next(moq_session_t *s, int slot);
+size_t sub_alias_count(moq_session_t *s, uint64_t alias);
+/* A subscriber-role subscription accepts an object at {group, object}: its
+ * acknowledged Forward state is 1 and its resolved window admits the
+ * Location (draft-22 §3.3.3: Pass = Forward AND Location Filters). */
+bool sub_accepts_object(const moq_sub_entry_t *e, uint64_t group, uint64_t object);
+/* Its resolved window admits some Location in `group`. */
+bool sub_accepts_group(const moq_sub_entry_t *e, uint64_t group);
+
+/* Every established subscription the peer gave `alias` -- subscriber-role
+ * subscriptions first, in establishment order, then subscriber-role
+ * publications (draft-22 §3.1.3 lets a SUBSCRIBE- and a PUBLISH-initiated
+ * subscription to one track share it). Exactly one of *sub / *pub is set. */
+typedef struct moq_alias_iter {
+    uint64_t alias;
+    int      sub;      /* next subscription slot, -1 once exhausted */
+    int32_t  pub;      /* next publication slot to examine, -1 at the end */
+} moq_alias_iter_t;
+void alias_iter_begin(moq_session_t *s, moq_alias_iter_t *it, uint64_t alias);
+bool alias_iter_next(moq_session_t *s, moq_alias_iter_t *it,
+                     moq_subscription_t *sub, moq_publication_t *pub);
+size_t alias_owner_count(moq_session_t *s, uint64_t alias);
+/* The owner accepts an object at {group, object} / some Location in
+ * `group` (Forward AND Location filter); false for a stale handle. */
+bool alias_owner_accepts_object(moq_session_t *s, moq_subscription_t sub,
+                                moq_publication_t pub,
+                                uint64_t group, uint64_t object);
+bool alias_owner_accepts_group(moq_session_t *s, moq_subscription_t sub,
+                               moq_publication_t pub, uint64_t group);
+/* The track-history record of an owner (its track identity), or NULL. */
+moq_track_hist_t *alias_owner_hist(moq_session_t *s, moq_subscription_t sub,
+                                   moq_publication_t pub);
+/* A subscriber-role publication accepts an object: its Forward state is 1
+ * and the filter it negotiated, resolved against the Largest Object its
+ * PUBLISH carried, admits the Location. */
+bool pub_accepts_object(const moq_pub_entry_t *e, uint64_t loc_max,
+                        uint64_t group, uint64_t object);
+bool pub_accepts_group(const moq_pub_entry_t *e, uint64_t loc_max, uint64_t group);
+/* Where concurrent subscriptions are allowed: the peer named `alias` for a
+ * subscription to the track `hist`; true when the alias already names a
+ * DIFFERENT track with an established (or pending inbound) subscription
+ * (draft-22 §3.1.3). Elsewhere: any use of the alias. */
+bool peer_alias_conflicts(moq_session_t *s, uint64_t alias,
+                          const moq_track_hist_t *hist);
+/* Where concurrent subscriptions are allowed: every subscription or
+ * publication of ours already using outbound `alias` is one we publish of
+ * the same track (given as a key blob, or as namespace and name when
+ * `key` is NULL), so the application may share it (draft-22 §3.1). */
+bool outbound_alias_shareable(moq_session_t *s, uint64_t alias,
+                              const uint8_t *key, size_t key_len,
+                              const moq_namespace_t *ns, moq_bytes_t name);
 
 /* -- Auth token processing (session_auth.c) ------------------------ */
 
@@ -2175,6 +3029,17 @@ bool sub_track_alias_in_use(moq_session_t *s, uint64_t alias);
  * Token value pointers borrow from decode buffer or cache; caller must
  * copy to scratch before the event is pushed.
  */
+moq_result_t session_setup_workspace_acquire(moq_session_t *s,
+                                             moq_setup_workspace_t *workspace);
+void session_setup_workspace_release(moq_session_t *s,
+                                      moq_setup_workspace_t *workspace);
+/* Consumes workspace on every return, before any deferred-request refeed. */
+moq_result_t session_setup_complete_peer(moq_session_t *s,
+                                         moq_setup_workspace_t *workspace,
+                                         const moq_setup_params_t *peer,
+                                         bool *setup_received,
+                                         bool setup_sent);
+
 moq_result_t process_auth_tokens(moq_session_t *s,
     const moq_decoded_auth_token_t *tokens_in, size_t tokens_in_count,
     moq_resolved_token_t *out_tokens, size_t *out_token_count,
@@ -2183,13 +3048,20 @@ moq_result_t process_auth_tokens(moq_session_t *s,
     bool *out_staged,
     moq_auth_txn_t *txn);
 
+/* Borrows one prepared prefix during this call only; commit prefix before txn.
+ * Abort/free each transaction independently. No prefix allocation is adopted. */
+moq_result_t process_auth_tokens_after(moq_session_t *s,
+    const moq_decoded_auth_token_t *tokens_in, size_t tokens_in_count,
+    moq_resolved_token_t *out_tokens, size_t *out_token_count,
+    size_t max_tokens, uint64_t *out_reject_code, bool *out_staged,
+    moq_auth_txn_t *txn, const moq_auth_txn_t *prefix);
+
 void process_auth_tokens_commit_txn(moq_session_t *s, moq_auth_txn_t *txn);
 void process_auth_tokens_abort_txn(moq_session_t *s, moq_auth_txn_t *txn);
 
 void process_auth_tokens_free_staging(moq_session_t *s,
     moq_resolved_token_t *tokens, const bool *staged,
     size_t count);
-
 
 /* Copy resolved token values + the token array into output scratch for
  * borrow-epoch-safe event delivery (session_subscribe.c; shared with the
@@ -2241,10 +3113,25 @@ typedef struct moq_subscribe_encode_args {
     uint64_t start_group;
     uint64_t start_object;
     uint64_t end_group;
+    uint64_t end_object;    /* OBJECT_END form only */
     const moq_auth_token_t *auth_tokens;
     size_t                  auth_token_count;
     bool has_new_group_request;
     uint64_t new_group_request;
+    /* A fill request carried on the SUBSCRIBE, or NULL. Only profiles with
+     * fills receive one (the core refuses the request otherwise). */
+    const moq_fill_input_t *fill;
+    bool has_location;
+    bool dt_has_object;
+    uint64_t dt_object_ms;
+    bool dt_has_subgroup;
+    uint64_t dt_subgroup_ms;
+    bool has_rendezvous_timeout;
+    uint64_t rendezvous_timeout_ms;
+    /* INCLUDE_PROPERTIES as the caller selected it (only on a profile with
+     * include_properties_request). */
+    bool has_include_properties;
+    bool include_properties;
 } moq_subscribe_encode_args_t;
 
 typedef struct moq_subscribe_ok_encode_args {
@@ -2257,6 +3144,9 @@ typedef struct moq_subscribe_ok_encode_args {
     uint64_t expires_ms;
     const uint8_t *track_properties;
     size_t track_properties_len;
+    /* Original properties remain available to the profile's omission policy. */
+    bool omit_track_properties;
+    bool inherit_track_group_order;
 } moq_subscribe_ok_encode_args_t;
 
 /* REQUEST_UPDATE_OK response (design §2b / §2 always-max): the REQUEST_OK sent
@@ -2267,6 +3157,49 @@ typedef struct moq_subscribe_ok_encode_args {
  * carry EXPIRES, and the codec/decoder support it), but the session's outbound
  * ack path currently always passes has_expires=false -- we never originate an
  * EXPIRES on this path. draft-16 has no EXPIRES here regardless. */
+/* A publisher's state notification on a subscription it serves. The filter
+ * is the core's form (type plus raw locations, internal forms included). */
+typedef struct moq_publish_state_encode_args {
+    bool     has_forward;
+    bool     forward;
+    bool     has_largest;
+    uint64_t largest_group;
+    uint64_t largest_object;
+    bool     has_filter;
+    uint32_t filter;
+    uint64_t start_group;
+    uint64_t start_object;
+    uint64_t end_group;
+    uint64_t end_object;
+} moq_publish_state_encode_args_t;
+
+/* A decoded state notification (profile -> core), same shape. */
+typedef struct moq_decoded_state_notify {
+    bool     has_forward;
+    bool     forward;
+    bool     has_largest;
+    uint64_t largest_group;
+    uint64_t largest_object;
+    bool     has_filter;
+    uint32_t filter_type;
+    uint64_t start_group;
+    uint64_t start_object;
+    uint64_t end_group;
+    uint64_t end_object;
+} moq_decoded_state_notify_t;
+
+/* The publisher's state notification on a subscription this side holds as
+ * subscriber (kind SUBSCRIPTION with the subscriber role, or PUBLISH with the
+ * subscriber role): records the new filter and Largest Object and surfaces
+ * MOQ_EVENT_PUBLISH_STATE. Nothing is sent back. */
+moq_result_t session_core_on_publish_state_notify(moq_session_t *s,
+    moq_request_kind_t kind, int slot, const moq_decoded_state_notify_t *d);
+
+/* Selected notification values must match the acknowledged owner state. */
+bool session_publish_state_matches(const moq_publish_state_encode_args_t *args,
+    bool forward, uint32_t filter_type, uint64_t start_group,
+    uint64_t start_object, uint64_t end_group, uint64_t end_object);
+
 typedef struct moq_request_update_ok_encode_args {
     uint64_t request_id;
     bool     has_largest;
@@ -2275,25 +3208,6 @@ typedef struct moq_request_update_ok_encode_args {
     bool     has_expires;
     uint64_t expires_ms;
 } moq_request_update_ok_encode_args_t;
-
-/* PUBLISH_OK response: the subscriber's delivery parameters plus
- * the raw SUBSCRIPTION_FILTER and FORWARD it chose. One args struct instead of
- * a growing positional vtable signature. Outbound EXPIRES is not supported,
- * so there is no field for it. */
-typedef struct moq_publish_ok_encode_args {
-    uint64_t               request_id;
-    uint8_t                subscriber_priority;  /* 128 = omitted */
-    uint8_t                group_order;          /* DEFAULT = omitted */
-    bool                   has_new_group_request;
-    uint64_t               new_group_request;
-    bool                   has_filter;           /* raw filter block */
-    moq_subscribe_filter_t filter;
-    uint64_t               start_group;
-    uint64_t               start_object;
-    uint64_t               end_group;
-    bool                   has_forward;
-    bool                   forward;
-} moq_publish_ok_encode_args_t;
 
 typedef struct moq_request_error_encode_args {
     uint64_t       request_id;
@@ -2312,6 +3226,13 @@ typedef struct moq_request_error_encode_args {
     const uint8_t  *redirect_track_name;
     size_t          redirect_track_name_len;
 } moq_request_error_encode_args_t;
+
+/* The REQUEST_ERROR for a request refused because a local pool or capacity
+ * is exhausted: the profile's capacity code, retryable at once where the
+ * profile says so (session.c). */
+moq_request_error_encode_args_t session_capacity_request_error(
+    const moq_session_t *s, uint64_t request_id, const char *reason,
+    size_t reason_len);
 
 typedef struct moq_request_update_encode_args {
     uint64_t request_id;
@@ -2333,7 +3254,25 @@ typedef struct moq_request_update_encode_args {
     uint64_t filter_start_group;
     uint64_t filter_start_object;
     uint64_t filter_end_group;
+    uint64_t filter_end_object;
+    /* Lossless, independent millisecond carriers on typed UPDATE profiles. */
+    bool     dt_has_object;
+    uint64_t dt_object_ms;
+    bool     dt_has_subgroup;
+    uint64_t dt_subgroup_ms;
+    /* A fill request carried on the update, or NULL (see the subscribe args). */
+    const moq_fill_input_t *fill;
+    /* Who sends the update: MOQ_UPDATE_SENDER_*. */
+    uint8_t  sender;
 } moq_request_update_encode_args_t;
+
+/* The sender of an outbound REQUEST_UPDATE: the subscriber of a subscription
+ * (begun with SUBSCRIBE or PUBLISH), the sender of a PUBLISH updating its own
+ * request, or the sender of a FETCH. Only profiles with requester_updates
+ * encode the last two. */
+#define MOQ_UPDATE_SENDER_SUBSCRIBER 0u
+#define MOQ_UPDATE_SENDER_PUBLISHER  1u
+#define MOQ_UPDATE_SENDER_FETCHER    2u
 
 #define MOQ_DECODED_MAX_NAMESPACE_PARTS 32
 
@@ -2349,6 +3288,8 @@ typedef struct moq_decoded_subscribe {
     uint8_t          group_order;        /* MOQ_GROUP_ORDER_* */
     bool             has_forward;
     bool             forward;
+    /* The answer is to carry no Track Properties (INCLUDE_PROPERTIES = 0). */
+    bool             omit_track_properties;
     bool             has_delivery_timeout;
     uint64_t         delivery_timeout_us;
     /* §9.8 exact per-type carriers from THIS message (raw wire ms; d16
@@ -2362,6 +3303,7 @@ typedef struct moq_decoded_subscribe {
     uint64_t         start_group;
     uint64_t         start_object;
     uint64_t         end_group;
+    uint64_t         end_object;    /* inclusive; OBJECT_END form only */
     moq_resolved_token_t tokens[MOQ_DECODED_MAX_TOKENS];
     bool             token_staged[MOQ_DECODED_MAX_TOKENS];
     size_t           token_count;
@@ -2369,6 +3311,11 @@ typedef struct moq_decoded_subscribe {
     uint64_t         auth_reject_code; /* non-zero: message-level token reject */
     bool             has_new_group_request;
     uint64_t         new_group_request;
+    /* The message's fill request, as decoded by the profile: requested is
+     * false on profiles without fills or when the parameter is absent. */
+    moq_fill_input_t fill;
+    bool has_rendezvous_timeout;
+    uint64_t rendezvous_timeout_ms;
 } moq_decoded_subscribe_t;
 
 /* -- Decoded inbound SUBSCRIBE_OK (profile → session core) ----------- */
@@ -2416,6 +3363,7 @@ typedef struct moq_decoded_request_update {
     uint64_t start_group;
     uint64_t start_object;
     uint64_t end_group;
+    uint64_t end_object;    /* inclusive; OBJECT_END form only */
     /* Resolved AUTHORIZATION_TOKEN parameters (both profiles; the auth
      * transaction commit/abort is a safe no-op on an empty transaction).
      * auth_reject_code is non-zero when a token failed at the message level
@@ -2427,7 +3375,32 @@ typedef struct moq_decoded_request_update {
     uint64_t         auth_reject_code;
     bool     has_new_group_request;
     uint64_t new_group_request;
+    /* The update's fill request (see moq_decoded_subscribe_t). */
+    moq_fill_input_t fill;
 } moq_decoded_request_update_t;
+
+/* Prepare retained original-sender UPDATE effects for explicit initial
+ * rejection. endpoint.has_request_id marks a complete admitted update. The
+ * caller commits its ID/auth only after terminal-output preflight succeeds,
+ * or aborts auth/staging on refusal; incomplete input has no effects. */
+moq_result_t moq_request_stream_prepare_pending_reject(moq_session_t *s,
+    const moq_request_stream_t *rs, moq_request_family_t family, bool peer_fin,
+    moq_decoded_request_update_t *out);
+
+/* rs is a borrowed suffix-only view. The optional initial ID/auth prefix is
+ * visible during preparation but not published; commit prefix then out.
+ * Private ID capacity may grow, while committed ranges/cache remain unchanged. */
+moq_result_t moq_request_stream_prepare_pending_reject_after(moq_session_t *s,
+    const moq_request_stream_t *rs, moq_request_family_t family, bool peer_fin,
+    const moq_request_endpoint_t *prefix_id, const moq_auth_txn_t *prefix_auth,
+    moq_decoded_request_update_t *out);
+
+/* Automatic initial refusal while staging still owns all input. Caller frees
+ * initial token staging and aborts auth unless MOQ_OK with the session open. */
+moq_result_t session_core_reject_initial_request(moq_session_t *s,
+    const moq_request_endpoint_t *endpoint, moq_auth_txn_t *auth,
+    moq_request_family_t family, bool reject_drain,
+    const moq_request_error_encode_args_t *error);
 
 /* -- Decoded inbound PUBLISH_NAMESPACE (profile → session core) ------- */
 
@@ -2446,7 +3419,7 @@ typedef struct moq_decoded_publish_namespace {
 /* `request_fin_observed` says the request bidi's FIN has been observed for the
  * buffered request now being dispatched -- on this transport call, or on an
  * earlier one whose refusal the generic staging owner retained in its
- * `req_recv_fin` latch (`handle_request_stream_bytes()` passes that latch, not
+ * `rs.recv_fin` latch (`handle_request_stream_bytes()` passes that latch, not
  * the raw call FIN, so an empty re-feed still carries the fact). Draft-16
  * passes false: its control-channel route has no per-request bidi FIN.
  *
@@ -2478,7 +3451,8 @@ moq_result_t session_core_on_announce_update_rejected(
 
 /* Peer teardown (RESET/STOP) of an established PUBLISH_NAMESPACE bidi: role-keyed
  * NAMESPACE_DONE (receiver) / NAMESPACE_CANCELLED (announcer) + free. */
-moq_result_t session_core_on_announce_torn_down(moq_session_t *s, int slot);
+moq_result_t session_core_on_announce_torn_down(moq_session_t *s, int slot,
+                                                moq_request_terminal_t term);
 
 typedef struct moq_decoded_publish_namespace_done {
     uint64_t request_id;
@@ -2522,7 +3496,18 @@ typedef enum moq_ns_sub_response_kind {
     MOQ_NS_RESP_NAMESPACE      = 3,  /* found */
     MOQ_NS_RESP_NAMESPACE_DONE = 4,  /* gone */
     MOQ_NS_RESP_GOAWAY         = 5,  /* request-stream GOAWAY (migrate) */
+    /* The answer to this side's REQUEST_UPDATE after the initial response
+     * (profiles with namespace updates): REQUEST_OK / REQUEST_ERROR. */
+    MOQ_NS_RESP_UPDATE_OK      = 6,
+    MOQ_NS_RESP_UPDATE_ERROR   = 7,
 } moq_ns_sub_response_kind_t;
+
+/* REQUEST_ERROR Retry Interval on the wire is the retry time plus one, zero
+ * meaning "do not retry"; the public API carries the time itself. */
+static inline uint64_t retry_interval_to_ms(uint64_t wire)
+{
+    return wire != 0 ? wire - 1 : 0;
+}
 
 typedef struct moq_decoded_ns_sub_response {
     moq_ns_sub_response_kind_t kind;
@@ -2543,6 +3528,10 @@ typedef struct moq_decoded_ns_sub_response {
     const uint8_t *goaway_uri;       /* borrowed; NULL/0 if none */
     size_t         goaway_uri_len;
     uint64_t       goaway_timeout_ms;
+
+    /* For UPDATE_OK: */
+    bool     has_expires;
+    uint64_t expires_ms;
 
     /* For NAMESPACE/NAMESPACE_DONE: */
     moq_namespace_t suffix;          /* parts in parts_buf */
@@ -2574,12 +3563,39 @@ typedef struct moq_decoded_fetch {
     int              joining_pub_slot;
     uint8_t          subscriber_priority;
     uint8_t          group_order;
+    /* The answer is to carry no Track Properties (INCLUDE_PROPERTIES = 0). */
+    bool             omit_track_properties;
     moq_resolved_token_t tokens[MOQ_DECODED_MAX_TOKENS];
     bool             token_staged[MOQ_DECODED_MAX_TOKENS];
     size_t           token_count;
     moq_auth_txn_t   auth_txn;
     uint64_t         auth_reject_code; /* non-zero: message-level token reject */
     bool             request_fin;      /* the request bidi FIN'd in this chunk */
+    /* A range given relative to the track's Largest Object, resolved by the
+     * core against its track history before the request is surfaced:
+     * start_relative puts the start `relative_offset` groups before the next
+     * group (0 is the next group, 1 the current one), start_next_object puts
+     * it just past the Largest Object, end_at_largest ends the range at the
+     * Largest Object. A start past the Largest Object, or a track with no
+     * objects, refuses the fetch with INVALID_RANGE. */
+    bool             start_relative;
+    uint64_t         relative_offset;
+    bool             start_next_object;
+    bool             end_at_largest;
+    /* The profile's FETCH carries its range as a Location Filter, so the
+     * request has the details moq_fetch_request_options_t surfaces:
+     * has_location / location_* are the filter as sent (the core's filter
+     * record: filter type, start, absolute end group, inclusive end object),
+     * has_fill_timeout / fill_timeout_ms its FILL_TIMEOUT. */
+    bool             has_options;
+    bool             has_location;
+    uint32_t         location_type;
+    uint64_t         location_start_group;
+    uint64_t         location_start_object;
+    uint64_t         location_end_group;
+    uint64_t         location_end_object;
+    bool             has_fill_timeout;
+    uint64_t         fill_timeout_ms;
 } moq_decoded_fetch_t;
 
 typedef struct moq_decoded_fetch_cancel {
@@ -2622,6 +3638,8 @@ typedef struct moq_decoded_fetch_object {
     uint64_t       payload_len;
     const uint8_t *properties;
     size_t         properties_len;
+    uint8_t        malformed;      /* MOQ_MALFORMED_*; property violations */
+    moq_obj_gaps_t gaps;
 } moq_decoded_fetch_object_t;
 
 /* -- Outbound fetch object encode args (session core → profile) ------- */
@@ -2665,6 +3683,16 @@ typedef struct moq_fetch_encode_args {
     uint8_t         group_order;
     const moq_auth_token_t *auth_tokens;
     size_t                  auth_token_count;
+    /* A standalone range in its semantic form, replacing start/end, and a
+     * FILL_TIMEOUT (only on a profile with fetch_request_options); NULL
+     * sends start/end. */
+    const moq_location_filter_cfg_t *location;
+    bool                    has_fill_timeout;
+    uint64_t                fill_timeout_ms;
+    /* INCLUDE_PROPERTIES as the caller selected it (only on a profile with
+     * include_properties_request). */
+    bool                    has_include_properties;
+    bool                    include_properties;
 } moq_fetch_encode_args_t;
 
 /* -- Fetch handlers (session_fetch.c) --------------------------------- */
@@ -2714,6 +3742,150 @@ moq_result_t session_core_on_fetch_cancel(moq_session_t *s,
 int fetch_resolve_handle(moq_session_t *s, moq_fetch_t h);
 int fetch_find_free(moq_session_t *s);
 void fetch_free_entry(moq_session_t *s, int slot);
+moq_result_t fetch_finish_response(moq_session_t *s, int slot);
+moq_result_t fetch_process_buffered_request(moq_session_t *s, int slot);
+
+/* -- Fill children (session_fill.c) ----------------------------------- */
+
+/* Per-slot state the ownership table deliberately leaves to the session. */
+typedef struct moq_fill_side {
+    moq_fill_t        handle;            /* public handle of the live generation */
+    moq_fill_input_t  input;             /* effective request: inherited values filled in */
+    bool              request_published; /* publisher: FILL_REQUEST surfaced */
+    uint32_t          error_domain;      /* terminal error domain/code once known */
+    uint64_t          error_code;
+    moq_fetch_prior_object_t prior;      /* publisher write cursor */
+    uint8_t           header_len;        /* publisher: FETCH_HEADER bytes on the
+                                            bound stream (reset reliable size) */
+} moq_fill_side_t;
+
+/* Pool lifecycle: init records the capacity (0 admits nothing); the storage
+ * is a separate allocation made by the first admission, so a session that
+ * never sees a fill allocates nothing for them. */
+moq_result_t fill_pool_init(moq_session_t *s, size_t cap);
+void fill_pool_destroy(moq_session_t *s);
+
+/* Drive every owed effect whose capacity is now available: a RESET or STOP a
+ * child owes its bound stream, a FILL_REQUEST not yet surfaced, the FILL_TERMINAL
+ * (exactly once), stream accounting and reclamation. Idempotent; a refusal
+ * for want of capacity retains the obligation. Runs from the advancing-call
+ * preamble, after every fill operation and when a poll frees capacity. */
+void fill_service(moq_session_t *s);
+
+/* Admission of a locally requested child (subscriber role): prepare checks the
+ * request and the pool and reserves nothing; commit records the child and
+ * pushes FILL_CREATED (the caller checked event capacity: fill_local_needs_event).
+ * `parent` names the subscription (family/slot/generation of the live entry);
+ * the inherited values are the parent's effective priority, group order and
+ * filter at request time. */
+moq_result_t fill_local_prepare(moq_session_t *s, moq_fill_parent_t parent,
+                                uint64_t initiating_id, const moq_fill_input_t *req,
+                                uint8_t inherit_priority, uint8_t inherit_group_order,
+                                uint32_t inherit_filter, uint64_t inherit_sg,
+                                uint64_t inherit_so, uint64_t inherit_eg,
+                                uint64_t inherit_eo, moq_fill_reservation_t *out,
+                                moq_fill_input_t *effective);
+void fill_local_commit(moq_session_t *s, const moq_fill_reservation_t *r,
+                       const moq_fill_input_t *effective);
+
+/* Admission of a peer-requested child (publisher role). The same prepare /
+ * commit split; the delivery is resolved later against a Largest snapshot
+ * (fill_control_resolved) and FILL_REQUEST is surfaced by fill_service.
+ * MOQ_ERR_REQUEST_BLOCKED means the pool has no slot for the child; the
+ * effective request is still filled in, and the caller answers the fill on
+ * the wire instead (fill_open_failed). Other refusals leave nothing changed. */
+moq_result_t fill_inbound_prepare(moq_session_t *s, moq_fill_parent_t parent,
+                                  uint64_t initiating_id, const moq_fill_input_t *req,
+                                  uint8_t inherit_priority, uint8_t inherit_group_order,
+                                  uint32_t inherit_filter, uint64_t inherit_sg,
+                                  uint64_t inherit_so, uint64_t inherit_eg,
+                                  uint64_t inherit_eo, moq_fill_reservation_t *out,
+                                  moq_fill_input_t *effective);
+void fill_inbound_commit(moq_session_t *s, const moq_fill_reservation_t *r,
+                         const moq_fill_input_t *effective);
+/* Whether a fill the pool could not admit would have opened a stream: its
+ * effective range resolved against the response's Largest snapshot and the
+ * subscription's paused state, exactly as an admitted child resolves. */
+bool fill_unserved_opens_stream(const moq_fill_input_t *effective, bool has_largest,
+                                uint64_t largest_group, uint64_t largest_object,
+                                bool paused);
+/* Fail a fill on the wire: a fill fetch stream carrying the FETCH_HEADER with
+ * the initiating request id, reset immediately after it. Two actions, which
+ * the caller reserved with its response. The stream is counted in
+ * *streams_opened (saturating), as any fill stream the session opens. */
+void fill_open_failed(moq_session_t *s, uint64_t initiating_id,
+                      uint8_t subscriber_priority, uint64_t *streams_opened);
+/* The Stream Count PUBLISH_DONE carries: the application's own data streams
+ * plus the fill streams the session opened, saturating to the profile's
+ * unknown sentinel; a sentinel from the application is sent unchanged. */
+uint64_t fill_stream_count(const moq_session_t *s, uint64_t app_count,
+                           uint64_t fill_streams_opened);
+
+/* The initiating request was answered: accepted (with the Largest snapshot
+ * the answer carried or was computed from, and whether the subscription is
+ * paused at that point) or rejected with error_code. Resolves the child's
+ * delivery on acceptance; a child whose stream already arrived keeps it. */
+void fill_control_resolved(moq_session_t *s, moq_fill_parent_t parent,
+                           uint64_t initiating_id, bool accepted, uint64_t error_code,
+                           bool has_largest, uint64_t largest_group,
+                           uint64_t largest_object, bool paused);
+void fill_control_resolved_receipt(moq_session_t *s, moq_fill_parent_t parent,
+    uint64_t initiating_id, bool accepted, uint64_t error_code,
+    bool has_largest, uint64_t largest_group, uint64_t largest_object, bool paused,
+    moq_pub_fill_receipt_t *receipt);
+
+/* Parent teardown. The preflight counts the actions (RESET on the publisher,
+ * STOP on the subscriber) the parent's bound children need so the caller can
+ * reserve them with its own; the cancel marks every child and queues what
+ * was reserved. error_domain/code describe the cause for the terminals. */
+size_t fill_parent_actions_needed(const moq_session_t *s, moq_fill_parent_t parent);
+void fill_parent_cancel(moq_session_t *s, moq_fill_parent_t parent,
+                        uint32_t error_domain, uint64_t error_code);
+/* The same cancellation, queuing stream actions only while more than `keep`
+ * action slots stay free and leaving the general service alone, so a caller
+ * that reserved slots for its own messages keeps them. What does not fit is
+ * retained by the children and issued as actions drain. */
+void fill_parent_cancel_keep(moq_session_t *s, moq_fill_parent_t parent,
+                             uint32_t error_domain, uint64_t error_code,
+                             size_t keep);
+
+static inline moq_fill_parent_t fill_parent_sub(const moq_session_t *s, size_t slot)
+{
+    moq_fill_parent_t p = { MOQ_FILL_PARENT_SUBSCRIBE, slot, s->subs[slot].generation };
+    return p;
+}
+static inline moq_fill_parent_t fill_parent_pub(const moq_session_t *s, size_t slot)
+{
+    moq_fill_parent_t p = { MOQ_FILL_PARENT_PUBLISH, slot, s->publishes[slot].generation };
+    return p;
+}
+
+/* Receive-side binding of a fetch response stream whose header named no
+ * fetch: binds it to the subscriber-role child with that initiating id and
+ * returns MOQ_OK, MOQ_ERR_STALE_HANDLE when no such child exists, or
+ * MOQ_ERR_PROTO when the child can take no stream (its range resolved to none,
+ * or it already has one). On MOQ_OK the rx carries the fill binding and the
+ * parent handle for stream counting. */
+moq_result_t fill_rx_bind(moq_session_t *s, moq_rx_stream_t *rx, uint64_t initiating_id);
+/* Stream signals on a bound fill stream (subscriber role). */
+void fill_rx_peer_fin(moq_session_t *s, const moq_rx_stream_t *rx);
+void fill_rx_peer_reset(moq_session_t *s, const moq_rx_stream_t *rx, uint64_t error_code);
+/* The session itself stopped the stream (budget or expiry): the child is
+ * cancelled locally and its STOP recorded. */
+void fill_rx_local_stop(moq_session_t *s, const moq_rx_stream_t *rx);
+/* The identity a bound rx's fill events carry (zeroed when the child is gone). */
+void fill_rx_identity(const moq_session_t *s, const moq_rx_stream_t *rx,
+                      moq_fill_t *fill, moq_subscription_t *sub,
+                      moq_publication_t *pub, uint64_t *initiating_id);
+/* True when the child still accepts objects (not cancelled or ended). */
+bool fill_rx_delivering(const moq_session_t *s, const moq_rx_stream_t *rx);
+/* Publisher side: the peer's STOP_SENDING on a bound fill stream. Reserves the
+ * RESET it owes (MOQ_ERR_WOULD_BLOCK with nothing changed when it cannot) and
+ * returns MOQ_ERR_STALE_HANDLE when no child owns the stream. */
+moq_result_t fill_on_data_stop(moq_session_t *s, moq_stream_ref_t ref, uint64_t error_code);
+/* Receive-side helper (session_receive.c): put a bound fill stream into the
+ * stopped/discard state after its STOP_DATA was queued. */
+void rx_fill_stopped(moq_session_t *s, moq_stream_ref_t ref);
 
 /* Fetcher-role completion: the FETCH holds both its FETCH_OK and its data
  * stream's FIN. `_fits` reports whether the commit can run now -- one event,
@@ -2778,6 +3950,20 @@ typedef struct moq_decoded_publish {
     uint64_t         largest_object;
     bool             has_expires;
     uint64_t         expires_ms;
+    /* The publisher's initial subscription settings carried on the PUBLISH
+     * (profiles whose PUBLISH has them); absent fields are the defaults. */
+    bool             has_subscriber_priority;
+    uint8_t          subscriber_priority;
+    bool             has_group_order;
+    uint8_t          group_order;
+    bool             has_filter;
+    uint32_t         filter_type;
+    uint64_t         filter_start_group;
+    uint64_t         filter_start_object;
+    uint64_t         filter_end_group;
+    uint64_t         filter_end_object;
+    /* Decoded value-only initial parameters; populated only by D22. */
+    moq_publish_initial_parameters_t initial;
 } moq_decoded_publish_t;
 
 typedef struct moq_decoded_publish_ok {
@@ -2785,6 +3971,10 @@ typedef struct moq_decoded_publish_ok {
     int      target_slot;
     bool     has_deferred_param_error;
     const char *deferred_param_reason;
+    /* The response carried no subscription parameters: forward, priority and group
+     * order below are placeholders and the publisher keeps the settings it
+     * put on the PUBLISH. */
+    bool     params_absent;
     bool     forward;
     uint8_t  subscriber_priority;
     uint8_t  group_order;
@@ -2807,28 +3997,8 @@ typedef struct moq_decoded_publish_ok {
     uint64_t filter_start_group;
     uint64_t filter_start_object;
     uint64_t filter_end_group;
+    uint64_t filter_end_object;    /* inclusive; OBJECT_END form only */
 } moq_decoded_publish_ok_t;
-
-/* -- Outbound PUBLISH encode args (session core → profile) ------------ */
-
-typedef struct moq_publish_encode_args {
-    uint64_t        request_id;
-    moq_namespace_t track_namespace;
-    moq_bytes_t     track_name;
-    uint64_t        track_alias;
-    bool            has_forward;
-    bool            forward;
-    const uint8_t  *track_properties;
-    size_t          track_properties_len;
-    const moq_auth_token_t *auth_tokens;
-    size_t                  auth_token_count;
-    /* LARGEST_OBJECT: filled by the session core from the
-     * track-history registry -- the publisher MUST advertise its largest once
-     * Objects have been published. Never caller-supplied. */
-    bool            has_largest;
-    uint64_t        largest_group;
-    uint64_t        largest_object;
-} moq_publish_encode_args_t;
 
 /* -- Outbound finish-publish encode args (session core → profile) ----- */
 
@@ -2865,11 +4035,26 @@ moq_result_t session_core_on_publish_ok(moq_session_t *s,
  * channel); when false the entry is marked draining and kept so the request bidi
  * can absorb its trailing FIN, and our send half is closed reciprocally
  * (stream-correlated profiles). */
+/* The publisher's REQUEST_UPDATE on its own established PUBLISH, read by the
+ * subscriber: answers REQUEST_OK (REQUEST_ERROR for an unsupported parameter
+ * or a rejected token), surfaces MOQ_EVENT_PUBLISH_UPDATED with the carried
+ * fields, and records the publisher's new Forward state and priority. */
+moq_result_t session_core_on_publication_update_by_publisher(
+    moq_session_t *s, moq_decoded_request_update_t *d);
+
+/* The fetcher's REQUEST_UPDATE on a FETCH this side serves: applies the
+ * priority to the fetch and its data-stream scheduling and answers
+ * REQUEST_OK. A rejected update answers REQUEST_ERROR and resets the fetch
+ * data stream when one is open. */
+moq_result_t session_core_on_fetch_request_update(
+    moq_session_t *s, moq_decoded_request_update_t *d);
+
 moq_result_t session_core_on_publish_error(moq_session_t *s, int slot,
     uint64_t error_code, bool can_retry, uint64_t retry_after_ms,
-    const uint8_t *reason, size_t reason_len, bool free_now);
+    const uint8_t *reason, size_t reason_len, bool free_now,
+    const moq_decoded_redirect_t *redirect);
 
-int pub_resolve_handle(moq_session_t *s, moq_publication_t h);
+int pub_resolve_handle(const moq_session_t *s, moq_publication_t h);
 int pub_find_free(moq_session_t *s);
 
 /*
@@ -2903,11 +4088,12 @@ void pub_free_entry(moq_session_t *s, int slot);
  * the delivery gates, never routed as unknown-alias). */
 int pub_find_by_alias_subscriber(moq_session_t *s, uint64_t alias);
 /* Track-alias collision checks shared with the subscription paths (the data
- * alias namespace is shared between publications and subscriptions). _in_use
- * covers any established publication plus a pending subscriber-role one (inbound
- * data alias); _outbound covers non-free publisher-role publications (outbound
- * data alias). */
-bool pub_track_alias_in_use(moq_session_t *s, uint64_t alias);
+ * alias namespace is shared between publications and subscriptions).
+ * peer_track_alias_in_use covers the aliases the peer assigned: established
+ * subscriber-role subscriptions and established or pending subscriber-role
+ * publications (inbound data alias); _outbound covers non-free
+ * publisher-role publications (outbound data alias). */
+bool peer_track_alias_in_use(moq_session_t *s, uint64_t alias);
 bool pub_outbound_alias_in_use(moq_session_t *s, uint64_t alias);
 /* Count a completed data stream toward a subscriber-role publication's
  * PUBLISH_DONE Stream Count, finalizing a deferred PUBLISH_FINISHED when the
@@ -3028,7 +4214,12 @@ bool sub_reap_deferred_dones_resumable(moq_session_t *s, uint32_t *budget);
 moq_result_t session_core_on_publish_done(moq_session_t *s,
                                            const moq_decoded_publish_done_t *d,
                                            bool free_now);
-moq_result_t session_core_on_publish_unsubscribed(moq_session_t *s, int slot);
+/* The subscriber ended a publication this side publishes. `reserve_after`
+ * action slots stay free for what the caller queues next; every subgroup
+ * stream still open is reset, or owes its reset when no slot is left. */
+moq_result_t session_core_on_publish_unsubscribed(moq_session_t *s, int slot,
+                                                  moq_request_terminal_t term,
+                                                  size_t reserve_after);
 moq_result_t session_core_on_publish_request_update(
     moq_session_t *s, moq_decoded_request_update_t *d);
 
@@ -3047,6 +4238,9 @@ typedef struct moq_decoded_track_status_request {
      * with this REQUEST_ERROR code and surfaces no event (a REGISTER still
      * commits its alias). */
     uint64_t                  auth_reject_code;
+    /* The request asked for an answer without Track Properties
+     * (INCLUDE_PROPERTIES = 0). */
+    bool                      omit_track_properties;
 } moq_decoded_track_status_request_t;
 
 typedef struct moq_track_status_encode_args {
@@ -3055,6 +4249,10 @@ typedef struct moq_track_status_encode_args {
     moq_bytes_t     track_name;
     const moq_auth_token_t *auth_tokens;
     size_t                  auth_token_count;
+    /* INCLUDE_PROPERTIES as the caller selected it (only on a profile with
+     * include_properties_request). */
+    bool                    has_include_properties;
+    bool                    include_properties;
 } moq_track_status_encode_args_t;
 
 /* TRACK_STATUS_OK response (draft-neutral): the publisher's status reply. The
@@ -3099,14 +4297,24 @@ moq_result_t session_core_on_track_status_error(moq_session_t *s, int slot,
 int ts_resolve_handle(moq_session_t *s, moq_track_status_handle_t h);
 int ts_find_free(moq_session_t *s);
 void ts_free_entry(moq_session_t *s, int slot);
+moq_result_t ts_receive_terminal(moq_session_t *s, int slot,
+                                moq_request_terminal_t term);
+moq_result_t ts_flush_terminal(moq_session_t *s, int slot);
+void ts_apply_deferred_signals(moq_ts_entry_t *e);
+moq_result_t ts_queue_cancellation(moq_session_t *s, int slot);
+void ts_retry_pending(moq_session_t *s);
 
 /* Per-family entry free, shared with the request-stream GOAWAY handler. */
 void ann_free_entry(moq_session_t *s, size_t slot);
+void ann_validate_response(moq_session_t *s, int slot);
+void ann_retry_pending(moq_session_t *s);
+moq_result_t ann_receive_goaway(moq_session_t *s, int slot,
+    const uint8_t *uri, size_t uri_len, uint64_t timeout_ms);
 void ns_sub_free_entry(moq_session_t *s, size_t slot);
 
 /* Surface MOQ_EVENT_REQUEST_GOAWAY for a request migrated by a request-stream
  * GOAWAY (§10.4): free the request entry, close our send half if still open, and
- * -- unless the peer's FIN has already been observed -- strict-drain the bidi.
+ * -- unless the peer's FIN has already been observed -- drain the bidi.
  * Leaves data streams alone (graceful migration). The caller resolves
  * family+slot from the bidi's stream ref.
  *
@@ -3145,8 +4353,8 @@ bool request_stream_is_publisher_subscription(moq_session_t *s,
 bool request_goaway_already_sent(moq_session_t *s, moq_stream_ref_t ref);
 
 /* Retire a request migrated by a per-request GOAWAY (sent or received): when
- * `need_drain`, strict-drain the request bidi (FIN/RESET/STOP retire it; a
- * duplicate GOAWAY or stray non-empty bytes close 0x3); either way free or
+ * `need_drain`, drain the request bidi (FIN/RESET/STOP retire it; messages
+ * are discarded and a second GOAWAY closes 0x3); either way free or
  * tombstone the entry, leaving data streams intact. The caller decides
  * `need_drain` -- an already-observed peer FIN leaves nothing to absorb -- and
  * has reserved the drain-ref slot when it is true. Retirement itself is
@@ -3182,6 +4390,7 @@ typedef struct moq_decoded_subscribe_tracks_request {
      * with this REQUEST_ERROR code and surfaces no event (a REGISTER still
      * commits its alias). */
     uint64_t               auth_reject_code;
+    moq_subscribe_tracks_options_t options;
 } moq_decoded_subscribe_tracks_request_t;
 
 typedef struct moq_decoded_publish_blocked {
@@ -3191,15 +4400,39 @@ typedef struct moq_decoded_publish_blocked {
     moq_bytes_t     track_name;
 } moq_decoded_publish_blocked_t;
 
+/* A draft-22 REQUEST_UPDATE of a namespace request (§9.5): the selected
+ * parameters its family permits. Spans borrow the message body. */
+typedef struct moq_decoded_namespace_update {
+    uint64_t        request_id;
+    bool            has_prefix;
+    moq_namespace_t prefix;
+    moq_bytes_t     prefix_parts[MOQ_DECODED_MAX_NAMESPACE_PARTS];
+    bool            has_forward;
+    bool            forward;
+} moq_decoded_namespace_update_t;
+
+typedef struct moq_namespace_update_encode_args {
+    uint64_t                request_id;
+    moq_request_family_t    family;
+    bool                    has_prefix;
+    moq_namespace_t         prefix;
+    bool                    has_forward;
+    bool                    forward;
+    const moq_auth_token_t *auth_tokens;
+    size_t                  auth_token_count;
+} moq_namespace_update_encode_args_t;
+
 moq_result_t session_core_on_subscribe_tracks(moq_session_t *s,
     moq_decoded_subscribe_tracks_request_t *d, bool request_fin);
 moq_result_t session_core_on_subscribe_tracks_ok(moq_session_t *s, int slot);
 moq_result_t session_core_on_subscribe_tracks_error(moq_session_t *s, int slot,
     uint64_t error_code, bool can_retry, uint64_t retry_after_ms,
-    const uint8_t *reason, size_t reason_len);
+    const uint8_t *reason, size_t reason_len,
+    const moq_decoded_redirect_t *redirect);
 moq_result_t session_core_on_publish_blocked(moq_session_t *s, int slot,
     const moq_decoded_publish_blocked_t *d);
-moq_result_t session_core_on_subscribe_tracks_torn_down(moq_session_t *s, int slot);
+moq_result_t session_core_on_subscribe_tracks_torn_down(moq_session_t *s, int slot,
+                                                        moq_request_terminal_t term);
 /* §10.9.1: a REQUEST_UPDATE on a SUBSCRIBE_TRACKS bidi is unsupported here;
  * REQUEST_ERROR + FIN on the bidi, commit the update's request id, terminate. */
 moq_result_t session_core_on_track_sub_update_rejected(moq_session_t *s,
@@ -3209,7 +4442,8 @@ int track_sub_resolve_handle(moq_session_t *s, moq_track_sub_handle_t h);
 int track_sub_find_free(moq_session_t *s);
 void track_sub_free_entry(moq_session_t *s, int slot);
 bool track_sub_prefix_conflicts(moq_session_t *s, const moq_bytes_t *parts,
-                                size_t count, int exclude_slot);
+                                size_t count, moq_track_sub_role_t role,
+                                int exclude_slot);
 
 /* -- Subscribe handlers (session_subscribe.c) ---------------------- */
 
@@ -3266,13 +4500,103 @@ moq_result_t session_core_on_subscribe_done(moq_session_t *s,
                                              bool free_now);
 moq_result_t session_core_on_request_update(moq_session_t *s,
                                              moq_decoded_request_update_t *d);
+
+/* -- Answering a subscriber's update (subscriptions and publications) --
+ * Shared by the subscription (session_subscribe.c) and the PUBLISH-initiated
+ * subscription (session_publish.c) paths, so both answer, coalesce and fail
+ * an update the same way. */
+
+/* What accepting an update needs, admitted before anything is queued. */
+typedef struct moq_update_plan {
+    /* The one registry snapshot: it feeds both the REQUEST_OK Largest Object
+     * and the stored resolved window. */
+    bool     snap_has;
+    uint64_t snap_group;
+    uint64_t snap_object;
+    bool     has_fill;      /* the fill child is reserved */
+    bool     fail_fill;     /* no pool slot: the fill fails on the wire */
+    moq_fill_reservation_t fres;
+    moq_fill_input_t       feff;
+} moq_update_plan_t;
+
+void session_update_from_decoded(const moq_decoded_request_update_t *d, moq_sub_update_t *u);
+/* Preflight the complete options/token projection and stage selected values.
+ * Legacy profiles return NULL options. Caller rolls scratch back on refusal. */
+moq_result_t session_update_stage_options(moq_session_t *s,
+    const moq_sub_update_t *u, const moq_resolved_token_t *tokens,
+    size_t token_count, moq_subscription_update_options_t **out);
+
+moq_result_t session_update_freeze_fill(const moq_sub_update_snapshot_t *v,
+    moq_update_plan_t *p);
+moq_result_t session_update_resolution_observe(const moq_session_t *s,
+    const moq_owed_update_t *o, uint64_t update_request_id,
+    moq_update_resolution_t *out, size_t out_size);
+/* Forget the owed answer and free the ids it covered. */
+void session_owed_update_clear(moq_session_t *s, moq_owed_update_t *o);
+/* Observe the cumulative record. Caller validates the session, typed owner
+ * and optional filter-output size before this writes any output. */
+moq_result_t session_owed_update_observe(const moq_owed_update_t *o,
+    uint64_t *out_update_request_id, bool *out_has_filter,
+    moq_location_filter_cfg_t *out_filter, size_t out_filter_size);
+/* The id of the i-th update of the owed run, in arrival order. */
+uint64_t session_owed_update_id(const moq_owed_update_t *o, uint32_t i);
+/* The owed run already holds as many updates as this side advertised it
+ * would take on the stream (§9.1.7); never true on a profile that
+ * advertises no bound. */
+bool session_owed_update_at_bound(const moq_session_t *s, const moq_owed_update_t *o);
+/* The owed record `u` would leave: `u` itself, or folded into the run
+ * already owed. Grows the older-id storage; changes nothing else. */
+moq_result_t session_owed_update_stage(moq_session_t *s, moq_owed_update_t *o,
+                                       const moq_sub_update_t *u,
+                                       moq_sub_update_t *cum, uint32_t *count);
+/* Commit what session_owed_update_stage computed. Cannot fail. */
+void session_owed_update_record(moq_owed_update_t *o, const moq_sub_update_t *cum,
+                                uint32_t count);
+moq_result_t session_update_encode_ok(moq_session_t *s, uint64_t request_id,
+                                      const moq_update_plan_t *p,
+                                      uint8_t *buf, size_t cap, size_t *out_len);
+moq_result_t session_update_accept_fits(moq_session_t *s, const moq_owed_update_t *o,
+                                        const moq_update_plan_t *p);
+moq_result_t session_update_reject_cfg_check(const moq_session_t *s,
+                                             const moq_reject_subscription_update_cfg_t *cfg);
+void session_update_reject_args(const moq_owed_update_t *o,
+                                const moq_reject_subscription_update_cfg_t *cfg,
+                                moq_request_error_encode_args_t *ea);
+/* The number of REQUEST_ERRORs a failed update is answered with when
+ * `n_before` owed updates fail with it. */
+size_t session_update_error_count(const moq_session_t *s, uint32_t n_before);
+/* The k-th of those `n_err` REQUEST_ERRORs: the owed run's earlier ids by
+ * their own id, the last one as `ea` names it. */
+moq_result_t session_update_encode_error(moq_session_t *s, const moq_owed_update_t *o,
+                                         const moq_request_error_encode_args_t *ea,
+                                         size_t k, size_t n_err,
+                                         uint8_t *buf, size_t cap, size_t *out_len);
+moq_result_t session_update_fail_len(moq_session_t *s, const moq_owed_update_t *o,
+                                     uint64_t done_request_id,
+                                     uint64_t done_stream_count,
+                                     const moq_request_error_encode_args_t *ea,
+                                     uint32_t n_before, size_t *err_total,
+                                     size_t *done_len);
+/* The Stream Count of a PUBLISH_DONE the session sends on its own: every
+ * data stream it opened for the request, subgroup and fill streams alike
+ * (zero when it opened none), saturating to the profile's unknown
+ * sentinel. */
+uint64_t session_done_stream_count(const moq_session_t *s,
+                                   uint64_t subgroup_streams_opened,
+                                   uint64_t fill_streams_opened);
 moq_result_t session_core_on_subscribe_update_ok(moq_session_t *s, int slot,
     bool has_largest, uint64_t largest_group, uint64_t largest_object,
     bool has_expires, uint64_t expires_ms);
-moq_result_t session_core_on_subscribe_update_error(moq_session_t *s, int slot);
+moq_result_t session_core_on_subscribe_update_error(moq_session_t *s, int slot,
+                                                    uint64_t error_code);
 /* Publication-update ack: clears the pending update on a PUBLISH-established
  * subscription and emits MOQ_EVENT_PUBLICATION_UPDATE_OK exactly once (queue-full
  * WOULD_BLOCK before clearing). Mirrors the subscription-update-ok hook. */
+moq_result_t session_core_on_fetch_update_ok(moq_session_t *s, int slot);
+moq_result_t session_core_on_fetch_update_error(moq_session_t *s, int slot,
+    uint64_t error_code, const uint8_t *reason, size_t reason_len);
+moq_result_t session_core_on_own_publish_update_error(moq_session_t *s, int slot,
+    uint64_t error_code, const uint8_t *reason, size_t reason_len);
 moq_result_t session_core_on_publish_update_ok(moq_session_t *s, int slot,
     bool has_largest, uint64_t largest_group, uint64_t largest_object,
     bool has_expires, uint64_t expires_ms);
@@ -3289,25 +4613,137 @@ bool fetch_cancel_tomb_consume(moq_session_t *s, uint64_t request_id);
 /* Drain-ring of locally cancelled request-bidi stream_refs (stream-correlated
  * profiles). add returns false when the ring is full; contains/remove report
  * and retire membership while draining late responses. */
-/* Drain-ref reason: NORMAL absorbs late in-flight bytes until FIN/reset; a
- * GOAWAY-strict ref additionally closes the session if the peer sends any more
- * bytes on a stream it already migrated via a request-stream GOAWAY (§10.4). */
+/* Drain-ref reason: NORMAL absorbs late in-flight bytes until FIN/reset. A
+ * GOAWAY-received ref is a request stream the peer migrated with a
+ * request-stream GOAWAY: the GOAWAY does not end the request, so the peer may
+ * still send what it owes there (an update answer, PUBLISH_DONE); those
+ * messages are discarded whole, and only a second GOAWAY on the stream closes
+ * the session with PROTOCOL_VIOLATION. */
 typedef enum moq_drain_reason {
-    MOQ_DRAIN_NORMAL        = 0,
-    MOQ_DRAIN_GOAWAY_STRICT = 1,
+    MOQ_DRAIN_NORMAL          = 0,
+    MOQ_DRAIN_GOAWAY_RECEIVED = 1,
+    /* ERROR+FIN is queued; cancellation of the pending UPDATE still owes
+     * STOP on the peer's open direction. No additional drain storage. */
+    MOQ_DRAIN_REJECT_STOP_OWED = 2,
+    /* The peer stopped this side's direction of a live request: the
+     * request is gone, but the peer's direction stays open, so only its FIN
+     * or RESET retires the reference -- never another STOP, whatever the
+     * profile's policy for streams this side cancelled. */
+    MOQ_DRAIN_PEER_STOPPED = 3,
 } moq_drain_reason_t;
 
+/* Message framing state of a GOAWAY-received drain ref: the payload bytes of
+ * the current message still to discard, then the next message's header
+ * (Type vi64 and Length 16) gathered across reads. */
+/* Advance `st` over `len` bytes of a GOAWAY-received request stream. A
+ * GOAWAY among them closes the session with PROTOCOL_VIOLATION (returns
+ * MOQ_OK, session closed), as does framing that cannot be a message header;
+ * every other message is discarded. */
+moq_result_t drain_goaway_scan(moq_session_t *s, moq_drain_scan_t *st,
+                               const uint8_t *buf, size_t len);
+/* The framing state of a present GOAWAY-received ref, or NULL. */
+moq_drain_scan_t *drain_ref_scan(moq_session_t *s, moq_stream_ref_t ref);
+
 bool drain_ref_add(moq_session_t *s, moq_stream_ref_t ref);
+/* drain_ref_add for a stream whose live request the peer's STOP_SENDING
+ * cancelled (MOQ_DRAIN_PEER_STOPPED). */
+bool drain_ref_add_peer_stopped(moq_session_t *s, moq_stream_ref_t ref);
+bool drain_ref_add_rejected(moq_session_t *s, moq_stream_ref_t ref,
+                            bool cancel_update);
+void drain_ref_retry_owed_stops(moq_session_t *s);
 void fetch_abort_tomb_add(moq_session_t *s, uint64_t request_id);
 /* Fetcher-side terminal for a peer RESET of the identified response data stream
  * of fetch `slot`: emits FETCH_RESET and retires the request (reserve-before-
  * mutate; MOQ_ERR_WOULD_BLOCK leaves the entry and the obligation intact). A
  * slot that already surfaced its terminal, or is not an active fetcher-role
  * request, is left alone and reports MOQ_OK. */
+/* Cancel a fetch whose response delivered an object this side cannot take
+ * (session_fetch.c); the caller stops the data stream. */
+moq_result_t fetch_cancel_on_receive(moq_session_t *s, int slot);
+
+/* -- Malformed Track (draft-22 §12.1) -------------------------------- */
+
+/* Fail one request whose Track is malformed: the subscriber cancels it
+ * (§6.4.2.3) with MALFORMED_TRACK and the application sees its terminal event
+ * with the MOQ_REQUEST_TERMINAL_MALFORMED_TRACK cause. Each reserves before it
+ * mutates (WOULD_BLOCK leaves the request as it was) and returns MOQ_OK for an
+ * entry that owes no terminal any more. */
+moq_result_t session_sub_fail_malformed(moq_session_t *s, int slot);
+moq_result_t session_pub_fail_malformed(moq_session_t *s, int slot);
+moq_result_t session_fetch_fail_malformed(moq_session_t *s, int slot);
+
+/* A Track the peer publishes is malformed. Every request this side holds for
+ * it from the peer -- each subscriber-role SUBSCRIBE (pending or
+ * established), each PUBLISH the peer sent (accepted, or awaiting this side's
+ * answer) and each FETCH this side sent -- is marked before any of them is
+ * retired, and the cancellations are driven at once; one the queues cannot
+ * take now stays owed and mt_retry_pending completes it on a later call,
+ * without further input. Requests that already owe their terminal are left
+ * alone; requests made after the verdict are not affected. The Track is
+ * named by its canonical full-track-name key; a NULL key fails nothing. */
+void session_fail_malformed_track(moq_session_t *s, const uint8_t *key, size_t key_len);
+/* The same, for the Track the peer delivers on `alias`, for the Track a
+ * FETCH (`fetch_slot`) carries, and for the Track of a fill's parent. */
+void session_fail_malformed_alias(moq_session_t *s, uint64_t alias);
+void session_fail_malformed_fetch(moq_session_t *s, int fetch_slot);
+void session_fail_malformed_owner(moq_session_t *s, moq_subscription_t sub,
+                                  moq_publication_t pub);
+/* True when a request bound to `alias` (or the FETCH in `fetch_slot`) has a
+ * malformed verdict whose cancellation is still owed: nothing more is
+ * delivered to it. */
+bool session_alias_failing(const moq_session_t *s, uint64_t alias);
+/* Drive the owed malformed-Track cancellations. */
+void mt_retry_pending(moq_session_t *s);
+/* Refuse a PUBLISH still awaiting this side's answer because its Track is
+ * malformed: REQUEST_ERROR MALFORMED_TRACK, then PUBLISH_FINISHED with the
+ * MOQ_REQUEST_TERMINAL_MALFORMED_TRACK cause. Reserve-before-mutate. */
+moq_result_t session_pub_reject_pending_malformed(moq_session_t *s, int slot);
+
+/* One received object as the detector sees it. */
+typedef struct moq_mt_object {
+    uint64_t              group_id;
+    uint64_t              object_id;
+    bool                  in_subgroup;   /* subgroup_id/priority are meaningful */
+    bool                  end_of_group;  /* the object is its group's final
+                                            (status, or a datagram EOG bit) */
+    uint8_t               priority;      /* resolved publisher priority */
+    /* The priority was omitted on the wire and resolved from the default of
+     * the request that received it. Two such objects state the same thing
+     * (nothing), whatever default each request resolved them against. */
+    bool                  priority_inherited;
+    uint64_t              subgroup_id;
+    moq_object_status_t   status;
+    const moq_obj_gaps_t *gaps;          /* NULL when none */
+} moq_mt_object_t;
+
+typedef struct moq_mt_track moq_mt_track_t;
+
+/* The detection record for the Track on `alias` / for one FETCH response,
+ * created on first use. NULL when the profile does not fail malformed Tracks
+ * locally or the record pool is full (detection is then skipped), with *rc
+ * MOQ_OK; NULL with MOQ_ERR_NOMEM when creating it failed (the caller
+ * retries the same object later). */
+moq_mt_track_t *mt_track_for_alias(moq_session_t *s, uint64_t alias,
+                                   moq_result_t *rc);
+moq_mt_track_t *mt_track_for_fetch(moq_session_t *s, moq_fetch_t fetch,
+                                   moq_result_t *rc);
+
+/* Check one received object against what the Track has said so far and,
+ * when it is consistent, record it. Returns MOQ_MALFORMED_NONE or the
+ * reason. Recording is idempotent, so a re-driven object is checked again
+ * with the same outcome. */
+uint8_t mt_object(moq_mt_track_t *t, const moq_mt_object_t *o);
+
+/* A subgroup stream ended with a FIN after `last` (when has_last): the final
+ * Object of the subgroup, and of the group when the header set END_OF_GROUP. */
+uint8_t mt_subgroup_fin(moq_mt_track_t *t, uint64_t group_id, uint64_t subgroup_id,
+                        bool has_last, uint64_t last, bool end_of_group);
+
+void mt_destroy_all(moq_session_t *s);
 moq_result_t fetch_on_data_stream_reset(moq_session_t *s, int slot,
                                         uint64_t error_code);
 bool fetch_abort_tomb_consume(moq_session_t *s, uint64_t request_id);
-bool drain_ref_add_strict(moq_session_t *s, moq_stream_ref_t ref);
+bool drain_ref_add_goaway_received(moq_session_t *s, moq_stream_ref_t ref);
 /* Reason of a present ref (MOQ_DRAIN_NORMAL if absent). */
 moq_drain_reason_t drain_ref_reason(const moq_session_t *s, moq_stream_ref_t ref);
 bool drain_ref_contains(const moq_session_t *s, moq_stream_ref_t ref);
@@ -3349,6 +4785,17 @@ void request_registry_remove_by_streamref(
 /* True if the bound profile correlates requests by per-request bidi stream
  * identity (draft-16: false). */
 bool moq_session_uses_request_streams(const moq_session_t *s);
+
+/* Whether publication `pe` is in draft-16's automatic rejected-update
+ * teardown (pub_reject_update_control): no producer output may overtake it. On a
+ * stream-correlated profile a publisher's update_failed instead means it owes
+ * PUBLISH_DONE(UPDATE_FAILED), and production is not refused. */
+static inline bool pub_control_reject_teardown(const moq_session_t *s,
+                                           const moq_pub_entry_t *pe)
+{
+    return pe->update_failed && pe->role == MOQ_PUB_ROLE_PUBLISHER &&
+           !moq_session_uses_request_streams(s);
+}
 
 /*
  * Whether a PUBLISH-initiated subscription may be joined by a Joining FETCH.
@@ -3403,6 +4850,8 @@ moq_result_t handle_data_reset(moq_session_t *s,
 
 /* -- Namespace-sub handlers (session_namespace_sub.c) --------------- */
 
+void ns_sub_retry_pending(moq_session_t *s);
+
 moq_result_t ns_sub_on_new_bidi(moq_session_t *s,
                                  moq_stream_ref_t stream_ref,
                                  const uint8_t *data, size_t len);
@@ -3440,5 +4889,109 @@ moq_result_t handle_bidi_stream_stop(moq_session_t *s,
 moq_result_t request_stream_teardown(moq_session_t *s,
                                      moq_stream_ref_t stream_ref,
                                      bool reset, uint64_t error_code);
+
+/* The peer closed its sending direction of a request bidi before the messages
+ * its role owes (the response; PUBLISH_DONE for an established subscription's
+ * publisher). On a profile where a FIN is not a cancellation this fails just
+ * that request: the family's terminal event carries MISSING_RESPONSE, or
+ * TRUNCATED_RESPONSE when `truncated` says a partial message was buffered, the
+ * entry is freed, and our own sending direction is reset with CANCELLED unless
+ * the family already closed it (TRACK_STATUS opens its bidi with the FIN).
+ * Reserve-before-mutate: a full event or action queue returns WOULD_BLOCK with
+ * the entry intact for the re-feed. */
+moq_result_t request_stream_failed_by_fin(moq_session_t *s,
+                                          moq_stream_ref_t stream_ref,
+                                          bool truncated);
+
+/* Queue a RESET_STREAM (CANCELLED) of our sending direction on a request
+ * bidi. The caller reserved the action slot. */
+void request_bidi_reset_local(moq_session_t *s, moq_stream_ref_t stream_ref);
+
+/* -- Draft-22 namespace updates (session_namespace_update.c) ---------- */
+
+struct moq_request_envelope;
+
+/* A peer namespace update between decode and its outcome: the decoded
+ * parameters, the admitted Request ID and the staged token transaction.
+ * refuse_code is the REQUEST_ERROR an automatic refusal answers with (a token
+ * failure, or INVALID_FILTER for a Range Filter); zero when the update passed
+ * the message-level checks. */
+typedef struct ns_update_admission {
+    moq_decoded_namespace_update_t d;
+    moq_request_endpoint_t endpoint;
+    moq_resolved_token_t   tokens[MOQ_DECODED_MAX_TOKENS];
+    bool                   token_staged[MOQ_DECODED_MAX_TOKENS];
+    size_t                 token_count;
+    moq_auth_txn_t         auth_txn;
+    uint64_t               refuse_code;
+    bool                   staged;
+} ns_update_admission_t;
+
+void ns_update_release(moq_session_t *s, moq_ns_update_t *u);
+void ns_update_clear_owed(moq_session_t *s, moq_ns_update_t *u);
+void ns_update_clear_outstanding(moq_session_t *s, moq_ns_update_t *u);
+void ns_update_fill_record(const moq_ns_update_t *u,
+                           moq_namespace_update_record_t *rec);
+moq_result_t ns_update_owed_query(const moq_ns_update_t *u,
+    moq_namespace_update_record_t *out, size_t out_size);
+moq_result_t ns_update_push_request_event(moq_session_t *s,
+    moq_request_family_t family, uint64_t handle_raw, const moq_ns_update_t *u);
+moq_result_t ns_update_push_result_event(moq_session_t *s,
+    moq_request_family_t family, uint64_t handle_raw, uint64_t update_request_id,
+    moq_namespace_update_outcome_t outcome, moq_request_role_t role,
+    uint64_t error_code, const uint8_t *reason, size_t reason_len,
+    bool has_expires, uint64_t expires_ms);
+/* Decode, admit the Request ID and stage the token transaction of a peer
+ * namespace update. A malformed message closes the session. On MOQ_OK the
+ * caller ends the admission with ns_update_defer, or with
+ * ns_update_admission_commit after answering it, or ns_update_admission_abort. */
+moq_result_t ns_update_admit(moq_session_t *s, moq_request_family_t family,
+    moq_stream_ref_t ref, const struct moq_request_envelope *env,
+    ns_update_admission_t *a);
+void ns_update_admission_commit(moq_session_t *s, ns_update_admission_t *a);
+void ns_update_admission_abort(moq_session_t *s, ns_update_admission_t *a);
+moq_result_t ns_update_defer(moq_session_t *s, moq_request_family_t family,
+    uint64_t handle_raw, moq_ns_update_t *u, ns_update_admission_t *a);
+moq_result_t ns_update_check_accept(const moq_session_t *s, const moq_ns_update_t *u,
+    const moq_accept_subscription_update_cfg_t *cfg);
+moq_result_t ns_update_check_reject(const moq_session_t *s, const moq_ns_update_t *u,
+    const moq_reject_subscription_update_cfg_t *cfg);
+moq_result_t ns_update_encode_ok(moq_session_t *s, uint64_t request_id,
+                                 uint8_t *buf, size_t cap, size_t *out_len);
+moq_result_t ns_update_encode_error(moq_session_t *s, uint64_t request_id,
+    uint64_t code, const uint8_t *reason, size_t reason_len,
+    uint8_t *buf, size_t cap, size_t *out_len);
+moq_result_t ns_update_cfg_read(const moq_session_t *s,
+    const moq_namespace_update_cfg_t *cfg, moq_request_family_t family,
+    moq_namespace_update_encode_args_t *out);
+moq_result_t ns_update_send(moq_session_t *s, moq_stream_ref_t ref,
+    moq_ns_update_t *u, moq_namespace_update_encode_args_t *args,
+    uint64_t *out_update_request_id);
+void ns_update_take_out_prefix(moq_ns_update_t *u, uint8_t **buf, size_t *buf_len,
+                               moq_bytes_t **parts, size_t *count);
+void ns_update_take_owed_prefix(moq_ns_update_t *u, uint8_t **buf, size_t *buf_len,
+                                moq_bytes_t **parts, size_t *count);
+bool ns_update_has_prefix(const moq_bytes_t *prefix, size_t prefix_count,
+                          const moq_bytes_t *ns, size_t ns_count);
+
+/* Family hooks. Each answers an inbound update on an established request it
+ * responds to, or a response to this side's update on one it made; `env` is
+ * the complete message and the caller consumes it on MOQ_OK. */
+moq_result_t ann_on_namespace_update(moq_session_t *s, int slot,
+    const struct moq_request_envelope *env);
+moq_result_t ann_on_update_response(moq_session_t *s, int slot, bool ok,
+    uint64_t error_code, const uint8_t *reason, size_t reason_len,
+    bool has_expires, uint64_t expires_ms);
+moq_result_t track_sub_on_namespace_update(moq_session_t *s, int slot,
+    const struct moq_request_envelope *env);
+moq_result_t track_sub_on_update_response(moq_session_t *s, int slot, bool ok,
+    uint64_t error_code, const uint8_t *reason, size_t reason_len,
+    bool has_expires, uint64_t expires_ms);
+/* The same admission when updates are not left to the application, ending
+ * in a refusal (its admission code, else NOT_SUPPORTED) without an event. */
+moq_result_t ann_refuse_namespace_update(moq_session_t *s, int slot,
+    const struct moq_request_envelope *env);
+moq_result_t track_sub_refuse_namespace_update(moq_session_t *s, int slot,
+    const struct moq_request_envelope *env);
 
 #endif /* MOQ_SESSION_INTERNAL_H */

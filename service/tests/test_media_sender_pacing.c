@@ -1421,11 +1421,28 @@ static void expect_conserved(moq_media_sender_t *s, uint64_t written,
 
 /* -- Fixture ----------------------------------------------------------- */
 
+/* Wire record of the publisher's CANCELLED (0x1) subgroup resets: every
+ * RESET_DATA action the client (the media sender's session) emits with that
+ * code. A subscriber that cancelled has deleted its subscription state, so
+ * only the wire shows that the publisher reset the cancelled subscription's
+ * open subgroup. */
+static int g_cancel_resets;
+
+static void trace_cancel_resets(void *ctx, const moq_sim_trace_record_t *r)
+{
+    (void)ctx;
+    if (r->kind == MOQ_SIM_TRACE_ACTION && r->from == MOQ_PERSPECTIVE_CLIENT &&
+        r->action_kind == MOQ_ACTION_RESET_DATA && r->code == 0x1)
+        g_cancel_resets++;
+}
+
 static moq_simpair_t *make_pair(moq_alloc_t *alloc, uint32_t max_actions,
                                 moq_version_t ver)
 {
     moq_simpair_cfg_t cfg = MOQ_SIMPAIR_CFG_INIT;
     cfg.alloc = alloc; cfg.seed = 42; cfg.initial_now_us = 1000;
+    cfg.trace_fn = trace_cancel_resets;
+    g_cancel_resets = 0;
     cfg.client_send_request_capacity = true;
     cfg.client_initial_request_capacity = 32;
     cfg.server_send_request_capacity = true;
@@ -2176,16 +2193,16 @@ static void test_demand_loss_after_emission(uint64_t version)
     drive(&fix, now);
     const tr_exp_t head[] = { { 0, 0, 0, 0x60, 0 } };
     expect_from(&fix, 0, head, 1, "demand-loss-head");
-    const reset_exp_t departure[] = {
-        { 0, 0, 0, 0x1, true, .sub_opaque = fix.sub[0]._opaque, .pub_opaque = 0 }
-    };
-
+    int cancel_resets = g_cancel_resets;
     MOQ_TEST_CHECK(moq_session_unsubscribe(moq_simpair_server(fix.sp),
                                           fix.sub[0], now) == MOQ_OK);
     for (int i = 0; i < 8 &&
          moq_media_sender_track_has_subscriber(fix.s, fix.t[0]); i++)
         drive(&fix, now);
     MOQ_TEST_CHECK(!moq_media_sender_track_has_subscriber(fix.s, fix.t[0]));
+    /* Both versions reset the departing subscription's open subgroup with
+     * CANCELLED on the wire. */
+    MOQ_TEST_CHECK_EQ_INT(g_cancel_resets - cancel_resets, 1);
     MOQ_TEST_CHECK(write_obj(&fix, 0, 0x61, false, false, 1100) == MOQ_OK);
     drive(&fix, now);
     expect_conserved(fix.s, 2, 1, 0, 1, 0, "demand-loss-drop");
@@ -2215,9 +2232,11 @@ static void test_demand_loss_after_emission(uint64_t version)
     };
     expect_status(&fix, terminal, 1, "demand-loss-terminal");
     expect_terminals(&fix, terms, 2, "demand-loss-fin");
-    expect_resets(&fix, departure, 1, "demand-loss-departure");
-    /* Both versions reset the departing subscription's open subgroup with
-     * CANCELLED. The service discharges its abandonment once. */
+    /* That reset (asserted on the wire above) surfaces no SUBGROUP_RESET:
+     * the subscriber deleted the subscription state when it cancelled,
+     * stopped its streams and discards what still arrives for them. The
+     * service discharges its abandonment once. */
+    expect_resets(&fix, NULL, 0, "demand-loss-departure");
     moq_media_sender_stats_t st;
     memset(&st, 0, sizeof(st));
     MOQ_TEST_CHECK(moq_media_sender_get_stats(fix.s, &st, sizeof(st)) == MOQ_OK);
@@ -3632,12 +3651,16 @@ static void test_terminal_flushes_reset(void)
     expect_from(&fix, from, anchor, 1, "tflush-anchor");
 
     /* The peer leaves the video track, and the sender observes it. */
+    int cancel_resets = g_cancel_resets;
     MOQ_TEST_CHECK(moq_session_unsubscribe(moq_simpair_server(fix.sp),
                                            fix.sub[0], now) == MOQ_OK);
     for (int i = 0; i < 8 &&
          moq_media_sender_track_has_subscriber(fix.s, fix.t[0]); i++)
         drive(&fix, now);
     MOQ_TEST_CHECK(!moq_media_sender_track_has_subscriber(fix.s, fix.t[0]));
+    /* The departure closes video g0/sg0 on the wire with the publisher's
+     * CANCELLED reset. */
+    MOQ_TEST_CHECK_EQ_INT(g_cancel_resets - cancel_resets, 1);
     /* Nothing armed yet, so nothing has been attempted. */
     MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_reset_attempts(fix.s), 0);
 
@@ -3687,13 +3710,14 @@ static void test_terminal_flushes_reset(void)
                                       { 1, 1, 0, true, true } };
         expect_terminals(&fix, terms, 2, "tflush-terminals");
         /* The peer's departure is what closed video g0/sg0 on the wire: the
-         * facade retires the open subgroup with its own code 0x1 while the
-         * subscription is torn down, long before the service arms its
-         * obligation. That is why the later service RESET (0x10) reaches no
-         * active slot and emits nothing, which is the state this row records. */
-        const reset_exp_t rst[1] = {
-            { 0, 0, 0, 0x1, true, .sub_opaque = 0, .pub_opaque = 0 } };
-        expect_resets(&fix, rst, 1, "tflush-resets");
+         * session resets the open subgroup with code 0x1 while the
+         * subscription is torn down (asserted on the wire above), long before
+         * the service arms its obligation, so the later service RESET (0x10)
+         * reaches no active slot and emits nothing. The departed peer
+         * surfaces no SUBGROUP_RESET for it: it stopped the stream when it
+         * deleted the subscription state (draft-16 §9.15) and discards what
+         * still arrives for it (draft-16 §10.1). */
+        expect_resets(&fix, NULL, 0, "tflush-resets");
     }
 
 out:
@@ -4085,6 +4109,9 @@ static void test_wait_recheck(void)
     cfg.namespace_ = (moq_namespace_t){ g_ns, 2 };
     cfg.pre_ready_max_objects = 2;
     cfg.block_timeout_us = 200000;
+    /* No session is ever latched here: pin the legacy companion, whose
+     * Group IDs count from 0. */
+    cfg.companion_profile = MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01;
     moq_media_sender_t *s = moq_media_sender_test_new_cfg(&cfg);
     MOQ_TEST_CHECK(s != NULL);
     if (!s) return;

@@ -3,6 +3,7 @@
  * Random: request/accept/reject with slot reuse after terminal events.
  * Each seed runs twice; trace hash + all counters must match. */
 #include <moq/sim.h>
+#include "scenario_pair_version.h"
 #include "../../tests/unit/test_support.h"
 #include <stdlib.h>
 #include <string.h>
@@ -247,6 +248,7 @@ static int run_exact_prelude(uint64_t seed, const moq_alloc_t *alloc,
 {
     int rc_out = -1;
     moq_simpair_cfg_t cfg = MOQ_SIMPAIR_CFG_INIT;
+    cfg.version = scenario_selected_version(MOQ_VERSION_DRAFT_16);
     cfg.alloc = alloc; cfg.seed = seed; cfg.initial_now_us = 1000;
     cfg.client_send_request_capacity = true;
     cfg.client_initial_request_capacity = 10;
@@ -350,6 +352,7 @@ static int run_scenario(uint64_t seed, const moq_alloc_t *alloc,
     }
 
     moq_simpair_cfg_t cfg = MOQ_SIMPAIR_CFG_INIT;
+    cfg.version = scenario_selected_version(MOQ_VERSION_DRAFT_16);
     cfg.alloc = alloc; cfg.seed = seed; cfg.initial_now_us = 1000;
     cfg.client_send_request_capacity = true;
     cfg.client_initial_request_capacity = 8;
@@ -409,6 +412,7 @@ static int run_scenario(uint64_t seed, const moq_alloc_t *alloc,
 
 int main(void)
 {
+    if (scenario_selected_version(MOQ_VERSION_DRAFT_16) == 0) return 1;
     int failures = 0;
     const char *es = getenv("MOQ_SCENARIO_SEEDS"), *eb = getenv("MOQ_SCENARIO_SEED_START"),
                *et = getenv("MOQ_SCENARIO_STEPS");

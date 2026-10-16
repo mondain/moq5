@@ -34,7 +34,7 @@ if(MOQ_BUILD_ADAPTER_WTQUIC AND MOQ_BUILD_PICO_WT_MANAGED)
     if(MOQ_BUILD_TESTS)
         add_test(NAME bench_wt_compare_smoke
             COMMAND ${CMAKE_COMMAND} -E env bash
-                ${CMAKE_SOURCE_DIR}/scripts/smoke_bench_wt_compare.sh
+                ${PROJECT_SOURCE_DIR}/scripts/smoke_bench_wt_compare.sh
                 $<TARGET_FILE:moq_bench_wt_compare>)
         set_tests_properties(bench_wt_compare_smoke PROPERTIES
             TIMEOUT 120
@@ -74,7 +74,7 @@ if(MOQ_BUILD_MSQUIC_MANAGED AND MOQ_BUILD_PQ_THREADED)
     if(MOQ_BUILD_TESTS)
         add_test(NAME bench_quic_compare_smoke
             COMMAND ${CMAKE_COMMAND} -E env bash
-                ${CMAKE_SOURCE_DIR}/scripts/smoke_bench_quic_compare.sh
+                ${PROJECT_SOURCE_DIR}/scripts/smoke_bench_quic_compare.sh
                 $<TARGET_FILE:moq_bench_quic_compare>)
         set_tests_properties(bench_quic_compare_smoke PROPERTIES
             TIMEOUT 120
@@ -83,7 +83,7 @@ if(MOQ_BUILD_MSQUIC_MANAGED AND MOQ_BUILD_PQ_THREADED)
             add_test(NAME bench_quic_compare_all_smoke
                 COMMAND ${CMAKE_COMMAND} -E env
                     MOQ_BENCH_BACKEND=all bash
-                    ${CMAKE_SOURCE_DIR}/scripts/smoke_bench_quic_compare.sh
+                    ${PROJECT_SOURCE_DIR}/scripts/smoke_bench_quic_compare.sh
                     $<TARGET_FILE:moq_bench_quic_compare>)
             set_tests_properties(bench_quic_compare_all_smoke PROPERTIES
                 TIMEOUT 120
@@ -181,8 +181,8 @@ if(MOQ_BUILD_TESTS)
     if(MOQ_BUILD_ADAPTER_PICOQUIC)
         add_test(NAME bench_picoquic_loopback_smoke
                  COMMAND ${CMAKE_COMMAND} -E env bash
-                         ${CMAKE_SOURCE_DIR}/scripts/smoke_bench_picoquic.sh
-                         ${CMAKE_BINARY_DIR})
+                         ${PROJECT_SOURCE_DIR}/scripts/smoke_bench_picoquic.sh
+                         ${PROJECT_BINARY_DIR})
         set_tests_properties(bench_picoquic_loopback_smoke PROPERTIES
             TIMEOUT 30
             LABELS "bench;smoke;transport")

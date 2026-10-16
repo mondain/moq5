@@ -82,7 +82,11 @@ its installed library directory; the workflow does not bake that path into
 the artifacts.
 
 The default smoke expects an SDK without adapters and checks real C `INVAL`
-for an invalid URL and `UNSUPPORTED` for valid QUIC and WebTransport URLs. When
+for an invalid URL and `UNSUPPORTED` for valid QUIC and WebTransport URLs. On
+every SDK it also checks, through the private bridge so the C rule answers,
+`INVAL` for a `wt_path` under STANDARD and for a preferred version beside an
+explicit offer; without adapters, the same `wt_path` under LEGACY and a
+draft-22 offer or preference reach `UNSUPPORTED`. When
 using an external SDK with adapters, pass `--skip-backendless-checks` to omit
 only the valid-URL attempts. This does not claim transport acceptance. Terminal
 raw-bit and type checks exercise Python values; a backend-free refusal cannot
@@ -99,10 +103,13 @@ python bindings/python/examples/connect.py moqt://relay.example:4433 \
 ```
 
 `https://relay.example/moq` selects WebTransport with the default protocol
-selection. The example accepts `--timeout-us` for its overall observation
+selection. The example currently selects STANDARD unless `--uri-mode legacy`
+is supplied, independently of `EndpointConfig`'s LEGACY default. Its URL path
+is the WebTransport path in STANDARD; `--wt-path` requires `--uri-mode legacy`.
+It accepts `--timeout-us` for its overall observation
 budget; this is separate from the transport-only handshake configuration.
-It reports terminal reasons and raw detail codes without treating failures as
-clean EOF.
+It reports the negotiated version by name when `Version` knows it, and
+terminal reasons and raw detail codes without treating failures as clean EOF.
 
 ```python
 from moq5 import Endpoint, EndpointConfig, WaitResult
@@ -124,19 +131,41 @@ is refused. Applications import only `moq5`; native handles stay private.
 
 `EndpointConfig` is a frozen, keyword-only dataclass. `url` is required; the
 defaults are `Protocol.AUTO`, `Backend.AUTO`, an empty version offer,
-`WtProfile.BACKEND_DEFAULT`, and `handshake_timeout_us=0`. Optional `sni`,
-`ca_file`, and `wt_path` default to `None`; `None` and empty strings both select
-the native default. Text must be a built-in `str`, must encode as UTF-8, and
-must not contain NUL. URL syntax remains the C service's authority.
+`WtProfile.BACKEND_DEFAULT`, `handshake_timeout_us=0`, `UriMode.LEGACY`,
+and `preferred_version=None`. Optional `sni`, `ca_file`, and `wt_path` default
+to `None`; `None` and empty strings both select the native default. Text must
+be a built-in `str`, must encode as UTF-8, and must not contain NUL. URL syntax
+remains the C service's authority.
+
+`uri_mode` selects how the C service reads the URL. `UriMode.STANDARD` is
+explicit opt-in and reads it as the MOQT URI scheme defines it: `moqt` and `https`
+case-insensitively, port 443 when the URL omits one, and the URL's own path
+and query (or `/` when it has none) as the WebTransport path. The URL carries
+the path, so a non-empty `wt_path` under STANDARD raises `ValueError` here,
+before any native effect; the service refuses the same combination with
+`INVAL`. `UriMode.LEGACY` is the default and original reading: lowercase `moqt`, `moq` and
+`https` only, port 4433 for `moqt` and `moq`, the `wt_path` override, and a
+`/moq` WebTransport default. Existing code that sets `wt_path` keeps that
+override without opting into a mode. A `moqt` URL without a port therefore
+reaches port 443 under STANDARD and 4433 under LEGACY. Every other URL rule,
+including which well-formed URLs STANDARD does not admit (`UNSUPPORTED`), stays
+with the C service.
 
 `versions` accepts a tuple or list of integers and stores a checked immutable
-tuple in preference order. An empty tuple means AUTO. Each offered version
-must be in `1..2**32-1`; `Version.DRAFT_16` and `Version.DRAFT_18` are named
-values, not a promise of compiled support. Unknown nonzero offers reach native
-validation without being silently downgraded. Protocol, backend, and WT profile
-fields accept their enum members or known integer values. Their numbers, all
-named wire versions, states, terminal reasons, and wait results come from C
-constants exposed by the compiled bridge.
+tuple in preference order. An empty tuple means AUTO: the default offer is
+every supported draft, newest first (draft-22, draft-18, draft-16).
+Each offered version
+must be in `1..2**32-1`; `Version.DRAFT_16`, `Version.DRAFT_18` and
+`Version.DRAFT_22` are named values, not a promise of compiled support.
+Unknown nonzero offers reach native validation without being silently
+downgraded. `preferred_version` names the version an AUTO offer places first;
+`None` leaves the library default. It takes the same range and is refused with
+`ValueError` beside a non-empty `versions`, whose order is already explicit (the
+service answers that combination with `INVAL`); a preferred version the SDK
+does not offer is the service's `UNSUPPORTED`. Protocol, backend, WT profile
+and URI mode fields accept their enum members or known integer values. Their
+numbers, all named wire versions, states, terminal reasons, and wait results
+come from C constants exposed by the compiled bridge.
 
 Native offer-count and support limits still govern validation: the Python
 layer checks each offer's range and type, and the native service refuses an
@@ -189,7 +218,9 @@ establishes a clean close; `NONE` and unknown reasons are not evidence of
 success. `detail_code` retains every unsigned 64-bit raw bit, including
 `2**64-1`; transport failures can have detail zero. Some backends encode signed
 native errors in these bits. `endpoint.negotiated_version` is an integer, zero
-before establishment, and preserves unknown future version numbers.
+before establishment, and preserves unknown future version numbers;
+`Version(endpoint.negotiated_version)` names a known one, including
+`Version.DRAFT_22`.
 
 TLS chain and server-name verification stay enabled. There is no insecure
 verification option or Python `ssl.SSLContext` mapping. Native backend defaults
@@ -211,6 +242,38 @@ commands and `poll_track()` require the owner thread; only `closed` may be
 read elsewhere. To cancel a blocked receiver wait from another thread use
 `receiver.endpoint.set_interrupted(True)` or `wake()`.
 
+`ReceiverConfig.companion_profile` defaults to `CompanionProfile.AUTO`, which
+the native receiver resolves to the profile matching the negotiated draft:
+`LEGACY_MSF01_LOC01` on draft 16/18, `D22_MSF01_LOC04_PUBLIC` on draft 22.
+An explicit profile pins one and refuses the other drafts. Native
+eligibility/refusals remain authoritative, including the D22 `SHARED_EPOCH`
+refusal (AUTO with `SHARED_EPOCH` has no draft-22 match). Receiver and subscribe configuration use
+the sized native initializers; endpoint and existing receiver defaults do not
+change.
+
+`subscribe(track, *, start=StartMode.CURRENT, priority=None, location=None,
+fill=None)` preserves the original call. `LocationFilter` is a checked,
+keyword-only semantic value: `NONE`, `RELATIVE_GROUP`, `ABSOLUTE_START`,
+`GROUP_END`, `OBJECT_END`, or `NEXT_OBJECT`. Absolute ends stay absolute and
+`end_object` is inclusive, including `2**64-1`. Explicit location supersedes
+`start`; `None` omits it, while `LocationFilter()` explicitly removes the
+constraint. A relative offset of 0 selects next group, 1 current, 2 preceding.
+
+`FillConfig(*, priority=None, group_order=None, timeout_ms=None, location=None)`
+requests one initial child, even with every override omitted. Unset overrides
+inherit; `FillGroupOrder` allows ASCENDING or DESCENDING, and an explicit zero
+timeout permits only immediately available objects, not a child-lifetime
+timer. Either explicit subscribe option suppresses the service's implicit
+current-group fill. Nested inputs are copied during the native call. Native
+validation resolves ranges and profile support without Python reinterpretation.
+
+`cancel_fill(track, initiating_request_id)` schedules only the identified child
+through the service, never unsubscribes its parent, and does not wait for its
+terminal. IDs are exact uint64 including zero. Every refusal raises `MoqError`
+with the original signed code and operation `"cancel_fill"`; stale IDs are not
+treated as successful cancellation. Owner-thread, process, track-owner and
+liveness checks remain in force.
+
 `poll_track()` returns one `TrackEvent`, or `PollOutcome.EMPTY` (nothing
 now) or `PollOutcome.CLOSED` (the event queue is empty AND the receiver is
 terminal -- not an aggregate end of stream). It never consults the interrupt
@@ -230,6 +293,18 @@ or that the native stamped prefixes (event, description, nested `info` and
 `init`) do not cover, are `None`, never zero; unknown enum values are kept as
 integers. `TrackEvent.largest` / `expires_ms` are `UPDATE_OK` observations,
 `parse_drop` a coalesced `PARSE_DROP` snapshot.
+
+`TrackEvent.kind_extended` adds `ExtendedTrackEventKind.LOCAL_FAILURE` and
+`FILL_TERMINAL`. The original `TrackEventKind` members and `kind` enum/int
+behavior are unchanged. `local_result` is the exact signed local failure,
+not a fabricated peer END_OF_TRACK. `track_state_extended(track)` names the
+corresponding `ExtendedTrackState.FAILED`, while `track_state()` preserves
+its original enum/int contract. Neither observation implies receiver fatal.
+`fill_terminal` is a copied `FillTerminal(initiating_request_id, reason,
+error_domain, error_code)` for one child only. Each unstamped field is `None`;
+unknown reason/domain values remain integers. STREAM error code zero is a
+real failure, not COMPLETE. Neither child termination nor local failure is
+parent END_OF_TRACK or aggregate EOF.
 
 A native poll consumes the event. If the bridge cannot convert it,
 `EventLost` (a `BindingError`) names the validated kind and the failing
@@ -261,6 +336,31 @@ signs are the C ones: unsigned 64-bit timestamps, a signed
 `composition_offset_us`, unsigned 32-bit sample fields with a signed
 `composition_offset`; `capture_time_us` is `None` when absent.
 `config_generation` is carried as reported.
+
+The keyword-only identity fields `group_id`, `object_id`, `subgroup_id`,
+`publisher_priority`, and `has_subgroup` are available only when the whole
+native identity block is stamped. Zero is a real ID; subgroup absence is
+`has_subgroup=False`, not subgroup ID zero. A short block leaves all fields
+`None`. `delivery_origin` is LIVE/FILL (or an unknown integer), with a valid
+`initiating_request_id` for FILL, including zero. LIVE has no initiator. A short
+origin block leaves both fields `None`, never inferred LIVE.
+
+`metadata` is a copied `MediaMetadata(time_domain, time_us, independent, loc)`;
+legacy or short records leave it `None`. `LocMetadata` retains raw timestamp,
+timescale, marking bytes, audio-level byte, effective video/audio config, and
+the raw presence mask. Config `None` is absent; `b""` is present-empty.
+`object_properties` and `track_properties` copy their distinct raw native
+blocks; nothing merges or reparses them. All bytes survive native cleanup and
+receiver destruction, including effective config inherited from track backing.
+Time-domain names are NONE, UNIX_US and APPLICATION_MEDIA; unknown values stay
+integers. `time_us=None` means native conversion unavailable, not zero. Raw
+zero/MAX ticks/scales survive unchanged, and Python never converts application
+ticks to UNIX capture time. `independent=None` means unknown, not false.
+
+The added `MediaObject` and `TrackEvent` fields are defaulted, keyword-only
+observations. Their old positional construction and pattern arity, equality
+and hash remain unchanged; compare new observation values explicitly when
+they matter.
 
 `status` decides `is_status_only`, never byte length: a zero-length NORMAL
 object is media with `payload == b""`; END_OF_GROUP / END_OF_TRACK carry no
@@ -311,9 +411,14 @@ publisher's wire sequence. A finite receiver campaign against our own relay on
 loopback has been run, with an independent C publisher and declared synthetic
 RAW/LOC payloads; acceptance against real media has not been run.
 
-The package requires a LibMoQ service SDK that declares
-`moq_media_receiver_track_desc_copy`; building against an older SDK fails
-at compile time rather than falling back to the borrowed descriptor.
+The package requires a LibMoQ service SDK with the sized receiver/subscribe
+initializers, `moq_media_receiver_cancel_fill`, the metadata/terminal output
+tails, and `moq_media_receiver_track_desc_copy`. Building against an older SDK
+fails rather than falling back to a borrowed descriptor or invented metadata.
+The fake-service tests exercise mapping, prefix gates, and copy ownership, not
+wire parsing or live transport. `tests/receiver_sdk_smoke.c` is a separate,
+public-header compile/link/default/cleanup check against the actual SDK; it
+creates no endpoint and makes no media-interoperability claim.
 
 ## Sender shell
 
@@ -416,9 +521,30 @@ in v0, because per track write order IS decode order. `presentation_time_us`
 drives the generated timelines. `capture_time_us` and `sap_type` are optional:
 `None` is absence and an explicit value is a declaration, so `sap_type=SapType.NONE`
 declares "not a SAP", which is not the same as declaring nothing.
-`capture_time_us` is the LOC Capture Timestamp (LOC-01 2.3.1.1) -- wall-clock
-microseconds since the Unix epoch, emitted verbatim; its encodable range
-follows the negotiated codec and is enforced by the service, not clamped here.
+For legacy RAW media on drafts 16 and 18, `capture_time_us` is wall-clock
+microseconds since the Unix epoch, emitted verbatim as the LOC-01 Capture
+Timestamp. Its encodable range follows the negotiated codec and is enforced
+by the service, not clamped here. These legacy timing fields do not supply
+draft-22 RAW metadata.
+
+`SenderConfig.companion_profile` defaults to `CompanionProfile.AUTO`: the
+native sender uses the profile matching the negotiated draft. An explicit
+`LEGACY_MSF01_LOC01` or `D22_MSF01_LOC04_PUBLIC` pins one; a known
+wire/companion mismatch is then `UNSUPPORTED`.
+For draft-22 RAW, supply `SendObject.loc_metadata` with an explicit Timestamp
+and optional Timescale. The `LocMetadata.present` bits must agree with its
+non-`None` fields; zero Timestamp and present-empty configuration spans remain
+declared values. With the explicit draft-22 profile no timestamp is inferred
+from capture time or PTS; under AUTO an object without `loc_metadata` carries
+LOC-04 metadata generated from the typed fields: `capture_time_us` as an
+unscaled Timestamp (UNIX microseconds), else the presentation time as media
+time with Timescale 1,000,000, plus the video sync marking. A capture time
+on a track whose `track_properties` carry a LOC-04 Timescale is refused with
+`INVAL` when the object may go out as draft 22. Without
+Timescale, Timestamp is UNIX microseconds; with Timescale, it is application
+time in that scale, even when the scale is 1,000,000. The native service
+rejects missing Timestamp, zero Timescale and conversion overflow. Legacy
+RAW and CMAF ignore `loc_metadata`.
 
 Spans are bytes only. `bytearray`, `memoryview`, `str` and `int` are each
 refused, so nothing mutable is held across the call. Nothing is parsed,

@@ -34,6 +34,7 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -41,10 +42,13 @@
 #include <time.h>
 
 #include "msquic_internal.h"
+#include "../../core/src/session/session_outbound_internal.h"
 
 #include <moq/msquic_managed.h>
 
 #include "../common/moq_alpn.h"
+#include "../common/moq_adapter_binding.h"
+#include "../common/moq_listen_port.h"
 
 #ifdef MOQ_MSQUIC_TESTING
 #include "tests/support/msq_test_seams.h"
@@ -62,6 +66,8 @@ static _Thread_local moq_msquic_managed_t *mgd_tls_cb;
 /* The lane whose pump/guard is running on this thread (NULL otherwise).
  * lane_next_conn gates on this so a pump only ever sees its own lane. */
 static _Thread_local moq_msquic_managed_lane_t *mgd_tls_lane;
+/* Activity/deadline callbacks may run outside a sweep's TLS lane marker. */
+static _Thread_local const moq_msquic_managed_t *mgd_tls_observer;
 
 /* One accepted (or, for a client, the one initiated) connection: its
  * MoQ session + attach adapter conn, serialized by its OWNING
@@ -110,11 +116,12 @@ struct moq_msquic_managed_lane {
 
     bool wake_pending;      /* coalesced app wake for this lane */
     bool pump_pending;      /* coalesced app pump, armed by worker batches */
-    /* lock-free cross-lane wake: set (without lane->mu) by a wake issued
-     * from a DIFFERENT lane's callback, where taking lane->mu could
-     * deadlock. The doorbell consumes it in its predicate; the bell below
-     * delivers it PROMPTLY, and the bounded idle wait remains only a
-     * robustness backstop. */
+    /* lock-free wake: set (without lane->mu) by a wake issued from any
+     * context other than this lane's own callback -- another lane's
+     * callback or any other thread -- where waiting for lane->mu could
+     * deadlock or stall behind a long pump. The doorbell consumes it in
+     * its predicate; the bell below delivers it PROMPTLY, and the bounded
+     * idle wait remains only a robustness backstop. */
     atomic_bool ext_wake;
     /* The bell: a dedicated wake-only signaling domain, independent of
      * lane->mu, so every wake source — including the cross-lane arm,
@@ -148,6 +155,11 @@ struct moq_msquic_managed_lane {
     bool in_lane_pump;
     bool pump_exit;         /* on_lane_pump returned nonzero */
     bool stop_requested;    /* stop() asked this lane's doorbell to quiesce */
+    /* The instant this lane's most recent pump sweep ran at (the now_us it
+     * handed on_lane_pump), 0 before the first. An application deadline at
+     * or before it has been served and no longer wakes the lane. Doorbell
+     * context, under lane->mu. */
+    uint64_t last_pump_us;
 
     /* sweep snapshot (the conns whose lane->mu the running pump holds);
      * lane_next_conn iterates this. Buffer sized to max_connections. */
@@ -168,9 +180,10 @@ struct moq_msquic_managed_lane {
      * st_wake_stamp_us is the OPEN-CYCLE marker — the first accepted
      * explicit wake CASes it from 0 to now (an arm that loses the CAS
      * found an open cycle -> st_wakes_coalesced); the consuming pump
-     * exchanges it back to 0 and records exactly one latency sample. */
+     * exchanges it back to 0 and records exactly one latency sample. The
+     * external arm takes no lane lock either, so its counter is atomic too. */
     uint64_t st_wakes_same_lane;
-    uint64_t st_wakes_external;
+    _Atomic uint64_t st_wakes_external;
     _Atomic uint64_t st_wakes_cross_lane;
     _Atomic uint64_t st_wakes_coalesced;
     _Atomic uint64_t st_wake_stamp_us;
@@ -205,6 +218,13 @@ struct moq_msquic_managed {
     char *host;
     char *cert_path;
     char *key_path;
+    /* The connection target every child is bound with when its profile
+     * requires one: the client's URI identity (configured, or derived from
+     * host/port) or the server's URI policy (configured, or serve-all).
+     * Bytes owned; the policy context borrowed. */
+    moq_connection_target_t target;
+    uint8_t *target_bytes;
+    size_t target_bytes_len;
 
     const QUIC_API_TABLE *api; /* owned via MsQuicOpen2 unless test-borrowed */
 #ifdef MOQ_MSQUIC_TESTING
@@ -360,8 +380,12 @@ static void mgd_bump_activity(moq_msquic_managed_t *m)
     m->activity_pending = true;
     pthread_cond_broadcast(&m->cv);
     pthread_mutex_unlock(&m->mu);
-    if (m->cfg.on_activity != NULL)
+    if (m->cfg.on_activity != NULL) {
+        const moq_msquic_managed_t *saved = mgd_tls_observer;
+        mgd_tls_observer = m;
         m->cfg.on_activity(m, m->cfg.on_activity_ctx);
+        mgd_tls_observer = saved;
+    }
 }
 
 /* --- guard: the attach adapter brackets every transport callback ---- *
@@ -384,6 +408,8 @@ void (*moq_msq_test_stats_pre_lock)(moq_msquic_managed_lane_t *lane);
  * at the lock boundary the snapshot serializes on, rather than at its intent
  * to reach it. Never compiled into production libraries. */
 void (*moq_msq_test_snapshot_pre_lock)(moq_msquic_managed_lane_t *lane);
+void (*moq_msq_test_flush_pre_lock)(moq_msquic_managed_t *m);
+void (*moq_msq_test_flush_observed)(moq_msquic_managed_t *m);
 #endif
 
 static void mgd_guard_enter(void *user)
@@ -511,6 +537,7 @@ static moq_result_t mgd_make_child(moq_msquic_managed_t *m,
     ccfg.guard_enter = mgd_guard_enter;
     ccfg.guard_leave = mgd_guard_leave;
     ccfg.guard_user = mc; /* the guard takes mc->lane->mu */
+    ccfg.target = &m->target; /* facade-owned for the facade's lifetime */
     moq_result_t rc = moq_msquic_conn_create(&ccfg, &mc->conn);
     if (rc != MOQ_OK) {
         moq_session_destroy(mc->session);
@@ -983,7 +1010,14 @@ static void doorbell_pump_sweep(moq_msquic_managed_lane_t *lane)
 {
     moq_msquic_managed_t *m = lane->owner;
 
+    /* The sweep's instant: what on_lane_pump is told, and what serves every
+     * application deadline at or before it (mgd_app_deadline). Recorded
+     * whether or not the callback runs, so a lane that is exiting or
+     * stopping never re-pumps for a deadline it cannot serve. */
+    const uint64_t pump_now = mgd_now_us();
+
     lane->st_pump_sweeps++;
+    lane->last_pump_us = pump_now;
     sweep_begin(lane);
     /* Snapshot each conn's event-progress token BEFORE the app pump, so the
      * re-drive predicate below spans the WHOLE pump+service cycle: the pump may
@@ -998,7 +1032,7 @@ static void doorbell_pump_sweep(moq_msquic_managed_lane_t *lane)
         !atomic_load_explicit(&m->stop_requested, memory_order_acquire) &&
         m->cfg.on_lane_pump != NULL) {
         lane->in_lane_pump = true; /* the exclusive per-conn window */
-        int rc = m->cfg.on_lane_pump(m, lane, mgd_now_us(),
+        int rc = m->cfg.on_lane_pump(m, lane, pump_now,
                                      m->cfg.on_lane_pump_user);
         lane->in_lane_pump = false; /* cleared before service + on_activity */
         if (rc != 0) {
@@ -1168,6 +1202,37 @@ uint64_t moq_msq_test_bell_wakes(moq_msquic_managed_lane_t *lane)
 }
 #endif
 
+/* The application deadline this lane still owes a pump: the earliest of
+ * the facade-wide query and this lane's own per-lane query, ignoring any
+ * instant at or before the lane's last pump. That pump already ran with the
+ * deadline due, so a query still answering it is one the pump could not
+ * advance -- it is another lane's (under the facade-wide query) or one the
+ * application has not moved yet -- and pumping again would only repeat the
+ * same pass without pause, holding lane->mu throughout. The lane waits
+ * instead, for a later instant, a wake or a transport event. lane->mu held,
+ * doorbell context. */
+static uint64_t mgd_app_deadline(const moq_msquic_managed_lane_t *lane)
+{
+    const moq_msquic_managed_t *m = lane->owner;
+    uint64_t best = UINT64_MAX;
+    const moq_msquic_managed_t *saved = mgd_tls_observer;
+    mgd_tls_observer = m;
+
+    if (m->cfg.app_deadline_us != NULL) {
+        uint64_t ad = m->cfg.app_deadline_us(m->cfg.app_deadline_ctx);
+        if (ad > lane->last_pump_us && ad < best)
+            best = ad;
+    }
+    if (m->cfg.app_lane_deadline_us != NULL) {
+        uint64_t ad = m->cfg.app_lane_deadline_us(m->cfg.app_lane_deadline_ctx,
+                                                  lane->index);
+        if (ad > lane->last_pump_us && ad < best)
+            best = ad;
+    }
+    mgd_tls_observer = saved;
+    return best;
+}
+
 /* Cap on an idle lane doorbell's wait: bounds worst-case latency for a
  * wake whose delivery path failed in some unforeseen way; with the bell,
  * explicit wakes no longer depend on it. */
@@ -1204,7 +1269,7 @@ static mgd_step_kind_t mgd_doorbell_step(moq_msquic_managed_lane_t *lane,
         /* a wake or worker-armed batch: ONE coalesced pump over the
          * whole lane. Run it BEFORE reaping so terminal children
          * stay visible to the pump that polls their final
-         * SESSION_CLOSED event. ext_wake is the lock-free cross-lane
+         * SESSION_CLOSED event. ext_wake is the lock-free foreign
          * wake; consuming it here (after a pump, or after the bounded
          * idle wait) is what makes that wake guaranteed. */
         lane->wake_pending = false;
@@ -1292,15 +1357,14 @@ static mgd_step_kind_t mgd_doorbell_step(moq_msquic_managed_lane_t *lane,
             deadline = dl;
     }
     /* Fold the application service deadline (e.g. media_sender's periodic
-     * catalog refresh) so a purely time-based deadline wakes this lane
-     * with no transport event. Pure cached read; the loop already broke
-     * above on stop, and lane->mu -> ep->mu here matches the pump's order.
-     * Recomputed every iteration, so there is no stale arm to guard. */
-    if (m->cfg.app_deadline_us != NULL) {
-        uint64_t ad = m->cfg.app_deadline_us(m->cfg.app_deadline_ctx);
-        if (ad < deadline)
-            deadline = ad;
-    }
+     * catalog refresh, or a relay shard's fill deadline) so a purely
+     * time-based deadline wakes this lane with no transport event. Pure
+     * cached reads; the loop already broke above on stop, and
+     * lane->mu -> ep->mu here matches the pump's order. Recomputed every
+     * iteration, so there is no stale arm to guard. */
+    uint64_t ad = mgd_app_deadline(lane);
+    if (ad < deadline)
+        deadline = ad;
     uint64_t now = mgd_now_us();
 
     /* a due session deadline: tick every session, then pump. Reaching
@@ -1342,6 +1406,18 @@ static void *doorbell_main(void *arg)
 
         if (kind == MGD_STEP_STOP)
             break;
+        if (kind == MGD_STEP_TICKED) {
+            /* A deadline-driven pass never chains into the next one with
+             * lane->mu held: release it, and yield, so a worker batch, a
+             * stats reader or stop() waiting on this lane gets in between
+             * passes even while a deadline keeps falling due. Releasing
+             * without yielding is not enough -- a waiter woken by the
+             * unlock usually finds the mutex retaken by this thread. */
+            pthread_mutex_unlock(&lane->mu);
+            sched_yield();
+            pthread_mutex_lock(&lane->mu);
+            continue;
+        }
         if (kind != MGD_STEP_IDLE)
             continue;
 
@@ -1513,6 +1589,8 @@ static void mgd_free(moq_msquic_managed_t *m)
     mgd_strfree(&alloc, m->host);
     mgd_strfree(&alloc, m->cert_path);
     mgd_strfree(&alloc, m->key_path);
+    if (m->target_bytes != NULL)
+        alloc.free(m->target_bytes, m->target_bytes_len, alloc.ctx);
     pthread_mutex_destroy(&m->mu);
     pthread_cond_destroy(&m->cv);
     alloc.free(m, sizeof(*m), alloc.ctx);
@@ -1623,6 +1701,11 @@ static void mgd_copy_cfg(moq_msquic_managed_t *m,
         m->cfg.app_deadline_us = NULL;
         m->cfg.app_deadline_ctx = NULL;
     }
+    /* The per-lane query is its own block, gated the same way. */
+    if (!MGD_CFG_HAS(cfg, app_lane_deadline_ctx)) {
+        m->cfg.app_lane_deadline_us = NULL;
+        m->cfg.app_lane_deadline_ctx = NULL;
+    }
     /* A partial appended scalar is poison, not a value. Keep the session
      * default unless the caller-sized prefix covers the whole field. */
     if (!MGD_CFG_HAS(cfg, max_open_subgroups))
@@ -1633,6 +1716,49 @@ static void mgd_copy_cfg(moq_msquic_managed_t *m,
      * caller pointer. */
     m->cfg.versions = NULL;
     m->cfg.version_count = 0;
+}
+
+/*
+ * Resolve and copy the facade's connection target from the caller's cfg (a
+ * prefix-sized caller has none). The configured target must fit the role:
+ * a client names a complete authority and path and no policy, a server a
+ * policy and no target. A client without one is identified by its dial
+ * parameters; a server without one serves every URI. MOQ_ERR_INVAL for a
+ * malformed or role-mismatched target, or a dial identity that does not fit
+ * the derivation (a host:port authority over 1022 bytes) -- never an
+ * unidentified client -- and MOQ_ERR_NOMEM when the copy fails.
+ */
+static moq_result_t mgd_init_target(moq_msquic_managed_t *m,
+                                    const moq_msquic_managed_cfg_t *cfg,
+                                    bool is_client, const char *host,
+                                    uint16_t port)
+{
+    const moq_connection_target_t *target =
+        MGD_CFG_HAS(cfg, target) ? cfg->target : NULL;
+    moq_connection_target_t derived;
+    char derived_buf[1024];
+
+    if (target != NULL) {
+        if (is_client
+                ? (target->target_present != MOQ_BINDING_TARGET_COMPLETE ||
+                   target->accept_uri != NULL || target->accept_uri_ctx != NULL)
+                : (target->target_present != 0 || target->accept_uri == NULL))
+            return MOQ_ERR_INVAL;
+    } else if (is_client && host != NULL && host[0] != '\0') {
+        /* The public constructor requires a host; only the lanes-only test
+         * facade, which dials nothing, has none to derive from. */
+        if (!moq_adapter_target_from_dial(derived_buf, sizeof(derived_buf),
+                                          host, (int)port, NULL, &derived))
+            return MOQ_ERR_INVAL;
+        target = &derived;
+    } else if (!is_client) {
+        memset(&derived, 0, sizeof(derived));
+        derived.struct_size = (uint32_t)sizeof(derived);
+        derived.accept_uri = moq_adapter_accept_any_uri;
+        target = &derived;
+    }
+    return moq_adapter_target_copy(&m->alloc, target, &m->target,
+                                   &m->target_bytes, &m->target_bytes_len);
 }
 
 /*
@@ -1897,6 +2023,11 @@ moq_result_t moq_msquic_managed_create(
         mgd_free(m);
         return MOQ_ERR_NOMEM;
     }
+    moq_result_t trc = mgd_init_target(m, cfg, is_client, cfg->host, cfg->port);
+    if (trc != MOQ_OK) {
+        mgd_free(m);
+        return trc;
+    }
 
     moq_result_t apirc = mgd_open_api(m, NULL);
 
@@ -2018,6 +2149,7 @@ moq_result_t moq_msquic_managed_create(
         }
     } else {
         QUIC_ADDR addr;
+        bool listening = false;
 
         memset(&addr, 0, sizeof(addr));
         QuicAddrSetFamily(&addr, QUIC_ADDRESS_FAMILY_UNSPEC);
@@ -2027,11 +2159,30 @@ moq_result_t moq_msquic_managed_create(
             mgd_free(m);
             return MOQ_ERR_INVAL;
         }
-        QuicAddrSetPort(&addr, cfg->port);
-        if (QUIC_FAILED(m->api->ListenerOpen(
-                m->registration, mgd_listener_cb, m, &m->listener)) ||
-            QUIC_FAILED(m->api->ListenerStart(m->listener, m->alpns,
-                                              m->alpn_count, &addr))) {
+        /* port 0 is a port IPv4 and IPv6 clients both reach: picked from
+         * the IPv4 allocator, each attempt on a fresh listener
+         * (common/moq_listen_port.h) */
+        for (int attempt = 0; !listening; attempt++) {
+            uint16_t port = 0;
+
+            if (moq_listen_port_pick(cfg->port, &port)) {
+                QuicAddrSetPort(&addr, port);
+                if (QUIC_SUCCEEDED(m->api->ListenerOpen(
+                        m->registration, mgd_listener_cb, m,
+                        &m->listener)))
+                    listening = QUIC_SUCCEEDED(m->api->ListenerStart(
+                        m->listener, m->alpns, m->alpn_count, &addr));
+                else
+                    m->listener = NULL;
+                if (!listening && m->listener != NULL) {
+                    m->api->ListenerClose(m->listener);
+                    m->listener = NULL;
+                }
+            }
+            if (!listening && !moq_listen_port_retry(cfg->port, attempt))
+                break;
+        }
+        if (!listening) {
             mgd_close_transport(m);
             mgd_free(m);
             return MOQ_ERR_INTERNAL;
@@ -2134,6 +2285,13 @@ static moq_result_t mgd_test_create_lanes_only(
     mgd_apply_derived_cfg(m, &derived);
     pthread_mutex_init(&m->mu, NULL);
     pthread_cond_init(&m->cv, NULL);
+    moq_result_t trc = mgd_init_target(
+        m, cfg, cfg->perspective == MOQ_PERSPECTIVE_CLIENT, cfg->host,
+        cfg->port);
+    if (trc != MOQ_OK) {
+        mgd_free(m);
+        return trc;
+    }
     moq_result_t ar = mgd_store_alpns(m, &m->version, 1);
     if (ar != MOQ_OK) {
         mgd_free(m);
@@ -2388,6 +2546,13 @@ moq_msquic_conn_t *moq_msq_test_managed_conn_adapter(
 {
     return conn != NULL ? conn->conn : NULL;
 }
+
+/* The facade's owned connection target, fixed at create. */
+const moq_connection_target_t *moq_msq_test_managed_target(
+    const moq_msquic_managed_t *m)
+{
+    return m != NULL ? &m->target : NULL;
+}
 #endif
 
 /* --- stop / destroy --------------------------------------------------------- */
@@ -2588,14 +2753,15 @@ moq_result_t moq_msquic_lane_wake(moq_msquic_managed_lane_t *lane)
         mgd_bell_ring(lane);
         return MOQ_OK;
     }
-    /* external (app) thread, holding no lane mutex: safe to block. */
-    pthread_mutex_lock(&lane->mu);
-    lane->st_wakes_external++;
+    /* any other thread: an application thread, or a callback of another
+     * facade (a WebTransport lane waking a raw lane, say). It may hold locks
+     * this facade cannot see, and the lane may be in a long pump, so it
+     * never waits for lane->mu either: the same lock-free arm and bell as
+     * the cross-lane case. */
+    atomic_fetch_add(&lane->st_wakes_external, 1);
     mgd_wake_cycle_arm(lane);
-    lane->wake_pending = true;
-    pthread_cond_broadcast(&lane->cv);
+    atomic_store_explicit(&lane->ext_wake, true, memory_order_release);
     mgd_bell_ring(lane);
-    pthread_mutex_unlock(&lane->mu);
     return MOQ_OK;
 }
 
@@ -2609,7 +2775,7 @@ static void mgd_lane_stats_fill(const moq_msquic_managed_lane_t *lane,
     full->struct_size = (uint32_t)sizeof(*full);
     full->wakes_same_lane = lane->st_wakes_same_lane;
     full->wakes_cross_lane = atomic_load(&lane->st_wakes_cross_lane);
-    full->wakes_external = lane->st_wakes_external;
+    full->wakes_external = atomic_load(&lane->st_wakes_external);
     full->wakes_coalesced = atomic_load(&lane->st_wakes_coalesced);
     full->pump_sweeps = lane->st_pump_sweeps;
     full->deadline_sweeps = lane->st_deadline_sweeps;
@@ -2867,6 +3033,66 @@ moq_result_t moq_msquic_managed_wait(moq_msquic_managed_t *m,
             pthread_cond_wait(&m->cv, &m->mu);
         }
     }
+}
+
+static bool mgd_flush_terminal(moq_msquic_managed_t *m)
+{
+    pthread_mutex_lock(&m->mu);
+    bool terminal = mgd_terminal(m);
+    pthread_mutex_unlock(&m->mu);
+    return terminal;
+}
+
+moq_result_t moq_msquic_managed_poll_flush(const moq_msquic_managed_t *cm)
+{
+    moq_msquic_managed_t *m = mgd_mut(cm);
+    if (m == NULL) return MOQ_ERR_INVAL;
+    if (m->cfg.perspective != MOQ_PERSPECTIVE_CLIENT) return MOQ_ERR_UNSUPPORTED;
+    if (mgd_tls_cb == m || mgd_tls_observer == m) return MOQ_ERR_WRONG_STATE;
+    if (mgd_flush_terminal(m)) return MOQ_ERR_CLOSED;
+
+    moq_msquic_managed_lane_t *lane = &m->lanes[0];
+#ifdef MOQ_MSQUIC_TESTING
+    if (moq_msq_test_flush_pre_lock != NULL) moq_msq_test_flush_pre_lock(m);
+#endif
+    if (pthread_mutex_trylock(&lane->mu) != 0)
+        return mgd_flush_terminal(m) ? MOQ_ERR_CLOSED : MOQ_DONE;
+
+    moq_result_t result = MOQ_DONE;
+    /* stop first crosses this lane mutex before retiring any child. Once it
+     * latches, do not inspect the post-join retirement list at all. */
+    if (atomic_load_explicit(&m->stop_requested, memory_order_acquire)) {
+        result = MOQ_ERR_CLOSED;
+    } else {
+        moq_msquic_managed_conn_t *mc = lane->conns;
+        moq_msquic_conn_t *c = mc != NULL ? mc->conn : NULL;
+        if (c == NULL || c->close_pending || c->peer_closed ||
+            c->teardown_sent || c->shutdown_complete || c->flush_failed ||
+            moq_msquic_conn_is_closed(c) || moq_msquic_conn_is_fatal(c)) {
+            result = MOQ_ERR_CLOSED;
+        } else if (c->flush_output_lost) {
+            result = MOQ_ERR_INTERNAL;
+        } else if (!session_has_outbound_obligation(mc->session) &&
+                   !moq_transport_bridge_has_outbound_pending(c->bridge) &&
+                   c->building == NULL && !c->building_fin &&
+                   c->pending_sends == 0 && c->dgram_inflight == 0) {
+            result = MOQ_OK;
+            for (const struct moq_msq_stream *ms = c->streams; ms; ms = ms->next)
+                if (((ms->reset_sent || ms->flush_withdrawn) && !ms->send_shutdown_complete) ||
+                    (ms->fin_sent && !ms->fin_acked && !ms->flush_withdrawn)) {
+                    result = MOQ_DONE;
+                    break;
+                }
+        }
+    }
+#ifdef MOQ_MSQUIC_TESTING
+    if (moq_msq_test_flush_observed != NULL) moq_msq_test_flush_observed(m);
+#endif
+    /* Lane before facade, as in the pump. Stop wins even if it latched while
+     * this read held the lane; no independently cached empty result is used. */
+    if (mgd_flush_terminal(m)) result = MOQ_ERR_CLOSED;
+    pthread_mutex_unlock(&lane->mu);
+    return result;
 }
 
 int moq_msquic_managed_pending_sends(const moq_msquic_managed_t *cm)

@@ -61,6 +61,7 @@
 
 #include <moq/types.h>
 #include <moq/session.h>
+#include <moq/connection_target.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -215,6 +216,33 @@ typedef struct moq_mvfst_managed_cfg {
      * moq_mvfst_managed_cfg_init_sized(). */
     uint64_t            (*app_deadline_us)(void *ctx);
     void                 *app_deadline_ctx;
+
+    /* Reserved: the 4 bytes of tail padding the layout that ended at
+     * app_deadline_ctx leaves on ILP32 targets that align uint64_t to 8.
+     * target is placed AFTER this slot so its struct_size gate lands past
+     * that old sizeof -- otherwise an old caller passing that sizeof would
+     * have its uninitialized tail bytes read as target. Never read. */
+    uint32_t              _reserved_target;
+
+    /* Appended (struct_size append-only ABI) — connection target.
+     *
+     * target: the URI identity each session is bound with when the configured
+     *   wire profile requires a transport binding (see
+     *   <moq/connection_target.h>; draft-22 does, draft-16/18 do not). This
+     *   adapter creates its sessions before the handshake, so such a session
+     *   is bound and started on the first pump after the transport reports
+     *   the handshake complete, with the facts of that connection: QUIC
+     *   DATAGRAM support from the local transport settings and the peer's
+     *   max_datagram_frame_size transport parameter. The target's fields and
+     *   bytes are copied during create() (accept_uri_ctx is borrowed until
+     *   destroy()). CLIENT: the authority and path/query the connection
+     *   dereferences, sent as the SETUP's AUTHORITY and PATH; NULL derives
+     *   them from `host`, `port` and an empty path (a host whose host:port
+     *   authority exceeds 1022 bytes is MOQ_ERR_INVAL at create(), not an
+     *   unbound client). SERVER: the URI policy
+     *   consulted for each client's SETUP; NULL serves every authority and
+     *   path. A malformed target is MOQ_ERR_INVAL at create(). */
+    const moq_connection_target_t *target;
 } moq_mvfst_managed_cfg_t;
 
 /* Pointer-only initializer. Clears and stamps ONLY the frozen v0 prefix (the

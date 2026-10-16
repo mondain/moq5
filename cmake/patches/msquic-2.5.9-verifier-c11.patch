@@ -11,6 +11,23 @@ index 5879d422d..6852d4e65 100644
  
  typedef enum QUIC_CERTIFICATE_HASH_STORE_FLAGS {
      QUIC_CERTIFICATE_HASH_STORE_FLAG_NONE           = 0x0000,
+@@ -1743,5 +1743,5 @@ typedef enum QUIC_CONNECTION_POOL_FLAGS {
+ } QUIC_CONNECTION_POOL_FLAGS;
+-
+-DEFINE_ENUM_FLAG_OPERATORS(QUIC_CONNECTION_POOL_FLAGS);
+-
++
++DEFINE_ENUM_FLAG_OPERATORS(QUIC_CONNECTION_POOL_FLAGS)
++
+ typedef struct QUIC_CONNECTION_POOL_CONFIG {
+diff --git a/src/inc/msquic_posix.h b/src/inc/msquic_posix.h
+--- a/src/inc/msquic_posix.h
++++ b/src/inc/msquic_posix.h
+@@ -389,3 +389,3 @@ QuicAddrIsWildCard(
+     } else {
+-        const IN6_ADDR ZeroAddr = {0};
++        const IN6_ADDR ZeroAddr = IN6ADDR_ANY_INIT;
+         return memcmp(&Addr->Ipv6.sin6_addr, &ZeroAddr, sizeof(IN6_ADDR)) == 0;
 diff --git a/src/platform/tls_quictls.c b/src/platform/tls_quictls.c
 index 65131bf2a..ad61b975c 100644
 --- a/src/platform/tls_quictls.c

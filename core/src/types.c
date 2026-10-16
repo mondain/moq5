@@ -24,6 +24,7 @@ const char *moq_strerror(moq_result_t rc)
     case MOQ_ERR_INTERRUPTED:     return "interrupted (latch set)";
     case MOQ_ERR_UNSUPPORTED:     return "not supported by this build";
     case MOQ_ERR_INPUT_NOT_CONSUMED: return "input not consumed (redeliver when the stream's pending state clears)";
+    case MOQ_ERR_LIMIT:           return "limit reached";
     case MOQ_ERR_INTERNAL:        return "internal error";
     default:                    return "unknown error";
     }
@@ -158,6 +159,13 @@ bool     moq_fetch_is_valid(moq_fetch_t h)                  { return handle_vali
 bool     moq_fetch_eq(moq_fetch_t a, moq_fetch_t b)        { return a._opaque == b._opaque; }
 uint64_t moq_fetch_hash(moq_fetch_t h)                      { return handle_hash(h._opaque); }
 uint64_t moq_fetch_id_for_trace(moq_fetch_t h)              { return h._opaque; }
+
+/* -- Fill helpers -------------------------------------------------- */
+
+bool     moq_fill_is_valid(moq_fill_t h)                    { return handle_valid(h._opaque, MOQ_HANDLE_POOL_FILL); }
+bool     moq_fill_eq(moq_fill_t a, moq_fill_t b)            { return a._opaque == b._opaque; }
+uint64_t moq_fill_hash(moq_fill_t h)                        { return handle_hash(h._opaque); }
+uint64_t moq_fill_id_for_trace(moq_fill_t h)                { return h._opaque; }
 
 /* -- Announcement helpers ------------------------------------------ */
 

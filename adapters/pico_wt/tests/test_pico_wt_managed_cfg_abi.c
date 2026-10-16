@@ -63,19 +63,24 @@ int main(void)
      * app_deadline_us would read cfg->app_deadline_ctx past the allocation. */
     size_t prefix = offsetof(moq_pico_wt_managed_cfg_t, app_deadline_us) +
                     sizeof(((moq_pico_wt_managed_cfg_t *)0)->app_deadline_us);
+    /* The fields are set on a full, properly typed local template and only
+     * the prefix bytes are copied into the short block, so no member is
+     * written through a struct lvalue larger than its storage. */
+    moq_pico_wt_managed_cfg_t tmpl;
+    memset(&tmpl, 0, sizeof(tmpl));
+    tmpl.struct_size = (uint32_t)prefix;
+    tmpl.alloc = moq_alloc_default();
+    tmpl.perspective = MOQ_PERSPECTIVE_CLIENT;
+    tmpl.port = 443;
+    tmpl.host = "127.0.0.1";
+    tmpl.insecure_skip_verify = true;      /* IP host -> "localhost" SNI, past the SNI gate */
+    tmpl.on_pump = pump_cb;
+    tmpl.app_deadline_us = deadline_cb;     /* a real callback, within the prefix */
+    /* app_deadline_ctx is beyond the prefix: not copied, not in the block. */
     unsigned char *raw = (unsigned char *)malloc(prefix);
     if (!raw) return 4;
-    memset(raw, 0, prefix);
+    memcpy(raw, &tmpl, prefix);
     moq_pico_wt_managed_cfg_t *cfg = (moq_pico_wt_managed_cfg_t *)raw;
-    cfg->struct_size = (uint32_t)prefix;
-    cfg->alloc = moq_alloc_default();
-    cfg->perspective = MOQ_PERSPECTIVE_CLIENT;
-    cfg->port = 443;
-    cfg->host = "127.0.0.1";
-    cfg->insecure_skip_verify = true;      /* IP host -> "localhost" SNI, past the SNI gate */
-    cfg->on_pump = pump_cb;
-    cfg->app_deadline_us = deadline_cb;     /* a real callback, within the prefix */
-    /* app_deadline_ctx is beyond the allocation -- intentionally not set. */
 
     /* This config passes every earlier validation and reaches the app_deadline
      * config-import in create(). A correct whole-block gate never touches
@@ -91,6 +96,58 @@ int main(void)
         moq_pico_wt_managed_destroy(fac);
     }
     free(raw);
+
+    /* A caller built before `target` was appended: its struct ends at
+     * keep_alive_interval_ms and struct_size is that layout's sizeof. Driven
+     * through create() twice: as an exact heap block (a target read is out of
+     * bounds under ASan) and inside current storage whose bytes past
+     * keep_alive_interval_ms are poisoned (a target read is a wild pointer,
+     * and a malformed target is refused at create). create() reads neither. */
+    {
+        const size_t end = offsetof(moq_pico_wt_managed_cfg_t, keep_alive_interval_ms) +
+                           sizeof(uint32_t);
+        const size_t align = _Alignof(moq_pico_wt_managed_cfg_t);
+        const size_t old_size = (end + align - 1) / align * align;
+        if (offsetof(moq_pico_wt_managed_cfg_t, target) < old_size) {
+            fprintf(stderr, "FAIL: target starts inside the old sizeof\n");
+            return 5;
+        }
+        moq_pico_wt_managed_cfg_t full;
+        moq_pico_wt_managed_cfg_init_sized(&full, sizeof(full));
+        full.alloc = moq_alloc_default();
+        full.perspective = MOQ_PERSPECTIVE_CLIENT;
+        full.port = 443;
+        full.host = "127.0.0.1";
+        full.insecure_skip_verify = true;
+        full.on_pump = pump_cb;
+        full.struct_size = (uint32_t)old_size;
+        for (int view = 0; view < 2; view++) {
+            unsigned char *blk = NULL;
+            moq_pico_wt_managed_cfg_t poisoned = full;
+            const moq_pico_wt_managed_cfg_t *c = &poisoned;
+            if (view == 0) {
+                blk = (unsigned char *)malloc(old_size);
+                if (!blk) return 6;
+                memcpy(blk, &full, end);
+                memset(blk + end, 0xa5, old_size - end);
+                c = (const moq_pico_wt_managed_cfg_t *)(const void *)blk;
+            } else {
+                memset((unsigned char *)&poisoned + end, 0xa5, sizeof(poisoned) - end);
+            }
+            moq_pico_wt_managed_t *f = NULL;
+            moq_result_t r = moq_pico_wt_managed_create(c, &f);
+            if (r == MOQ_ERR_INVAL) {
+                fprintf(stderr, "FAIL: old-size create refused (target read?)\n");
+                free(blk);
+                return 7;
+            }
+            if (r == MOQ_OK && f) {
+                moq_pico_wt_managed_stop(f);
+                moq_pico_wt_managed_destroy(f);
+            }
+            free(blk);
+        }
+    }
 
     printf("PASS: pico_wt_managed_cfg_abi\n");
     return 0;

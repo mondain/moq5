@@ -275,11 +275,11 @@ int main(void)
     {
         moq_fetch_entry_t fe;
         memset(&fe, 0, sizeof(fe));
-        fe.request_stream_ref = moq_stream_ref_from_u64(0xAAAA);
+        fe.rs.ref = moq_stream_ref_from_u64(0xAAAA);
         fe.data_stream_ref    = moq_stream_ref_from_u64(0xBBBB);
-        MOQ_TEST_CHECK_EQ_U64(fe.request_stream_ref._v, 0xAAAA);
+        MOQ_TEST_CHECK_EQ_U64(fe.rs.ref._v, 0xAAAA);
         MOQ_TEST_CHECK_EQ_U64(fe.data_stream_ref._v, 0xBBBB);
-        MOQ_TEST_CHECK(fe.request_stream_ref._v != fe.data_stream_ref._v);
+        MOQ_TEST_CHECK(fe.rs.ref._v != fe.data_stream_ref._v);
     }
 
     /* == G. D16 neutrality: a real subscribe flow never touches the ===

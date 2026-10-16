@@ -38,7 +38,12 @@ final class RenderPipeline {
         self.displayLayer = displayLayer
         // Clear any frame left over from a prior session before this one's
         // timebase takes over.
-        displayLayer.flushAndRemoveImage()
+        if #available(iOS 17.0, macOS 14.0, tvOS 17.0, *) {
+            displayLayer.sampleBufferRenderer.flush(
+                removingDisplayedImage: true, completionHandler: nil)
+        } else {
+            displayLayer.flushAndRemoveImage()
+        }
         synchronizer.addRenderer(videoRenderer)
     }
 

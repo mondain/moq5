@@ -12,7 +12,7 @@
 // Network.framework -> real MsQuic peer -- through the same public API
 // SimplePlayer uses (LiveMediaSession over MoQEndpoint + MediaReceiver):
 //
-//   exchange <port> <16|18>
+//   exchange <port> <16|18|22>
 //       Establish (assert the negotiated draft), watch the namespace,
 //       receive the object, verify every payload byte, stop cleanly.
 //
@@ -106,27 +106,31 @@ final class PhaseTrace: @unchecked Sendable {
 /// (catalog + SUBSCRIBE done), receive THE object, verify every byte,
 /// stop cleanly. One deterministic attempt per phase.
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
-func exchange(port: UInt16, version: MoQVersion, label: String) async {
+func exchange(port: UInt16, version: WireVersion, label: String) async {
     let trace = PhaseTrace()
     let session = LiveMediaSession()
+    var endpointConfig = makeEndpointConfig(port: port, verify: false)
+    endpointConfig.wireVersions = .exactly(version)
     let config = LiveMediaSession.Configuration(
-        endpoint: makeEndpointConfig(port: port, verify: false),
+        endpoint: endpointConfig,
         namespace: MediaNamespace(parts: ["proof", "live"]))
     session.start(config)
 
     // Phase 1: drive the state stream to a receiver-bearing state
-    // (awaitingFirstObject/receiving), asserting the negotiated draft
-    // at established. The trace attributes any stall by its last state.
+    // (awaitingFirstObject/receiving), checking the legacy projection at
+    // established (nil for nonlegacy drafts). The durable wire check below
+    // is authoritative. The trace attributes any stall by its last state.
     do {
         try await within(seconds: 15) {
             for await state in session.stateUpdates() {
                 trace.note(state)
                 switch state {
                 case .established(let v):
-                    guard v == version else {
+                    guard v == version.legacyVersion else {
                         trace.dump(label)
-                        fail("\(label): negotiated \(String(describing: v)), "
-                             + "want \(version)")
+                        fail("\(label): legacy negotiated \(String(describing: v)), "
+                             + "want \(String(describing: version.legacyVersion)) "
+                             + "for wire draft \(version.draftNumber)")
                     }
                 case .failed(let err):
                     trace.dump(label)
@@ -148,7 +152,7 @@ func exchange(port: UInt16, version: MoQVersion, label: String) async {
         trace.dump(label)
         let ep = session.endpoint
         let diag = "endpoint.state=\(String(describing: ep?.state)) "
-            + "negotiated=\(String(describing: ep?.negotiatedVersion))"
+            + "negotiatedWireVersion=\(String(describing: ep?.negotiatedWireVersion))"
         FileHandle.standardError.write(Data("PROOF DIAG: \(diag)\n".utf8))
         await session.stop()
         fail("\(label): establish/subscribe: \(error)")
@@ -156,18 +160,19 @@ func exchange(port: UInt16, version: MoQVersion, label: String) async {
 
     // The DURABLE version check: the state stream coalesces
     // (bufferingNewest(1)), so .established may never be observed and
-    // the in-stream assertion above is best-effort. The endpoint's own
-    // negotiated-version snapshot is authoritative and must hold
+    // the in-stream legacy assertion above is best-effort. The endpoint's
+    // negotiated wire-version snapshot is authoritative and must hold
     // regardless of which states were seen.
-    guard let negotiated = session.endpoint?.negotiatedVersion else {
+    guard let negotiated = session.endpoint?.negotiatedWireVersion else {
         trace.dump(label)
         await session.stop()
-        fail("\(label): no negotiated version on the live endpoint")
+        fail("\(label): no negotiated wire version on the live endpoint")
     }
     guard negotiated == version else {
         trace.dump(label)
         await session.stop()
-        fail("\(label): endpoint negotiated \(negotiated), want \(version)")
+        fail("\(label): endpoint negotiated wire draft \(negotiated.draftNumber), "
+             + "want \(version.draftNumber)")
     }
 
     // Phase 2: receive and verify THE object (single attempt, bounded).
@@ -216,7 +221,7 @@ func exchange(port: UInt16, version: MoQVersion, label: String) async {
 
     // Clean stop: the endpoint must come down without a failure state.
     await session.stop()
-    print("PROOF \(label): establish(\(version)) + object bytes + stop OK")
+    print("PROOF \(label): establish(draft\(version.draftNumber)) + object bytes + stop OK")
 }
 
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
@@ -255,13 +260,14 @@ func u16(_ s: String) -> UInt16 { UInt16(s) ?? { fail("bad port \(s)") }() }
 if #available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *) {
     switch args.count >= 2 ? args[1] : "" {
     case "exchange" where args.count == 4:
-        // exactly 16 or 18; anything else is a usage error, never a
+        // exactly 16, 18 or 22; anything else is a usage error, never a
         // silent draft-16 default
-        let version: MoQVersion
+        let version: WireVersion
         switch args[3] {
         case "16": version = .draft16
         case "18": version = .draft18
-        default: fail("bad version '\(args[3])' (want 16 or 18)")
+        case "22": version = .draft22
+        default: fail("bad version '\(args[3])' (want 16, 18 or 22)")
         }
         await exchange(port: u16(args[2]), version: version,
                        label: "exchange-d\(args[3])")
@@ -270,7 +276,7 @@ if #available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *) {
     case "untrusted" where args.count == 3:
         await runUntrusted(port: u16(args[2]))
     default:
-        fail("usage: exchange <port> <16|18> | reconnect <portA> <portB> | untrusted <port>")
+        fail("usage: exchange <port> <16|18|22> | reconnect <portA> <portB> | untrusted <port>")
     }
     exit(0)
 } else { fail("requires macOS 13 / iOS 16") }

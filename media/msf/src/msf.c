@@ -136,22 +136,48 @@ static bool get_framerate_millis(const json_object_element_t *e,
     return true;
 }
 
+/* Whether the caller's struct covers version_form (a struct that ends at
+ * `_dom_size` predates the field), and the form it selects. */
+static bool catalog_has_version_form(const moq_msf_catalog_t *cat)
+{
+    return cat->struct_size >= offsetof(moq_msf_catalog_t, version_form) +
+                                   sizeof(cat->version_form);
+}
+
+static moq_msf_version_form_t catalog_version_form(const moq_msf_catalog_t *cat)
+{
+    return catalog_has_version_form(cat) ? cat->version_form
+                                         : MOQ_MSF_VERSION_FORM_NUMERAL;
+}
+
 /*
- * MSF version handling (§5.1.1). "version" is the JSON String "1" -- the wire
- * form strict MSF-01 receivers (PlayA) accept and the form this encoder emits
- * (see the encoder). On parse this code also accepts "draft-01" (catalogs
- * emitted by intermediate libmoq builds that briefly used a draft-name string)
- * and the pre-01 numeric form (1) for LEGACY COMPATIBILITY ONLY (MSF-00
- * emitted a JSON number). Anything else -- other versions, other or malformed
- * draft strings, empty, or a non-string/non-number -- is unsupported; per
- * §5.1.1 a subscriber MUST NOT parse a version it does not understand.
+ * MSF version handling (§5.1.1). The encoder emits the JSON String "1" (the
+ * form existing MSF-01 receivers accept) or, when the caller selects
+ * MOQ_MSF_VERSION_FORM_DRAFT_NAME, "draft-01" (5.1.1's convention for
+ * catalogs against an Internet-Draft release). The parser accepts both and the
+ * pre-01 numeric form (1) for LEGACY COMPATIBILITY ONLY (MSF-00 emitted a JSON
+ * number), and reports the form in *form. Anything else -- other versions,
+ * other or malformed draft strings, empty, or a non-string/non-number -- is
+ * unsupported; per §5.1.1 a subscriber MUST NOT parse a version it does not
+ * understand.
  */
-static bool version_is_supported(const json_object_element_t *e)
+static bool version_is_supported(const json_object_element_t *e,
+                                 moq_msf_version_form_t *form)
 {
     json_string_t *s = json_value_as_string(e->value);
-    if (s) return str_eq(s, "1") || str_eq(s, "draft-01");
+    if (s) {
+        if (str_eq(s, "1")) { *form = MOQ_MSF_VERSION_FORM_NUMERAL; return true; }
+        if (str_eq(s, "draft-01")) {
+            *form = MOQ_MSF_VERSION_FORM_DRAFT_NAME;
+            return true;
+        }
+        return false;
+    }
     int v = 0;
-    if (get_int(e, &v)) return v == MOQ_MSF_VERSION;   /* legacy MSF-00 numeric */
+    if (get_int(e, &v) && v == MOQ_MSF_VERSION) {   /* legacy MSF-00 numeric */
+        *form = MOQ_MSF_VERSION_FORM_NUMERAL;
+        return true;
+    }
     return false;
 }
 
@@ -972,7 +998,7 @@ moq_result_t moq_msf_catalog_parse(const moq_alloc_t *alloc,
 
     for (json_object_element_t *e = top->start; e; e = e->next) {
         if (str_eq(e->name, "version")) {
-            if (!version_is_supported(e)) {
+            if (!version_is_supported(e, &out->version_form)) {
                 moq_msf_catalog_cleanup(alloc, out);
                 return MOQ_ERR_PROTO;
             }
@@ -1738,6 +1764,8 @@ moq_result_t moq_msf_catalog_apply_delta_ex(const moq_alloc_t *alloc,
         memset(&mid, 0, sizeof(mid));
         mid.struct_size = sizeof(mid);
         mid.version = MOQ_MSF_VERSION;
+        /* The applied catalog keeps the base's version spelling. */
+        mid.version_form = catalog_version_form(base);
         mid.tracks = eff;
         mid.track_count = live;
         if (delta->has_generated_at) {
@@ -2786,14 +2814,17 @@ static size_t enc_catalog_to(uint8_t *buf, size_t cap,
         return b.pos;
     }
 
-    /* MSF-01 §5.1.1: version is the JSON String "1" -- the numeral, not a
-     * draft-name string. This is the wire form strict MSF-01 receivers
-     * (PlayA) accept and the form libmoq itself emitted cross-impl before
-     * the "draft-01" regression (E2E case D captured fixture). The parser
-     * still accepts "draft-01" (catalogs from intermediate builds) and
-     * legacy numeric 1 (MSF-00). */
-    enc_lit(&b, "{\"version\":\"");
-    { char num[8]; snprintf(num, sizeof(num), "%d", cat->version); enc_lit(&b, num); }
+    /* MSF-01 §5.1.1: version is a JSON String. By default the numeral "1",
+     * the wire form strict MSF-01 receivers (PlayA) accept and the form libmoq
+     * has emitted cross-impl (E2E case D captured fixture). A caller that
+     * selects MOQ_MSF_VERSION_FORM_DRAFT_NAME gets 5.1.1's draft-name
+     * convention, "draft-01". */
+    bool draft_name =
+        catalog_version_form(cat) == MOQ_MSF_VERSION_FORM_DRAFT_NAME;
+    enc_lit(&b, draft_name ? "{\"version\":\"draft-" : "{\"version\":\"");
+    { char num[8];
+      snprintf(num, sizeof(num), draft_name ? "%02d" : "%d", cat->version);
+      enc_lit(&b, num); }
     enc_char(&b, '"');
 
     if (cat->has_generated_at) {
@@ -2860,6 +2891,14 @@ static moq_result_t catalog_encode_impl(const moq_alloc_t *alloc,
 {
     if (!alloc || !cat || !out_json) return MOQ_ERR_INVAL;
     *out_json = NULL;
+
+    /* The version form is a closed authoring input: absent (a caller struct
+     * that ends before it) or NUMERAL selects "1", DRAFT_NAME selects
+     * "draft-01", anything else is rejected rather than spelled as "1". */
+    if (catalog_has_version_form(cat) &&
+        cat->version_form != MOQ_MSF_VERSION_FORM_NUMERAL &&
+        cat->version_form != MOQ_MSF_VERSION_FORM_DRAFT_NAME)
+        return MOQ_ERR_INVAL;
 
     /* A delta catalog (MSF 5.1.6/5.3): no version/tracks; >= 1 op, each with
      * >= 1 op-validated track. */

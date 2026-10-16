@@ -1417,7 +1417,9 @@ int main(void)
         uint64_t alias = ev.u.subscribe_ok.track_alias;
 
         /* Craft subgroup with two status objects:
-         * object 0 = END_OF_GROUP (0x3), object 1 = END_OF_TRACK (0x4) */
+         * object 0 = END_OF_GROUP (0x3), object 1 = END_OF_TRACK (0x4). The
+         * End of Track sits in Group 1: an object after Group 0's End of
+         * Group object would make the Track malformed (draft-16 §2.4.2). */
         uint8_t wire[64];
         moq_buf_writer_t w;
         moq_buf_writer_init(&w, wire, sizeof(wire));
@@ -1434,19 +1436,29 @@ int main(void)
         moq_buf_write_varint(&w, 0);  /* delta */
         moq_buf_write_varint(&w, 0);  /* payload_len */
         moq_buf_write_varint(&w, 0x3); /* END_OF_GROUP */
-        /* object 1: delta=0, payload_len=0, status=END_OF_TRACK */
-        moq_buf_write_varint(&w, 0);
-        moq_buf_write_varint(&w, 0);
-        moq_buf_write_varint(&w, 0x4);
-
         moq_stream_ref_t rx_ref = moq_stream_ref_from_u64(71);
         MOQ_TEST_CHECK(moq_session_on_data_bytes(c, rx_ref,
+            wire, moq_buf_writer_offset(&w), true, 0) == MOQ_OK);
+
+        /* object 1 of Group 1: delta=1, payload_len=0, status=END_OF_TRACK */
+        moq_buf_writer_init(&w, wire, sizeof(wire));
+        shdr.group_id = 1;
+        moq_d16_encode_subgroup_header(&w, &shdr);
+        moq_buf_write_varint(&w, 1);
+        moq_buf_write_varint(&w, 0);
+        moq_buf_write_varint(&w, 0x4);
+        MOQ_TEST_CHECK(moq_session_on_data_bytes(c, moq_stream_ref_from_u64(75),
             wire, moq_buf_writer_offset(&w), true, 0) == MOQ_OK);
 
         MOQ_TEST_CHECK(moq_session_poll_events(c, &ev, 1) == 1);
         MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_OBJECT_RECEIVED);
         MOQ_TEST_CHECK(ev.u.object_received.status == MOQ_OBJECT_END_OF_GROUP);
         MOQ_TEST_CHECK(ev.u.object_received.payload == NULL);
+        moq_event_cleanup(&ev);
+
+        /* Group 0's stream ended first. */
+        MOQ_TEST_CHECK(moq_session_poll_events(c, &ev, 1) == 1);
+        MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_SUBGROUP_FINISHED);
         moq_event_cleanup(&ev);
 
         MOQ_TEST_CHECK(moq_session_poll_events(c, &ev, 1) == 1);
@@ -2997,7 +3009,9 @@ int main(void)
         MOQ_TEST_CHECK(as.balance == 0);
     }
 
-    /* -- malformed extension KVP closes with PROTOCOL_VIOLATION ------- */
+    /* -- unparseable extension KVP fails the subscription (draft-16
+     *    §11.2: "A Key-Value-Pair cannot be parsed" makes the Track
+     *    malformed; §2.4.2: the subscriber "MUST UNSUBSCRIBE") ---------- */
     {
         test_alloc_state_t as = {0};
         moq_alloc_t alloc = test_allocator(&as);
@@ -3050,7 +3064,16 @@ int main(void)
         moq_stream_ref_t rx_ref = moq_stream_ref_from_u64(910);
         moq_session_on_data_bytes(c, rx_ref,
             wire, moq_buf_writer_offset(&w), false, 0);
-        MOQ_TEST_CHECK(moq_session_state(c) == MOQ_SESS_CLOSED);
+        MOQ_TEST_CHECK(moq_session_state(c) == MOQ_SESS_ESTABLISHED);
+        bool unsubscribed = false, object = false;
+        while (moq_session_poll_events(c, &ev, 1) == 1) {
+            if (ev.kind == MOQ_EVENT_UNSUBSCRIBED &&
+                ev.u.unsubscribed.cause == MOQ_REQUEST_TERMINAL_MALFORMED_TRACK)
+                unsubscribed = true;
+            if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED) object = true;
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK(unsubscribed && !object);
 
         moq_session_destroy(c);
         moq_session_destroy(sv);
@@ -3969,7 +3992,9 @@ int main(void)
         moq_result_t frc = moq_session_on_data_bytes(c, rx_ref,
             combined, clen, true, 0);
         MOQ_TEST_CHECK(frc == MOQ_OK);
-        int baseline = fas.call_count;
+        /* Less the one allocation the first object of a Track makes once:
+         * its Malformed Track detection record. */
+        int baseline = fas.call_count - 1;
 
         MOQ_TEST_CHECK(moq_session_poll_events(c, &ev, 1) == 1);
         MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_OBJECT_CHUNK);
@@ -3980,7 +4005,10 @@ int main(void)
         moq_event_cleanup(&ev);
 
         /* Now set up a second object to test NOMEM on the chunk rcbuf.
-         * The last alloc in the baseline is the chunk rcbuf. */
+         * The last alloc in the baseline is the chunk rcbuf. It goes in
+         * Group 1: Object 1 on Subgroup 0 of Group 0 after that subgroup's
+         * FIN at Object 0 would make the Track malformed (§2.4.2). */
+        sg_cfg.group_id = 1;
         moq_session_open_subgroup(sv, ssub, &sg_cfg, 0, &sg);
         moq_rcbuf_t *p2 = NULL;
         moq_rcbuf_create(&alloc, (const uint8_t *)"data", 4, &p2);
@@ -5923,12 +5951,16 @@ int main(void)
             tb, true, 0);
         MOQ_TEST_CHECK(drc == MOQ_OK);
         moq_rcbuf_decref(tb);
-        int baseline = fas.call_count;
+        /* Less the Track's one-time Malformed Track detection record. */
+        int baseline = fas.call_count - 1;
 
         while (moq_session_poll_events(c, &ev, 1) == 1)
             moq_event_cleanup(&ev);
 
-        /* Second object: fail on the last alloc (the slice header). */
+        /* Second object: fail on the last alloc (the slice header). It goes
+         * in Group 1: Subgroup 0 of Group 0 already ended with a FIN at
+         * Object 0 (§2.4.2). */
+        sg_cfg.group_id = 1;
         moq_session_open_subgroup(sv, ssub, &sg_cfg, 0, &sg);
         p = NULL;
         moq_rcbuf_create(&alloc, (const uint8_t *)"retry", 5, &p);

@@ -21,6 +21,10 @@ int ts_resolve_handle(moq_session_t *s, moq_track_status_handle_t h)
     if (slot >= s->ts_cap) return -1;
     if (s->track_statuses[slot].generation != gen) return -1;
     if (s->track_statuses[slot].state == MOQ_TS_FREE) return -1;
+    if (s->track_statuses[slot].terminal_notified) return -1;
+    if (s->track_statuses[slot].migration_committed) return -1;
+    if (s->track_statuses[slot].goaway_sent &&
+        s->track_statuses[slot].state == MOQ_TS_DRAINING_RESPONSE) return -1;
     return (int)slot;
 }
 
@@ -29,8 +33,8 @@ void ts_free_entry(moq_session_t *s, int slot)
     moq_ts_entry_t *e = &s->track_statuses[slot];
     request_registry_remove_by_id(s, e->request_id);
     /* Stream-correlated profiles also key the entry by its request bidi. */
-    if (e->request_stream_ref._v != 0)
-        request_registry_remove_by_streamref(s, e->request_stream_ref);
+    if (e->rs.ref._v != 0)
+        request_registry_remove_by_streamref(s, e->rs.ref);
     /* Release the reserved registry record and free the owned track-name key
      * exactly once BEFORE the memset. */
     if (e->hist) {
@@ -44,13 +48,114 @@ void ts_free_entry(moq_session_t *s, int slot)
     }
     uint32_t next_gen = e->generation + 1;
     /* Preserve the co-allocated request-bidi receive buffer across reuse. */
-    uint8_t *recv_buf = e->req_recv_buf;
-    size_t   recv_cap = e->req_recv_cap;
+    uint8_t *recv_buf = e->rs.recv_buf;
+    size_t   recv_cap = e->rs.recv_cap;
     memset(e, 0, sizeof(*e));
     e->state = MOQ_TS_FREE;
     e->generation = next_gen;
-    e->req_recv_buf = recv_buf;
-    e->req_recv_cap = recv_cap;
+    e->rs.recv_buf = recv_buf;
+    e->rs.recv_cap = recv_cap;
+}
+
+void ts_apply_deferred_signals(moq_ts_entry_t *e)
+{
+    if (e->deferred_reset)
+        (void)moq_request_lifetime_peer_reset(&e->rs.lifetime);
+    if (e->deferred_stop)
+        (void)moq_request_lifetime_peer_stop(&e->rs.lifetime);
+    e->deferred_reset = false;
+    e->deferred_stop = false;
+}
+
+/* Each direction commits independently; a one-action queue can make progress.
+ * A queued STOP is not evidence that the peer's sending direction has ended. */
+moq_result_t ts_queue_cancellation(moq_session_t *s, int slot)
+{
+    moq_ts_entry_t *e = &s->track_statuses[slot];
+    unsigned owed = moq_request_lifetime_cancel_actions(&e->rs.lifetime);
+    if (owed & MOQ_REQUEST_CANCEL_RESET_LOCAL) {
+        if (action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+        request_bidi_reset_local(s, e->rs.ref);
+        (void)moq_request_lifetime_reset_committed(&e->rs.lifetime);
+    }
+    if (owed & MOQ_REQUEST_CANCEL_STOP_PEER) {
+        if (action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+        moq_action_t a;
+        memset(&a, 0, sizeof(a));
+        a.kind = MOQ_ACTION_STOP_BIDI_STREAM;
+        a.detail_size = (uint32_t)sizeof(moq_stop_bidi_stream_action_t);
+        a.borrow_epoch = s->borrow_epoch;
+        a.u.stop_bidi_stream.stream_ref = e->rs.ref;
+        a.u.stop_bidi_stream.error_code = MOQ_STREAM_ERROR_CANCELLED;
+        (void)push_action(s, &a);
+        (void)moq_request_lifetime_stop_committed(&e->rs.lifetime);
+    }
+    return MOQ_OK;
+}
+
+moq_result_t ts_flush_terminal(moq_session_t *s, int slot)
+{
+    moq_ts_entry_t *e = &s->track_statuses[slot];
+    if (e->state == MOQ_TS_FREE) return MOQ_OK;
+    if (e->response_validated) return MOQ_ERR_WOULD_BLOCK;
+    const bool sent_migration = e->goaway_sent && e->state == MOQ_TS_DRAINING_RESPONSE &&
+                                !e->terminal_cause && !e->migration_committed;
+    bool blocked = false;
+    if (e->terminal_cause && !e->terminal_notified) {
+        if (event_queue_full(s)) {
+            blocked = true;
+        } else {
+            moq_request_terminal_t term = {e->terminal_cause, e->terminal_code};
+            push_request_terminated(s, MOQ_REQUEST_FAMILY_TRACK_STATUS,
+                e->role == MOQ_TS_ROLE_REQUESTER ? MOQ_REQUEST_ROLE_REQUESTER
+                                                 : MOQ_REQUEST_ROLE_RESPONDER,
+                term, e->handle._opaque);
+            e->terminal_notified = true;
+        }
+    }
+    if (e->terminal_cause || e->migration_committed || e->rs.lifetime.cancelled ||
+        sent_migration) {
+        if (ts_queue_cancellation(s, slot) != MOQ_OK) blocked = true;
+    }
+    const moq_request_lifetime_t *life = &e->rs.lifetime;
+    if (!blocked && (e->terminal_notified || e->state == MOQ_TS_DRAINING_RESPONSE) &&
+        (life->local_fin || life->local_reset) && (life->peer_fin || life->peer_reset))
+        ts_free_entry(s, slot);
+    /* Sent migration has no application outcome to retry. The peer signal is
+     * consumed; the retained owner retries any blocked local output on polls. */
+    return blocked && !sent_migration ? MOQ_ERR_WOULD_BLOCK : MOQ_OK;
+}
+
+moq_result_t ts_receive_terminal(moq_session_t *s, int slot,
+                                moq_request_terminal_t term)
+{
+    moq_ts_entry_t *e = &s->track_statuses[slot];
+    if (e->response_validated) {
+        /* The original validated bytes stay authoritative. Retain each later
+         * direction's first code without failing the response lifetime. */
+        if (term.cause == MOQ_REQUEST_TERMINAL_PEER_RESET_STREAM && !e->deferred_reset) {
+            e->deferred_reset = true;
+            e->deferred_reset_code = term.error_code;
+        }
+        if (term.cause == MOQ_REQUEST_TERMINAL_PEER_STOP_SENDING && !e->deferred_stop) {
+            e->deferred_stop = true;
+            e->deferred_stop_code = term.error_code;
+        }
+        return MOQ_ERR_WOULD_BLOCK;
+    }
+    if (term.cause == MOQ_REQUEST_TERMINAL_PEER_RESET_STREAM)
+        (void)moq_request_lifetime_peer_reset(&e->rs.lifetime);
+    else if (term.cause == MOQ_REQUEST_TERMINAL_PEER_STOP_SENDING)
+        (void)moq_request_lifetime_peer_stop(&e->rs.lifetime);
+    else
+        (void)moq_request_lifetime_peer_fin(&e->rs.lifetime);
+    if (e->goaway_sent && !e->terminal_cause)
+        e->state = MOQ_TS_DRAINING_RESPONSE;
+    if (!e->terminal_cause && e->state != MOQ_TS_DRAINING_RESPONSE) {
+        e->terminal_cause = term.cause;
+        e->terminal_code = term.error_code;
+    }
+    return ts_flush_terminal(s, slot);
 }
 
 /* -- Copy namespace into output scratch ---------------------------- */
@@ -121,11 +226,9 @@ moq_result_t session_core_on_track_status_request(moq_session_t *s,
         uint8_t err_buf[128];
         moq_buf_writer_t ew;
         moq_buf_writer_init(&ew, err_buf, sizeof(err_buf));
-        rc = s->profile->encode_request_error(s, &ew,
-            &(moq_request_error_encode_args_t){
-                .request_id = d->endpoint.request_id, .error_code = 0x0,
-                .reason = (const uint8_t *)"track status pool full",
-                .reason_len = 22 });
+        moq_request_error_encode_args_t full = session_capacity_request_error(
+            s, d->endpoint.request_id, "track status pool full", 22);
+        rc = s->profile->encode_request_error(s, &ew, &full);
         if (rc < 0) { result = rc; goto cleanup_all; }
         /* The error rides the request bidi for stream-correlated profiles, the
          * control channel otherwise. */
@@ -177,11 +280,9 @@ moq_result_t session_core_on_track_status_request(moq_session_t *s,
         uint8_t herr_buf[128];
         moq_buf_writer_t ew;
         moq_buf_writer_init(&ew, herr_buf, sizeof(herr_buf));
-        rc = s->profile->encode_request_error(s, &ew,
-            &(moq_request_error_encode_args_t){
-                .request_id = d->endpoint.request_id, .error_code = 0x0,
-                .reason = (const uint8_t *)"track history full",
-                .reason_len = 18 });
+        moq_request_error_encode_args_t full = session_capacity_request_error(
+            s, d->endpoint.request_id, "track history full", 18);
+        rc = s->profile->encode_request_error(s, &ew, &full);
         if (rc < 0) { result = rc; goto cleanup_all; }
         rc = d->endpoint.has_stream_ref
             ? queue_send_bidi(s, d->endpoint.stream_ref, herr_buf,
@@ -296,6 +397,12 @@ moq_result_t session_core_on_track_status_request(moq_session_t *s,
     entry->track_id_buf = tskey;
     entry->track_id_len = tskey_len;
     entry->hist = tshist;
+    entry->omit_track_properties = d->omit_track_properties;
+    if (s->profile->premature_fin_fails_request) {
+        (void)moq_request_lifetime_init(&entry->rs.lifetime,
+            MOQ_REQUEST_FAMILY_TRACK_STATUS, false);
+        if (request_fin) (void)moq_request_lifetime_peer_fin(&entry->rs.lifetime);
+    }
     d->endpoint.kind = MOQ_REQ_TRACK_STATUS;
     d->endpoint.slot = slot;
     if (d->endpoint.has_stream_ref) {
@@ -303,7 +410,7 @@ moq_result_t session_core_on_track_status_request(moq_session_t *s,
          * slot: re-key the stream-ref to (TRACK_STATUS, slot). The request-stream
          * handler frees the staging slot afterwards. */
         request_registry_remove_by_streamref(s, d->endpoint.stream_ref);
-        entry->request_stream_ref = d->endpoint.stream_ref;
+        entry->rs.ref = d->endpoint.stream_ref;
         request_registry_insert_by_streamref(s, d->endpoint.stream_ref,
                                              d->endpoint);
     } else {
@@ -387,9 +494,15 @@ moq_result_t session_core_on_track_status_ok(moq_session_t *s,
     if (d->has_largest && e->hist)
         track_hist_merge(e->hist, d->largest_group, d->largest_object);
 
+    if (s->profile->premature_fin_fails_request) {
+        (void)moq_request_lifetime_initial_response_committed(&e->rs.lifetime, false, true);
+        e->response_validated = false;
+        ts_apply_deferred_signals(e);
+    }
+
     /* Stream-correlated profiles keep the request bidi drainable until its FIN
      * (the request-stream handler frees it); draft-16 frees now. */
-    if (e->request_stream_ref._v != 0)
+    if (e->rs.ref._v != 0)
         e->state = MOQ_TS_DRAINING_RESPONSE;
     else
         ts_free_entry(s, d->target_slot);
@@ -455,9 +568,15 @@ moq_result_t session_core_on_track_status_error(moq_session_t *s, int slot,
         }
     }
 
+    if (s->profile->premature_fin_fails_request) {
+        (void)moq_request_lifetime_initial_response_committed(&e->rs.lifetime, false, false);
+        e->response_validated = false;
+        ts_apply_deferred_signals(e);
+    }
+
     /* Stream-correlated profiles keep the request bidi drainable until its FIN;
      * draft-16 frees now. */
-    if (e->request_stream_ref._v != 0)
+    if (e->rs.ref._v != 0)
         e->state = MOQ_TS_DRAINING_RESPONSE;
     else
         ts_free_entry(s, slot);
@@ -466,11 +585,29 @@ moq_result_t session_core_on_track_status_error(moq_session_t *s, int slot,
 
 /* -- Outbound track_status request --------------------------------- */
 
-void moq_track_status_cfg_init(moq_track_status_cfg_t *cfg)
+/* The layout through auth_token_count, rounded to the struct's alignment:
+ * the sizeof of the struct before has_include_properties was appended. */
+#define MOQ_TRACK_STATUS_CFG_SIZE_THROUGH_TOKENS \
+    ((offsetof(moq_track_status_cfg_t, auth_token_count) + \
+      sizeof(((moq_track_status_cfg_t *)0)->auth_token_count) + \
+      (_Alignof(moq_track_status_cfg_t) - 1)) & \
+     ~(_Alignof(moq_track_status_cfg_t) - 1))
+
+/* Parenthesized: defines the symbol, not the header's sized macro. */
+void (moq_track_status_cfg_init)(moq_track_status_cfg_t *cfg)
 {
     if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(moq_track_status_cfg_t);
+    memset(cfg, 0, MOQ_TRACK_STATUS_CFG_SIZE_THROUGH_TOKENS);
+    cfg->struct_size = (uint32_t)MOQ_TRACK_STATUS_CFG_SIZE_THROUGH_TOKENS;
+}
+
+void moq_track_status_cfg_init_sized(moq_track_status_cfg_t *cfg, size_t cfg_size)
+{
+    if (!cfg) return;
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    if (n < sizeof(cfg->struct_size)) return;   /* too small to even stamp */
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
 }
 
 moq_result_t moq_session_track_status(moq_session_t *s,
@@ -491,12 +628,18 @@ moq_result_t moq_session_track_status(moq_session_t *s,
         auth_tokens = cfg->auth_tokens;
         auth_token_count = cfg->auth_token_count;
     }
-    if (moq_validate_auth_tokens(auth_tokens, auth_token_count) < 0)
+    if (moq_validate_auth_tokens(auth_tokens, auth_token_count,
+                                 s->profile->auth_token_type_max) < 0)
         return MOQ_ERR_INVAL;
     if (moq_validate_full_track_name_min_fields(
             &cfg->track_namespace, cfg->track_name,
             s->profile->min_track_namespace_fields) < 0)
         return MOQ_ERR_INVAL;
+    const bool has_include_properties =
+        TS_CFG_HAS(include_properties) && cfg->has_include_properties;
+    const bool include_properties = has_include_properties && cfg->include_properties;
+    if (has_include_properties && !s->profile->include_properties_request)
+        return MOQ_ERR_UNSUPPORTED;
 #undef TS_CFG_HAS
 #undef TS_CFG_MIN
 
@@ -547,6 +690,8 @@ moq_result_t moq_session_track_status(moq_session_t *s,
         .track_name = cfg->track_name,
         .auth_tokens = auth_tokens,
         .auth_token_count = auth_token_count,
+        .has_include_properties = has_include_properties,
+        .include_properties = include_properties,
     };
 
     bool req_stream = moq_session_uses_request_streams(s);
@@ -603,6 +748,10 @@ moq_result_t moq_session_track_status(moq_session_t *s,
     e->track_id_buf = tskey;
     e->track_id_len = tskey_len;
     e->hist = tshist;
+    if (s->profile->premature_fin_fails_request) {
+        (void)moq_request_lifetime_init(&e->rs.lifetime, MOQ_REQUEST_FAMILY_TRACK_STATUS, true);
+        (void)moq_request_lifetime_fin_committed(&e->rs.lifetime);
+    }
 
     uint64_t packed = moq_handle_pack(MOQ_HANDLE_POOL_TRACK_STATUS,
                                        s->session_tag, live_gen,
@@ -613,7 +762,7 @@ moq_result_t moq_session_track_status(moq_session_t *s,
     req_ep.kind = MOQ_REQ_TRACK_STATUS;
     req_ep.slot = slot;
     if (req_stream) {
-        e->request_stream_ref = req_ref;
+        e->rs.ref = req_ref;
         req_ep.has_stream_ref = true;
         req_ep.stream_ref = req_ref;
         request_registry_insert_by_streamref(s, req_ref, req_ep);
@@ -629,11 +778,30 @@ moq_result_t moq_session_track_status(moq_session_t *s,
 
 /* -- Accept track-status request ----------------------------------- */
 
-void moq_accept_track_status_cfg_init(moq_accept_track_status_cfg_t *cfg)
+/* The layout through expires_ms, rounded to the struct's alignment: the
+ * sizeof of the struct before track_properties was appended. */
+#define MOQ_ACCEPT_TRACK_STATUS_CFG_SIZE_THROUGH_EXPIRES \
+    ((offsetof(moq_accept_track_status_cfg_t, expires_ms) + \
+      sizeof(((moq_accept_track_status_cfg_t *)0)->expires_ms) + \
+      (_Alignof(moq_accept_track_status_cfg_t) - 1)) & \
+     ~(_Alignof(moq_accept_track_status_cfg_t) - 1))
+
+/* Parenthesized: defines the symbol, not the header's sized macro. */
+void (moq_accept_track_status_cfg_init)(moq_accept_track_status_cfg_t *cfg)
 {
     if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(moq_accept_track_status_cfg_t);
+    memset(cfg, 0, MOQ_ACCEPT_TRACK_STATUS_CFG_SIZE_THROUGH_EXPIRES);
+    cfg->struct_size = (uint32_t)MOQ_ACCEPT_TRACK_STATUS_CFG_SIZE_THROUGH_EXPIRES;
+}
+
+void moq_accept_track_status_cfg_init_sized(moq_accept_track_status_cfg_t *cfg,
+                                            size_t cfg_size)
+{
+    if (!cfg) return;
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    if (n < sizeof(cfg->struct_size)) return;   /* too small to even stamp */
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
 }
 
 moq_result_t moq_session_accept_track_status(moq_session_t *s,
@@ -645,6 +813,15 @@ moq_result_t moq_session_accept_track_status(moq_session_t *s,
     if (cfg->struct_size < ATS_CFG_MIN) return MOQ_ERR_INVAL;
 #define ATS_CFG_HAS(f) \
     (cfg->struct_size >= offsetof(moq_accept_track_status_cfg_t, f) + sizeof(cfg->f))
+
+    /* The answer's Track Properties are checked as the SUBSCRIBE_OK's would
+     * be, before anything advances. */
+    moq_bytes_t props = { NULL, 0 };
+    if (ATS_CFG_HAS(track_properties)) props = cfg->track_properties;
+    if (props.len > 0 && !props.data) return MOQ_ERR_INVAL;
+    if (s->profile->validate_track_properties &&
+        s->profile->validate_track_properties(props.data, props.len) < 0)
+        return MOQ_ERR_INVAL;
 
     session_begin_advance(s, now_us);
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;
@@ -658,6 +835,13 @@ moq_result_t moq_session_accept_track_status(moq_session_t *s,
      * capacity preflight so the contract is WRONG_STATE, not WOULD_BLOCK. */
     if (e->goaway_sent) return MOQ_ERR_WRONG_STATE;
 
+    if (s->profile->premature_fin_fails_request) {
+        if (e->terminal_cause) return MOQ_ERR_WRONG_STATE;
+        if (e->response_validated) return MOQ_ERR_WOULD_BLOCK;
+        moq_result_t lrc = moq_request_lifetime_check_initial_response(&e->rs.lifetime, true);
+        if (lrc != MOQ_OK) return lrc;
+    }
+
     moq_track_status_ok_encode_args_t ok_args;
     memset(&ok_args, 0, sizeof(ok_args));
     ok_args.request_id = e->request_id;
@@ -666,9 +850,26 @@ moq_result_t moq_session_accept_track_status(moq_session_t *s,
         ok_args.largest_group = cfg->largest_group;
         ok_args.largest_object = cfg->largest_object;
     }
+    /* §9.13: the parameters a SUBSCRIBE_OK would carry, so the same Largest
+     * Object -- the larger of the application's and this track's registry
+     * record, as moq_session_accept_subscribe() reports it. */
+    const moq_track_hist_t *th = e->hist;
+    if (th && th->has_largest &&
+        (!ok_args.has_largest || th->largest_group > ok_args.largest_group ||
+         (th->largest_group == ok_args.largest_group &&
+          th->largest_object > ok_args.largest_object))) {
+        ok_args.has_largest = true;
+        ok_args.largest_group = th->largest_group;
+        ok_args.largest_object = th->largest_object;
+    }
     if (ATS_CFG_HAS(expires_ms) && cfg->has_expires) {
         ok_args.has_expires = true;
         ok_args.expires_ms = cfg->expires_ms;
+    }
+    /* §9.20.21: INCLUDE_PROPERTIES = 0 asks for empty Track Properties. */
+    if (!e->omit_track_properties) {
+        ok_args.track_properties = props.data;
+        ok_args.track_properties_len = props.len;
     }
 #undef ATS_CFG_HAS
 #undef ATS_CFG_MIN
@@ -676,24 +877,48 @@ moq_result_t moq_session_accept_track_status(moq_session_t *s,
     /* Stream-correlated profiles free the request bidi after the terminal
      * response, so reserve a drain slot up front (unless the requester already
      * FIN'd, in which case the bidi is fully closed and nothing late arrives). */
-    bool req_stream = (e->request_stream_ref._v != 0);
+    bool req_stream = (e->rs.ref._v != 0);
     bool need_drain = req_stream && !ts_peer_fin_observed(e);
     if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
         return MOQ_ERR_WOULD_BLOCK;
+    if (action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
 
-    uint8_t buf[256];
+    /* Encoded in place at the send buffer's tail and committed only once the
+     * action is queued. A shortfall the buffer can recover from (it holds
+     * other output) is retryable; one it never can is not. */
     moq_buf_writer_t w;
-    moq_buf_writer_init(&w, buf, sizeof(buf));
+    moq_buf_writer_init(&w, s->send_buf + s->send_len, s->send_cap - s->send_len);
     moq_result_t rc = s->profile->encode_track_status_ok(s, &w, &ok_args);
+    if (rc == MOQ_ERR_BUFFER && s->send_len > 0) return MOQ_ERR_WOULD_BLOCK;
     if (rc < 0) return rc;
-    rc = req_stream
-        ? queue_send_bidi(s, e->request_stream_ref, buf,
-                          moq_buf_writer_offset(&w), true)
-        : queue_send_control(s, buf, moq_buf_writer_offset(&w));
-    if (rc < 0) return rc;
+    size_t ok_len = moq_buf_writer_offset(&w);
 
+    moq_action_t act;
+    memset(&act, 0, sizeof(act));
+    act.borrow_epoch = s->borrow_epoch;
+    if (req_stream) {
+        act.kind = MOQ_ACTION_SEND_BIDI_STREAM;
+        act.detail_size = (uint32_t)sizeof(moq_send_bidi_stream_action_t);
+        act.u.send_bidi_stream.stream_ref = e->rs.ref;
+        act.u.send_bidi_stream.data = s->send_buf + s->send_len;
+        act.u.send_bidi_stream.len = ok_len;
+        act.u.send_bidi_stream.fin = true;
+    } else {
+        act.kind = MOQ_ACTION_SEND_CONTROL;
+        act.detail_size = (uint32_t)sizeof(moq_send_control_action_t);
+        act.u.send_control.data = s->send_buf + s->send_len;
+        act.u.send_control.len = ok_len;
+    }
+    rc = push_action(s, &act);
+    if (rc < 0) return rc;
+    s->send_len += ok_len;
+
+    if (s->profile->premature_fin_fails_request) {
+        (void)moq_request_lifetime_initial_response_committed(&e->rs.lifetime, true, true);
+        (void)moq_request_lifetime_fin_committed(&e->rs.lifetime);
+    }
     if (need_drain)
-        (void)drain_ref_add(s, e->request_stream_ref);   /* slot reserved above */
+        (void)drain_ref_add(s, e->rs.ref);   /* slot reserved above */
     ts_free_entry(s, slot);
     return MOQ_OK;
 }
@@ -754,14 +979,21 @@ moq_result_t moq_session_reject_track_status(moq_session_t *s,
     if (vrc < 0) return vrc;
 #undef TS_REJ_HAS
 
-    bool req_stream = (e->request_stream_ref._v != 0);
+    if (s->profile->premature_fin_fails_request) {
+        if (e->terminal_cause) return MOQ_ERR_WRONG_STATE;
+        if (e->response_validated) return MOQ_ERR_WOULD_BLOCK;
+        moq_result_t lrc = moq_request_lifetime_check_initial_response(&e->rs.lifetime, true);
+        if (lrc != MOQ_OK) return lrc;
+    }
+
+    bool req_stream = (e->rs.ref._v != 0);
     bool need_drain = req_stream && !ts_peer_fin_observed(e);
     if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
         return MOQ_ERR_WOULD_BLOCK;
 
     moq_result_t rc;
     if (err_args.has_redirect) {
-        rc = queue_request_error_bidi(s, e->request_stream_ref, &err_args);
+        rc = queue_request_error_bidi(s, e->rs.ref, &err_args);
     } else {
         uint8_t err_buf[256];
         moq_buf_writer_t ew;
@@ -769,14 +1001,18 @@ moq_result_t moq_session_reject_track_status(moq_session_t *s,
         rc = s->profile->encode_request_error(s, &ew, &err_args);
         if (rc < 0) return rc;
         rc = req_stream
-            ? queue_send_bidi(s, e->request_stream_ref, err_buf,
+            ? queue_send_bidi(s, e->rs.ref, err_buf,
                               moq_buf_writer_offset(&ew), true)
             : queue_send_control(s, err_buf, moq_buf_writer_offset(&ew));
     }
     if (rc < 0) return rc;
 
+    if (s->profile->premature_fin_fails_request) {
+        (void)moq_request_lifetime_initial_response_committed(&e->rs.lifetime, true, false);
+        (void)moq_request_lifetime_fin_committed(&e->rs.lifetime);
+    }
     if (need_drain)
-        (void)drain_ref_add(s, e->request_stream_ref);   /* slot reserved above */
+        (void)drain_ref_add(s, e->rs.ref);   /* slot reserved above */
     ts_free_entry(s, slot);
     return MOQ_OK;
 }
@@ -793,6 +1029,8 @@ moq_result_t moq_session_request_goaway_track_status(
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;
     int slot = ts_resolve_handle(s, handle);
     if (slot < 0) return MOQ_ERR_STALE_HANDLE;
+    if (s->track_statuses[slot].terminal_cause) return MOQ_ERR_WRONG_STATE;
+    if (s->track_statuses[slot].response_validated) return MOQ_ERR_WOULD_BLOCK;
     return session_core_send_request_goaway(s, MOQ_REQUEST_FAMILY_TRACK_STATUS, slot,
         cfg->new_session_uri.data, cfg->new_session_uri.len, cfg->timeout_ms);
 }

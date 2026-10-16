@@ -16,6 +16,7 @@ final class CBytesArena {
         for allocation in byteAllocations { allocation.deallocate() }
         for allocation in versionAllocations { allocation.deallocate() }
         for allocation in namespaceAllocations { allocation.deallocate() }
+        for allocation in tokenAllocations { allocation.deallocate() }
     }
 
     func bytes(_ string: String?) -> moq_bytes_t {
@@ -42,6 +43,19 @@ final class CBytesArena {
     }
 
     private var namespaceAllocations: [UnsafeMutableBufferPointer<moq_bytes_t>] = []
+    private var tokenAllocations: [UnsafeMutableBufferPointer<moq_auth_token_t>] = []
+
+    func authTokens(_ tokens: [MoQEndpoint.SetupAuthorizationToken])
+        -> (UnsafePointer<moq_auth_token_t>?, Int) {
+        guard !tokens.isEmpty else { return (nil, 0) }
+        let buffer = UnsafeMutableBufferPointer<moq_auth_token_t>.allocate(
+            capacity: tokens.count)
+        _ = buffer.initialize(fromContentsOf: tokens.map {
+            moq_auth_token_t(token_type: $0.tokenType, token_value: bytes($0.value))
+        })
+        tokenAllocations.append(buffer)
+        return (UnsafePointer(buffer.baseAddress), tokens.count)
+    }
 
     func namespaceParts(_ parts: [String]) -> moq_namespace_t {
         guard !parts.isEmpty else { return moq_namespace_t(parts: nil, count: 0) }
@@ -55,10 +69,15 @@ final class CBytesArena {
 
     func versions(_ versions: [MoQVersion])
         -> (UnsafePointer<moq_version_t>?, Int) {
+        wireVersions(versions.map(WireVersion.init))
+    }
+
+    func wireVersions(_ versions: [WireVersion])
+        -> (UnsafePointer<moq_version_t>?, Int) {
         guard !versions.isEmpty else { return (nil, 0) }
         let buffer = UnsafeMutableBufferPointer<moq_version_t>.allocate(
             capacity: versions.count)
-        _ = buffer.initialize(fromContentsOf: versions.map(cVersion))
+        _ = buffer.initialize(fromContentsOf: versions.map { moq_version_t(rawValue: $0.rawValue) })
         versionAllocations.append(buffer)
         return (UnsafePointer(buffer.baseAddress), versions.count)
     }
@@ -105,7 +124,9 @@ func serviceError(fromCreate rc: moq_result_t, what: String) -> MoQServiceError 
 
 /// Build the C endpoint cfg from the model configuration and run `body`
 /// with it; every borrowed buffer stays alive for the call (the C side
-/// copies what it retains before `moq_endpoint_connect` returns).
+/// copies what it retains before `moq_endpoint_connect` returns). The cfg
+/// is initialized at its full size so the appended `uri_mode` and
+/// `preferred_version` fields are read.
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
 func withEndpointCFG<T>(
     _ configuration: MoQEndpoint.Configuration,
@@ -113,28 +134,60 @@ func withEndpointCFG<T>(
 ) rethrows -> T {
     let arena = CBytesArena()
     var cfg = moq_endpoint_cfg_t()
-    moq_endpoint_cfg_init(&cfg)
+    moq_endpoint_cfg_init_sized(&cfg, MemoryLayout<moq_endpoint_cfg_t>.size)
     cfg.url = arena.bytes(configuration.url.absoluteString)
     cfg.`protocol` = cProtocol(configuration.transportProtocol)
     cfg.backend = cBackend(configuration.backend)
+    /* The offer carries its own struct_size, and 0 reads as AUTO whatever
+     * the policy field holds, so an explicit offer must stamp it. */
+    let offerSize = UInt32(MemoryLayout<moq_version_offer_t>.size)
     switch configuration.versions {
     case .automatic:
-        break                       /* zero-init == AUTO (offer everything) */
+        break                       /* zero-init == AUTO (draft-18, then draft-16) */
     case .list(let versions):
         let (pointer, count) = arena.versions(versions)
+        cfg.versions.struct_size = offerSize
         cfg.versions.policy = MOQ_VERSION_POLICY_LIST
         cfg.versions.versions = pointer
         cfg.versions.version_count = count
     case .exactly(let version):
         let (pointer, count) = arena.versions([version])
+        cfg.versions.struct_size = offerSize
         cfg.versions.policy = MOQ_VERSION_POLICY_EXACT
         cfg.versions.versions = pointer
         cfg.versions.version_count = count
+    }
+    if let offer = configuration.wireVersions {
+        switch offer {
+        case .automatic: break
+        case .list(let versions):
+            let (pointer, count) = arena.wireVersions(versions)
+            cfg.versions.struct_size = offerSize
+            cfg.versions.policy = MOQ_VERSION_POLICY_LIST
+            cfg.versions.versions = pointer
+            cfg.versions.version_count = count
+        case .exactly(let version):
+            let (pointer, count) = arena.wireVersions([version])
+            cfg.versions.struct_size = offerSize
+            cfg.versions.policy = MOQ_VERSION_POLICY_EXACT
+            cfg.versions.versions = pointer
+            cfg.versions.version_count = count
+        }
     }
     cfg.sni = arena.bytes(configuration.serverName)
     cfg.ca_file = arena.bytes(configuration.caFileURL?.path)
     cfg.insecure_skip_verify = configuration.insecureSkipVerify
     cfg.wt_path = arena.bytes(configuration.webTransportPath)
+    cfg.uri_mode = cURIMode(configuration.uriMode)
+    if let preferred = configuration.preferredVersion {
+        cfg.preferred_version = cVersion(preferred)
+    }
+    if let preferred = configuration.preferredWireVersion {
+        cfg.preferred_version = moq_version_t(rawValue: preferred.rawValue)
+    }
+    let (tokens, tokenCount) = arena.authTokens(configuration.setupAuthorizationTokens)
+    cfg.setup_auth_tokens = tokens
+    cfg.setup_auth_token_count = tokenCount
     return try withExtendedLifetime(arena) {
         try body(&cfg)
     }
@@ -191,6 +244,25 @@ final class ServiceEndpointBackend: EndpointBackend, @unchecked Sendable {
 
     var negotiatedVersion: MoQVersion? {
         swiftVersion(moq_endpoint_negotiated_version(endpoint))
+    }
+
+    var negotiatedWireVersion: WireVersion? {
+        let version = moq_endpoint_negotiated_version(endpoint).rawValue
+        return version == 0 ? nil : WireVersion(rawValue: version)
+    }
+
+    var goawayNewSessionURI: Data? {
+        var length = 0
+        var rc = moq_endpoint_get_goaway_uri(endpoint, nil, 0, &length)
+        if rc == moq_result_t(MOQ_OK) { return Data() }
+        guard rc == moq_result_t(MOQ_ERR_BUFFER) else { return nil }
+        /* The URI is recorded once and never replaced, so the sized read
+         * that follows sees the same length. */
+        var buffer = [UInt8](repeating: 0, count: length)
+        rc = buffer.withUnsafeMutableBufferPointer {
+            moq_endpoint_get_goaway_uri(endpoint, $0.baseAddress, $0.count, &length)
+        }
+        return rc == moq_result_t(MOQ_OK) ? Data(buffer.prefix(length)) : nil
     }
 
     var isFatal: Bool { moq_endpoint_is_fatal(endpoint) }
@@ -260,8 +332,10 @@ extension MoQEndpoint {
     /// Create the managed transport (network thread, QUIC context, session)
     /// and begin connecting. Returns immediately -- the handshake completes
     /// asynchronously; `try await established()` to observe it. Synchronous
-    /// validation failures (unrecognized scheme, missing host, a version
-    /// this build cannot offer) throw before any I/O.
+    /// validation failures (unrecognized scheme, missing host, a
+    /// `webTransportPath` under `URIMode.standard`, a `preferredVersion`
+    /// beside an explicit offer, a version this build cannot offer) throw
+    /// before any I/O.
     public static func connect(configuration: Configuration) throws -> MoQEndpoint {
         _ = moqSwiftStackGuardService()     /* always-linked canary anchor */
         try configuration.validate()

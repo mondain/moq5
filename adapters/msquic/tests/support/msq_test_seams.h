@@ -32,6 +32,11 @@ extern const QUIC_API_TABLE *moq_msq_test_api_override;
  */
 extern bool moq_msq_test_no_doorbell;
 
+/* Exact flush-query rendezvous, before trylock and after observation while the
+ * lane is still held. Test-only: never compiled/exported by production. */
+extern void (*moq_msq_test_flush_pre_lock)(moq_msquic_managed_t *m);
+extern void (*moq_msq_test_flush_observed)(moq_msquic_managed_t *m);
+
 /* The outcome of one production doorbell iteration. */
 typedef enum {
     MOQ_MSQ_TEST_STEP_PUMPED = 0,

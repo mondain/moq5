@@ -66,6 +66,20 @@ test_pump(moq_wtquic_msquic_managed_t *m,
     return 0;
 }
 
+/* a per-lane application deadline query of the production signature; only
+ * its identity is under test */
+static uint64_t
+test_deadline(void *ctx, uint32_t lane_index)
+{
+    (void)ctx;
+    (void)lane_index;
+    return UINT64_MAX;
+}
+
+/* the hook every build() hands over unless a case says otherwise */
+static uint64_t (*g_build_deadline)(void *, uint32_t) = test_deadline;
+static void *g_build_deadline_ctx;
+
 static const char *const kAllowlistJson =
     "{\"listener\":{\"port\":4433,\"cert\":\"/raw.pem\",\"key\":\"/raw.key\"},"
     "\"webtransport\":{\"host\":\"127.0.0.2\",\"port\":4711,"
@@ -90,7 +104,9 @@ build(const char *json, moqr_cli_config_t *cfg, uint32_t lanes, uint32_t caps,
         return 1;
     }
     rc = moqr_cli_wt_listener_create(cfg, lanes, caps, test_pump, user,
-                                     NULL, NULL, out);
+                                     NULL, NULL,
+                                     g_build_deadline, g_build_deadline_ctx,
+                                     out);
     if (rc != want) {
         printf("FAIL: create returned %d, not the transport's %d\n",
                (int)rc, (int)want);
@@ -107,7 +123,10 @@ t_full_configuration(void)
     static moqr_cli_config_t cfg;
     moq_wtquic_msquic_managed_t *m = NULL;
     void *const user = (void *)&cfg;
+    static int deadline_ctx;
 
+    g_build_deadline = test_deadline;
+    g_build_deadline_ctx = &deadline_ctx;
     failures += build(kAllowlistJson, &cfg, 3, 4096, user, &m, MOQ_OK);
     if (failures != 0) {
         return failures;
@@ -157,6 +176,14 @@ t_full_configuration(void)
         /* the pump and its context by identity */
         MOQ_TEST_CHECK(c->on_lane_pump == test_pump);
         MOQ_TEST_CHECK(c->on_lane_pump_user == user);
+        /* the per-lane deadline query and its context by identity: the
+         * relay's fill deadlines reach this facade's lanes only through it,
+         * and the facade-wide query, which would show every lane every
+         * shard's deadline, stays unset */
+        MOQ_TEST_CHECK(c->app_lane_deadline_us == test_deadline);
+        MOQ_TEST_CHECK(c->app_lane_deadline_ctx == g_build_deadline_ctx);
+        MOQ_TEST_CHECK(c->app_deadline_us == NULL);
+        MOQ_TEST_CHECK(c->app_deadline_ctx == NULL);
         /* the Origin policy and its list */
         MOQ_TEST_CHECK_EQ_U64((uint64_t)c->origin_policy,
                               (uint64_t)MOQR_CLI_ORIGIN_POLICY_ALLOWLIST);
@@ -323,11 +350,40 @@ t_partition(void)
     return failures;
 }
 
+/* -- the deadline query travels as given, absent included ------------------ */
+static int
+t_deadline_pass_through(void)
+{
+    int failures = 0;
+    static moqr_cli_config_t cfg;
+    moq_wtquic_msquic_managed_t *m = NULL;
+    static int ctx_a, ctx_b;
+
+    g_build_deadline = test_deadline;
+    g_build_deadline_ctx = &ctx_a;
+    failures += build(kAllowlistJson, &cfg, 1, 8, NULL, &m, MOQ_OK);
+    MOQ_TEST_CHECK(g_relay_wt_capture.cfg.app_lane_deadline_us == test_deadline);
+    MOQ_TEST_CHECK(g_relay_wt_capture.cfg.app_lane_deadline_ctx == &ctx_a);
+    /* a different context is that context, not the first one remembered */
+    g_build_deadline_ctx = &ctx_b;
+    failures += build(kAllowlistJson, &cfg, 1, 8, NULL, &m, MOQ_OK);
+    MOQ_TEST_CHECK(g_relay_wt_capture.cfg.app_lane_deadline_ctx == &ctx_b);
+    /* no query: the facade is told none, not handed a stale one */
+    g_build_deadline = NULL;
+    g_build_deadline_ctx = NULL;
+    failures += build(kAllowlistJson, &cfg, 1, 8, NULL, &m, MOQ_OK);
+    MOQ_TEST_CHECK(g_relay_wt_capture.cfg.app_lane_deadline_us == NULL);
+    MOQ_TEST_CHECK(g_relay_wt_capture.cfg.app_lane_deadline_ctx == NULL);
+    g_build_deadline = test_deadline;
+    return failures;
+}
+
 int
 main(void)
 {
     int rc = 0;
     rc |= t_full_configuration();
+    rc |= t_deadline_pass_through();
     rc |= t_policy_list_pairing();
     rc |= t_profile_pass_through();
     rc |= t_result_propagation();

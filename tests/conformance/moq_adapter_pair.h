@@ -33,6 +33,9 @@ enum {
     MOQ_ADAPTER_PAIR_CAP_VIRTUAL_TIME      = 1 << 7,
     MOQ_ADAPTER_PAIR_CAP_OPENED_BIDI_COUNT = 1 << 8,
     MOQ_ADAPTER_PAIR_CAP_INJECT_BIDI_FIN   = 1 << 9,
+    /* Each side carries control messages on its own unidirectional stream
+     * and every request opens a bidirectional stream. */
+    MOQ_ADAPTER_PAIR_CAP_UNI_CONTROL       = 1 << 10,
 };
 
 typedef enum moq_adapter_pair_side {

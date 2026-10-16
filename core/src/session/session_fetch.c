@@ -38,6 +38,15 @@ void fetch_free_entry(moq_session_t *s, int slot)
 {
     fetch_occ_unlink(s, (size_t)slot);
     moq_fetch_entry_t *e = &s->fetches[slot];
+    if (e->mt_failing) {
+        e->mt_failing = false;
+        s->mt_failing_count--;
+    }
+    if (e->track_key) {
+        s->alloc.free(e->track_key, e->track_key_len, s->alloc.ctx);
+        e->track_key = NULL;
+        e->track_key_len = 0;
+    }
     /* Free any buffered Joining-FETCH staged token values the entry still owns
      * (a PENDING_JOIN freed without release; the memset below only drops the
      * descriptors, not the heap values). */
@@ -47,20 +56,60 @@ void fetch_free_entry(moq_session_t *s, int slot)
     request_registry_remove_by_id(s, e->request_id);
     /* Stream-correlated profiles key the request bidi by stream_ref; remove that
      * mapping so a recycled slot never carries a stale key. */
-    if (e->request_stream_ref._v != 0)
-        request_registry_remove_by_streamref(s, e->request_stream_ref);
+    if (e->rs.ref._v != 0)
+        request_registry_remove_by_streamref(s, e->rs.ref);
     uint32_t next_gen = e->generation + 1;
     /* The request-bidi receive buffer is co-allocated in the session block;
      * preserve the pointer/cap across the reset (memset would null it). */
-    uint8_t *recv_buf = e->req_recv_buf;
-    size_t   recv_cap = e->req_recv_cap;
+    uint8_t *recv_buf = e->rs.recv_buf;
+    size_t   recv_cap = e->rs.recv_cap;
     memset(e, 0, sizeof(*e));
     e->state = MOQ_FETCH_FREE;
     e->generation = next_gen;
     e->occ_next = -1;      /* the memset zeroed these; -1 is "unlinked" */
     e->occ_prev = -1;
-    e->req_recv_buf = recv_buf;
-    e->req_recv_cap = recv_cap;
+    e->rs.recv_buf = recv_buf;
+    e->rs.recv_cap = recv_cap;
+}
+
+/* Called only after buffered response messages have been dispatched. Data FIN
+ * and request FIN are independent; neither can discard a coalesced outcome. */
+moq_result_t fetch_finish_response(moq_session_t *s, int slot)
+{
+    moq_fetch_entry_t *e = &s->fetches[slot];
+    if (!s->profile->request_fin_is_not_cancel ||
+        e->role != MOQ_FETCH_ROLE_FETCHER ||
+        e->state != MOQ_FETCH_PENDING_FETCHER || !e->control_ok ||
+        e->rs.recv_len != 0)
+        return MOQ_OK;
+
+    bool complete = e->data_stream_fin;
+    if (e->rs.recv_fin) (void)moq_request_lifetime_peer_fin(&e->rs.lifetime);
+    bool close_half = !e->rs.lifetime.local_fin && (complete || e->rs.recv_fin);
+    bool need_drain = complete && !fetch_peer_fin_observed(e);
+    if (close_half) e->rs.retained_output = MOQ_RETAINED_OUTPUT_FIN;
+    if ((complete && event_queue_full(s)) ||
+        (close_half && action_queue_full(s)) ||
+        (need_drain && s->drain_ref_count >= s->drain_ref_cap))
+        return MOQ_ERR_WOULD_BLOCK;
+
+    if (close_half) {
+        (void)queue_close_bidi(s, e->rs.ref); /* reserved above */
+        (void)moq_request_lifetime_fin_committed(&e->rs.lifetime);
+        e->rs.retained_output = MOQ_RETAINED_OUTPUT_NONE;
+    }
+    if (complete) {
+        moq_event_t ev;
+        memset(&ev, 0, sizeof(ev));
+        ev.kind = MOQ_EVENT_FETCH_COMPLETE;
+        ev.detail_size = (uint32_t)sizeof(moq_fetch_complete_event_t);
+        ev.borrow_epoch = s->borrow_epoch;
+        ev.u.fetch_complete.fetch = e->handle;
+        (void)push_event(s, &ev); /* reserved above */
+        if (need_drain) (void)drain_ref_add(s, e->rs.ref);
+        fetch_free_entry(s, slot);
+    }
+    return MOQ_OK;
 }
 
 /* -- Fetcher-role completion --------------------------------------- *
@@ -74,7 +123,7 @@ void fetch_free_entry(moq_session_t *s, int slot)
 
 static bool fetch_completion_closes_request(const moq_fetch_entry_t *e)
 {
-    return e->request_stream_ref._v != 0;
+    return e->rs.ref._v != 0;
 }
 
 bool fetch_fetcher_completion_fits(const moq_session_t *s, int slot,
@@ -92,7 +141,7 @@ bool fetch_fetcher_completion_fits(const moq_session_t *s, int slot,
 moq_result_t fetch_fetcher_completion_commit(moq_session_t *s, int slot)
 {
     moq_fetch_entry_t *e = &s->fetches[slot];
-    moq_stream_ref_t req_ref = e->request_stream_ref;
+    moq_stream_ref_t req_ref = e->rs.ref;
     bool close_half = fetch_completion_closes_request(e);
     bool need_drain = close_half && !fetch_peer_fin_observed(e);
 
@@ -168,11 +217,11 @@ void fetch_on_request_goaway_release(moq_session_t *s, int slot)
     }
     /* The data uni has not presented its FETCH_HEADER yet. Keep the request-id
      * registry mapping (so a late header resolves to this slot and is absorbed),
-     * drop only the request-bidi stream-ref mapping (that bidi is GOAWAY-strict
-     * drained by the caller), and invalidate the public handle. */
-    if (e->request_stream_ref._v != 0) {
-        request_registry_remove_by_streamref(s, e->request_stream_ref);
-        e->request_stream_ref = moq_stream_ref_from_u64(0);
+     * drop only the request-bidi stream-ref mapping (that bidi is drained by the
+     * caller), and invalidate the public handle. */
+    if (e->rs.ref._v != 0) {
+        request_registry_remove_by_streamref(s, e->rs.ref);
+        e->rs.ref = moq_stream_ref_from_u64(0);
     }
     e->goaway_sent = false;   /* selective free: clear the migration marker (the
                                * slot is tombstoned, not reusable, until the full
@@ -183,17 +232,148 @@ void fetch_on_request_goaway_release(moq_session_t *s, int slot)
 
 /* -- Inbound FETCH handler ----------------------------------------- */
 
+/* -- Inbound REQUEST_UPDATE on a FETCH this side serves ----------------- */
+
+/* A refused REQUEST_UPDATE ends a fetch whose FETCH_OK has gone out: "When a
+ * REQUEST_UPDATE fails for a FETCH, the publisher MUST reset the FETCH data
+ * stream" (draft-18 §10.9.1, draft-22 §9.5.1). The caller has queued the
+ * REQUEST_ERROR with FIN as the last message on the request stream and
+ * reserved one action (the reset, when the data stream is still open), one
+ * event and, when `need_drain`, a drain slot for the fetcher's later FIN.
+ * The serving application learns of the end from FETCH_CANCELLED; the handle
+ * is retired, so no write can open a data stream without its FETCH_HEADER. */
+static void fetch_end_on_refused_update(moq_session_t *s, int slot,
+                                        bool reset_data, bool need_drain)
+{
+    moq_fetch_entry_t *fe = &s->fetches[slot];
+    if (reset_data) {
+        moq_action_t a;
+        memset(&a, 0, sizeof(a));
+        a.kind = MOQ_ACTION_RESET_DATA;
+        a.detail_size = (uint32_t)sizeof(moq_reset_data_action_t);
+        a.borrow_epoch = s->borrow_epoch;
+        a.u.reset_data.stream_ref = fe->data_stream_ref;
+        a.u.reset_data.error_code = 0x1;   /* CANCELLED */
+        a.u.reset_data.reliable_size = fe->data_header_len;
+        (void)push_action(s, &a);           /* slot reserved by the caller */
+    }
+    moq_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.kind = MOQ_EVENT_FETCH_CANCELLED;
+    ev.detail_size = (uint32_t)sizeof(moq_fetch_cancelled_event_t);
+    ev.borrow_epoch = s->borrow_epoch;
+    ev.u.fetch_cancelled.fetch = fe->handle;
+    (void)push_event(s, &ev);               /* slot reserved by the caller */
+    if (need_drain)
+        (void)drain_ref_add(s, fe->rs.ref); /* slot reserved by the caller */
+    fetch_free_entry(s, slot);
+}
+
+moq_result_t session_core_on_fetch_request_update(
+    moq_session_t *s, moq_decoded_request_update_t *d)
+{
+    moq_stream_ref_t resp_ref = d->endpoint.stream_ref;
+    bool auth_committed = false;
+    moq_result_t result = MOQ_OK;
+    moq_result_t rc;
+    moq_fetch_entry_t *fe = &s->fetches[d->target_slot];
+    const bool refused = d->has_unsupported || d->auth_reject_code;
+    const uint64_t err_code = d->auth_reject_code
+        ? d->auth_reject_code : MOQ_REQUEST_ERROR_NOT_SUPPORTED;
+
+    /* Not yet answered. FETCH_OK is the first message on the request stream
+     * (draft-18 §10.13, draft-22 §9.12), so the answer waits for it and the
+     * update is recorded: accept_fetch sends the answers right after
+     * FETCH_OK, in arrival order; a refusal is answered there too and ends
+     * the fetch. A refusal already owed covers every later update (one
+     * REQUEST_ERROR may answer coalesced updates). Recorded answers count
+     * against the advertised MAX_REQUEST_UPDATES. */
+    if (fe->state != MOQ_FETCH_ACCEPTED) {
+        if (s->profile->request_updates_max != 0 &&
+            fe->upd_owed >= s->profile->request_updates_max) {
+            process_auth_tokens_free_staging(s, d->tokens, d->token_staged,
+                                             d->token_count);
+            process_auth_tokens_abort_txn(s, &d->auth_txn);
+            return close_with_error(s, s->profile->request_updates_exceeded_error,
+                "too many outstanding REQUEST_UPDATEs");
+        }
+        fe->upd_owed++;
+        if (!fe->upd_failed) {
+            if (refused) {
+                fe->upd_failed = true;
+                fe->upd_fail_code = err_code;
+            } else {
+                fe->upd_ok_owed++;
+                /* The priority steers the data stream once it opens. */
+                if (d->has_subscriber_priority)
+                    fe->subscriber_priority = d->subscriber_priority;
+            }
+        }
+        goto committed;
+    }
+
+    /* A refused update answers REQUEST_ERROR, the last message on the
+     * request stream, and ends the fetch. */
+    if (refused) {
+        bool reset_data = fe->data_stream_started && !fe->data_stream_fin;
+        bool need_drain = !fetch_peer_fin_observed(fe);
+        if (event_queue_full(s) ||
+            action_queue_avail(s) < (reset_data ? 2u : 1u) ||
+            (need_drain && s->drain_ref_count >= s->drain_ref_cap)) {
+            result = MOQ_ERR_WOULD_BLOCK; goto cleanup_all;
+        }
+        uint8_t err_buf[128];
+        moq_buf_writer_t ew;
+        moq_buf_writer_init(&ew, err_buf, sizeof(err_buf));
+        rc = s->profile->encode_request_error(s, &ew,
+            &(moq_request_error_encode_args_t){
+                .request_id = d->request_id, .error_code = err_code });
+        if (rc < 0) { result = rc; goto cleanup_all; }
+        rc = queue_send_bidi(s, resp_ref, err_buf, moq_buf_writer_offset(&ew), true);
+        if (rc < 0) { result = rc; goto cleanup_all; }
+        fetch_end_on_refused_update(s, d->target_slot, reset_data, need_drain);
+        goto committed;
+    }
+
+    if (action_queue_full(s)) { result = MOQ_ERR_WOULD_BLOCK; goto cleanup_all; }
+    {
+        uint8_t ok_buf[64];
+        moq_buf_writer_t ow;
+        moq_buf_writer_init(&ow, ok_buf, sizeof(ok_buf));
+        moq_request_update_ok_encode_args_t oka = { .request_id = d->request_id };
+        rc = s->profile->encode_request_update_ok(s, &ow, &oka);
+        if (rc < 0) { result = rc; goto cleanup_all; }
+        rc = queue_send_bidi(s, resp_ref, ok_buf, moq_buf_writer_offset(&ow), false);
+        if (rc < 0) { result = rc; goto cleanup_all; }
+    }
+    /* The priority steers this fetch's data-stream scheduling from here on. */
+    if (d->has_subscriber_priority)
+        fe->subscriber_priority = d->subscriber_priority;
+
+committed:
+    s->profile->commit_inbound_request(s, &d->endpoint);
+    auth_committed = true;
+    process_auth_tokens_commit_txn(s, &d->auth_txn);
+    result = MOQ_OK;
+
+cleanup_all:
+    process_auth_tokens_free_staging(s, d->tokens, d->token_staged, d->token_count);
+    if (!auth_committed)
+        process_auth_tokens_abort_txn(s, &d->auth_txn);
+    return result;
+}
+
 /* Emit a core-generated FETCH REQUEST_ERROR, routed like the auth-reject path: on
  * the request bidi for stream-correlated profiles (draft-18, REQUEST_ERROR + FIN),
  * on the shared control channel otherwise (draft-16). The caller commits the
  * inbound request + auth transaction after this returns MOQ_OK. */
-static moq_result_t fetch_auto_reject(moq_session_t *s,
-                                      const moq_decoded_fetch_t *d,
-                                      uint64_t error_code)
+static moq_result_t fetch_auto_reject_ex(moq_session_t *s,
+    const moq_decoded_fetch_t *d, const moq_request_error_encode_args_t *args)
 {
     uint8_t err_buf[256];
     moq_buf_writer_t ew;
     moq_buf_writer_init(&ew, err_buf, sizeof(err_buf));
+    moq_request_error_encode_args_t a = *args;
     if (d->endpoint.has_stream_ref) {
         /* REQUEST_ERROR + FIN is terminal and the request is never registered as a
          * fetch, so the fetcher's *later* FIN/RESET must be absorbed by the drain
@@ -204,8 +384,8 @@ static moq_result_t fetch_auto_reject(moq_session_t *s,
         bool need_drain = !d->request_fin;
         if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
             return MOQ_ERR_WOULD_BLOCK;
-        moq_result_t rc = s->profile->encode_request_error(s, &ew,
-            &(moq_request_error_encode_args_t){ .error_code = error_code });
+        a.request_id = 0;
+        moq_result_t rc = s->profile->encode_request_error(s, &ew, &a);
         if (rc < 0) return rc;
         rc = queue_send_bidi(s, d->endpoint.stream_ref, err_buf,
                              moq_buf_writer_offset(&ew), true);
@@ -215,11 +395,18 @@ static moq_result_t fetch_auto_reject(moq_session_t *s,
         return MOQ_OK;
     }
     if (action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
-    moq_result_t rc = s->profile->encode_request_error(s, &ew,
-        &(moq_request_error_encode_args_t){
-            .request_id = d->request_id, .error_code = error_code });
+    a.request_id = d->request_id;
+    moq_result_t rc = s->profile->encode_request_error(s, &ew, &a);
     if (rc < 0) return rc;
     return queue_send_control(s, err_buf, moq_buf_writer_offset(&ew));
+}
+
+static moq_result_t fetch_auto_reject(moq_session_t *s,
+                                      const moq_decoded_fetch_t *d,
+                                      uint64_t error_code)
+{
+    return fetch_auto_reject_ex(s, d,
+        &(moq_request_error_encode_args_t){ .error_code = error_code });
 }
 
 /* Upper bound on a bare REQUEST_ERROR (no reason / no redirect) queued on a
@@ -245,10 +432,18 @@ static moq_result_t fetch_buffer_pending_join(moq_session_t *s,
                                               bool *auth_committed)
 {
     int slot = fetch_find_free(s);
-    if (slot < 0)
-        /* Stream-correlated: a fetch-pool shortfall is fatal (mirrors the
-         * standalone staging path), never a per-request error. */
-        return close_with_error(s, 0x3, "fetch pool full");
+    if (slot < 0) {
+        /* A full fetch pool is this side's capacity, not a peer error: the
+         * request is refused on its own stream, as a standalone FETCH is. */
+        moq_request_error_encode_args_t full =
+            session_capacity_request_error(s, 0, "fetch pool full", 15);
+        moq_result_t rrc = fetch_auto_reject_ex(s, d, &full);
+        if (rrc < 0) return rrc;
+        s->profile->commit_inbound_request(s, &d->endpoint);
+        *auth_committed = true;
+        process_auth_tokens_commit_txn(s, &d->auth_txn);
+        return MOQ_OK;
+    }
 
     /* Build entry-owned token storage in temporaries first, so a copy failure
      * leaves the fetch slot untouched (still FREE) and commits nothing: no
@@ -309,7 +504,7 @@ static moq_result_t fetch_buffer_pending_join(moq_session_t *s,
     e->handle = (moq_fetch_t){ moq_handle_pack(MOQ_HANDLE_POOL_FETCH,
         s->session_tag, live_gen, (uint32_t)slot) };
     e->request_id = d->request_id;
-    e->request_stream_ref = d->endpoint.stream_ref;
+    e->rs.ref = d->endpoint.stream_ref;
     /* The peer's FIN is NOT copied here: the generic destination handoff
      * installs it as transitional ownership on this entry and drives the
      * family's own FIN handling, exactly as it does for a standalone FETCH. */
@@ -319,6 +514,8 @@ static moq_result_t fetch_buffer_pending_join(moq_session_t *s,
     e->join_subscriber_priority = d->subscriber_priority;
     e->subscriber_priority = d->subscriber_priority;
     e->join_group_order = (moq_group_order_t)d->group_order;
+    e->effective_group_order = d->group_order == MOQ_GROUP_ORDER_DEFAULT
+        ? MOQ_GROUP_ORDER_ASCENDING : (moq_group_order_t)d->group_order;
     for (size_t i = 0; i < n; i++) {
         e->join_tokens[i] = tmp[i];
         e->join_token_staged[i] = tmp_staged[i];
@@ -346,7 +543,7 @@ static moq_result_t fetch_reject_pending_join(moq_session_t *s, int slot,
                                               uint64_t error_code)
 {
     moq_fetch_entry_t *e = &s->fetches[slot];
-    moq_stream_ref_t ref = e->request_stream_ref;
+    moq_stream_ref_t ref = e->rs.ref;
     bool need_drain = ref._v != 0 && !fetch_peer_fin_observed(e);
     /* Reserve the drain slot before the send: the fetcher's later FIN/RESET on the
      * (soon-freed) join bidi must be absorbed, never read as a stray FIN. */
@@ -428,7 +625,7 @@ moq_result_t session_core_pending_joins_can_resolve(moq_session_t *s, uint64_t s
             any_reject = true;
             n_action++;
             send += PENDING_JOIN_REJECT_BOUND;
-            if (e->request_stream_ref._v != 0 &&
+            if (e->rs.ref._v != 0 &&
                 !fetch_peer_fin_observed(e)) n_drain++;
         } else {
             n_event++;
@@ -606,6 +803,53 @@ moq_result_t session_core_on_fetch(moq_session_t *s,
         process_auth_tokens_commit_txn(s, &d->auth_txn);
         result = MOQ_OK;
         goto cleanup_all;
+    }
+
+    /* Under moq_session_cfg_t.defer_fetch_ranges a standalone range stated
+     * as a Location Filter is the application's to resolve: it is surfaced
+     * as sent and checked against the accept's End instead. */
+    const bool range_deferred = s->defer_fetch_ranges && d->has_options &&
+                                d->fetch_type == 1;
+
+    /* A range stated relative to the Largest Object resolves against this
+     * side's track history. No objects, or a start past the Largest Object,
+     * cannot be served: INVALID_RANGE on the request, not a session error. */
+    if (!range_deferred &&
+        (d->start_relative || d->start_next_object || d->end_at_largest)) {
+        const moq_track_hist_t *h =
+            track_hist_find_id(s, &d->track_namespace, d->track_name);
+        /* Next Object is past Largest even when Object + 1 cannot fit. */
+        bool servable = !d->start_next_object && h && h->has_largest;
+        if (servable) {
+            const uint64_t lg = h->largest_group, lo = h->largest_object;
+            if (d->start_relative) {
+                /* `relative_offset` groups before the next group, clamped at
+                 * the origin and at the ceiling. */
+                if (d->relative_offset == 0)
+                    d->start_group = lg == UINT64_MAX ? UINT64_MAX : lg + 1;
+                else
+                    d->start_group = d->relative_offset - 1 > lg
+                                   ? 0 : lg - (d->relative_offset - 1);
+                d->start_object = 0;
+            }
+            if (d->end_at_largest) {
+                /* The core's end object is exclusive, zero meaning the whole
+                 * end group. */
+                d->end_group = lg;
+                d->end_object = lo == UINT64_MAX ? 0 : lo + 1;
+            }
+            servable = d->start_group < lg ||
+                       (d->start_group == lg && d->start_object <= lo);
+        }
+        if (!servable) {
+            rc = fetch_auto_reject(s, d, MOQ_REQUEST_ERROR_INVALID_RANGE);
+            if (rc < 0) { result = rc; goto cleanup_all; }
+            s->profile->commit_inbound_request(s, &d->endpoint);
+            auth_committed = true;
+            process_auth_tokens_commit_txn(s, &d->auth_txn);
+            result = MOQ_OK;
+            goto cleanup_all;
+        }
     }
 
     /* Joining fetch: resolve referenced subscription and calculate range. */
@@ -818,11 +1062,18 @@ joining_resolved: ;
     int slot = fetch_find_free(s);
     if (slot < 0) {
         if (d->endpoint.has_stream_ref) {
-            /* Stream-correlated profiles: a local resource shortfall (no free
-             * fetch slot) is treated as fatal rather than a per-request
-             * REQUEST_ERROR. Routes through cleanup_all to release any auth
-             * staging/transaction. */
-            result = close_with_error(s, 0x3, "fetch pool full");
+            /* No free fetch slot is this side's load, not a peer error: on a
+             * request stream the FETCH is refused before any application
+             * processing with REQUEST_ERROR and a FIN (draft-18 §3.3.2,
+             * draft-22 §6.4.2.3), carrying the profile's capacity code. */
+            moq_request_error_encode_args_t full =
+                session_capacity_request_error(s, 0, "fetch pool full", 15);
+            rc = fetch_auto_reject_ex(s, d, &full);
+            if (rc < 0) { result = rc; goto cleanup_all; }
+            s->profile->commit_inbound_request(s, &d->endpoint);
+            auth_committed = true;
+            process_auth_tokens_commit_txn(s, &d->auth_txn);
+            result = MOQ_OK;
             goto cleanup_all;
         }
         if (action_queue_full(s)) {
@@ -832,11 +1083,9 @@ joining_resolved: ;
         uint8_t err_buf[128];
         moq_buf_writer_t ew;
         moq_buf_writer_init(&ew, err_buf, sizeof(err_buf));
-        rc = s->profile->encode_request_error(s, &ew,
-            &(moq_request_error_encode_args_t){
-                .request_id = d->request_id, .error_code = 0x0,
-                .reason = (const uint8_t *)"fetch pool full",
-                .reason_len = 15 });
+        moq_request_error_encode_args_t full = session_capacity_request_error(
+            s, d->request_id, "fetch pool full", 15);
+        rc = s->profile->encode_request_error(s, &ew, &full);
         if (rc < 0) { result = rc; goto cleanup_all; }
         rc = queue_send_control(s, err_buf, moq_buf_writer_offset(&ew));
         if (rc < 0) { result = rc; goto cleanup_all; }
@@ -915,6 +1164,36 @@ joining_resolved: ;
                d->token_count * sizeof(moq_resolved_token_t));
     }
 
+    /* The request's options, borrowed from scratch with the event. */
+    moq_fetch_request_options_t *ev_opts = NULL;
+    if (d->has_options) {
+        ev_opts = (moq_fetch_request_options_t *)event_scratch_alloc_aligned(
+            s, sizeof(*ev_opts), _Alignof(moq_fetch_request_options_t));
+        if (!ev_opts) {
+            s->event_scratch_len = scratch_saved;
+            if (scratch_saved == 0) {
+                result = close_with_error(s, 0x1,
+                    "event scratch permanently too small");
+                goto cleanup_all;
+            }
+            result = MOQ_ERR_BUFFER;
+            goto cleanup_all;
+        }
+        memset(ev_opts, 0, sizeof(*ev_opts));
+        ev_opts->struct_size = (uint32_t)sizeof(*ev_opts);
+        ev_opts->range_unresolved = range_deferred;
+        ev_opts->flags = (d->has_fill_timeout ? MOQ_FETCH_REQUEST_HAS_FILL_TIMEOUT : 0u) |
+                        (d->omit_track_properties ? 0u : MOQ_FETCH_REQUEST_INCLUDE_PROPERTIES);
+        ev_opts->fill_timeout_ms = d->has_fill_timeout ? d->fill_timeout_ms : 0;
+        moq_location_filter_cfg_init(&ev_opts->location);
+        if (d->has_location) {
+            moq_location_filter_from_core(d->location_type,
+                d->location_start_group, d->location_start_object,
+                d->location_end_group, d->location_end_object,
+                &ev_opts->location, sizeof(ev_opts->location));
+        }
+    }
+
     /* Build handle WITHOUT mutating entry. */
     moq_fetch_entry_t *entry = &s->fetches[slot];
     uint32_t live_gen = entry->generation | 1;
@@ -943,6 +1222,7 @@ joining_resolved: ;
     e.u.fetch_request.group_order = d->group_order;
     e.u.fetch_request.tokens = ev_tokens;
     e.u.fetch_request.token_count = d->token_count;
+    e.u.fetch_request.options = ev_opts;
 
     rc = push_event(s, &e);
     if (rc < 0) {
@@ -957,7 +1237,22 @@ joining_resolved: ;
     fetch_occ_link(s, (size_t)slot);
     entry->state = MOQ_FETCH_PENDING_PUBLISHER;
     entry->subscriber_priority = d->subscriber_priority;
+    entry->omit_track_properties = d->omit_track_properties;
     entry->role = MOQ_FETCH_ROLE_PUBLISHER;
+    entry->effective_group_order = d->group_order == MOQ_GROUP_ORDER_DEFAULT
+        ? MOQ_GROUP_ORDER_ASCENDING : (moq_group_order_t)d->group_order;
+    if (range_deferred) {
+        /* What the accept's End is checked against. */
+        entry->range_deferred = true;
+        entry->req_start_relative = d->start_relative;
+        entry->req_start_next_object = d->start_next_object;
+        entry->req_end_at_largest = d->end_at_largest;
+        entry->req_relative_offset = d->relative_offset;
+        entry->start_group = d->start_group;
+        entry->start_object = d->start_object;
+        entry->req_end_group = d->end_group;
+        entry->req_end_object = d->end_object;
+    }
     entry->handle = handle;
     entry->request_id = d->request_id;
     d->endpoint.kind = MOQ_REQ_FETCH;
@@ -966,9 +1261,9 @@ joining_resolved: ;
         /* Hand the request bidi off from the staging slot to this fetch slot:
          * remove the staging stream-ref mapping, then bind it to (FETCH, slot).
          * The request-stream handler frees the staging slot afterwards (after
-         * clearing its request_stream_ref, so this mapping is not removed). */
+         * clearing its rs.ref, so this mapping is not removed). */
         request_registry_remove_by_streamref(s, d->endpoint.stream_ref);
-        entry->request_stream_ref = d->endpoint.stream_ref;
+        entry->rs.ref = d->endpoint.stream_ref;
         request_registry_insert_by_streamref(s, d->endpoint.stream_ref,
                                              d->endpoint);
     } else {
@@ -987,6 +1282,13 @@ cleanup_all:
     return result;
 }
 
+moq_result_t moq_session_set_defer_fetch_ranges(moq_session_t *s, bool defer)
+{
+    if (!s) return MOQ_ERR_INVAL;
+    s->defer_fetch_ranges = defer;
+    return MOQ_OK;
+}
+
 /* -- Inbound FETCH error (REQUEST_ERROR for fetch) ----------------- */
 
 moq_result_t session_core_on_fetch_error(moq_session_t *s, int slot,
@@ -999,7 +1301,7 @@ moq_result_t session_core_on_fetch_error(moq_session_t *s, int slot,
     if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
     /* Stream-correlated profiles close the fetcher's send half after the terminal
      * error so the peer can retire the request bidi; reserve the action up front. */
-    bool close_half = !free_now && s->fetches[slot].request_stream_ref._v != 0;
+    bool close_half = !free_now && s->fetches[slot].rs.ref._v != 0;
     if (close_half && action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
 
     size_t scratch_saved = s->event_scratch_len;
@@ -1051,7 +1353,7 @@ moq_result_t session_core_on_fetch_error(moq_session_t *s, int slot,
          * its trailing FIN; the request-stream handler frees it on FIN. Close our
          * send half (reserved above) so the peer can retire the bidi. */
         if (close_half)
-            (void)queue_close_bidi(s, s->fetches[slot].request_stream_ref);
+            (void)queue_close_bidi(s, s->fetches[slot].rs.ref);
         s->fetches[slot].state = MOQ_FETCH_DRAINING_RESPONSE;
         s->fetches[slot].control_response_seen = true;
     }
@@ -1080,6 +1382,7 @@ moq_result_t session_core_on_fetch_cancel(moq_session_t *s,
         a.borrow_epoch = s->borrow_epoch;
         a.u.reset_data.stream_ref = e->data_stream_ref;
         a.u.reset_data.error_code = 0x1;
+        a.u.reset_data.reliable_size = e->data_header_len;
         moq_result_t arc = push_action(s, &a);
         if (arc < 0) return arc;
     }
@@ -1108,6 +1411,9 @@ int fetch_find_by_request_id(moq_session_t *s, uint64_t request_id)
 
 
 static moq_result_t fetch_request_bidi_cancel(moq_session_t *s, int slot);
+static moq_result_t fetch_request_bidi_cancel_ex(moq_session_t *s, int slot,
+                                                 bool stop_data_stream,
+                                                 uint64_t error_code);
 
 moq_result_t session_core_on_fetch_ok(moq_session_t *s,
                                        const moq_decoded_fetch_ok_t *d)
@@ -1119,8 +1425,12 @@ moq_result_t session_core_on_fetch_ok(moq_session_t *s,
 
     /* If data FIN already arrived, FETCH_OK also completes the fetch: reserve
      * the completion (its event, request-half FIN and drain slot) alongside
-     * FETCH_OK's own event. */
-    if (e->data_stream_fin) {
+     * FETCH_OK's own event. A draft-22 completion instead waits until the
+     * enclosing dispatcher has consumed every buffered response, including a
+     * following GOAWAY. */
+    bool complete_here = e->data_stream_fin &&
+                         !s->profile->request_fin_is_not_cancel;
+    if (complete_here) {
         if (!fetch_fetcher_completion_fits(s, d->target_slot, 1))
             return MOQ_ERR_WOULD_BLOCK;
     } else if (event_queue_avail(s) < 1) {
@@ -1200,9 +1510,12 @@ moq_result_t session_core_on_fetch_ok(moq_session_t *s,
 
     e->control_response_seen = true;
     e->control_ok = true;
+    if (s->profile->request_fin_is_not_cancel)
+        (void)moq_request_lifetime_initial_response_committed(&e->rs.lifetime,
+                                                             false, true);
 
     /* The completion precheck above reserved everything this commits. */
-    if (e->data_stream_fin)
+    if (complete_here)
         return fetch_fetcher_completion_commit(s, d->target_slot);
 
     return MOQ_OK;
@@ -1265,6 +1578,58 @@ void moq_accept_fetch_cfg_init(moq_accept_fetch_cfg_t *cfg)
     cfg->struct_size = sizeof(moq_accept_fetch_cfg_t);
 }
 
+/* Order of two Locations. */
+static int fetch_loc_cmp(uint64_t ag, uint64_t ao, uint64_t bg, uint64_t bo)
+{
+    if (ag != bg) return ag < bg ? -1 : 1;
+    if (ao != bo) return ao < bo ? -1 : 1;
+    return 0;
+}
+
+/* The inclusive Location of a fetch end in the core's form: an exclusive end
+ * object, zero meaning the whole end group. */
+static void fetch_end_inclusive(uint64_t end_group, uint64_t end_object,
+                                uint64_t *g, uint64_t *o)
+{
+    *g = end_group;
+    *o = end_object == 0 ? UINT64_MAX : end_object - 1;
+}
+
+/* Whether the End Location an application resolved for a fetch surfaced with
+ * its range unresolved is one the request allows. A form without an end ends
+ * at the Largest Object, so the End is the Largest Object, and a start stated
+ * relative to it follows from the End: {G + 1 - N, 0} for a relative offset
+ * N, clamped to [0, UINT64_MAX], and {G, O + 1} for the Next Object. The End may not
+ * precede the start (the fetcher closes the session on such a FETCH_OK) and
+ * may not pass a bounded request's own end. */
+static bool fetch_deferred_end_allowed(const moq_fetch_entry_t *e,
+                                       uint64_t end_group, uint64_t end_object)
+{
+    uint64_t eg, eo;
+    fetch_end_inclusive(end_group, end_object, &eg, &eo);
+    uint64_t sg = e->start_group, so = e->start_object;
+    if (e->req_start_relative) {
+        so = 0;
+        if (e->req_relative_offset == 0) {
+            sg = eg == UINT64_MAX ? UINT64_MAX : eg + 1;
+        } else {
+            sg = e->req_relative_offset - 1 > eg
+               ? 0 : eg - (e->req_relative_offset - 1);
+        }
+    } else if (e->req_start_next_object) {
+        if (eo == UINT64_MAX) return false;
+        sg = eg;
+        so = eo + 1;
+    }
+    if (fetch_loc_cmp(eg, eo, sg, so) < 0) return false;
+    if (!e->req_end_at_largest) {
+        uint64_t rg, ro;
+        fetch_end_inclusive(e->req_end_group, e->req_end_object, &rg, &ro);
+        if (fetch_loc_cmp(eg, eo, rg, ro) > 0) return false;
+    }
+    return true;
+}
+
 moq_result_t moq_session_accept_fetch(
     moq_session_t *s,
     moq_fetch_t fetch,
@@ -1277,16 +1642,21 @@ moq_result_t moq_session_accept_fetch(
 #define ACCEPT_FETCH_HAS(f) \
     (cfg->struct_size >= offsetof(moq_accept_fetch_cfg_t, f) + sizeof(cfg->f))
 
-    /* Track Properties on FETCH_OK are carried only by stream-correlated
-     * profiles (draft-18); reject rather than silently drop them elsewhere. */
+    /* Every draft's FETCH_OK ends with the track's properties (draft-16
+     * Track Extensions, draft-18/22 Track Properties). */
     const uint8_t *fetch_props = NULL;
     size_t fetch_props_len = 0;
     if (ACCEPT_FETCH_HAS(track_properties) && cfg->track_properties.len > 0) {
         if (!cfg->track_properties.data) return MOQ_ERR_INVAL;
-        if (!moq_session_uses_request_streams(s)) return MOQ_ERR_INVAL;
         fetch_props = cfg->track_properties.data;
         fetch_props_len = cfg->track_properties.len;
     }
+    if (s->profile->validate_track_properties &&
+        s->profile->validate_track_properties(fetch_props, fetch_props_len) < 0)
+        return MOQ_ERR_INVAL;
+    /* The request asked for none (INCLUDE_PROPERTIES = 0): "the Track
+     * Properties are still present in the message, but they SHOULD be
+     * empty". Applied once the handle resolves, below. */
 #undef ACCEPT_FETCH_HAS
 #undef ACCEPT_FETCH_CFG_MIN
 
@@ -1297,18 +1667,42 @@ moq_result_t moq_session_accept_fetch(
     if (slot < 0) return MOQ_ERR_STALE_HANDLE;
     if (s->fetches[slot].state != MOQ_FETCH_PENDING_PUBLISHER)
         return MOQ_ERR_WRONG_STATE;
+    if (s->fetches[slot].range_deferred &&
+        !fetch_deferred_end_allowed(&s->fetches[slot], cfg->end_group,
+                                    cfg->end_object))
+        return MOQ_ERR_INVAL;
+    if (s->fetches[slot].omit_track_properties) {
+        fetch_props = NULL;
+        fetch_props_len = 0;
+    }
+    if (s->profile->request_fin_is_not_cancel && cfg->empty) {
+        moq_result_t rc = fetch_process_buffered_request(s, slot);
+        if (rc < 0) return rc;
+        if (!session_is_active(s)) return MOQ_ERR_CLOSED;
+        slot = fetch_resolve_handle(s, fetch);
+        if (slot < 0) return MOQ_ERR_STALE_HANDLE;
+        if (s->fetches[slot].rs.recv_len != 0) return MOQ_ERR_WOULD_BLOCK;
+    }
 
     /* Stream-correlated profiles deliver FETCH_OK on the request bidi, then open
      * the response data uni with a FETCH_HEADER (carrying the Request ID). */
     if (moq_session_uses_request_streams(s)) {
-        /* Two actions: FETCH_OK on the request bidi + FETCH_HEADER on the uni.
-         * An empty fetch is finished by this call (§10.12.3: header and FIN
-         * on the data stream), so FETCH_OK also FINs the request stream's
-         * local half, and while the fetcher's half is still open a drain slot
-         * absorbs its later FIN or RESET once the entry is gone. */
-        const bool need_drain = cfg->empty &&
-                                !fetch_peer_fin_observed(&s->fetches[slot]);
-        if (action_queue_avail(s) < 2) return MOQ_ERR_WOULD_BLOCK;
+        /* REQUEST_UPDATEs that arrived before this answer are answered right
+         * after FETCH_OK, in the same send; a refused one ends the fetch
+         * here (see fetch_end_on_refused_update). An empty fetch is finished
+         * by this call (§10.12.3: header and FIN on the data stream), so
+         * FETCH_OK also FINs the request stream's local half. Either way,
+         * while the fetcher's half is still open a drain slot absorbs its
+         * later FIN or RESET once the entry is gone. */
+        moq_fetch_entry_t *fe = &s->fetches[slot];
+        const bool upd_refused = fe->upd_failed;
+        const bool empty_fin = cfg->empty;
+        const bool need_drain = (upd_refused || empty_fin) &&
+                                !fetch_peer_fin_observed(fe);
+        /* Two actions: FETCH_OK on the request bidi + FETCH_HEADER on the uni;
+         * a third (the data stream's reset) and an event for a refusal. */
+        if (action_queue_avail(s) < (upd_refused ? 3u : 2u)) return MOQ_ERR_WOULD_BLOCK;
+        if (upd_refused && event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
         if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
             return MOQ_ERR_WOULD_BLOCK;
         moq_accept_fetch_encode_args_t ok_args = {
@@ -1324,6 +1718,16 @@ moq_result_t moq_session_accept_fetch(
                             s->send_cap - s->send_len);
         moq_result_t rc = s->profile->encode_fetch_ok(s, &w, &ok_args);
         if (rc < 0) return rc;
+        for (uint32_t i = 0; i < fe->upd_ok_owed; i++) {
+            moq_request_update_ok_encode_args_t oka = { .request_id = 0 };
+            rc = s->profile->encode_request_update_ok(s, &w, &oka);
+            if (rc < 0) return rc;
+        }
+        if (upd_refused) {
+            rc = s->profile->encode_request_error(s, &w,
+                &(moq_request_error_encode_args_t){ .error_code = fe->upd_fail_code });
+            if (rc < 0) return rc;
+        }
         size_t ok_len = moq_buf_writer_offset(&w);
 
         uint8_t hdr_inline[32];
@@ -1338,7 +1742,7 @@ moq_result_t moq_session_accept_fetch(
          * still to be written and ends with it for an empty fetch. Post-GOAWAY
          * gate (§10.4): a migrated request accepts no further request-bidi bytes
          * (defensive — accept on an already-ACCEPTED+migrated fetch is unreachable). */
-        if (request_goaway_already_sent(s, s->fetches[slot].request_stream_ref))
+        if (request_goaway_already_sent(s, s->fetches[slot].rs.ref))
             return MOQ_ERR_WRONG_STATE;
         moq_action_t ok_act;
         memset(&ok_act, 0, sizeof(ok_act));
@@ -1346,10 +1750,10 @@ moq_result_t moq_session_accept_fetch(
         ok_act.detail_size = (uint32_t)sizeof(moq_send_bidi_stream_action_t);
         ok_act.borrow_epoch = s->borrow_epoch;
         ok_act.u.send_bidi_stream.stream_ref =
-            s->fetches[slot].request_stream_ref;
+            s->fetches[slot].rs.ref;
         ok_act.u.send_bidi_stream.data = s->send_buf + s->send_len;
         ok_act.u.send_bidi_stream.len = ok_len;
-        ok_act.u.send_bidi_stream.fin = cfg->empty;
+        ok_act.u.send_bidi_stream.fin = upd_refused || empty_fin;
         rc = push_action(s, &ok_act);
         if (rc < 0) return rc;
         s->send_len += ok_len;
@@ -1365,7 +1769,7 @@ moq_result_t moq_session_accept_fetch(
         data_act.u.send_data.stream_ref =
             moq_stream_ref_from_u64(s->next_stream_ref);
         data_act.u.send_data.payload = NULL;
-        data_act.u.send_data.fin = cfg->empty;
+        data_act.u.send_data.fin = cfg->empty && !upd_refused;
         data_act.u.send_data.scheduling_priority = UINT64_C(0x10000) |
             ((uint64_t)s->fetches[slot].subscriber_priority << 8) | 128;
         rc = push_action(s, &data_act);
@@ -1374,10 +1778,13 @@ moq_result_t moq_session_accept_fetch(
         s->fetches[slot].state = MOQ_FETCH_ACCEPTED;
         s->fetches[slot].data_stream_ref = data_act.u.send_data.stream_ref;
         s->fetches[slot].data_stream_started = true;
+        s->fetches[slot].data_header_len = hdr_len;
         s->next_stream_ref++;
-        if (cfg->empty) {
+        if (upd_refused)
+            fetch_end_on_refused_update(s, slot, true, need_drain);
+        else if (cfg->empty) {
             if (need_drain)   /* slot reserved above */
-                (void)drain_ref_add(s, s->fetches[slot].request_stream_ref);
+                (void)drain_ref_add(s, fe->rs.ref);
             fetch_free_entry(s, slot);
         }
         return MOQ_OK;
@@ -1392,6 +1799,8 @@ moq_result_t moq_session_accept_fetch(
         .end_of_track = cfg->end_of_track,
         .end_group = cfg->end_group,
         .end_object = cfg->end_object,
+        .track_properties = fetch_props,
+        .track_properties_len = fetch_props_len,
     };
     moq_buf_writer_t w;
     moq_buf_writer_init(&w, s->send_buf + s->send_len,
@@ -1440,6 +1849,7 @@ moq_result_t moq_session_accept_fetch(
     entry->state = MOQ_FETCH_ACCEPTED;
     entry->data_stream_ref = data_act.u.send_data.stream_ref;
     entry->data_stream_started = true;
+    entry->data_header_len = hdr_len;
     s->next_stream_ref++;
 
     if (cfg->empty) {
@@ -1475,7 +1885,8 @@ moq_result_t moq_session_fetch(moq_session_t *s,
         auth_tokens = cfg->auth_tokens;
         auth_token_count = cfg->auth_token_count;
     }
-    if (moq_validate_auth_tokens(auth_tokens, auth_token_count) < 0)
+    if (moq_validate_auth_tokens(auth_tokens, auth_token_count,
+                                 s->profile->auth_token_type_max) < 0)
         return MOQ_ERR_INVAL;
 
     /* Exactly one joining discriminator. Checked here, before
@@ -1488,10 +1899,47 @@ moq_result_t moq_session_fetch(moq_session_t *s,
     const bool has_join_pub =
         FETCH_CFG_HAS(joining_pub) && cfg->joining_pub._opaque != 0;
     const bool has_join_sub = cfg->joining_sub._opaque != 0;
+    if (cfg->is_joining && !s->profile->supports_joining_fetch)
+        return MOQ_ERR_UNSUPPORTED;  /* no joining form on this profile */
     if (cfg->is_joining && (has_join_pub == has_join_sub))
         return MOQ_ERR_INVAL;      /* both, or neither */
     if (!cfg->is_joining && (has_join_pub || has_join_sub))
         return MOQ_ERR_INVAL;      /* a standalone fetch names no owner */
+
+    /* A standalone range in its semantic form, and a FILL_TIMEOUT: only on a
+     * profile whose FETCH carries them. */
+    const moq_location_filter_cfg_t *location =
+        FETCH_CFG_HAS(location) ? cfg->location : NULL;
+    const bool has_fill_timeout =
+        FETCH_CFG_HAS(fill_timeout_ms) && cfg->has_fill_timeout;
+    uint64_t loc_start_group = 0, loc_start_object = 0;
+    if (location || has_fill_timeout) {
+        if (cfg->is_joining) return MOQ_ERR_INVAL;
+        if (!s->profile->fetch_request_options) return MOQ_ERR_UNSUPPORTED;
+    }
+    const bool has_include_properties =
+        FETCH_CFG_HAS(include_properties) && cfg->has_include_properties;
+    const bool include_properties = has_include_properties && cfg->include_properties;
+    if (has_include_properties) {
+        if (cfg->is_joining) return MOQ_ERR_INVAL;
+        if (!s->profile->include_properties_request) return MOQ_ERR_UNSUPPORTED;
+    }
+    if (location) {
+        uint32_t ft;
+        uint64_t eg, eo;
+        moq_result_t lrc = moq_location_filter_to_core(location, &ft,
+            &loc_start_group, &loc_start_object, &eg, &eo);
+        if (lrc < 0) return lrc;
+        /* A start relative to the publisher's Largest Object is not known
+         * here: FETCH_OK's End is checked against the origin, which every
+         * start follows. */
+        if (location->kind == MOQ_LOCATION_FILTER_RELATIVE_GROUP ||
+            location->kind == MOQ_LOCATION_FILTER_NEXT_OBJECT ||
+            location->kind == MOQ_LOCATION_FILTER_NONE) {
+            loc_start_group = 0;
+            loc_start_object = 0;
+        }
+    }
 #undef FETCH_CFG_HAS
 
     session_begin_advance(s, now_us);
@@ -1558,10 +2006,10 @@ moq_result_t moq_session_fetch(moq_session_t *s,
                 &cfg->track_namespace, cfg->track_name,
                 s->profile->min_track_namespace_fields) < 0)
             return MOQ_ERR_INVAL;
-        if (cfg->end_group < cfg->start_group)
+        if (!location && cfg->end_group < cfg->start_group)
             return MOQ_ERR_INVAL;
-        if (cfg->end_group == cfg->start_group && cfg->end_object > 0 &&
-            cfg->end_object <= cfg->start_object)
+        if (!location && cfg->end_group == cfg->start_group &&
+            cfg->end_object > 0 && cfg->end_object <= cfg->start_object)
             return MOQ_ERR_INVAL;
     }
     if (cfg->group_order != MOQ_GROUP_ORDER_DEFAULT &&
@@ -1575,23 +2023,57 @@ moq_result_t moq_session_fetch(moq_session_t *s,
         !s->profile->fetch_descending_supported)
         return MOQ_ERR_INVAL;
 
+    /* The Track this FETCH is for, kept with the request: a malformed Track
+     * found on any request for it cancels this one too (draft-22 §12.1). A
+     * joining FETCH is for its subscription's Track. */
+    uint8_t *track_key = NULL;
+    size_t track_key_len = 0;
+    {
+        const uint8_t *src = NULL;
+        size_t src_len = 0;
+        if (cfg->is_joining && has_join_pub) {
+            const moq_track_hist_t *h = s->publishes[pub_resolve_handle(s, cfg->joining_pub)].hist;
+            if (h) { src = h->key; src_len = h->key_len; }
+        } else if (cfg->is_joining) {
+            const moq_sub_entry_t *je = &s->subs[sub_resolve_handle(s, cfg->joining_sub)];
+            if (je->track_id_buf) { src = je->track_id_buf; src_len = je->track_id_len; }
+            else if (je->hist) { src = je->hist->key; src_len = je->hist->key_len; }
+        }
+        if (cfg->is_joining) {
+            if (src && src_len > 0) {
+                track_key = (uint8_t *)s->alloc.alloc(src_len, s->alloc.ctx);
+                if (!track_key) return MOQ_ERR_NOMEM;
+                memcpy(track_key, src, src_len);
+                track_key_len = src_len;
+            }
+        } else {
+            track_key = moq_build_track_key(s, &cfg->track_namespace, cfg->track_name,
+                                            &track_key_len);
+            if (!track_key) return MOQ_ERR_NOMEM;
+        }
+    }
+#define FETCH_DROP_KEY() \
+    do { if (track_key) s->alloc.free(track_key, track_key_len, s->alloc.ctx); } while (0)
+
     bool req_stream = moq_session_uses_request_streams(s);
     moq_stream_ref_t req_ref = moq_stream_ref_from_u64(0);
 
     moq_request_endpoint_t req_ep;
     {
         moq_result_t prc = s->profile->prepare_request(s, &req_ep);
-        if (prc < 0) return prc;
+        if (prc < 0) { FETCH_DROP_KEY(); return prc; }
     }
 
     int slot = fetch_find_free(s);
     if (slot < 0) {
         s->profile->abort_request(s, &req_ep);
+        FETCH_DROP_KEY();
         return MOQ_ERR_WOULD_BLOCK;
     }
 
     if (action_queue_full(s)) {
         s->profile->abort_request(s, &req_ep);
+        FETCH_DROP_KEY();
         return MOQ_ERR_WOULD_BLOCK;
     }
     {
@@ -1617,6 +2099,11 @@ moq_result_t moq_session_fetch(moq_session_t *s,
             .group_order = (uint8_t)cfg->group_order,
             .auth_tokens = auth_tokens,
             .auth_token_count = auth_token_count,
+            .location = location,
+            .has_fill_timeout = has_fill_timeout,
+            .fill_timeout_ms = has_fill_timeout ? cfg->fill_timeout_ms : 0,
+            .has_include_properties = has_include_properties,
+            .include_properties = include_properties,
         };
 
         moq_buf_writer_t w;
@@ -1626,6 +2113,7 @@ moq_result_t moq_session_fetch(moq_session_t *s,
         moq_result_t rc2 = s->profile->encode_fetch(s, &w, &args);
         if (rc2 < 0) {
             s->profile->abort_request(s, &req_ep);
+            FETCH_DROP_KEY();
             return rc2;
         }
 
@@ -1651,29 +2139,40 @@ moq_result_t moq_session_fetch(moq_session_t *s,
         moq_result_t arc = push_action(s, &act);
         if (arc < 0) {
             s->profile->abort_request(s, &req_ep);
+            FETCH_DROP_KEY();
             return arc;
         }
         s->send_len += encoded_len;
     }
+#undef FETCH_DROP_KEY
 
     /* Commit. */
     moq_fetch_entry_t *entry = &s->fetches[slot];
     entry->generation |= 1;
+    entry->track_key = track_key;
+    entry->track_key_len = track_key_len;
     /* Allocated: join the occupancy list the preamble scans walk. */
     fetch_occ_link(s, (size_t)slot);
     entry->state = MOQ_FETCH_PENDING_FETCHER;
     entry->role = MOQ_FETCH_ROLE_FETCHER;
+    entry->effective_group_order = cfg->group_order == MOQ_GROUP_ORDER_DEFAULT
+        ? MOQ_GROUP_ORDER_ASCENDING : (moq_group_order_t)cfg->group_order;
     entry->request_id = req_ep.request_id;
     entry->handle = fetch_make_handle(s, (size_t)slot);
-    entry->start_group = cfg->is_joining ? joining_computed_start_group : cfg->start_group;
-    entry->start_object = cfg->is_joining ? 0 : cfg->start_object;
+    entry->start_group = cfg->is_joining ? joining_computed_start_group
+                       : location ? loc_start_group : cfg->start_group;
+    entry->start_object = cfg->is_joining ? 0
+                        : location ? loc_start_object : cfg->start_object;
     req_ep.kind = MOQ_REQ_FETCH;
     req_ep.slot = slot;
     if (req_stream) {
         /* The FETCH_OK/REQUEST_ERROR response correlates by the request bidi
          * stream identity; the response data uni (FETCH_HEADER) carries the
          * Request ID, so register BOTH keys. fetch_free_entry removes both. */
-        entry->request_stream_ref = req_ref;
+        entry->rs.ref = req_ref;
+        if (s->profile->request_fin_is_not_cancel)
+            (void)moq_request_lifetime_init(&entry->rs.lifetime,
+                                            MOQ_REQUEST_FAMILY_FETCH, true);
         req_ep.has_stream_ref = true;
         req_ep.stream_ref = req_ref;
         request_registry_insert_by_streamref(s, req_ref, req_ep);
@@ -1734,7 +2233,7 @@ moq_result_t moq_session_reject_fetch(
      * without FIN, so absorb its later empty FIN / in-flight bytes via the drain
      * ring once the entry is freed (else the empty-FIN path is fatal). Reserve the
      * drain slot before mutating (D16 responds on the control channel: no drain). */
-    moq_stream_ref_t req_ref = s->fetches[slot].request_stream_ref;
+    moq_stream_ref_t req_ref = s->fetches[slot].rs.ref;
     bool need_drain = req_ref._v != 0 &&
                       !fetch_peer_fin_observed(&s->fetches[slot]);
     if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
@@ -1759,12 +2258,12 @@ moq_result_t moq_session_reject_fetch(
              * finish that stream. Post-GOAWAY gate (§10.4): a migrated request
              * accepts no further request-bidi bytes (defensive — a reject targets a
              * pending fetch, which cannot have been migrated). */
-            if (request_goaway_already_sent(s, s->fetches[slot].request_stream_ref))
+            if (request_goaway_already_sent(s, s->fetches[slot].rs.ref))
                 return MOQ_ERR_WRONG_STATE;
             act.kind = MOQ_ACTION_SEND_BIDI_STREAM;
             act.detail_size = (uint32_t)sizeof(moq_send_bidi_stream_action_t);
             act.u.send_bidi_stream.stream_ref =
-                s->fetches[slot].request_stream_ref;
+                s->fetches[slot].rs.ref;
             act.u.send_bidi_stream.data = s->send_buf + s->send_len;
             act.u.send_bidi_stream.len = elen;
             act.u.send_bidi_stream.fin = true;
@@ -1798,44 +2297,60 @@ moq_result_t moq_session_reject_fetch(
  * an inbound advance). */
 static moq_result_t fetch_request_bidi_cancel(moq_session_t *s, int slot)
 {
+    return fetch_request_bidi_cancel_ex(s, slot, true, 0x1 /* CANCELLED */);
+}
+
+/* stop_data_stream false leaves the response data stream to a caller that
+ * stops it itself (the receive path, which owns that stream's state). */
+static moq_result_t fetch_request_bidi_cancel_ex(moq_session_t *s, int slot,
+                                                 bool stop_data_stream,
+                                                 uint64_t error_code)
+{
     moq_fetch_entry_t *e = &s->fetches[slot];
-    bool stop_data = e->data_stream_started && !e->data_stream_fin;
+    bool stop_data = stop_data_stream &&
+                     e->data_stream_started && !e->data_stream_fin;
+    /* An early responder FIN may already have closed both request directions,
+     * while this owner still receives data. Cancel only that remaining data. */
+    bool abort_request = !(s->profile->request_fin_is_not_cancel &&
+        e->rs.lifetime.local_fin && fetch_peer_fin_observed(e));
     /* One drain decision for both the preflight and the insertion below: the
      * reference exists to absorb what the peer may still send on the request
-     * bidi, so an already-observed FIN makes it unnecessary. The abort, the
-     * data-stream STOP, the registry removal, the cancel tombstone and the
-     * entry's retirement are unaffected. */
-    bool need_drain = e->request_stream_ref._v != 0 &&
+     * bidi, so an already-observed FIN makes it unnecessary. The data-stream
+     * STOP, registry removal, cancel tombstone and retirement still apply. */
+    bool need_drain = e->rs.ref._v != 0 &&
                       !fetch_peer_fin_observed(e);
-    if (action_queue_avail(s) < (size_t)(1 + (stop_data ? 1 : 0)))
+    if (action_queue_avail(s) < (size_t)((abort_request ? 1 : 0) + (stop_data ? 1 : 0)))
         return MOQ_ERR_WOULD_BLOCK;
     if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
         return MOQ_ERR_WOULD_BLOCK;
-    moq_stream_ref_t ref = e->request_stream_ref;
+    moq_stream_ref_t ref = e->rs.ref;
     moq_action_t a;
     memset(&a, 0, sizeof(a));
     a.kind = MOQ_ACTION_ABORT_BIDI_STREAM;
     a.detail_size = (uint32_t)sizeof(moq_abort_bidi_stream_action_t);
     a.borrow_epoch = s->borrow_epoch;
     a.u.abort_bidi_stream.stream_ref = ref;
-    a.u.abort_bidi_stream.error_code = 0x1;   /* CANCELLED */
-    moq_result_t arc = push_action(s, &a);
-    if (arc < 0) return arc;
+    a.u.abort_bidi_stream.error_code = error_code;
+    moq_result_t arc;
+    if (abort_request) {
+        arc = push_action(s, &a);
+        if (arc < 0) return arc;
+    }
     if (stop_data) {
         memset(&a, 0, sizeof(a));
         a.kind = MOQ_ACTION_STOP_DATA;
         a.detail_size = (uint32_t)sizeof(moq_stop_data_action_t);
         a.borrow_epoch = s->borrow_epoch;
         a.u.stop_data.stream_ref = e->data_stream_ref;
-        a.u.stop_data.error_code = 0x1;
+        a.u.stop_data.error_code = error_code;
         arc = push_action(s, &a);
         if (arc < 0) return arc;
     }
-    if (e->request_stream_ref._v != 0) {
-        request_registry_remove_by_streamref(s, e->request_stream_ref);
+    if (e->rs.ref._v != 0) {
+        request_registry_remove_by_streamref(s, e->rs.ref);
         if (need_drain)
             (void)drain_ref_add(s, ref);   /* slot reserved above */
-        e->request_stream_ref = moq_stream_ref_from_u64(0);
+        e->rs.ref = moq_stream_ref_from_u64(0);
     }
     /* The request bidi is entered in the drain ring only while still peer-open;
      * either way the fetch slot is freed now and the request id tombstoned, so a
@@ -1843,6 +2358,123 @@ static moq_result_t fetch_request_bidi_cancel(moq_session_t *s, int slot)
      * the pool. */
     fetch_cancel_tomb_add(s, e->request_id);
     fetch_free_entry(s, slot);
+    return MOQ_OK;
+}
+
+void moq_fetch_update_cfg_init(moq_fetch_update_cfg_t *cfg)
+{
+    if (!cfg) return;
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->struct_size = (uint32_t)sizeof(*cfg);
+}
+
+moq_result_t moq_session_update_fetch(moq_session_t *s, moq_fetch_t fetch,
+                                      const moq_fetch_update_cfg_t *cfg,
+                                      uint64_t now_us)
+{
+    if (!s || !cfg || cfg->struct_size < sizeof(moq_fetch_update_cfg_t))
+        return MOQ_ERR_INVAL;
+    if (!cfg->has_subscriber_priority && cfg->auth_token_count == 0)
+        return MOQ_ERR_INVAL;
+    if (moq_validate_auth_tokens(cfg->auth_tokens, cfg->auth_token_count,
+                                 s->profile->auth_token_type_max) < 0)
+        return MOQ_ERR_INVAL;
+    session_begin_advance(s, now_us);
+    if (!session_is_active(s)) return MOQ_ERR_CLOSED;
+    if (!s->profile->requester_updates) return MOQ_ERR_UNSUPPORTED;
+    int slot = fetch_resolve_handle(s, fetch);
+    if (slot < 0) return MOQ_ERR_STALE_HANDLE;
+    moq_fetch_entry_t *e = &s->fetches[slot];
+    if (e->role != MOQ_FETCH_ROLE_FETCHER ||
+        e->state != MOQ_FETCH_PENDING_FETCHER ||
+        e->rs.ref._v == 0 || e->rs.lifetime.local_fin ||
+        e->goaway_sent || e->own_update_pending)
+        return MOQ_ERR_WRONG_STATE;
+
+    moq_request_update_encode_args_t args = {
+        .existing_request_id = e->request_id,
+        .has_subscriber_priority = cfg->has_subscriber_priority,
+        .subscriber_priority = cfg->subscriber_priority,
+        .auth_tokens = cfg->auth_token_count ? cfg->auth_tokens : NULL,
+        .auth_token_count = cfg->auth_token_count,
+        .sender = MOQ_UPDATE_SENDER_FETCHER,
+    };
+    moq_request_endpoint_t ep;
+    moq_result_t rc = s->profile->prepare_request(s, &ep);
+    if (rc < 0) return rc;
+    args.request_id = ep.request_id;
+    uint8_t buf[1024];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    rc = s->profile->encode_request_update(s, &w, &args);
+    if (rc == MOQ_OK && action_queue_full(s)) rc = MOQ_ERR_WOULD_BLOCK;
+    if (rc == MOQ_OK)
+        rc = queue_send_bidi(s, e->rs.ref, buf, moq_buf_writer_offset(&w), false);
+    if (rc < 0) {
+        s->profile->abort_request(s, &ep);
+        return rc;
+    }
+    s->profile->commit_request(s, &ep);
+    e->own_update_pending = true;
+    return MOQ_OK;
+}
+
+/* The publisher acknowledged this side's update of its FETCH. */
+moq_result_t session_core_on_fetch_update_ok(moq_session_t *s, int slot)
+{
+    moq_fetch_entry_t *e = &s->fetches[slot];
+    if (!e->own_update_pending)
+        return close_with_error(s, 0x3, "REQUEST_OK without a pending update");
+    e->own_update_pending = false;
+    return MOQ_OK;
+}
+
+/* The publisher refused this side's update of its FETCH (§9.5.1: it resets
+ * the FETCH data stream): the fetch ends. Both of its streams are stopped,
+ * the handle retired, and FETCH_ERROR carries the refusal's code. The event
+ * slot and the reason's arena space are reserved before anything changes; a
+ * reason no arena of this session's size can hold is dropped, never the
+ * session: the refusal is this request's outcome. */
+moq_result_t session_core_on_fetch_update_error(moq_session_t *s, int slot,
+    uint64_t error_code, const uint8_t *reason, size_t reason_len)
+{
+    if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+    moq_fetch_entry_t *e = &s->fetches[slot];
+    moq_fetch_t handle = e->handle;
+    size_t scratch_saved = s->event_scratch_len;
+    moq_bytes_t ev_reason = {0};
+    switch (event_scratch_classify_bytes(s, reason_len)) {
+    case MOQ_EVENT_SCRATCH_PERMANENT:
+        reason_len = 0;   /* the outcome is the code; see moq_session_update_fetch */
+        break;
+    case MOQ_EVENT_SCRATCH_BLOCKED:
+        return MOQ_ERR_WOULD_BLOCK;
+    case MOQ_EVENT_SCRATCH_FITS:
+        break;
+    }
+    if (reason_len > 0) {
+        ev_reason.data = event_scratch_copy(s, reason, reason_len);
+        ev_reason.len = reason_len;
+        if (!ev_reason.data) {
+            s->event_scratch_len = scratch_saved;
+            return close_with_error(s, 0x1,
+                "internal: event scratch preflight mismatch");
+        }
+    }
+    moq_result_t rc = fetch_request_bidi_cancel_ex(s, slot, true, 0x1 /* CANCELLED */);
+    if (rc < 0) {
+        s->event_scratch_len = scratch_saved;
+        return rc;
+    }
+    moq_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.kind = MOQ_EVENT_FETCH_ERROR;
+    ev.detail_size = (uint32_t)sizeof(moq_fetch_error_event_t);
+    ev.borrow_epoch = s->borrow_epoch;
+    ev.u.fetch_error.fetch = handle;
+    ev.u.fetch_error.error_code = s->profile->semantic_request_error(error_code);
+    ev.u.fetch_error.reason = ev_reason;
+    (void)push_event(s, &ev);               /* slot reserved above */
     return MOQ_OK;
 }
 
@@ -1876,7 +2508,7 @@ moq_result_t moq_session_fetch_cancel(moq_session_t *s,
     moq_result_t rc = s->profile->encode_fetch_cancel(s, &w, e->request_id);
     if (rc < 0) return rc;
 
-    rc = queue_send_control(s, buf, moq_buf_writer_offset(&w));
+    rc = queue_send_cancel(s, buf, moq_buf_writer_offset(&w));
     if (rc < 0) return rc;
 
     /* Free the fetch slot immediately so max_fetches is reusable; record the
@@ -1885,6 +2517,75 @@ moq_result_t moq_session_fetch_cancel(moq_session_t *s,
      * pool or closing the session. */
     fetch_cancel_tomb_add(s, e->request_id);
     fetch_free_entry(s, slot);
+    return MOQ_OK;
+}
+
+/* This side cannot take an object the response delivered (it exceeds the
+ * local object-size limit): the fetch is cancelled, not the session.
+ * §3.2.4: a subscriber cancelling a FETCH "MUST send STOP_SENDING for the bidi
+ * request stream" (and MAY stop the data stream, which the caller does); on
+ * a profile without request streams the cancel is the FETCH_CANCEL message.
+ * Streams are terminated with CANCELLED (§12.5: "The stream was cancelled by
+ * either endpoint"). The application sees FETCH_RESET with cause
+ * MOQ_REQUEST_TERMINAL_LOCAL_CANCEL. The caller has reserved one event and
+ * the actions; a refusal (WOULD_BLOCK) leaves everything unchanged. A fetch
+ * that owes no terminal any more is left alone. */
+static moq_result_t fetch_cancel_on_receive_code(moq_session_t *s, int slot,
+                                                 uint64_t error_code,
+                                                 moq_request_terminal_cause_t cause);
+
+moq_result_t fetch_cancel_on_receive(moq_session_t *s, int slot)
+{
+    return fetch_cancel_on_receive_code(s, slot, 0x1 /* CANCELLED */,
+                                        MOQ_REQUEST_TERMINAL_LOCAL_CANCEL);
+}
+
+/* The response carries a malformed Track (draft-22 §12.1): the fetch is
+ * cancelled as above, its request stream reset and stopped with
+ * MALFORMED_TRACK, and FETCH_RESET carries the MALFORMED_TRACK cause. */
+moq_result_t session_fetch_fail_malformed(moq_session_t *s, int slot)
+{
+    return fetch_cancel_on_receive_code(s, slot, MOQ_STREAM_ERROR_MALFORMED_TRACK,
+                                        MOQ_REQUEST_TERMINAL_MALFORMED_TRACK);
+}
+
+static moq_result_t fetch_cancel_on_receive_code(moq_session_t *s, int slot,
+                                                 uint64_t error_code,
+                                                 moq_request_terminal_cause_t cause)
+{
+    moq_fetch_entry_t *e = &s->fetches[slot];
+    if (e->role != MOQ_FETCH_ROLE_FETCHER) return MOQ_OK;
+    if (e->state != MOQ_FETCH_PENDING_FETCHER) return MOQ_OK;
+    if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+    moq_fetch_t handle = e->handle;
+    moq_result_t rc;
+    if (moq_session_uses_request_streams(s)) {
+        rc = fetch_request_bidi_cancel_ex(s, slot, false, error_code);
+        if (rc < 0) return rc;
+    } else {
+        uint8_t buf[32];
+        moq_buf_writer_t w;
+        moq_buf_writer_init(&w, buf, sizeof(buf));
+        rc = s->profile->encode_fetch_cancel(s, &w, e->request_id);
+        if (rc < 0) return rc;
+        rc = queue_send_control(s, buf, moq_buf_writer_offset(&w));
+        if (rc < 0) return rc;
+        fetch_cancel_tomb_add(s, e->request_id);
+        fetch_free_entry(s, slot);
+    }
+    moq_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.kind = MOQ_EVENT_FETCH_RESET;
+    ev.detail_size = (uint32_t)sizeof(moq_fetch_reset_event_t);
+    ev.borrow_epoch = s->borrow_epoch;
+    ev.u.fetch_reset.fetch = handle;
+    /* As sent: FETCH_CANCEL carries no code. */
+    ev.u.fetch_reset.error_code =
+        moq_session_uses_request_streams(s) ? error_code : 0;
+    ev.u.fetch_reset.data_stream = true;
+    ev.u.fetch_reset.stop_sending = false;
+    ev.u.fetch_reset.cause = cause;
+    (void)push_event(s, &ev);               /* slot reserved above */
     return MOQ_OK;
 }
 
@@ -1906,10 +2607,12 @@ moq_result_t fetch_on_data_stream_reset(moq_session_t *s, int slot,
      * drain reference while the peer's FIN is unobserved) -- a late FETCH_OK
      * or REQUEST_ERROR on it is then absorbed, never a fresh request. On the
      * control-channel profile the cancel tombstone absorbs those instead. */
-    bool uses_streams = e->request_stream_ref._v != 0;
+    bool uses_streams = e->rs.ref._v != 0;
     bool need_drain = uses_streams && !fetch_peer_fin_observed(e);
+    bool abort_request = uses_streams && !(s->profile->request_fin_is_not_cancel &&
+        e->rs.lifetime.local_fin && fetch_peer_fin_observed(e));
     if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
-    if (uses_streams && action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+    if (abort_request && action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
     if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
         return MOQ_ERR_WOULD_BLOCK;
 
@@ -1922,10 +2625,11 @@ moq_result_t fetch_on_data_stream_reset(moq_session_t *s, int slot,
     ev.u.fetch_reset.error_code = error_code;
     ev.u.fetch_reset.data_stream = true;
     ev.u.fetch_reset.stop_sending = false;
+    ev.u.fetch_reset.cause = MOQ_REQUEST_TERMINAL_PEER_RESET_STREAM;
     (void)push_event(s, &ev);               /* slot reserved above */
 
     if (uses_streams) {
-        moq_stream_ref_t ref = e->request_stream_ref;
+        moq_stream_ref_t ref = e->rs.ref;
         moq_action_t a;
         memset(&a, 0, sizeof(a));
         a.kind = MOQ_ACTION_ABORT_BIDI_STREAM;
@@ -1933,11 +2637,11 @@ moq_result_t fetch_on_data_stream_reset(moq_session_t *s, int slot,
         a.borrow_epoch = s->borrow_epoch;
         a.u.abort_bidi_stream.stream_ref = ref;
         a.u.abort_bidi_stream.error_code = 0x1;   /* CANCELLED */
-        (void)push_action(s, &a);           /* slot reserved above */
+        if (abort_request) (void)push_action(s, &a); /* slot reserved above */
         request_registry_remove_by_streamref(s, ref);
         if (need_drain)
             (void)drain_ref_add(s, ref);    /* slot reserved above */
-        e->request_stream_ref = moq_stream_ref_from_u64(0);
+        e->rs.ref = moq_stream_ref_from_u64(0);
     }
     fetch_cancel_tomb_add(s, e->request_id);
     fetch_free_entry(s, slot);
@@ -2041,7 +2745,8 @@ moq_result_t moq_session_write_fetch_object(
 
         moq_buf_writer_t hw1;
         moq_buf_writer_init(&hw1, a1.u.send_data.header, 32);
-        moq_result_t rc = s->profile->encode_fetch_object(s, &hw1, &hdr_args,
+        moq_result_t rc = s->profile->encode_fetch_object(s, &hw1,
+                                                           entry->effective_group_order, &hdr_args,
                                                            &entry->prior);
         if (rc < 0) return rc;
         a1.u.send_data.header_len = (uint8_t)moq_buf_writer_offset(&hw1);
@@ -2103,7 +2808,8 @@ moq_result_t moq_session_write_fetch_object(
 
         moq_buf_writer_t hw;
         moq_buf_writer_init(&hw, a.u.send_data.header, 32);
-        moq_result_t rc = s->profile->encode_fetch_object(s, &hw, &obj_args,
+        moq_result_t rc = s->profile->encode_fetch_object(s, &hw,
+                                                           entry->effective_group_order, &obj_args,
                                                            &entry->prior);
         if (rc < 0) return rc;
         a.u.send_data.header_len = (uint8_t)moq_buf_writer_offset(&hw);
@@ -2186,6 +2892,17 @@ static moq_result_t fetch_range_marker(
     return MOQ_OK;
 }
 
+/* A marker kind the session's profile can write on a fetch stream: Timed-Out
+ * only where the profile has an End of Timed-Out Range. */
+static bool fetch_range_kind_writable(const moq_session_t *s,
+                                      moq_fetch_range_kind_t kind)
+{
+    return kind == MOQ_FETCH_RANGE_NON_EXISTENT ||
+           kind == MOQ_FETCH_RANGE_UNKNOWN ||
+           (kind == MOQ_FETCH_RANGE_TIMED_OUT &&
+            s->profile->fetch_range_timed_out);
+}
+
 moq_result_t moq_session_write_fetch_range(
     moq_session_t *s,
     moq_fetch_t fetch,
@@ -2195,8 +2912,7 @@ moq_result_t moq_session_write_fetch_range(
     uint64_t now_us)
 {
     if (!s) return MOQ_ERR_INVAL;
-    if (kind != MOQ_FETCH_RANGE_NON_EXISTENT && kind != MOQ_FETCH_RANGE_UNKNOWN)
-        return MOQ_ERR_INVAL;
+    if (!fetch_range_kind_writable(s, kind)) return MOQ_ERR_INVAL;
     return fetch_range_marker(s, fetch, kind, group_id, object_id, now_us);
 }
 
@@ -2208,8 +2924,7 @@ moq_result_t moq_session_write_fetch_range_before_group(
     uint64_t now_us)
 {
     if (!s) return MOQ_ERR_INVAL;
-    if (kind != MOQ_FETCH_RANGE_NON_EXISTENT && kind != MOQ_FETCH_RANGE_UNKNOWN)
-        return MOQ_ERR_INVAL;
+    if (!fetch_range_kind_writable(s, kind)) return MOQ_ERR_INVAL;
     if (first_group == 0) return MOQ_ERR_INVAL;   /* nothing precedes group 0 */
     /* The profile owns the draft's maximum encodable object id; the marker's
      * inclusive Location is the LAST object of the group before first_group. */
@@ -2221,6 +2936,24 @@ bool moq_session_supports_fetch_datagram(const moq_session_t *s)
 {
     if (!s) return false;
     return s->profile->fetch_datagram_supported;
+}
+
+bool moq_session_supports_joining_fetch(const moq_session_t *s)
+{
+    if (!s) return false;
+    return s->profile->supports_joining_fetch;
+}
+
+bool moq_session_supports_fill(const moq_session_t *s)
+{
+    if (!s) return false;
+    return s->profile->supports_fill;
+}
+
+bool moq_session_supports_concurrent_subscriptions(const moq_session_t *s)
+{
+    if (!s) return false;
+    return s->profile->allows_concurrent_subscriptions;
 }
 
 moq_result_t moq_session_end_fetch(
@@ -2240,13 +2973,24 @@ moq_result_t moq_session_end_fetch(
 
     moq_fetch_entry_t *entry = &s->fetches[slot];
 
+    const bool finish_request = s->profile->request_fin_is_not_cancel;
+    if (finish_request) {
+        moq_result_t rc = fetch_process_buffered_request(s, slot);
+        if (rc < 0) return rc;
+        if (!session_is_active(s)) return MOQ_ERR_CLOSED;
+        slot = fetch_resolve_handle(s, fetch);
+        if (slot < 0) return MOQ_ERR_STALE_HANDLE; /* refused UPDATE won */
+        entry = &s->fetches[slot];
+        if (entry->rs.recv_len != 0) return MOQ_ERR_WOULD_BLOCK;
+    }
+
     /* The response ends here (§5.2: the publisher can destroy FETCH state once
      * the data stream is closed with FIN). On stream-correlated profiles the
      * request stream has nothing more to carry either, so its local half is
      * FINed in the same commit; while the fetcher's half is still open a drain
      * slot absorbs its later FIN or RESET once the entry is gone. Everything
      * is reserved first: WOULD_BLOCK leaves the fetch untouched. */
-    moq_stream_ref_t req_ref = entry->request_stream_ref;
+    moq_stream_ref_t req_ref = entry->rs.ref;
     bool close_req = req_ref._v != 0;
     bool need_drain = close_req && !fetch_peer_fin_observed(entry);
     if (action_queue_avail(s) < (close_req ? 2u : 1u)) return MOQ_ERR_WOULD_BLOCK;
@@ -2302,7 +3046,7 @@ moq_result_t moq_session_abort_fetch(
      * the peer's FIN was already observed, its later empty FIN / RESET must be
      * absorbed by the drain ring (an unknown request stream's empty FIN is
      * otherwise fatal), exactly as reject_fetch arranges. */
-    moq_stream_ref_t req_ref = entry->request_stream_ref;
+    moq_stream_ref_t req_ref = entry->rs.ref;
     bool uses_streams = req_ref._v != 0;
     bool need_drain = uses_streams && !fetch_peer_fin_observed(entry);
     if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
@@ -2322,6 +3066,7 @@ moq_result_t moq_session_abort_fetch(
     a.borrow_epoch = s->borrow_epoch;
     a.u.reset_data.stream_ref = entry->data_stream_ref;
     a.u.reset_data.error_code = error_code;
+    a.u.reset_data.reliable_size = entry->data_header_len;
     moq_result_t rc = push_action(s, &a);
     if (rc < 0) return rc;
     if (uses_streams) {

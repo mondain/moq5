@@ -20,6 +20,10 @@ allocation size, keep the resulting `struct_size`, and follow each resolver's
 minimum-prefix rules. Do not claim a larger allocation or use packed structs.
 Nested core/binding templates in the shard config must be initialized in full
 with the shipped initializer; they are not independently extensible tails.
+Because the binding config is embedded that way, binding settings added after
+it are setters, never fields: the fill wait is `moqr_bind_set_fill_timeouts`,
+which the shard runtime applies to every shard's binding from the shard
+config's own appended `fill_timeout_default_ms` / `fill_timeout_max_ms`.
 Existing enum and capacity validation continues to apply before construction.
 
 The four `_get_stats_sized` functions require space for the complete record.
@@ -43,6 +47,7 @@ private; defining a testing macro does not expose them from installed headers.
 | `moqr_shards_core/bind/trace` return values | Borrowed children; never destroy independently or use after parent destruction |
 | Allocator/context | Keep both alive through destruction and final retained-buffer release |
 | Policy/router callbacks and contexts | Application-owned; valid until all invoking lanes are quiescent |
+| Fill source table and context (`moqr_bind_set_fill_source`) | The binding copies the table; the context is caller-owned and must outlive every fill that claimed through it (a shard runtime installs its own) |
 | Namespace/name input spans | Borrowed for the call unless that declaration explicitly specifies otherwise |
 | Ingest payload/properties | Transfer on `MOQR_OK`; remain caller-owned on refusal |
 | Delivery/fetch/intent views | Borrowed under the specific declaration's advancing-call and acknowledgement rules |
@@ -54,6 +59,47 @@ acknowledgement. Use `moq_rcbuf_incref` when the buffer contract permits retenti
 beyond a call, and match it with a decref; a copied pointer is not a retained ref.
 Destroying a relay abandons retained relay work and releases its references; it
 does not close transports or prove application delivery succeeded.
+
+## Retained Track Lifetime
+
+`moqr_core_track_current_generation` resolves a complete retained-track handle
+without advancing the owner. It returns the current source generation for
+PENDING, ACTIVE and WARM tracks, and leaves output unchanged on failure. NULL
+core/output is INVAL; an invalid, retired or replaced handle is STALE_HANDLE.
+It allocates nothing and neither borrows storage nor pins the track. Numeric
+handle tags do not authorize using another core's handle.
+
+A new source generation is not a new retained identity. Binding metadata is
+reclaimed only when the full handle is stale, at normal maintenance or before
+charging a new copy. WARM metadata and separately held reply/manager references
+remain charged until their own final release; the metadata budget is unchanged.
+
+## Source Metadata Ownership
+
+The historical `moqr_core_binding_open` path remains property-less. Its source
+can be published before or after creating a session binding, even when the
+caller already consumed ACCEPT_PUBLISH. Only an eligible, admitted direct
+source with no recorded metadata obligation receives an explicit empty-property
+reply; a default marker on a fresh pending demand cannot authorize a reply.
+
+`moqr_core_binding_open_with_options` accepts NULL/default options for that same
+legacy behavior. `moqr_binding_options_init_sized` initializes only the known
+caller prefix; the accepted minimum is a frozen 8 bytes. Unknown flags and
+short prefixes are rejected before pool/trace mutation. Existing structs and
+the old open entry point are unchanged.
+
+Session attachments and shard pseudo/manager bindings opt into
+`MOQR_BINDING_TRACK_METADATA_MANAGED` before admission. The core retains the
+selected source's flag, not its subscribers' flags. Its pure
+`moqr_core_track_metadata_managed` query resolves the full retained handle and
+leaves output unchanged on failure. Managed provenance survives WARM, source
+detach, consumed intents, binding recreation, failover and rejoin. Only a
+genuinely new retained identity/log starts from its own selected source.
+
+Managed directory loss, explicit UNAVAILABLE, OOM/budget refusal and routed
+uncertainty remain unavailable, never empty. Pending/old reply pins stay
+immutable. Library metadata imports require a managed local source; applications
+needing Track Properties cannot supply them through the property-less direct API.
 
 ## Scheduling
 

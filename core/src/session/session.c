@@ -1,6 +1,7 @@
 #include <assert.h>
 #include "session_internal.h"
 #include "../internal/validate.h"
+#include "session_event_admission.h"
 
 /* Bounded backoff applied to the *reported* next deadline when a subgroup
  * delivery-timeout reset cannot be enqueued because the action queue is full.
@@ -46,6 +47,20 @@ moq_result_t session_scan_dt_props(const moq_session_t *s,
                                          * d18 walk may have filled one type
                                          * before hitting a later duplicate) */
     return rc;
+}
+
+uint8_t session_resolve_publisher_priority(moq_session_t *s,
+                                           moq_subscription_t sub,
+                                           moq_publication_t pub,
+                                           bool omitted, uint8_t priority)
+{
+    if (!omitted) return priority;
+    if (!s->profile->scan_default_publisher_priority) return 128;
+    int slot = sub_resolve_handle(s, sub);
+    if (slot >= 0) return s->subs[slot].default_publisher_priority;
+    slot = pub_resolve_handle(s, pub);
+    if (slot >= 0) return s->publishes[slot].default_publisher_priority;
+    return 128; /* No live recipient: callers discard it, never latch this. */
 }
 
 /*
@@ -194,6 +209,12 @@ static bool session_sweep_run(moq_session_t *s, uint32_t *budget)
 static void session_call_prepare(moq_session_t *s)
 {
     s->borrow_epoch++;
+    if (s->state_location_retired != s->state_location_cap) {
+        s->state_locations[s->state_location_retired_tail].next = s->state_location_free;
+        s->state_location_free = s->state_location_retired;
+        s->state_location_retired = s->state_location_cap;
+        s->state_location_retired_tail = s->state_location_cap;
+    }
     if (s->action_head == s->action_tail)
         s->send_len = 0;
 #ifndef NDEBUG
@@ -383,6 +404,15 @@ static bool session_advance_sweep(moq_session_t *s, uint64_t now_us,
                                   uint32_t *budget)
 {
     session_call_prepare(s);
+    /* Fill children retain their owed effects across refusals; every
+     * advancing call gives them one chance before its own work. */
+    if (session_is_active(s)) {
+        fill_service(s);
+        mt_retry_pending(s);
+        ts_retry_pending(s);
+        ann_retry_pending(s);
+        ns_sub_retry_pending(s);
+    }
 
     for (;;) {
 #ifdef MOQ_SESSION_SWEEP_TESTING
@@ -459,6 +489,7 @@ void session_begin_advance(moq_session_t *s, uint64_t now_us)
  */
 moq_result_t session_advance_entry(moq_session_t *s, uint64_t now_us)
 {
+    if (moq_binding_required_unbound(s)) return MOQ_ERR_WRONG_STATE;
     if (s->budget_active)
         return session_begin_advance_budgeted(s, now_us);
     session_begin_advance(s, now_us);
@@ -488,7 +519,10 @@ void decref_queued_event_payloads(moq_session_t *s)
 #ifdef MOQ_SESSION_SWEEP_TESTING
         session_work_queued_event++;
 #endif
-        if (e->kind == MOQ_EVENT_OBJECT_RECEIVED) {
+        if (e->kind == MOQ_EVENT_PUBLISH_STATE && e->u.publish_state.location) {
+            event_location_release(s, e->u.publish_state.location);
+            e->u.publish_state.location = NULL;
+        } else if (e->kind == MOQ_EVENT_OBJECT_RECEIVED) {
             if (e->u.object_received.payload) {
                 size_t plen = moq_rcbuf_len(e->u.object_received.payload);
                 if (plen <= s->recv_payload_bytes)
@@ -525,6 +559,25 @@ void decref_queued_event_payloads(moq_session_t *s)
                     s->recv_payload_bytes = 0;
                 moq_rcbuf_decref(e->u.fetch_object.properties);
                 e->u.fetch_object.properties = NULL;
+            }
+        } else if (e->kind == MOQ_EVENT_FILL_OBJECT) {
+            if (e->u.fill_object.payload) {
+                size_t plen = moq_rcbuf_len(e->u.fill_object.payload);
+                if (plen <= s->recv_payload_bytes)
+                    s->recv_payload_bytes -= plen;
+                else
+                    s->recv_payload_bytes = 0;
+                moq_rcbuf_decref(e->u.fill_object.payload);
+                e->u.fill_object.payload = NULL;
+            }
+            if (e->u.fill_object.properties) {
+                size_t elen = moq_rcbuf_len(e->u.fill_object.properties);
+                if (elen <= s->recv_payload_bytes)
+                    s->recv_payload_bytes -= elen;
+                else
+                    s->recv_payload_bytes = 0;
+                moq_rcbuf_decref(e->u.fill_object.properties);
+                e->u.fill_object.properties = NULL;
             }
         } else if (e->kind == MOQ_EVENT_OBJECT_CHUNK) {
             if (e->u.object_chunk.chunk) {
@@ -588,6 +641,14 @@ void free_rx_stream_bufs(moq_session_t *s)
                     s->recv_input_bytes = 0;
                 s->alloc.free(rx->input_buf, rx->input_cap, s->alloc.ctx);
                 rx->input_buf = NULL;
+            }
+            /* A stream attributed per object (a shared alias) owns its
+             * recipient list. */
+            if (rx->fan) {
+                s->alloc.free(rx->fan, (size_t)rx->fan_cap * sizeof(moq_rx_fan_t),
+                              s->alloc.ctx);
+                rx->fan = NULL;
+                rx->fan_cap = rx->fan_count = 0;
             }
         }
         rx->active = false;
@@ -785,6 +846,34 @@ bool moq_session_has_events(const moq_session_t *s)
     return s->event_head != s->event_tail;
 }
 
+moq_result_t moq_session_register_transport_owner(moq_session_t *s,
+                                                  const void *owner)
+{
+    if (!s || !owner) return MOQ_ERR_INVAL;
+    if (s->transport_owner && s->transport_owner != owner)
+        return MOQ_ERR_WRONG_STATE;
+    s->transport_owner = owner;
+    return MOQ_OK;
+}
+
+void moq_session_unregister_transport_owner(moq_session_t *s,
+                                            const void *owner)
+{
+    if (s && owner && s->transport_owner == owner) {
+        s->transport_owner = NULL;
+        s->has_owner_deadline = false;
+        s->owner_deadline_us = 0;
+    }
+}
+
+void moq_session_set_owner_deadline(moq_session_t *s, const void *owner,
+                                    bool has, uint64_t deadline_us)
+{
+    if (!s || !owner || s->transport_owner != owner) return;
+    s->has_owner_deadline = has;
+    s->owner_deadline_us = has ? deadline_us : 0;
+}
+
 moq_uni_class_t moq_session_classify_peer_uni(const moq_session_t *s,
                                               const uint8_t *data, size_t len)
 {
@@ -799,6 +888,7 @@ moq_result_t moq_session_validate_inbound_request_stream(
     moq_session_t *s, moq_stream_ref_t ref, uint64_t msg_type,
     uint64_t wire_request_id, moq_request_endpoint_t *out)
 {
+    if (moq_binding_required_unbound(s)) return MOQ_ERR_WRONG_STATE;
     /* Profiles that do not open a bidi stream per request (draft-16) leave the
      * hook NULL; this path is never taken for them. */
     if (!s->profile->validate_inbound_request_stream) {
@@ -823,49 +913,237 @@ size_t moq_session_action_capacity(const moq_session_t *s)
     return used >= s->action_cap ? 0 : s->action_cap - used;
 }
 
-moq_result_t push_action(moq_session_t *s, const moq_action_t *a)
+/* The scheduling record of a SEND_DATA action, from the stream it rides:
+ * a subgroup stream, a FETCH response stream, or a fill fetch stream. Fills
+ * in the public scheduling snapshot too when the producer left it absent. */
+static void derive_stream_meta(moq_session_t *s, moq_action_t *queued,
+                               moq_action_meta_t *m)
+{
+    moq_stream_ref_t ref = queued->u.send_data.stream_ref;
+    for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next) {
+        const moq_sg_entry_t *sg = &s->subgroups[i];
+        if (sg->stream_ref._v != ref._v) continue;
+        sg_stream_meta(s, sg, m);
+        if (!queued->u.send_data.scheduling_priority)
+            queued->u.send_data.scheduling_priority = UINT64_C(0x10000) |
+                ((uint64_t)m->subscriber_priority << 8) | m->publisher_priority;
+        return;
+    }
+    for (int32_t i = s->fetch_occ_head; i >= 0; i = s->fetches[i].occ_next) {
+        const moq_fetch_entry_t *f = &s->fetches[i];
+        if (f->data_stream_ref._v != ref._v) continue;
+        m->mode = MOQ_SCHED_MODE_FETCH;
+        m->owner = f->handle._opaque;
+        m->subscriber_priority = f->subscriber_priority;
+        m->publisher_priority = f->prior.has_actual ? f->prior.publisher_priority : 128;
+        if (!queued->u.send_data.scheduling_priority)
+            queued->u.send_data.scheduling_priority = UINT64_C(0x10000) |
+                ((uint64_t)m->subscriber_priority << 8) | m->publisher_priority;
+        return;
+    }
+    for (size_t i = 0; s->fill_storage && i < s->fill_cap; i++) {
+        const moq_fill_entry_t *f = &s->fill_storage[i];
+        if (!f->active || !f->stream_bound || f->stream._v != ref._v) continue;
+        fill_stream_meta(s, f, m);
+        return;
+    }
+}
+
+moq_result_t push_action_ex(moq_session_t *s, const moq_action_t *a,
+                            const moq_action_meta_t *meta, uint64_t deadline_us)
 {
     if (action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
-    s->actions[s->action_tail % s->action_cap] = *a;
-    moq_action_t *queued = &s->actions[s->action_tail % s->action_cap];
-    if (a->kind == MOQ_ACTION_SEND_DATA && !a->u.send_data.scheduling_priority) {
-        for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next) {
-            const moq_sg_entry_t *sg = &s->subgroups[i];
-            if (sg->stream_ref._v != a->u.send_data.stream_ref._v) continue;
-            uint8_t subscriber = 128;
-            int sub = sub_resolve_handle(s, sg->sub);
-            int pub = pub_resolve_handle(s, sg->pub);
-            if (sub >= 0) subscriber = s->subs[sub].subscriber_priority;
-            else if (pub >= 0) subscriber = s->publishes[pub].subscriber_priority;
-            queued->u.send_data.scheduling_priority = UINT64_C(0x10000) |
-                ((uint64_t)subscriber << 8) | sg->publisher_priority;
-            break;
-        }
-        if (!queued->u.send_data.scheduling_priority) {
-            for (int32_t i = s->fetch_occ_head; i >= 0; i = s->fetches[i].occ_next) {
-                const moq_fetch_entry_t *f = &s->fetches[i];
-                if (f->data_stream_ref._v != a->u.send_data.stream_ref._v) continue;
-                queued->u.send_data.scheduling_priority = UINT64_C(0x10000) |
-                    ((uint64_t)f->subscriber_priority << 8) |
-                    (f->prior.has_actual ? f->prior.publisher_priority : 128);
-                break;
-            }
-        }
+    size_t idx = s->action_tail % s->action_cap;
+    s->actions[idx] = *a;
+    moq_action_t *queued = &s->actions[idx];
+    moq_action_meta_t *m = &s->action_meta[idx];
+    memset(m, 0, sizeof(*m));
+    m->deadline_us = UINT64_MAX;
+    if (meta) {
+        *m = *meta;
+    } else if (a->kind == MOQ_ACTION_SEND_DATA) {
+        derive_stream_meta(s, queued, m);
     }
+    if (a->kind == MOQ_ACTION_SEND_DATA && queued->u.send_data.scheduling_priority) {
+        /* The producer's snapshot is the authority for the priorities. */
+        m->subscriber_priority = (uint8_t)(queued->u.send_data.scheduling_priority >> 8);
+        m->publisher_priority = (uint8_t)queued->u.send_data.scheduling_priority;
+    }
+    m->deadline_us = deadline_us;
     s->action_tail++;
     session_refresh_idle(s, s->last_now_us);
     return MOQ_OK;
 }
 
+moq_result_t push_action(moq_session_t *s, const moq_action_t *a)
+{
+    return push_action_ex(s, a, NULL, UINT64_MAX);
+}
+
+uint64_t session_queued_data_deadline(const moq_session_t *s)
+{
+    uint64_t d = UINT64_MAX;
+    for (size_t i = s->action_head; i < s->action_tail; i++) {
+        uint64_t x = s->action_meta[i % s->action_cap].deadline_us;
+        if (x < d) d = x;
+    }
+    return d;
+}
+
+/* -- Scheduling (design: Priorities) ------------------------------- *
+ * Among the queued data actions up to the next non-data action, the poll
+ * takes the one the scheduling algorithm places first: the higher subscriber
+ * priority, then the higher publisher priority, then -- within one request --
+ * the group order between groups (a fill whose order differs from its
+ * subscription's yields to the subscription-delivered object) and, within a
+ * group, the fill-delivered object, then a datagram before a subgroup, then
+ * the lowest Subgroup ID or Object ID. Actions on one stream keep their
+ * order, ties keep queue order, and a non-data action holds its place. */
+
+static bool action_is_data(uint32_t kind)
+{
+    return kind == MOQ_ACTION_SEND_DATA || kind == MOQ_ACTION_SEND_DATAGRAM;
+}
+
+static int sched_compare(const moq_action_meta_t *x, const moq_action_meta_t *y)
+{
+    if (x->subscriber_priority != y->subscriber_priority)
+        return x->subscriber_priority < y->subscriber_priority ? -1 : 1;
+    if (x->publisher_priority != y->publisher_priority)
+        return x->publisher_priority < y->publisher_priority ? -1 : 1;
+    if (x->owner == 0 || x->owner != y->owner || !x->has_location || !y->has_location)
+        return 0;
+    bool xf = x->mode == MOQ_SCHED_MODE_FILL, yf = y->mode == MOQ_SCHED_MODE_FILL;
+    if (xf && yf) return 0;
+    if (x->group_id != y->group_id) {
+        if (xf != yf) {
+            const moq_action_meta_t *fill = xf ? x : y;
+            if (fill->fill_group_order != fill->group_order)
+                return xf ? 1 : -1;
+        }
+        bool desc = x->group_order == MOQ_GROUP_ORDER_DESCENDING;
+        bool x_first = desc ? x->group_id > y->group_id : x->group_id < y->group_id;
+        return x_first ? -1 : 1;
+    }
+    if (xf != yf) return xf ? -1 : 1;
+    if (x->mode != y->mode) {
+        if (x->mode == MOQ_SCHED_MODE_DATAGRAM) return -1;
+        if (y->mode == MOQ_SCHED_MODE_DATAGRAM) return 1;
+        return 0;
+    }
+    if (x->mode == MOQ_SCHED_MODE_SUBGROUP && x->subgroup_id != y->subgroup_id)
+        return x->subgroup_id < y->subgroup_id ? -1 : 1;
+    if (x->mode == MOQ_SCHED_MODE_DATAGRAM && x->object_id != y->object_id)
+        return x->object_id < y->object_id ? -1 : 1;
+    return 0;
+}
+
+/* The queue index (head <= idx < tail) of the action the next poll takes. */
+static size_t action_select(const moq_session_t *s)
+{
+    size_t head = s->action_head, tail = s->action_tail, cap = s->action_cap;
+    if (!action_is_data(s->actions[head % cap].kind)) return head;
+    size_t best = head;
+    for (size_t i = head + 1; i < tail; i++) {
+        const moq_action_t *a = &s->actions[i % cap];
+        if (!action_is_data(a->kind)) break;
+        if (a->kind == MOQ_ACTION_SEND_DATA) {
+            bool later_on_its_stream = false;
+            for (size_t j = head; j < i; j++) {
+                const moq_action_t *b = &s->actions[j % cap];
+                if (b->kind == MOQ_ACTION_SEND_DATA &&
+                    b->u.send_data.stream_ref._v == a->u.send_data.stream_ref._v) {
+                    later_on_its_stream = true;
+                    break;
+                }
+            }
+            if (later_on_its_stream) continue;
+        }
+        if (sched_compare(&s->action_meta[i % cap], &s->action_meta[best % cap]) < 0)
+            best = i;
+    }
+    return best;
+}
+
+/* Remove the action at idx from the ring into *out, keeping the order of the
+ * actions it overtook. */
+static void action_take(moq_session_t *s, size_t idx, moq_action_t *out)
+{
+    size_t cap = s->action_cap;
+    *out = s->actions[idx % cap];
+    for (size_t j = idx; j > s->action_head; j--) {
+        s->actions[j % cap] = s->actions[(j - 1) % cap];
+        s->action_meta[j % cap] = s->action_meta[(j - 1) % cap];
+    }
+    s->action_head++;
+}
+
 bool event_queue_full(const moq_session_t *s)
 {
-    return (s->event_tail - s->event_head) >= s->event_cap;
+    return (s->event_tail - s->event_head) + s->event_reserve >= s->event_cap;
+}
+
+/* The Prior Group/Object ID Gaps an object event surfaces are read from the
+ * properties it carries, so every producer of an object event reports them
+ * the same way. A block that does not yield them (none, a malformed block,
+ * or a profile without them) reports neither. */
+static void event_set_gaps(const moq_session_t *s, moq_event_t *e)
+{
+    const moq_rcbuf_t *props = NULL;
+    bool *hg = NULL, *ho = NULL;
+    uint64_t *g = NULL, *o = NULL;
+    switch (e->kind) {
+    case MOQ_EVENT_OBJECT_RECEIVED: {
+        moq_object_received_event_t *x = &e->u.object_received;
+        props = x->properties; hg = &x->has_prior_group_gap;
+        ho = &x->has_prior_object_gap; g = &x->prior_group_gap;
+        o = &x->prior_object_gap;
+        break;
+    }
+    case MOQ_EVENT_OBJECT_CHUNK: {
+        moq_object_chunk_event_t *x = &e->u.object_chunk;
+        if (!x->begin) return;
+        props = x->properties; hg = &x->has_prior_group_gap;
+        ho = &x->has_prior_object_gap; g = &x->prior_group_gap;
+        o = &x->prior_object_gap;
+        break;
+    }
+    case MOQ_EVENT_FETCH_OBJECT: {
+        moq_fetch_object_event_t *x = &e->u.fetch_object;
+        props = x->properties; hg = &x->has_prior_group_gap;
+        ho = &x->has_prior_object_gap; g = &x->prior_group_gap;
+        o = &x->prior_object_gap;
+        break;
+    }
+    case MOQ_EVENT_FILL_OBJECT: {
+        moq_fill_object_event_t *x = &e->u.fill_object;
+        props = x->properties; hg = &x->has_prior_group_gap;
+        ho = &x->has_prior_object_gap; g = &x->prior_group_gap;
+        o = &x->prior_object_gap;
+        break;
+    }
+    default:
+        return;
+    }
+    *hg = *ho = false;
+    *g = *o = 0;
+    if (!props || !s->profile->scan_object_gaps) return;
+    moq_obj_gaps_t gaps;
+    if (s->profile->scan_object_gaps(moq_rcbuf_data(props), moq_rcbuf_len(props),
+                                     &gaps) < 0)
+        return;
+    *hg = gaps.has_group_gap;
+    *g = gaps.group_gap;
+    *ho = gaps.has_object_gap;
+    *o = gaps.object_gap;
 }
 
 moq_result_t push_event(moq_session_t *s, const moq_event_t *e)
 {
     if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
-    s->events[s->event_tail % s->event_cap] = *e;
+    moq_event_t *q = &s->events[s->event_tail % s->event_cap];
+    *q = *e;
+    event_set_gaps(s, q);
     s->event_tail++;
     /* Monotonic event-progress token: advances on every enqueue (here) AND every
      * dequeue (moq_session_poll_events_ex). A caller that services the session on
@@ -914,6 +1192,33 @@ uint8_t *scratch_copy(moq_session_t *s, const uint8_t *data, size_t len)
     if (!p) return NULL;
     memcpy(p, data, len);
     return p;
+}
+
+moq_location_filter_cfg_t *event_location_alloc(moq_session_t *s)
+{
+    if (s->state_location_free == s->state_location_cap) return NULL;
+    size_t index = s->state_location_free;
+    s->state_location_free = s->state_locations[index].next;
+    return &s->state_locations[index].value;
+}
+
+void event_location_release(moq_session_t *s, const moq_location_filter_cfg_t *value)
+{
+    /* value is the first member of a cell reserved from this session's pool. */
+    const moq_state_location_cell_t *cell = (const moq_state_location_cell_t *)value;
+    size_t index = (size_t)(cell - s->state_locations);
+    s->state_locations[index].next = s->state_location_free;
+    s->state_location_free = index;
+}
+
+static void event_location_retire(moq_session_t *s, const moq_location_filter_cfg_t *value)
+{
+    const moq_state_location_cell_t *cell = (const moq_state_location_cell_t *)value;
+    size_t index = (size_t)(cell - s->state_locations);
+    if (s->state_location_retired == s->state_location_cap)
+        s->state_location_retired_tail = index;
+    s->state_locations[index].next = s->state_location_retired;
+    s->state_location_retired = index;
 }
 
 /* -- Event borrow arena --------------------------------------------
@@ -1110,14 +1415,8 @@ moq_event_scratch_verdict_t event_scratch_classify_bytes(
 
 /* -- Send helper --------------------------------------------------- */
 
-moq_result_t queue_send_control(moq_session_t *s,
-                                 const uint8_t *data, size_t len)
+static moq_result_t commit_send_control_tail(moq_session_t *s, size_t len)
 {
-    if (len == 0) return MOQ_OK;
-    if (action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
-    if (len > s->send_cap - s->send_len) return MOQ_ERR_BUFFER;
-    memcpy(s->send_buf + s->send_len, data, len);
-
     moq_action_t a;
     memset(&a, 0, sizeof(a));
     a.kind = MOQ_ACTION_SEND_CONTROL;
@@ -1132,17 +1431,31 @@ moq_result_t queue_send_control(moq_session_t *s,
     return MOQ_OK;
 }
 
+moq_result_t queue_send_control(moq_session_t *s,
+                                 const uint8_t *data, size_t len)
+{
+    if (len == 0) return MOQ_OK;
+    if (action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+    if (len > s->send_cap - s->send_len) return MOQ_ERR_BUFFER;
+    memcpy(s->send_buf + s->send_len, data, len);
+    return commit_send_control_tail(s, len);
+}
+
+moq_result_t queue_send_cancel(moq_session_t *s, const uint8_t *data, size_t len)
+{
+    if (len > s->send_cap) return MOQ_ERR_BUFFER;
+    if (len > s->send_cap - s->send_len) return MOQ_ERR_WOULD_BLOCK;
+    return queue_send_control(s, data, len);
+}
+
 moq_result_t queue_send_bidi(moq_session_t *s, moq_stream_ref_t ref,
                               const uint8_t *data, size_t len, bool fin)
 {
-    /* Once a per-request GOAWAY has been sent on this request bidi the request is
-     * migrating (§10.4): the peer treats the GOAWAY as terminal and closes on any
-     * trailing bytes, so no further control message (SUBSCRIBE_OK / FETCH_OK /
-     * TRACK_STATUS_OK / PUBLISH_DONE / REQUEST_UPDATE / NAMESPACE / PUBLISH_BLOCKED
-     * / …) may be written here. Data streams are unaffected -- they are separate
-     * uni streams, not this action. The GOAWAY itself is queued before its marker
-     * is set, so it is never blocked by this guard. */
-    if (request_goaway_already_sent(s, ref)) return MOQ_ERR_WRONG_STATE;
+    /* A per-request GOAWAY sent on this bidi does not end the request (§10.4:
+     * it "does not impact subscription state"), so what the session still owes
+     * there -- the answer to an update already in flight, a terminal -- is
+     * written after it. Which application operations remain open on a
+     * migrating request is decided by each entry point. */
     if (action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
     /* Distinguish a message that can never fit (permanent failure) from a
      * temporary shortfall in the remaining buffer (retryable): the latter must
@@ -1245,6 +1558,39 @@ void moq_request_goaway_cfg_init(moq_request_goaway_cfg_t *cfg)
     cfg->struct_size = sizeof(moq_request_goaway_cfg_t);
 }
 
+bool session_namespace_reserved(const moq_namespace_t *ns)
+{
+    if (!ns || ns->count == 0 || !ns->parts) return false;
+    const moq_bytes_t *f = &ns->parts[0];
+    if (f->len == 1 && f->data && f->data[0] == '.') return true;
+    return f->len == 8 && f->data && memcmp(f->data, ".session", 8) == 0;
+}
+
+bool session_refuses_request(const moq_session_t *s, const moq_namespace_t *ns,
+                             uint64_t *out_code)
+{
+    if (session_refuses_new_requests(s)) {
+        *out_code = s->profile->going_away_request_error;
+        return true;
+    }
+    if (s->profile->reserved_session_namespaces && session_namespace_reserved(ns)) {
+        *out_code = MOQ_REQUEST_ERROR_DOES_NOT_EXIST;
+        return true;
+    }
+    return false;
+}
+
+void session_retry_owed_stream_actions(moq_session_t *s)
+{
+    drain_ref_retry_owed_stops(s);
+    session_retry_owed_stops(s);
+    sg_retry_owed_resets(s);
+    /* A fill stream's owed RESET or STOP, before the terminal it holds. */
+    fill_service(s);
+    /* A terminal held behind owed stream closures follows them. */
+    session_release_held_dones(s);
+}
+
 moq_result_t session_core_send_request_goaway(
     moq_session_t *s, moq_request_family_t family, int slot,
     const uint8_t *uri, size_t uri_len, uint64_t timeout_ms)
@@ -1274,23 +1620,28 @@ moq_result_t session_core_send_request_goaway(
     switch (family) {
     case MOQ_REQUEST_FAMILY_SUBSCRIBE:
         /* A deferred terminal (done_pending) is logically Terminated: no
-         * control (including a per-request GOAWAY) may follow it. */
+         * control (including a per-request GOAWAY) may follow it. An owed
+         * update answer must precede the GOAWAY, after which nothing more
+         * may be written on the request stream. */
         eligible = s->subs[slot].state == MOQ_SUB_ESTABLISHED &&
-                   !s->subs[slot].done_pending;
-        ref = s->subs[slot].request_stream_ref;
+                   !s->subs[slot].done_pending &&
+                   !s->subs[slot].owed_update.owed;
+        ref = s->subs[slot].rs.ref;
         sent = &s->subs[slot].goaway_sent; break;
     case MOQ_REQUEST_FAMILY_FETCH:
         eligible = s->fetches[slot].state == MOQ_FETCH_ACCEPTED;
-        ref = s->fetches[slot].request_stream_ref;
+        ref = s->fetches[slot].rs.ref;
         sent = &s->fetches[slot].goaway_sent; break;
     case MOQ_REQUEST_FAMILY_PUBLISH:
+        /* As for a subscription: an owed update answer comes first. */
         eligible = s->publishes[slot].state == MOQ_PUB_ESTABLISHED &&
-                   !s->publishes[slot].done_pending;
-        ref = s->publishes[slot].request_stream_ref;
+                   !s->publishes[slot].done_pending &&
+                   !s->publishes[slot].owed_update.owed;
+        ref = s->publishes[slot].rs.ref;
         sent = &s->publishes[slot].goaway_sent; break;
     case MOQ_REQUEST_FAMILY_ANNOUNCEMENT:
         eligible = s->announcements[slot].state == MOQ_ANN_ESTABLISHED;
-        ref = s->announcements[slot].request_stream_ref;
+        ref = s->announcements[slot].rs.ref;
         sent = &s->announcements[slot].goaway_sent; break;
     case MOQ_REQUEST_FAMILY_NS_SUB:
         eligible = s->ns_subs[slot].state == MOQ_NS_SUB_ESTABLISHED;
@@ -1298,13 +1649,13 @@ moq_result_t session_core_send_request_goaway(
         sent = &s->ns_subs[slot].goaway_sent; break;
     case MOQ_REQUEST_FAMILY_SUBSCRIBE_TRACKS:
         eligible = s->track_subs[slot].state == MOQ_TRACK_SUB_ESTABLISHED;
-        ref = s->track_subs[slot].request_stream_ref;
+        ref = s->track_subs[slot].rs.ref;
         sent = &s->track_subs[slot].goaway_sent; break;
     case MOQ_REQUEST_FAMILY_TRACK_STATUS:
         /* The requester opened the bidi with FIN; only the responder's send half
          * is still open, so only it may migrate (before answering). */
         eligible = s->track_statuses[slot].state == MOQ_TS_PENDING_PUBLISHER;
-        ref = s->track_statuses[slot].request_stream_ref;
+        ref = s->track_statuses[slot].rs.ref;
         sent = &s->track_statuses[slot].goaway_sent; break;
     default:
         return MOQ_ERR_INVAL;
@@ -1330,6 +1681,11 @@ moq_result_t session_core_send_request_goaway(
     s->output_scratch_len = scratch_saved;
     if (rc < 0) return rc;
     *sent = true;
+    /* A namespace subscription's publisher side keeps the request it parsed
+     * in its receive buffer; from here that buffer collects what the
+     * subscriber still sends on the migrating stream. */
+    if (family == MOQ_REQUEST_FAMILY_NS_SUB && !s->ns_subs[slot].local_subscriber)
+        s->ns_subs[slot].recv_len = 0;
     return MOQ_OK;
 }
 
@@ -1368,6 +1724,29 @@ moq_result_t queue_open_uni_control(moq_session_t *s, moq_stream_ref_t ref,
     moq_result_t rc = push_action(s, &a);
     if (rc < 0) return rc;
 
+    s->send_len += len;
+    return MOQ_OK;
+}
+
+/* Queue an OPEN_UNI_CONTROL for `len` bytes a caller has already written at
+ * send_buf + send_len. The caller has checked that they fit; the cursor
+ * advances only when the action is queued, so a refusal leaves the arena
+ * exactly as it was and the bytes are rewritten on retry. */
+moq_result_t queue_open_uni_control_in_place(moq_session_t *s,
+                                             moq_stream_ref_t ref, size_t len)
+{
+    if (len == 0) return MOQ_OK;
+    if (action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+    moq_action_t a;
+    memset(&a, 0, sizeof(a));
+    a.kind = MOQ_ACTION_OPEN_UNI_CONTROL;
+    a.detail_size = (uint32_t)sizeof(moq_open_uni_control_action_t);
+    a.borrow_epoch = s->borrow_epoch;
+    a.u.open_uni_control.stream_ref = ref;
+    a.u.open_uni_control.data = s->send_buf + s->send_len;
+    a.u.open_uni_control.len  = len;
+    moq_result_t rc = push_action(s, &a);
+    if (rc < 0) return rc;
     s->send_len += len;
     return MOQ_OK;
 }
@@ -1439,9 +1818,14 @@ moq_result_t close_with_error(moq_session_t *s,
      * "the terminal event is in the queue", not "a close was attempted". Both
      * queues were just cleared above, so this cannot block today -- checking the
      * result keeps the fact honest if that ever changes. Monotonic: an already
-     * true fact stays true. */
+     * true fact stays true. The session's terminal outranks a slot a request
+     * operation holds for its own terminal: that operation is unwinding
+     * inside this close and emits nothing once it sees the session closed. */
+    size_t held = s->event_reserve;
+    s->event_reserve = 0;
     if (push_event(s, &e) == MOQ_OK)
         s->terminal_enqueued = true;
+    s->event_reserve = held;
     return MOQ_OK;
 }
 
@@ -1488,7 +1872,13 @@ static moq_result_t handle_tick(moq_session_t *s)
                                 "GOAWAY drain timeout");
     }
 
-    /* Subgroup delivery timeout: reset expired subgroups. */
+    /* Object delivery timeout: drop expired queued objects, resetting their
+     * streams. */
+    session_expire_queued_data(s);
+
+    /* Subgroup delivery timeout: reset expired subgroups. A CLOSING entry
+     * whose deadline is armed is one whose FIN-started timer ran out before
+     * the transport reported the stream committed. */
     if (s->subgroup_deadline_us != UINT64_MAX &&
         s->last_now_us >= s->subgroup_deadline_us) {
         for (size_t i = 0; i < s->sg_cap; i++) {
@@ -1496,8 +1886,7 @@ static moq_result_t handle_tick(moq_session_t *s)
             if (sg->state == MOQ_SG_FREE) continue;
             if (sg->delivery_deadline_us == UINT64_MAX) continue;
             if (s->last_now_us < sg->delivery_deadline_us) continue;
-            if (sg->state == MOQ_SG_CLOSING ||
-                sg->state == MOQ_SG_RESETTING) {
+            if (sg->state == MOQ_SG_RESETTING) {
                 sg->delivery_deadline_us = UINT64_MAX;
                 continue;
             }
@@ -1519,6 +1908,7 @@ static moq_result_t handle_tick(moq_session_t *s)
             a.borrow_epoch = s->borrow_epoch;
             a.u.reset_data.stream_ref = sg->stream_ref;
             a.u.reset_data.error_code = MOQ_RESET_DELIVERY_TIMEOUT;
+            a.u.reset_data.reliable_size = sg->header_len;
             moq_result_t arc = push_action(s, &a);
             if (arc < 0) {
                 sg_recompute_deadline(s);
@@ -1529,6 +1919,7 @@ static moq_result_t handle_tick(moq_session_t *s)
             sg->state = MOQ_SG_RESETTING;
             sg->streaming_payload_len = 0;
             sg->streaming_bytes_written = 0;
+            sg->streaming_deadline_us = UINT64_MAX;
             sg->delivery_deadline_us = UINT64_MAX;
         }
         sg_recompute_deadline(s);
@@ -1547,6 +1938,8 @@ static void staged_slot_free(moq_session_t *s, size_t i)
     moq_staged_datagram_t *e = &s->staged_dg[i];
     if (!e->in_use) return;
     if (e->bytes) s->alloc.free(e->bytes, e->len, s->alloc.ctx);
+    if (e->payload) moq_rcbuf_decref(e->payload);
+    if (e->properties) moq_rcbuf_decref(e->properties);
     if (e->len <= s->staged_bytes) s->staged_bytes -= e->len;
     else                           s->staged_bytes = 0;
     *e = (moq_staged_datagram_t){0};
@@ -1560,6 +1953,8 @@ static void staged_clear(moq_session_t *s)
     for (size_t i = 0; i < s->staged_cap; i++) staged_slot_free(s, i);
 }
 
+static bool staged_held_ready(moq_session_t *s, const moq_staged_datagram_t *e);
+
 /* Free only held datagrams whose alias is NOT established. An established
  * alias's held data is still deliverable (merely stuck under event-queue
  * pressure) and must not be dropped just because no subscription is pending. */
@@ -1570,8 +1965,14 @@ static void staged_clear_unresolved(moq_session_t *s)
 #ifdef MOQ_SESSION_SWEEP_TESTING
         session_work_staged_probes++;
 #endif
-        if (s->staged_dg[i].in_use &&
-            sub_find_by_alias_subscriber(s, s->staged_dg[i].alias) < 0)
+        if (!s->staged_dg[i].in_use) continue;
+        if (moq_subscription_is_valid(s->staged_dg[i].for_sub)) {
+            /* Held for a subscription that has its answer by now: kept only
+             * while that answer can still surface it. */
+            if (!staged_held_ready(s, &s->staged_dg[i])) staged_slot_free(s, i);
+            continue;
+        }
+        if (sub_find_by_alias_subscriber(s, s->staged_dg[i].alias) < 0)
             staged_slot_free(s, i);
     }
 }
@@ -1601,6 +2002,135 @@ static void staged_evict_oldest(moq_session_t *s)
         staged_slot_free(s, best);
         s->staged_dropped++;
     }
+}
+
+/* A free slot in the held ring for `len` more bytes, evicting the oldest
+ * entries as needed; staged_cap when there is none (counted as a drop). */
+static size_t staged_take_slot(moq_session_t *s, size_t len)
+{
+    if (s->staged_cap == 0 || len > s->staged_bytes_cap) { s->staged_dropped++; return s->staged_cap; }
+    if (!s->staged_dg) {
+        size_t sz = s->staged_cap * sizeof(*s->staged_dg);
+        s->staged_dg = (moq_staged_datagram_t *)s->alloc.alloc(sz, s->alloc.ctx);
+        if (!s->staged_dg) { s->staged_dropped++; return s->staged_cap; }
+        memset(s->staged_dg, 0, sz);
+    }
+    while (s->staged_count > 0 && s->staged_bytes + len > s->staged_bytes_cap)
+        staged_evict_oldest(s);
+    size_t slot = s->staged_cap;
+    for (size_t i = 0; i < s->staged_cap; i++)
+        if (!s->staged_dg[i].in_use) { slot = i; break; }
+    if (slot == s->staged_cap) { staged_evict_oldest(s);
+        for (size_t i = 0; i < s->staged_cap; i++)
+            if (!s->staged_dg[i].in_use) { slot = i; break; }
+    }
+    if (slot == s->staged_cap) s->staged_dropped++;
+    return slot;
+}
+
+moq_request_error_encode_args_t session_capacity_request_error(
+    const moq_session_t *s, uint64_t request_id, const char *reason,
+    size_t reason_len)
+{
+    moq_request_error_encode_args_t a;
+    memset(&a, 0, sizeof(a));
+    a.request_id = request_id;
+    a.error_code = s->profile->capacity_request_error;
+    a.can_retry = s->profile->capacity_request_error_retryable;
+    a.retry_after_ms = 0;
+    a.reason = (const uint8_t *)reason;
+    a.reason_len = reason_len;
+    return a;
+}
+
+void session_stage_held_object(moq_session_t *s, moq_subscription_t for_sub,
+                               uint64_t alias, const moq_held_object_t *o)
+{
+    size_t plen = o->payload ? moq_rcbuf_len(o->payload) : 0;
+    size_t elen = o->properties ? moq_rcbuf_len(o->properties) : 0;
+    if (elen > SIZE_MAX - plen) { s->staged_dropped++; return; }
+    size_t slot = staged_take_slot(s, plen + elen);
+    if (slot == s->staged_cap) return;
+    s->staged_dg[slot] = (moq_staged_datagram_t){
+        .in_use = true, .seq = s->staged_next_seq++, .alias = alias,
+        .len = plen + elen, .for_sub = for_sub,
+        .group_id = o->group_id, .subgroup_id = o->subgroup_id,
+        .object_id = o->object_id, .publisher_priority = o->publisher_priority,
+        .status = o->status, .end_of_group = o->end_of_group,
+        .datagram = o->datagram,
+        .default_priority = o->default_priority,
+        .first_object = o->first_object,
+        .subgroup_properties = o->subgroup_properties,
+        .payload = o->payload ? moq_rcbuf_incref(o->payload) : NULL,
+        .properties = o->properties ? moq_rcbuf_incref(o->properties) : NULL };
+    s->staged_count++;
+    s->staged_bytes += plen + elen;
+}
+
+void session_settle_pending(moq_session_t *s, moq_subscription_t sub,
+                            bool established, uint64_t alias)
+{
+    if (!s->profile->allows_concurrent_subscriptions) return;
+    if (s->staged_dg) {
+        for (size_t i = 0; i < s->staged_cap; i++) {
+            moq_staged_datagram_t *e = &s->staged_dg[i];
+            if (!e->in_use || !moq_subscription_is_valid(e->for_sub) ||
+                !moq_subscription_eq(e->for_sub, sub))
+                continue;
+            if (!established || e->alias != alias) staged_slot_free(s, i);
+        }
+    }
+    rx_settle_pending(s, sub, established, alias);
+}
+
+/* An object held for a subscription that is now established under the
+ * entry's alias: surfaced if the subscription's own filter accepts it,
+ * dropped otherwise. WOULD_BLOCK keeps it held. */
+static moq_result_t staged_deliver_held(moq_session_t *s, size_t i)
+{
+    moq_staged_datagram_t *e = &s->staged_dg[i];
+    int slot = sub_resolve_handle(s, e->for_sub);
+    if (slot < 0 || !sub_accepts_object(&s->subs[slot], e->group_id, e->object_id)) {
+        staged_slot_free(s, i);
+        return MOQ_OK;
+    }
+    if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+    moq_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.kind = MOQ_EVENT_OBJECT_RECEIVED;
+    ev.detail_size = (uint32_t)sizeof(moq_object_received_event_t);
+    ev.borrow_epoch = s->borrow_epoch;
+    moq_object_received_event_t *o = &ev.u.object_received;
+    o->sub = e->for_sub;
+    o->group_id = e->group_id;
+    o->subgroup_id = e->subgroup_id;
+    o->object_id = e->object_id;
+    o->publisher_priority = session_resolve_publisher_priority(s, e->for_sub,
+        MOQ_PUBLICATION_INVALID, e->default_priority, e->publisher_priority);
+    o->status = (moq_object_status_t)e->status;
+    o->end_of_group = e->end_of_group;
+    o->datagram = e->datagram;
+    o->first_object = e->first_object;
+    o->subgroup_properties = e->subgroup_properties;
+    o->payload = e->payload;
+    o->properties = e->properties;
+    moq_result_t rc = push_event(s, &ev);
+    if (rc < 0) return rc;
+    /* The references moved to the event, and with them the budget share the
+     * poll releases. */
+    s->recv_payload_bytes += e->len;
+    e->payload = NULL;
+    e->properties = NULL;
+    staged_slot_free(s, i);
+    return MOQ_OK;
+}
+
+static bool staged_held_ready(moq_session_t *s, const moq_staged_datagram_t *e)
+{
+    int slot = sub_resolve_handle(s, e->for_sub);
+    return slot >= 0 && s->subs[slot].state == MOQ_SUB_ESTABLISHED &&
+           s->subs[slot].role == MOQ_SUB_ROLE_SUBSCRIBER &&
+           s->subs[slot].track_alias == e->alias;
 }
 
 /* Copy a datagram for later replay once its alias is established. Bounded by
@@ -1698,10 +2228,16 @@ static void staged_replay(moq_session_t *s, uint64_t only_alias)
             moq_staged_datagram_t *e = &s->staged_dg[i];
             if (!e->in_use) continue;
             if (only_alias != UINT64_MAX && e->alias != only_alias) continue;
-            if (sub_find_by_alias_subscriber(s, e->alias) < 0) continue;
+            if (moq_subscription_is_valid(e->for_sub)) {
+                if (!staged_held_ready(s, e)) continue;
+            } else if (sub_find_by_alias_subscriber(s, e->alias) < 0) continue;
             if (e->seq < best_seq) { best = i; best_seq = e->seq; }
         }
         if (best == s->staged_cap) break;
+        if (moq_subscription_is_valid(s->staged_dg[best].for_sub)) {
+            if (staged_deliver_held(s, best) == MOQ_ERR_WOULD_BLOCK) break;
+            continue;
+        }
         moq_result_t rc = deliver_datagram(s, s->staged_dg[best].bytes,
                                            s->staged_dg[best].len, false);
         if (rc == MOQ_ERR_WOULD_BLOCK) break;   /* no capacity; retry later */
@@ -1832,6 +2368,15 @@ void moq_event_cleanup(moq_event_t *event)
             moq_rcbuf_decref(event->u.fetch_object.properties);
             event->u.fetch_object.properties = NULL;
         }
+    } else if (event->kind == MOQ_EVENT_FILL_OBJECT) {
+        if (event->u.fill_object.payload) {
+            moq_rcbuf_decref(event->u.fill_object.payload);
+            event->u.fill_object.payload = NULL;
+        }
+        if (event->u.fill_object.properties) {
+            moq_rcbuf_decref(event->u.fill_object.properties);
+            event->u.fill_object.properties = NULL;
+        }
     } else if (event->kind == MOQ_EVENT_OBJECT_CHUNK) {
         if (event->u.object_chunk.chunk) {
             moq_rcbuf_decref(event->u.object_chunk.chunk);
@@ -1937,8 +2482,11 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
         sizeof(cfg->setup_auth_token_count) && cfg->setup_auth_token_count > 0) {
         setup_tokens_in = cfg->setup_auth_tokens;
         setup_token_count = cfg->setup_auth_token_count;
+        /* Shape here; the Token Type width is the profile's, checked once
+         * the version is resolved below. */
         if (setup_token_count > MOQ_DECODED_MAX_TOKENS ||
-            moq_validate_auth_tokens(setup_tokens_in, setup_token_count) < 0)
+            moq_validate_auth_tokens(setup_tokens_in, setup_token_count,
+                                     UINT64_MAX) < 0)
             return MOQ_ERR_INVAL;
         for (size_t i = 0; i < setup_token_count; i++) {
             if (setup_tokens_in[i].token_value.len > UINT16_MAX)
@@ -2028,6 +2576,23 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
     if (!track_sub_cap)  track_sub_cap = MOQ_DEFAULT_MAX_TRACK_SUBS;
     if (track_sub_cap > 0xFFFF) return MOQ_ERR_INVAL;
 
+    bool defer_subscription_updates = false;
+    if (cfg->struct_size >=
+        offsetof(moq_session_cfg_t, defer_subscription_updates) +
+        sizeof(cfg->defer_subscription_updates))
+        defer_subscription_updates = cfg->defer_subscription_updates;
+    bool defer_fetch_ranges = false;
+    if (cfg->struct_size >=
+        offsetof(moq_session_cfg_t, defer_fetch_ranges) +
+        sizeof(cfg->defer_fetch_ranges))
+        defer_fetch_ranges = cfg->defer_fetch_ranges;
+
+    /* Fill children: separately allocated below. The slot is 16 bits wide. */
+    size_t fill_cap = cfg_read_u32(cfg,
+        offsetof(moq_session_cfg_t, max_fills), sizeof(cfg->max_fills));
+    if (!fill_cap)    fill_cap = MOQ_DEFAULT_MAX_FILLS;
+    if (fill_cap > 0x10000) return MOQ_ERR_INVAL;
+
     /* Track-largest history registry: default covers one record per
      * subscription + publish + track-status entry (each is a merge source
      * and reserves a record at establishment). Separately allocated below.
@@ -2057,6 +2622,9 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
     }
     const moq_profile_ops_t *profile = moq_profile_lookup(version);
     if (!profile) return MOQ_ERR_INVAL;
+    if (moq_validate_auth_tokens(setup_tokens_in, setup_token_count,
+                                 profile->auth_token_type_max) < 0)
+        return MOQ_ERR_INVAL;
 
 #define ALIGN_UP(x, a) (((x) + (a) - 1) & ~((a) - 1))
 
@@ -2074,9 +2642,16 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
 
     size_t off_actions = ALIGN_UP(sizeof(moq_session_t), act_align);
     size_t act_bytes   = action_cap * sizeof(moq_action_t);
-    size_t off_events  = ALIGN_UP(off_actions + act_bytes, evt_align);
+    size_t off_action_meta = ALIGN_UP(off_actions + act_bytes,
+                                      _Alignof(moq_action_meta_t));
+    size_t action_meta_bytes = action_cap * sizeof(moq_action_meta_t);
+    size_t off_events  = ALIGN_UP(off_action_meta + action_meta_bytes, evt_align);
     size_t evt_bytes   = event_cap * sizeof(moq_event_t);
-    size_t off_send    = off_events + evt_bytes;
+    size_t location_cap = profile->encode_publish_state_notify ? event_cap : 0;
+    size_t location_bytes = location_cap * sizeof(moq_state_location_cell_t);
+    size_t off_locations = ALIGN_UP(off_events + evt_bytes,
+                                     _Alignof(moq_state_location_cell_t));
+    size_t off_send    = off_locations + location_bytes;
     size_t off_recv    = off_send + send_cap;
     size_t off_subs    = ALIGN_UP(off_recv + recv_cap, sub_align);
     size_t sub_bytes   = sub_cap * sizeof(moq_sub_entry_t);
@@ -2134,14 +2709,18 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
     size_t drain_ref_cap = sub_cap + fetch_cap + ann_cap + ns_sub_cap + ts_cap +
                            track_sub_cap + pub_cap;
     size_t drain_ref_bytes = drain_ref_cap * sizeof(uint64_t);
-    /* Parallel per-drain-ref reason byte (NORMAL absorb vs GOAWAY-strict). */
+    /* Parallel per-drain-ref reason byte (NORMAL absorb vs GOAWAY-received). */
     size_t off_drain_reason = off_drain_ref + drain_ref_bytes;
     size_t drain_reason_bytes = drain_ref_cap * sizeof(uint8_t);
+    /* Parallel framing state of a GOAWAY-received drain ref. */
+    size_t off_drain_scan = ALIGN_UP(off_drain_reason + drain_reason_bytes,
+                                     _Alignof(moq_drain_scan_t));
+    size_t drain_scan_bytes = drain_ref_cap * sizeof(moq_drain_scan_t);
     size_t idx_sub_cap = moq_index_cap_for(sub_cap * 2 + ann_cap + fetch_cap + pub_cap + ts_cap + ns_sub_cap + track_sub_cap);
     size_t idx_rx_cap  = moq_index_cap_for(rx_cap);
     size_t idx_ns_cap  = moq_index_cap_for(ns_sub_cap);
     const size_t idx_align = _Alignof(moq_index_entry_t);
-    size_t off_idx_sub = ALIGN_UP(off_drain_reason + drain_reason_bytes, idx_align);
+    size_t off_idx_sub = ALIGN_UP(off_drain_scan + drain_scan_bytes, idx_align);
     size_t idx_sub_bytes = idx_sub_cap * sizeof(moq_index_entry_t);
     size_t off_idx_rx  = ALIGN_UP(off_idx_sub + idx_sub_bytes, idx_align);
     size_t idx_rx_bytes = idx_rx_cap * sizeof(moq_index_entry_t);
@@ -2250,7 +2829,10 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
      * otherwise the layout discipline is incomplete and a bad cap could silently
      * under-size a region. */
     if (act_bytes / sizeof(moq_action_t) != action_cap ||
+        action_meta_bytes / sizeof(moq_action_meta_t) != action_cap ||
+        off_action_meta < off_actions ||
         evt_bytes / sizeof(moq_event_t)  != event_cap  ||
+        location_bytes / sizeof(moq_state_location_cell_t) != location_cap ||
         sub_bytes / sizeof(moq_sub_entry_t) != sub_cap ||
         ann_bytes / sizeof(moq_ann_entry_t) != ann_cap ||
         fetch_bytes / sizeof(moq_fetch_entry_t) != fetch_cap ||
@@ -2264,6 +2846,7 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
         fetch_cancel_tomb_bytes / sizeof(uint64_t) != fetch_cancel_tomb_cap ||
         fetch_abort_tomb_bytes / sizeof(uint64_t) != fetch_abort_tomb_cap ||
         drain_ref_bytes / sizeof(uint64_t) != drain_ref_cap ||
+        drain_scan_bytes / sizeof(moq_drain_scan_t) != drain_ref_cap ||
         off_fetch_cancel_tomb < off_unsub_tomb ||
         off_fetch_abort_tomb < off_fetch_cancel_tomb ||
         off_drain_ref < off_fetch_abort_tomb ||
@@ -2271,7 +2854,8 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
         track_sub_bytes / sizeof(moq_track_sub_entry_t) != track_sub_cap ||
         idx_reqref_bytes / sizeof(moq_index_entry_t) != idx_reqref_cap ||
         idx_sub_alias_bytes / sizeof(moq_index_entry_t) != idx_sub_alias_cap ||
-        off_events < off_actions || off_send < off_events ||
+        off_events < off_action_meta || off_locations < off_events ||
+        off_send < off_locations ||
         off_recv < off_send || off_subs < off_recv + recv_cap ||
         off_ann < off_subs || off_fetch < off_ann || off_pub < off_fetch ||
         off_ts < off_pub ||
@@ -2317,9 +2901,17 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
     s->borrow_epoch = 1;
 
     s->actions    = (moq_action_t *)(mem + off_actions);
+    s->action_meta = (moq_action_meta_t *)(mem + off_action_meta);
     s->action_cap = action_cap;
     s->events     = (moq_event_t *)(mem + off_events);
     s->event_cap  = event_cap;
+    s->state_locations = location_cap ? (moq_state_location_cell_t *)(mem + off_locations) : NULL;
+    s->state_location_cap = location_cap;
+    s->state_location_free = 0;
+    s->state_location_retired = location_cap;
+    s->state_location_retired_tail = location_cap;
+    for (size_t i = 0; i < location_cap; ++i)
+        s->state_locations[i].next = i + 1;
     s->send_buf   = mem + off_send;
     s->send_cap   = send_cap;
     s->recv_buf   = mem + off_recv;
@@ -2364,6 +2956,7 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
     s->fetch_abort_tomb_cap  = fetch_abort_tomb_cap;
     s->drain_refs         = (uint64_t *)(mem + off_drain_ref);
     s->drain_ref_reasons  = (uint8_t *)(mem + off_drain_reason);
+    s->drain_ref_scans    = (moq_drain_scan_t *)(mem + off_drain_scan);
     s->drain_ref_cap      = drain_ref_cap;
     s->idx_req_by_rid     = (moq_index_entry_t *)(mem + off_idx_sub);
     s->idx_req_mask       = idx_sub_cap - 1;
@@ -2393,35 +2986,35 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
         s->ns_subs[i].recv_cap = ns_sub_recv_cap;
     }
     for (size_t i = 0; i < sub_cap; i++) {
-        s->subs[i].req_recv_buf = mem + off_sub_req_recv + i * sub_req_recv_cap;
-        s->subs[i].req_recv_cap = sub_req_recv_cap;
+        s->subs[i].rs.recv_buf = mem + off_sub_req_recv + i * sub_req_recv_cap;
+        s->subs[i].rs.recv_cap = sub_req_recv_cap;
     }
     for (size_t i = 0; i < fetch_cap; i++) {
-        s->fetches[i].req_recv_buf =
+        s->fetches[i].rs.recv_buf =
             mem + off_fetch_req_recv + i * fetch_req_recv_cap;
-        s->fetches[i].req_recv_cap = fetch_req_recv_cap;
+        s->fetches[i].rs.recv_cap = fetch_req_recv_cap;
     }
     for (size_t i = 0; i < ann_cap; i++) {
-        s->announcements[i].req_recv_buf =
+        s->announcements[i].rs.recv_buf =
             mem + off_ann_req_recv + i * ann_req_recv_cap;
-        s->announcements[i].req_recv_cap = ann_req_recv_cap;
+        s->announcements[i].rs.recv_cap = ann_req_recv_cap;
     }
     for (size_t i = 0; i < ts_cap; i++) {
-        s->track_statuses[i].req_recv_buf =
+        s->track_statuses[i].rs.recv_buf =
             mem + off_ts_req_recv + i * ts_req_recv_cap;
-        s->track_statuses[i].req_recv_cap = ts_req_recv_cap;
+        s->track_statuses[i].rs.recv_cap = ts_req_recv_cap;
     }
     s->track_subs     = (moq_track_sub_entry_t *)(mem + off_track_sub);
     s->track_sub_cap  = track_sub_cap;
     for (size_t i = 0; i < track_sub_cap; i++) {
-        s->track_subs[i].req_recv_buf =
+        s->track_subs[i].rs.recv_buf =
             mem + off_track_sub_recv + i * track_sub_recv_cap;
-        s->track_subs[i].req_recv_cap = track_sub_recv_cap;
+        s->track_subs[i].rs.recv_cap = track_sub_recv_cap;
     }
     for (size_t i = 0; i < pub_cap; i++) {
-        s->publishes[i].req_recv_buf =
+        s->publishes[i].rs.recv_buf =
             mem + off_pub_req_recv + i * pub_req_recv_cap;
-        s->publishes[i].req_recv_cap = pub_req_recv_cap;
+        s->publishes[i].rs.recv_cap = pub_req_recv_cap;
     }
     /*
      * The occupancy lists start EMPTY. -1 is written explicitly because the
@@ -2519,6 +3112,8 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
 
     s->send_auth_token_cache_size = send_auth_token_cache_size;
     s->auth_token_cache_size = auth_token_cache_size;
+    s->defer_subscription_updates = defer_subscription_updates;
+    s->defer_fetch_ranges = defer_fetch_ranges;
     {
         size_t cache_max = (size_t)auth_token_cache_size;
         size_t cache_entries;
@@ -2558,6 +3153,17 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
         memset(s->track_hist, 0, th_bytes);
     }
 
+    {
+        moq_result_t frc = fill_pool_init(s, fill_cap);
+        if (frc < 0) {
+            track_hist_destroy(s);
+            moq_token_cache_free(&s->peer_token_cache);
+            profile->destroy(s->profile_state);
+            session_release_block(s, total);
+            return frc;
+        }
+    }
+
     /* The SETUP carrying configured tokens is encoded once here, with every
      * other option this side sends, into a buffer as large as the SETUP
      * message length allows: a configuration whose SETUP cannot be encoded
@@ -2588,6 +3194,12 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
 void moq_session_destroy(moq_session_t *s)
 {
     if (!s) return;
+    moq_binding_destroy(s);
+    if (s->peer_implementation)
+        s->alloc.free(s->peer_implementation, s->peer_implementation_len,
+                      s->alloc.ctx);
+    s->peer_implementation = NULL;
+    s->peer_implementation_len = 0;
     session_sweep_discard(s);
     if (s->profile && s->profile_state)
         s->profile->destroy(s->profile_state);
@@ -2596,6 +3208,8 @@ void moq_session_destroy(moq_session_t *s)
     free_rx_stream_bufs(s);
     free_staged_datagrams(s);
     track_hist_destroy(s);
+    mt_destroy_all(s);
+    fill_pool_destroy(s);
     moq_token_cache_free(&s->peer_token_cache);
     for (size_t i = 0; i < s->sub_cap; i++) {
         if (s->subs[i].track_id_buf)
@@ -2606,13 +3220,17 @@ void moq_session_destroy(moq_session_t *s)
         if (s->subs[i].done_reason_buf)
             s->alloc.free(s->subs[i].done_reason_buf,
                           s->subs[i].done_reason_len, s->alloc.ctx);
+        /* An update answer still owed holds the older covered ids. */
+        session_owed_update_clear(s, &s->subs[i].owed_update);
     }
-    /* Same for a publication whose gated done never finalized (the normal
-     * path frees it in pub_free_entry). */
+    /* Same for a publication: the reason copy of a gated done that never
+     * finalized, and the ids of an owed update answer (the normal path frees
+     * both in pub_free_entry). */
     for (size_t i = 0; i < s->pub_cap; i++) {
         if (s->publishes[i].done_reason_buf)
             s->alloc.free(s->publishes[i].done_reason_buf,
                           s->publishes[i].done_reason_len, s->alloc.ctx);
+        session_owed_update_clear(s, &s->publishes[i].owed_update);
     }
     /* Track-status entries own a canonical track-name key that is
      * freed in ts_free_entry on the normal path; free any still-live one here on
@@ -2628,6 +3246,7 @@ void moq_session_destroy(moq_session_t *s)
             s->alloc.free(s->announcements[i].ns_id_buf,
                           s->announcements[i].ns_id_len,
                           s->alloc.ctx);
+        ns_update_release(s, &s->announcements[i].update);
     }
     /* A buffered or released-but-unaccepted Joining FETCH (§10.12.2) owns deep-copied
      * auth-token values until the fetch entry is freed; release them on teardown. */
@@ -2635,6 +3254,11 @@ void moq_session_destroy(moq_session_t *s)
         if (s->fetches[i].join_token_count > 0)
             process_auth_tokens_free_staging(s, s->fetches[i].join_tokens,
                 s->fetches[i].join_token_staged, s->fetches[i].join_token_count);
+        /* A fetcher-role entry owns its Track key (freed in fetch_free_entry
+         * on the normal path). */
+        if (s->fetches[i].track_key)
+            s->alloc.free(s->fetches[i].track_key, s->fetches[i].track_key_len,
+                          s->alloc.ctx);
     }
     ns_sub_destroy_all(s);
     track_sub_destroy_all(s);
@@ -2693,12 +3317,15 @@ moq_result_t moq_session_process_pending(moq_session_t *s, uint64_t now_us)
 }
 
 /* Draft-neutral inbound-GOAWAY handling shared by all profiles: copy the
- * (already-decoded) New Session URI, enter DRAINING, arm the drain deadline, and
- * surface MOQ_EVENT_GOAWAY. The profile owns the wire decode and the pre-decode
+ * (already-decoded) New Session URI, enter DRAINING and surface
+ * MOQ_EVENT_GOAWAY. No drain deadline is armed on receipt: the GOAWAY_TIMEOUT
+ * close belongs to the GOAWAY's sender, and a deadline this side armed by
+ * sending its own GOAWAY is kept. The profile owns the wire decode and the pre-decode
  * active/duplicate checks; this owns the state transition and the event. A
  * server receiving a non-empty URI is a protocol violation (§10.4). */
 moq_result_t session_core_on_goaway(moq_session_t *s,
-                                    const uint8_t *uri, size_t uri_len)
+                                    const uint8_t *uri, size_t uri_len,
+                                    bool has_timeout, uint64_t timeout_ms)
 {
     if (s->perspective == MOQ_PERSPECTIVE_SERVER && uri_len > 0)
         return close_with_error(s, 0x3, "GOAWAY with URI to server");
@@ -2727,11 +3354,15 @@ moq_result_t session_core_on_goaway(moq_session_t *s,
                 "internal: event scratch preflight mismatch");
     }
 
+    /* The receiver arms no drain deadline: GOAWAY_TIMEOUT is the sender's
+     * close code (draft-22 §9.2: "the sender closes the session with
+     * GOAWAY_TIMEOUT after the indicated timeout"; draft-18 §10.4 says the
+     * same, draft-16 §3.5 "The server closes the session with a
+     * GOAWAY_TIMEOUT if the client doesn't close the session quickly
+     * enough"). goaway_timeout_us bounds only a GOAWAY this side sends. */
     s->goaway_received = true;
     if (s->state == MOQ_SESS_ESTABLISHED)
         s->state = MOQ_SESS_DRAINING;
-    if (s->goaway_timeout_us > 0 && s->goaway_deadline_us == UINT64_MAX)
-        s->goaway_deadline_us = deadline_add(s->last_now_us, s->goaway_timeout_us);
 
     moq_event_t e;
     memset(&e, 0, sizeof(e));
@@ -2742,6 +3373,8 @@ moq_result_t session_core_on_goaway(moq_session_t *s,
         e.u.goaway.new_session_uri.data = uri_copy;
         e.u.goaway.new_session_uri.len = uri_len;
     }
+    e.u.goaway.has_timeout = has_timeout;
+    e.u.goaway.timeout_ms = has_timeout ? timeout_ms : 0;
     return push_event(s, &e);
 }
 
@@ -2804,7 +3437,7 @@ static bool redirect_event_scratch_requirement_fits(
  * recycles. The two answers can differ by more than the occupied bytes, since
  * the namespace array's padding depends on where the earlier regions leave the
  * cursor. */
-static moq_event_scratch_verdict_t redirect_event_scratch_classify(
+moq_event_scratch_verdict_t redirect_event_scratch_classify(
     const moq_session_t *s, const moq_decoded_redirect_t *rd, size_t reason_len)
 {
     if (!redirect_event_scratch_requirement_fits(s, rd, reason_len, 0))
@@ -2900,14 +3533,18 @@ moq_result_t moq_session_goaway(moq_session_t *s,
     if (s->perspective == MOQ_PERSPECTIVE_CLIENT && uri_len > 0)
         return MOQ_ERR_INVAL;
 
-    uint8_t buf[8224];
     moq_buf_writer_t w;
-    moq_buf_writer_init(&w, buf, sizeof(buf));
+    moq_buf_writer_init(&w, s->send_buf + s->send_len,
+                         s->send_cap - s->send_len);
     moq_goaway_encode_args_t ga = { .uri = uri, .uri_len = uri_len };
     moq_result_t rc = s->profile->encode_goaway(s, &w, &ga);
-    if (rc < 0) return rc;
+    if (rc < 0) {
+        /* Argument validation precedes queue refusal; a valid message that
+         * cannot fit still observes the original queue-before-capacity order. */
+        return rc == MOQ_ERR_BUFFER && action_queue_full(s) ? MOQ_ERR_WOULD_BLOCK : rc;
+    }
 
-    rc = queue_send_control(s, buf, moq_buf_writer_offset(&w));
+    rc = commit_send_control_tail(s, moq_buf_writer_offset(&w));
     if (rc < 0) return rc;
 
     s->goaway_sent = true;
@@ -3031,6 +3668,7 @@ moq_result_t moq_session_on_data_rcbuf(moq_session_t *s,
                                        uint64_t now_us)
 {
     if (!s) return MOQ_ERR_INVAL;
+    if (moq_binding_required_unbound(s)) return MOQ_ERR_WRONG_STATE;
     session_begin_advance(s, now_us);
     if (session_idle_expired(s))
         return close_with_error(s, MOQ_CLOSE_IDLE_TIMEOUT, "idle timeout");
@@ -3102,7 +3740,7 @@ bool moq_session_has_transport_stream(const moq_session_t *s, moq_stream_ref_t r
     if (!s) return false;
     if (moq_index_find(s->idx_rx_by_ref, s->idx_rx_mask, ref._v) >= 0)
         return true;
-    /* A data stream STOPped while the receive pool was full: no entry, but
+    /* A data stream STOPped without a receive entry: no entry, but
      * its identity is retained and its remaining bytes are consumed here
      * until the peer's FIN or RESET, so the bridge must keep delivering. */
     if (rx_stopped_ref_find(s, ref._v) >= 0)
@@ -3158,7 +3796,7 @@ bool moq_session_stream_awaits_peer_terminal(const moq_session_t *s,
     if (!s) return false;
     if (moq_index_find(s->idx_rx_by_ref, s->idx_rx_mask, ref._v) >= 0)
         return true;
-    /* A data stream STOPped while the receive pool was full: no entry, but
+    /* A data stream STOPped without a receive entry: no entry, but
      * its identity is retained and its remaining bytes are consumed here
      * until the peer's FIN or RESET, so the bridge must keep delivering. */
     if (rx_stopped_ref_find(s, ref._v) >= 0)
@@ -3170,6 +3808,16 @@ bool moq_session_stream_awaits_peer_terminal(const moq_session_t *s,
     if (drain_ref_contains(s, ref))
         return true;
     moq_request_endpoint_t ep = request_registry_find_by_streamref(s, ref);
+    if (s->profile->premature_fin_fails_request) {
+        if (ep.kind == MOQ_REQ_TRACK_STATUS) {
+            const moq_request_lifetime_t *life = &s->track_statuses[ep.slot].rs.lifetime;
+            return !life->peer_fin && !life->peer_reset;
+        }
+        if (ep.kind == MOQ_REQ_ANNOUNCEMENT) {
+            const moq_request_lifetime_t *life = &s->announcements[ep.slot].rs.lifetime;
+            return !life->peer_fin && !life->peer_reset;
+        }
+    }
     if (ep.kind == MOQ_REQ_TRACK_STATUS &&
         s->track_statuses[ep.slot].role == MOQ_TS_ROLE_REQUESTER)
         return true;
@@ -3209,18 +3857,28 @@ moq_result_t moq_session_poll_actions_ex(moq_session_t *s,
     size_t n = 0;
     uint8_t *dst = (uint8_t *)out;
 
+    /* Handing an action to the adapter is the handover to the transport: an
+     * object whose OBJECT_DELIVERY_TIMEOUT has elapsed must not cross it. */
+    if (session_is_active(s))
+        session_expire_queued_data(s);
+    ts_retry_pending(s);
+    ann_retry_pending(s);
+    ns_sub_retry_pending(s);
+
     while (n < cap && s->action_head < s->action_tail) {
-        const moq_action_t *head = &s->actions[s->action_head % s->action_cap];
+        size_t idx = action_select(s);
+        const moq_action_t *head = &s->actions[idx % s->action_cap];
 
         if (head->kind == MOQ_ACTION_SEND_DATA &&
             element_size < send_data_needed)
             break;
 
+        moq_action_t taken;
+        action_take(s, idx, &taken);
         memset(dst, 0, element_size);
-        memcpy(dst, head, copy);
+        memcpy(dst, &taken, copy);
         uint64_t epoch = s->borrow_epoch;
         memcpy(dst + offsetof(moq_action_t, borrow_epoch), &epoch, sizeof(epoch));
-        s->action_head++;
         dst += element_size;
         n++;
     }
@@ -3228,11 +3886,20 @@ moq_result_t moq_session_poll_actions_ex(moq_session_t *s,
     if (n == 0 && s->action_head < s->action_tail)
         return MOQ_ERR_ABI_MISMATCH;
 
-    /* Draining actions freed action-queue capacity: a STOP_DATA refused
-     * earlier (the entry parked in NEED_STOP) is owed regardless of whether
-     * the peer ever sends another byte on that stream. */
-    if (n > 0 && session_is_active(s))
-        session_retry_owed_stops(s);
+    /* Draining actions freed action-queue capacity: a stream action owed
+     * earlier is issued regardless of whether the peer ever sends another
+     * byte on that stream. */
+    if (n > 0 && session_is_active(s)) {
+        session_retry_owed_stream_actions(s);
+        /* Likewise a RESET or STOP a fill child owes its stream. */
+        fill_service(s);
+        /* And a malformed Track's cancellation that wanted an action. */
+        mt_retry_pending(s);
+    }
+
+    ts_retry_pending(s);
+    ann_retry_pending(s);
+    ns_sub_retry_pending(s);
 
     *out_count = n;
     return MOQ_OK;
@@ -3248,15 +3915,30 @@ static size_t event_min_poll_size(uint32_t kind)
         return prefix + sizeof(moq_fetch_object_event_t);
     case MOQ_EVENT_OBJECT_CHUNK:
         return prefix + sizeof(moq_object_chunk_event_t);
+    /* Every fill event needs its complete frozen prefix: the object event
+     * transfers owned buffers, and the others carry the identifying handles
+     * a partial copy would truncate. */
+    case MOQ_EVENT_FILL_CREATED:
+        return prefix + MOQ_FILL_CREATED_EVENT_V0_SIZE;
+    case MOQ_EVENT_FILL_REQUEST:
+        return prefix + MOQ_FILL_REQUEST_EVENT_V0_SIZE;
+    case MOQ_EVENT_FILL_OBJECT:
+        return prefix + MOQ_FILL_OBJECT_EVENT_V0_SIZE;
+    case MOQ_EVENT_FILL_GAP:
+        return prefix + MOQ_FILL_GAP_EVENT_V0_SIZE;
+    case MOQ_EVENT_FILL_TERMINAL:
+        return prefix + MOQ_FILL_TERMINAL_EVENT_V0_SIZE;
     default:
         return prefix;
     }
 }
 
-moq_result_t moq_session_poll_events_ex(moq_session_t *s,
+static moq_result_t session_poll_events_impl(moq_session_t *s,
                                          void *out, size_t cap,
                                          size_t element_size,
-                                         size_t *out_count)
+                                         size_t *out_count,
+    session_event_admission_t (*admit)(void *, const moq_event_t *),
+    void *admit_ctx, bool *discarded)
 {
     if (out_count) *out_count = 0;
     if (!s || !out || !out_count) return MOQ_ERR_INVAL;
@@ -3267,6 +3949,11 @@ moq_result_t moq_session_poll_events_ex(moq_session_t *s,
 
     const size_t lib_size = sizeof(moq_event_t);
     const size_t copy = lib_size < element_size ? lib_size : element_size;
+    if (!admit || s->event_head == s->event_tail) {
+        ts_retry_pending(s);
+        ann_retry_pending(s);
+        ns_sub_retry_pending(s);
+    }
 
     size_t n = 0;
     uint8_t *dst = (uint8_t *)out;
@@ -3276,6 +3963,13 @@ moq_result_t moq_session_poll_events_ex(moq_session_t *s,
 
         if (element_size < event_min_poll_size(head->kind))
             break;
+
+        session_event_admission_t decision = admit
+            ? admit(admit_ctx, head) : SESSION_EVENT_TAKE;
+        if (decision == SESSION_EVENT_LEAVE) {
+            *out_count = n;
+            return MOQ_ERR_WOULD_BLOCK;
+        }
 
         /* Release session budget when owned refs transfer to caller. */
         if (head->kind == MOQ_EVENT_OBJECT_RECEIVED) {
@@ -3308,6 +4002,21 @@ moq_result_t moq_session_poll_events_ex(moq_session_t *s,
                 else
                     s->recv_payload_bytes = 0;
             }
+        } else if (head->kind == MOQ_EVENT_FILL_OBJECT) {
+            if (head->u.fill_object.payload) {
+                size_t plen = moq_rcbuf_len(head->u.fill_object.payload);
+                if (plen <= s->recv_payload_bytes)
+                    s->recv_payload_bytes -= plen;
+                else
+                    s->recv_payload_bytes = 0;
+            }
+            if (head->u.fill_object.properties) {
+                size_t elen = moq_rcbuf_len(head->u.fill_object.properties);
+                if (elen <= s->recv_payload_bytes)
+                    s->recv_payload_bytes -= elen;
+                else
+                    s->recv_payload_bytes = 0;
+            }
         } else if (head->kind == MOQ_EVENT_OBJECT_CHUNK) {
             if (head->u.object_chunk.properties) {
                 size_t elen = moq_rcbuf_len(head->u.object_chunk.properties);
@@ -3332,6 +4041,12 @@ moq_result_t moq_session_poll_events_ex(moq_session_t *s,
          * because a push_event placed it. */
         if (head->kind == MOQ_EVENT_SESSION_CLOSED)
             s->terminal_observed = true;
+        if (head->kind == MOQ_EVENT_PUBLISH_STATE && head->u.publish_state.location)
+            event_location_retire(s, head->u.publish_state.location);
+        if (decision == SESSION_EVENT_DISCARD) {
+            moq_event_cleanup((moq_event_t *)out);
+            *discarded = true;
+        }
         s->event_head++;
         /* Advance the progress token on event TRANSFER too (not only enqueue):
          * a bounded poll that dequeues events frees queue capacity, which is the
@@ -3367,8 +4082,40 @@ moq_result_t moq_session_poll_events_ex(moq_session_t *s,
     if (n > 0 && s->request_refeed_pending && session_is_active(s))
         (void)request_streams_refeed_deferred(s);
 
+    /* Freed event capacity may let a fill child surface its owed request or
+     * terminal (session_fill.c retains them until then). */
+    if (n > 0 && session_is_active(s)) {
+        fill_service(s);
+        /* Likewise a malformed Track's cancellation that wanted an event. */
+        mt_retry_pending(s);
+    }
+
+    ts_retry_pending(s);
+    ann_retry_pending(s);
+    ns_sub_retry_pending(s);
+
     *out_count = n;
     return MOQ_OK;
+}
+
+moq_result_t moq_session_poll_events_ex(moq_session_t *s,
+    void *out, size_t cap, size_t element_size, size_t *out_count)
+{
+    return session_poll_events_impl(s, out, cap, element_size, out_count,
+                                    NULL, NULL, NULL);
+}
+
+moq_result_t session_poll_event_admitted(moq_session_t *s, moq_event_t *out,
+    session_event_admission_t (*admit)(void *, const moq_event_t *), void *ctx)
+{
+    if (!admit) return MOQ_ERR_INVAL;
+    size_t count = 0;
+    bool discarded = false;
+    moq_result_t rc = session_poll_events_impl(s, out, 1, sizeof(*out), &count,
+                                               admit, ctx, &discarded);
+    if (rc != MOQ_OK) return rc;
+    if (discarded) return MOQ_ERR_BUFFER;
+    return count ? MOQ_OK : MOQ_DONE;
 }
 
 /* -- Request capacity ---------------------------------------------- */
@@ -3464,6 +4211,8 @@ uint64_t moq_session_next_deadline_us(const moq_session_t *s)
     uint64_t d = s->goaway_deadline_us;
     uint64_t sg = reported_subgroup_deadline(s);
     if (sg < d) d = sg;
+    uint64_t qd = session_queued_data_deadline(s);
+    if (qd < d) d = qd;
     if (s->idle_deadline_us < d) d = s->idle_deadline_us;
     /* §9.8: every armed, not-yet-fired terminal deadline; fired entries
      * contribute only via the bounded retry deadline below. */
@@ -3476,5 +4225,7 @@ uint64_t moq_session_next_deadline_us(const moq_session_t *s)
             s->publishes[i].done_deadline_us < d)
             d = s->publishes[i].done_deadline_us;
     if (s->expiry_retry_deadline_us < d) d = s->expiry_retry_deadline_us;
+    if (s->has_owner_deadline && s->owner_deadline_us < d)
+        d = s->owner_deadline_us;
     return d;
 }

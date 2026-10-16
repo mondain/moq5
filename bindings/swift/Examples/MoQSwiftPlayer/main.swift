@@ -73,7 +73,12 @@ final class PlayerState {
         videoTime.reset(); audioTime.reset()
         syncHostTime = 0; timebaseStarted = false
         if let tb = videoTimebase { CMTimebaseSetRate(tb, rate: 0) }
-        displayLayer.flush(); audioDecoder.flush()
+        if #available(macOS 14.0, *) {
+            displayLayer.sampleBufferRenderer.flush()
+        } else {
+            displayLayer.flush()
+        }
+        audioDecoder.flush()
     }
 }
 
@@ -245,7 +250,11 @@ func connect(relay: ParsedRelay, args: RecvArgs, ns: Namespace,
                                 data: data, formatDescription: fd,
                                 decodeTimeUS: relDTS, presentationTimeUS: relPTS,
                                 durationUS: dur, isKeyframe: kf)
-                            state.displayLayer.enqueue(sb)
+                            if #available(macOS 14.0, *) {
+                                state.displayLayer.sampleBufferRenderer.enqueue(sb)
+                            } else {
+                                state.displayLayer.enqueue(sb)
+                            }
                         } catch {
                             if state.frameCount <= 10 { logErr("Sample: \(error)") }
                         }
@@ -266,7 +275,11 @@ func connect(relay: ParsedRelay, args: RecvArgs, ns: Namespace,
                                 data: data, formatDescription: fd,
                                 decodeTimeUS: relDTS, presentationTimeUS: relPTS,
                                 durationUS: 0, isKeyframe: kf)
-                            state.displayLayer.enqueue(sb)
+                            if #available(macOS 14.0, *) {
+                                state.displayLayer.sampleBufferRenderer.enqueue(sb)
+                            } else {
+                                state.displayLayer.enqueue(sb)
+                            }
                         } catch {
                             if state.frameCount <= 10 { logErr("Sample: \(error)") }
                         }

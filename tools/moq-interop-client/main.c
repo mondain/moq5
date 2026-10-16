@@ -16,7 +16,11 @@
 
 #include <moq/endpoint.h>
 #include <moq/session.h>
+#include <moq/rcbuf.h>
 
+#include "endpoint_error.h"
+#include "object_relay.h"
+#include "sub_answers.h"
 #include "url_policy.h"
 
 #include <fcntl.h>
@@ -89,10 +93,10 @@ typedef struct {
     moq_bytes_t        *subscribe_ns;
     size_t              subscribe_ns_count;
 
-    /* dual-session publisher side: accept incoming subscribe */
+    /* dual-session publisher side: accept the test track's SUBSCRIBE and
+     * refuse every other forwarded one (sub_answers.h) */
     bool                req_accept_sub;
-    bool                subscribe_request_received;
-    moq_subscription_t  incoming_sub;
+    interop_sub_answers_t answers;
     bool                accept_sub_sent;
     bool                accept_sub_failed;
     int                 accept_sub_rc;
@@ -187,14 +191,17 @@ static moq_result_t interop_pump_task(moq_endpoint_t *ep, moq_session_t *sess,
     if (state == MOQ_SESS_ESTABLISHED && !c->setup_complete)
         c->setup_complete = true;
 
+    /* Refusals queued by earlier cycles that the session could not take. */
+    interop_sub_answers_flush(&c->answers, sess, now);
+
     /* Snapshot requested actions. */
     bool do_publish_ns = c->req_publish_ns && !c->publish_ns_sent;
     bool do_publish_ns_done = c->req_publish_ns_done && !c->publish_ns_done_sent;
     bool do_subscribe = c->req_subscribe && !c->subscribe_sent;
-    bool do_accept_sub = c->req_accept_sub && c->subscribe_request_received
+    bool do_accept_sub = c->req_accept_sub && c->answers.have_test
                          && !c->accept_sub_sent;
     moq_announcement_t ann_copy = c->ann;
-    moq_subscription_t incoming_sub_copy = c->incoming_sub;
+    moq_subscription_t incoming_sub_copy = c->answers.test_sub;
     pthread_mutex_unlock(&c->mu);
 
     if (do_publish_ns) {
@@ -316,10 +323,10 @@ static moq_result_t interop_pump_task(moq_endpoint_t *ep, moq_session_t *sess,
             c->subscribe_error = true;
             break;
         case MOQ_EVENT_SUBSCRIBE_REQUEST:
-            if (!c->subscribe_request_received) {
-                c->subscribe_request_received = true;
-                c->incoming_sub = ev.u.subscribe_request.sub;
-            }
+            /* The test track's first request is accepted on the next cycle
+             * (when req_accept_sub); every other one is refused below. */
+            interop_sub_answers_on_request(&c->answers, sess,
+                                           &ev.u.subscribe_request);
             break;
         default:
             break;
@@ -327,6 +334,10 @@ static moq_result_t interop_pump_task(moq_endpoint_t *ep, moq_session_t *sess,
         pthread_mutex_unlock(&c->mu);
         moq_event_cleanup(&ev);
     }
+
+    pthread_mutex_lock(&c->mu);
+    interop_sub_answers_flush(&c->answers, sess, now);
+    pthread_mutex_unlock(&c->mu);
 
     return MOQ_OK;
 }
@@ -350,7 +361,7 @@ typedef struct {
     const char *test_name;
     bool        tls_disable_verify;
     bool        verbose;
-    int         draft;   /* 0 = auto (offer every draft); 16/18 = pin exactly */
+    int         draft;   /* 0 = auto (offer every draft); 16/18/22 = pin exactly */
     moq_transport_backend_t backend;   /* 0 = AUTO (picoquic); see --backend */
     const char *backend_name;          /* the selected name, for diagnostics */
     uint32_t wt_profile;               /* moq_wt_profile_t; 0 = backend default */
@@ -392,7 +403,7 @@ static void print_usage(const char *prog)
         "                          https://host:port[/path] (WebTransport;\n"
         "                          no path means the root mount \"/\")\n"
         "  --test NAME             test case name (default: run all cases)\n"
-        "  --draft N               pin the offered draft to 16 or 18\n"
+        "  --draft N               pin the offered draft to 16, 18 or 22\n"
         "                          (default: offer every draft, negotiate one)\n"
         "  --backend NAME          transport backend (testing): auto|picoquic|\n"
         "                          msquic|mvfst|proxygen|wtquic-msquic|\n"
@@ -416,11 +427,14 @@ static void print_usage(const char *prog)
         "every draft this build supports) unless pinned with --draft/MOQT_DRAFT.\n"
         "\n"
         "Supported: setup-only, announce-only, publish-namespace-done,\n"
-        "  subscribe-error, announce-subscribe, subscribe-before-announce\n",
+        "  subscribe-error, announce-subscribe, subscribe-before-announce\n"
+        "Named only (not in the run-all suite): object-relay -- opaque object\n"
+        "  conformance through a relay (MOQ_INTEROP_OBJECT_RELAY_FAULT=\n"
+        "  corrupt-byte|drop-object|extra-object injects a publisher fault)\n",
         prog);
 }
 
-/* Strict draft parse: NULL/empty -> 0 (auto), exactly "16" or "18" -> that
+/* Strict draft parse: NULL/empty -> 0 (auto), exactly "16", "18" or "22" -> that
  * draft, anything else -> -1 (rejected). atoi would silently accept "16junk"
  * as 16 and "abc" as 0 (auto), falsifying per-draft interop results. */
 static int parse_draft(const char *s)
@@ -428,7 +442,7 @@ static int parse_draft(const char *s)
     if (!s || !*s) return 0;
     char *end = NULL;
     long v = strtol(s, &end, 10);
-    if (*end != '\0' || (v != 16 && v != 18)) return -1;
+    if (*end != '\0' || (v != 16 && v != 18 && v != 22)) return -1;
     return (int)v;
 }
 
@@ -477,7 +491,7 @@ static cli_opts_t parse_cli(int argc, char **argv)
     }
     opts.draft = parse_draft(draft_str);
     if (opts.draft < 0) {
-        fprintf(stderr, "error: --draft/MOQT_DRAFT must be exactly 16 or 18 "
+        fprintf(stderr, "error: --draft/MOQT_DRAFT must be exactly 16, 18 or 22 "
                 "(got \"%s\"); omit for auto-negotiation\n", draft_str);
         exit(1);
     }
@@ -572,7 +586,7 @@ static cli_opts_t parse_cli(int argc, char **argv)
 /* ------------------------------------------------------------------ */
 
 /* Draft to pin for this run: 0 = auto (offer every draft this build supports),
- * 16/18 = offer exactly that one. Set once from the CLI/env in main(). */
+ * 16/18/22 = offer exactly that one. Set once from the CLI/env in main(). */
 static int g_draft_pin = 0;
 
 /* Transport backend for this run (default AUTO = picoquic); set from
@@ -599,7 +613,8 @@ static void tap_plan(int n)
      * backend/draft combination was exercised. */
     printf("# request: backend=%s wt-profile=%s draft=%s\n", g_backend_name,
            g_wt_profile_name,
-           g_draft_pin == 16 ? "16" : g_draft_pin == 18 ? "18" : "auto");
+           g_draft_pin == 16 ? "16" : g_draft_pin == 18 ? "18" :
+           g_draft_pin == 22 ? "22" : "auto");
     fflush(stdout);
 }
 
@@ -652,6 +667,19 @@ static void tap_negotiated(moq_endpoint_t *ep, const char *url)
  * by the endpoint: AUTO protocol derives the transport from the URL scheme;
  * the zero-init version offer means "offer every draft this build supports"
  * unless a specific draft was pinned (--draft / MOQT_DRAFT). */
+/* Why the last make_endpoint call failed (main thread only). */
+static moq_result_t g_endpoint_rc = MOQ_OK;
+
+/* The TAP message for a step whose endpoint could not be created: the
+ * connect's result and, for an unsupported pinned draft, a hint. Valid until
+ * the next call. */
+static const char *endpoint_failure(const char *what)
+{
+    static char buf[256];
+    return interop_endpoint_error(buf, sizeof(buf), what, g_endpoint_rc,
+                                  (uint32_t)g_draft_pin);
+}
+
 static moq_endpoint_t *make_endpoint(const char *url, bool insecure)
 {
     moq_endpoint_cfg_t cfg;
@@ -677,6 +705,9 @@ static moq_endpoint_t *make_endpoint(const char *url, bool insecure)
     }
     cfg.insecure_skip_verify = insecure;
     cfg.perspective = MOQ_PERSPECTIVE_CLIENT;
+    /* This tool's URL conventions (port 4433 by default, the "moq" scheme,
+     * the wt_path override below) are the endpoint's LEGACY reading. */
+    cfg.uri_mode = MOQ_ENDPOINT_URI_LEGACY;
     /* cfg.sni empty -> defaults to URL host; cfg.wt_path empty -> URL path,
      * which the endpoint then defaults to "/moq". A relay URL with no path at
      * all asked for the root mount instead, which is where interop relays
@@ -688,7 +719,8 @@ static moq_endpoint_t *make_endpoint(const char *url, bool insecure)
     }
 
     moq_endpoint_t *ep = NULL;
-    if (moq_endpoint_connect(&cfg, &ep) != MOQ_OK) return NULL;
+    g_endpoint_rc = moq_endpoint_connect(&cfg, &ep);
+    if (g_endpoint_rc != MOQ_OK) return NULL;
     return ep;
 }
 
@@ -751,7 +783,7 @@ static int run_setup_only(const char *url, bool insecure, bool verbose)
     moq_endpoint_t *ep = make_endpoint(url, insecure);
     if (!ep) {
         tap_plan(1);
-        tap_result(1, false, "setup handshake", 0, "failed to create endpoint");
+        tap_result(1, false, "setup handshake", 0, endpoint_failure("endpoint"));
         ctx_destroy(&c);
         return 1;
     }
@@ -786,7 +818,7 @@ static int run_announce_only(const char *url, bool insecure, bool verbose)
     moq_endpoint_t *ep = make_endpoint(url, insecure);
     if (!ep) {
         tap_plan(2);
-        tap_result(1, false, "setup", 0, "failed to create endpoint");
+        tap_result(1, false, "setup", 0, endpoint_failure("endpoint"));
         tap_result_skip(2, "namespace accepted", "setup failed");
         ctx_destroy(&c);
         return 1;
@@ -880,7 +912,7 @@ static int run_publish_namespace_done(const char *url, bool insecure,
     moq_endpoint_t *ep = make_endpoint(url, insecure);
     if (!ep) {
         tap_plan(3);
-        tap_result(1, false, "setup", 0, "failed to create endpoint");
+        tap_result(1, false, "setup", 0, endpoint_failure("endpoint"));
         tap_result_skip(2, "namespace accepted", "setup failed");
         tap_result_skip(3, "namespace done sent", "setup failed");
         ctx_destroy(&c);
@@ -998,7 +1030,7 @@ static int run_subscribe_error(const char *url, bool insecure, bool verbose)
     moq_endpoint_t *ep = make_endpoint(url, insecure);
     if (!ep) {
         tap_plan(2);
-        tap_result(1, false, "setup", 0, "failed to create endpoint");
+        tap_result(1, false, "setup", 0, endpoint_failure("endpoint"));
         tap_result_skip(2, "subscribe error or timeout", "setup failed");
         ctx_destroy(&c);
         return 1;
@@ -1107,6 +1139,9 @@ static int run_dual_session(const char *url, bool insecure, bool verbose,
     sub_ctx.subscribe_ns = ns_interop_parts;
     sub_ctx.subscribe_ns_count = ns_interop_count;
     pub_ctx.req_accept_sub = true;
+    interop_sub_answers_init(&pub_ctx.answers,
+                             (moq_namespace_t){ ns_interop_parts, ns_interop_count },
+                             (moq_bytes_t){ (const uint8_t *)"test-track", 10 });
 
     moq_endpoint_t *pub_ep = NULL, *sub_ep = NULL;
 
@@ -1135,7 +1170,7 @@ static int run_dual_session(const char *url, bool insecure, bool verbose,
     /* -- subscribe-before-announce: subscriber connects first -- */
     if (subscribe_first) {
         sub_ep = make_endpoint(url, insecure);
-        if (!sub_ep) { FAIL(2, "failed to create subscriber"); goto emit; }
+        if (!sub_ep) { FAIL(2, "%s", endpoint_failure("subscriber")); goto emit; }
         if (verbose) fprintf(stderr, "[sub] connecting to %s...\n", url);
 
         uint64_t t0 = now_us_mono();
@@ -1155,11 +1190,11 @@ static int run_dual_session(const char *url, bool insecure, bool verbose,
         nanosleep(&sl, NULL);
 
         pub_ep = make_endpoint(url, insecure);
-        if (!pub_ep) { FAIL(0, "failed to create publisher"); goto emit; }
+        if (!pub_ep) { FAIL(0, "%s", endpoint_failure("publisher")); goto emit; }
         if (verbose) fprintf(stderr, "[pub] connecting to %s...\n", url);
     } else {
         pub_ep = make_endpoint(url, insecure);
-        if (!pub_ep) { FAIL(0, "failed to create publisher"); goto emit; }
+        if (!pub_ep) { FAIL(0, "%s", endpoint_failure("publisher")); goto emit; }
         if (verbose) fprintf(stderr, "[pub] connecting to %s...\n", url);
     }
 
@@ -1219,7 +1254,7 @@ static int run_dual_session(const char *url, bool insecure, bool verbose,
     /* announce-subscribe: subscriber connects after announce. */
     if (!subscribe_first) {
         sub_ep = make_endpoint(url, insecure);
-        if (!sub_ep) { FAIL(2, "failed to create subscriber"); goto emit; }
+        if (!sub_ep) { FAIL(2, "%s", endpoint_failure("subscriber")); goto emit; }
         if (verbose) fprintf(stderr, "[sub] connecting to %s...\n", url);
 
         uint64_t t0 = now_us_mono();
@@ -1246,8 +1281,13 @@ static int run_dual_session(const char *url, bool insecure, bool verbose,
             bool sent = pub_ctx.accept_sub_sent;
             bool afail = pub_ctx.accept_sub_failed;
             bool closed = pub_ctx.session_closed;
+            /* Accepting the test SUBSCRIBE is not enough: every other
+             * forwarded request must be answered too (a queued refusal keeps
+             * the wait going until it is sent or the deadline passes). */
+            interop_verdict_t av = interop_publisher_verdict(sent, &pub_ctx.answers, NULL);
+            bool unanswered = pub_ctx.answers.unanswered;
             pthread_mutex_unlock(&pub_ctx.mu);
-            if (sent || afail) break;
+            if (afail || unanswered || av == INTEROP_VERDICT_PASS) break;
             if (subscribe_first) {
                 /* Premature SUBSCRIBE rejected by the relay -> the publisher
                  * will never see one to accept; stop waiting (that rejection
@@ -1272,6 +1312,9 @@ static int run_dual_session(const char *url, bool insecure, bool verbose,
         bool asent = pub_ctx.accept_sub_sent;
         bool afail = pub_ctx.accept_sub_failed;
         int arc = pub_ctx.accept_sub_rc;
+        const char *answer_why = NULL;
+        interop_verdict_t av = interop_publisher_verdict(true, &pub_ctx.answers,
+                                                         &answer_why);
         pthread_mutex_unlock(&pub_ctx.mu);
 
         /* subscribe-before-announce: a relay that rejected the premature
@@ -1286,6 +1329,11 @@ static int run_dual_session(const char *url, bool insecure, bool verbose,
         }
 
         if (afail)             { FAIL(3, "accept_subscribe failed: %d", arc); goto emit; }
+        else if (av == INTEROP_VERDICT_FAIL) { FAIL(3, "%s", answer_why); goto emit; }
+        else if (av == INTEROP_VERDICT_WAIT) {
+            FAIL(3, "a forwarded SUBSCRIBE refusal was still queued at the deadline");
+            goto emit;
+        }
         else if (asent)        { PASS(3, "SUBSCRIBE accepted"); }
         else if (sub_rejected) { PASS(3, "relay rejected premature SUBSCRIBE (expected)"); }
         else                   { FAIL(3, "%s", ar); goto emit; }
@@ -1341,6 +1389,20 @@ static int run_dual_session(const char *url, bool insecure, bool verbose,
     }
 
 emit:
+    /* A forwarded request that went unanswered at any point fails the
+     * publisher's step, also after it first passed. */
+    {
+        const char *late_why = NULL;
+        pthread_mutex_lock(&pub_ctx.mu);
+        interop_verdict_t lv = interop_publisher_verdict(ok[3], &pub_ctx.answers,
+                                                         &late_why);
+        pthread_mutex_unlock(&pub_ctx.mu);
+        if (ok[3] && lv != INTEROP_VERDICT_PASS) {
+            ok[3] = false;
+            snprintf(msg[3], sizeof(msg[3]), "%s", late_why ? late_why
+                     : "a forwarded SUBSCRIBE refusal was still queued");
+        }
+    }
     close_endpoint(sub_ep);
     close_endpoint(pub_ep);
 
@@ -1371,6 +1433,640 @@ static int run_subscribe_before_announce(const char *url, bool insecure,
 }
 
 /* ------------------------------------------------------------------ */
+/* Test: object-relay (opaque object conformance through a relay)      */
+/* ------------------------------------------------------------------ */
+
+/* A publisher session and a subscriber session, each its own connection to
+ * the relay, exchange the fixed Object sequence of object_relay.h through it:
+ * the publisher announces a namespace unique to this run, the subscriber
+ * subscribes to a track in it through the relay, the publisher accepts the
+ * forwarded SUBSCRIBE and, once the subscriber holds SUBSCRIBE_OK, writes
+ * ORL_GROUPS subgroups of ORL_OBJECTS objects, closes each subgroup with a FIN
+ * and ends the subscription with PUBLISH_DONE TRACK_ENDED. The subscriber
+ * checks every identity, length and byte against the sequence and requires
+ * every FIN and the done after the tail. Payloads are opaque: this is object
+ * transport conformance, not catalog discovery, codec parsing or playback.
+ *
+ * Every wait is bounded; a timeout is a failure. MOQ_INTEROP_OBJECT_RELAY_FAULT
+ * (corrupt-byte | drop-object | extra-object) makes the PUBLISHER deviate from
+ * the sequence so the unchanged verifier can be shown to reject it; it is a
+ * test-only knob and never part of a passing run. */
+
+#define ORL_SETUP_US      3000000u
+#define ORL_SUBSCRIBE_US  5000000u
+#define ORL_DELIVERY_US  10000000u
+
+typedef enum {
+    ORL_FAULT_NONE,
+    ORL_FAULT_CORRUPT_BYTE,   /* g=1 o=2: one payload byte flipped */
+    ORL_FAULT_DROP_OBJECT,    /* g=1 o=3: never written */
+    ORL_FAULT_EXTRA_OBJECT,   /* g=2: an object o=ORL_OBJECTS after the tail */
+} orl_fault_t;
+
+typedef struct {
+    pthread_mutex_t     mu;
+    bool                verbose;
+    const char         *log_prefix;
+    const moq_bytes_t  *ns;
+    size_t              ns_count;
+    moq_bytes_t         track;
+
+    bool                setup_complete;
+    bool                session_closed;
+
+    /* publisher */
+    bool                req_publish_ns;
+    bool                publish_ns_sent;
+    bool                publish_ns_failed;
+    int                 publish_ns_rc;
+    bool                ns_accepted;
+    bool                ns_rejected;
+    interop_sub_answers_t answers;   /* the test track's SUBSCRIBE; others refused */
+    moq_subscription_t  up_sub;
+    bool                accept_sent;
+    bool                accept_failed;
+    int                 accept_rc;
+    bool                go;
+    orl_fault_t         fault;
+    uint64_t            g_next;
+    uint64_t            o_next;
+    bool                sg_open;
+    moq_subgroup_handle_t sg;
+    uint64_t            streams_opened;
+    uint64_t            objects_written;
+    uint64_t            bytes_written;
+    uint64_t            done_delay_us;
+    uint64_t            tail_closed_us;
+    bool                done_sent;
+    bool                publish_failed;
+    int                 publish_rc;
+    const char         *publish_step;
+
+    /* subscriber */
+    bool                req_subscribe;
+    bool                subscribe_sent;
+    bool                subscribe_failed;
+    int                 subscribe_rc;
+    bool                subscribe_ok;
+    bool                subscribe_error;
+    moq_subscription_t  sub;
+    orl_verifier_t      ver;
+    bool                chunk_open;
+    bool                chunk_own;
+    uint64_t            chunk_group, chunk_subgroup, chunk_object, chunk_status;
+    size_t              chunk_len;
+    uint8_t             chunk_buf[ORL_MAX_PAYLOAD];
+} orl_ctx_t;
+
+static void orl_ctx_init(orl_ctx_t *c, bool verbose, const char *prefix,
+                         const moq_bytes_t *ns, size_t ns_count,
+                         moq_bytes_t track)
+{
+    memset(c, 0, sizeof(*c));
+    pthread_mutex_init(&c->mu, NULL);
+    c->verbose = verbose;
+    c->log_prefix = prefix;
+    c->ns = ns;
+    c->ns_count = ns_count;
+    c->track = track;
+    interop_sub_answers_init(&c->answers, (moq_namespace_t){ ns, ns_count }, track);
+    orl_verifier_init(&c->ver);
+}
+
+/* Publisher: write as much of the sequence as the session admits now; a
+ * WOULD_BLOCK leaves the position unchanged for the next cycle. Runs on the
+ * network thread. Session calls are made without c->mu, except the refusals
+ * interop_sub_answers_flush sends, whose queue and counts live under it (the
+ * app thread never calls into the session, so holding it there is safe);
+ * every field the app thread reads is updated under it. */
+static void orl_publish_failed(orl_ctx_t *c, const char *step, moq_result_t rc)
+{
+    pthread_mutex_lock(&c->mu);
+    c->publish_failed = true;
+    c->publish_step = step;
+    c->publish_rc = (int)rc;
+    pthread_mutex_unlock(&c->mu);
+}
+
+static void orl_publish_step(orl_ctx_t *c, moq_session_t *sess, uint64_t now)
+{
+    static uint8_t buf[ORL_MAX_PAYLOAD];
+    moq_result_t rc;
+    while (c->g_next < ORL_GROUPS) {
+        if (!c->sg_open) {
+            moq_subgroup_cfg_t sgc;
+            moq_subgroup_cfg_init(&sgc);
+            sgc.group_id = c->g_next;
+            sgc.subgroup_id = 0;
+            sgc.publisher_priority = 128;
+            /* A new subgroup carrying its first object ever published
+             * (draft-18 and draft-22 Section 2.2). */
+            sgc.first_object = true;
+            rc = moq_session_open_subgroup(sess, c->up_sub, &sgc, now, &c->sg);
+            if (rc == MOQ_ERR_WOULD_BLOCK) return;
+            if (rc != MOQ_OK) { orl_publish_failed(c, "open_subgroup failed", rc); return; }
+            c->sg_open = true;
+            pthread_mutex_lock(&c->mu);
+            c->streams_opened++;
+            pthread_mutex_unlock(&c->mu);
+        }
+        uint64_t last = ORL_OBJECTS;
+        if (c->fault == ORL_FAULT_EXTRA_OBJECT && c->g_next == ORL_GROUPS - 1)
+            last = ORL_OBJECTS + 1;
+        while (c->o_next < last) {
+            uint64_t g = c->g_next, o = c->o_next;
+            if (c->fault == ORL_FAULT_DROP_OBJECT && g == 1 && o == 3) {
+                c->o_next++;
+                continue;
+            }
+            /* The extra object (fault only) reuses the tail object's bytes. */
+            uint64_t src = o < ORL_OBJECTS ? o : ORL_OBJECTS - 1;
+            size_t len = orl_payload_len(g, src);
+            orl_payload_fill(g, src, buf);
+            if (c->fault == ORL_FAULT_CORRUPT_BYTE && g == 1 && o == 2)
+                buf[len / 2] ^= 0x01;
+            moq_rcbuf_t *pl = NULL;
+            rc = moq_rcbuf_create(moq_alloc_default(), buf, len, &pl);
+            if (rc != MOQ_OK) { orl_publish_failed(c, "rcbuf_create failed", rc); return; }
+            rc = moq_session_write_object(sess, c->sg, o, pl, now);
+            moq_rcbuf_decref(pl);   /* the session keeps its own reference */
+            if (rc == MOQ_ERR_WOULD_BLOCK) return;
+            if (rc != MOQ_OK) { orl_publish_failed(c, "write_object failed", rc); return; }
+            c->o_next++;
+            pthread_mutex_lock(&c->mu);
+            c->objects_written++;
+            c->bytes_written += len;
+            pthread_mutex_unlock(&c->mu);
+        }
+        rc = moq_session_close_subgroup(sess, c->sg, now);
+        if (rc == MOQ_ERR_WOULD_BLOCK) return;
+        if (rc != MOQ_OK) { orl_publish_failed(c, "close_subgroup failed", rc); return; }
+        c->sg_open = false;
+        c->g_next++;
+        c->o_next = 0;
+    }
+    /* PUBLISH_DONE only after every stream is closed (draft-18 Section
+     * 10.11, draft-22 Section 9.9), counting each subgroup stream opened.
+     * MOQ_INTEROP_OBJECT_RELAY_DONE_DELAY_MS holds it back that long after the
+     * last FIN: a diagnostic that separates a relay ending its downstream
+     * before forwarding the tail from a missing tail. A passing run never
+     * sets it. */
+    if (!c->tail_closed_us) c->tail_closed_us = now ? now : 1;
+    if (now < c->tail_closed_us + c->done_delay_us) return;
+    moq_done_subscribe_cfg_t dc;
+    moq_done_subscribe_cfg_init(&dc);
+    dc.status_code = ORL_DONE_TRACK_ENDED;
+    dc.stream_count = c->streams_opened;
+    rc = moq_session_done_subscribe(sess, c->up_sub, &dc, now);
+    if (rc == MOQ_ERR_WOULD_BLOCK) return;
+    if (rc != MOQ_OK) { orl_publish_failed(c, "done_subscribe failed", rc); return; }
+    pthread_mutex_lock(&c->mu);
+    c->done_sent = true;
+    pthread_mutex_unlock(&c->mu);
+}
+
+static void orl_object(orl_ctx_t *c, bool own, uint64_t g, uint64_t sg,
+                       uint64_t o, uint64_t status, const uint8_t *data,
+                       size_t len)
+{
+    orl_verifier_object(&c->ver, own, g, sg, o, status, data, len);
+}
+
+static moq_result_t orl_pump_task(moq_endpoint_t *ep, moq_session_t *sess,
+                                  uint64_t now, void *ctx)
+{
+    (void)ep;
+    orl_ctx_t *c = (orl_ctx_t *)ctx;
+    if (!sess) {
+        pthread_mutex_lock(&c->mu);
+        c->session_closed = true;
+        pthread_mutex_unlock(&c->mu);
+        return MOQ_OK;
+    }
+
+    pthread_mutex_lock(&c->mu);
+    if (moq_session_state(sess) == MOQ_SESS_ESTABLISHED) c->setup_complete = true;
+    /* Refusals queued by earlier cycles that the session could not take. */
+    interop_sub_answers_flush(&c->answers, sess, now);
+    bool do_publish_ns = c->req_publish_ns && !c->publish_ns_sent;
+    bool do_accept = c->answers.have_test && !c->accept_sent;
+    if (do_accept) c->up_sub = c->answers.test_sub;
+    bool do_subscribe = c->req_subscribe && !c->subscribe_sent;
+    bool do_publish = c->go && !c->done_sent && !c->publish_failed;
+    pthread_mutex_unlock(&c->mu);
+
+    if (do_publish_ns) {
+        moq_publish_namespace_cfg_t ncfg;
+        moq_publish_namespace_cfg_init(&ncfg);
+        ncfg.track_namespace.parts = c->ns;
+        ncfg.track_namespace.count = c->ns_count;
+        moq_announcement_t ann;
+        moq_result_t rc = moq_session_publish_namespace(sess, &ncfg, now, &ann);
+        pthread_mutex_lock(&c->mu);
+        if (rc == MOQ_OK) c->publish_ns_sent = true;
+        else if (rc != MOQ_ERR_WOULD_BLOCK) {
+            c->publish_ns_sent = c->publish_ns_failed = true;
+            c->publish_ns_rc = (int)rc;
+        }
+        pthread_mutex_unlock(&c->mu);
+    }
+    if (do_accept) {
+        moq_accept_subscribe_cfg_t acfg;
+        moq_accept_subscribe_cfg_init(&acfg);
+        moq_result_t rc = moq_session_accept_subscribe(sess, c->up_sub, &acfg, now);
+        pthread_mutex_lock(&c->mu);
+        if (rc == MOQ_OK) c->accept_sent = true;
+        else if (rc != MOQ_ERR_WOULD_BLOCK) {
+            c->accept_sent = c->accept_failed = true;
+            c->accept_rc = (int)rc;
+        }
+        pthread_mutex_unlock(&c->mu);
+    }
+    if (do_subscribe) {
+        moq_subscribe_cfg_t scfg;
+        moq_subscribe_cfg_init(&scfg);
+        scfg.track_namespace.parts = c->ns;
+        scfg.track_namespace.count = c->ns_count;
+        scfg.track_name = c->track;
+        /* The track has no Objects yet; the publisher writes only after this
+         * subscription is acknowledged, so every Object of the sequence lies
+         * after the Largest Object at subscribe time. */
+        scfg.filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
+        scfg.has_forward = true;
+        scfg.forward = true;
+        moq_subscription_t sub;
+        moq_result_t rc = moq_session_subscribe(sess, &scfg, now, &sub);
+        pthread_mutex_lock(&c->mu);
+        if (rc == MOQ_OK) { c->subscribe_sent = true; c->sub = sub; }
+        else if (rc != MOQ_ERR_WOULD_BLOCK) {
+            c->subscribe_sent = c->subscribe_failed = true;
+            c->subscribe_rc = (int)rc;
+        }
+        pthread_mutex_unlock(&c->mu);
+    }
+    if (do_publish) orl_publish_step(c, sess, now);
+
+    moq_event_t ev;
+    while (moq_session_poll_events(sess, &ev, 1) == 1) {
+        if (c->verbose)
+            fprintf(stderr, "  [%s] event kind=%u\n", c->log_prefix, ev.kind);
+        pthread_mutex_lock(&c->mu);
+        switch (ev.kind) {
+        case MOQ_EVENT_SESSION_CLOSED:
+            c->session_closed = true;
+            break;
+        case MOQ_EVENT_NAMESPACE_ACCEPTED:
+            c->ns_accepted = true;
+            break;
+        case MOQ_EVENT_NAMESPACE_REJECTED:
+            c->ns_rejected = true;
+            break;
+        case MOQ_EVENT_SUBSCRIBE_REQUEST:
+            /* The test track's first request is accepted on the next cycle;
+             * every other one is refused after this drain. */
+            interop_sub_answers_on_request(&c->answers, sess,
+                                           &ev.u.subscribe_request);
+            break;
+        case MOQ_EVENT_SUBSCRIBE_OK:
+            c->subscribe_ok = true;
+            break;
+        case MOQ_EVENT_SUBSCRIBE_ERROR:
+            c->subscribe_error = true;
+            break;
+        case MOQ_EVENT_OBJECT_RECEIVED: {
+            const moq_object_received_event_t *o = &ev.u.object_received;
+            const moq_rcbuf_t *p = o->payload;
+            orl_object(c, moq_subscription_eq(o->sub, c->sub), o->group_id,
+                       o->subgroup_id, o->object_id, o->status,
+                       p ? moq_rcbuf_data(p) : NULL, p ? moq_rcbuf_len(p) : 0);
+            break;
+        }
+        case MOQ_EVENT_OBJECT_CHUNK: {
+            const moq_object_chunk_event_t *k = &ev.u.object_chunk;
+            if (k->begin) {
+                if (c->chunk_open)
+                    orl_verifier_error(&c->ver, "object chunk began before the "
+                                       "previous object ended");
+                c->chunk_open = true;
+                c->chunk_own = moq_subscription_eq(k->sub, c->sub);
+                c->chunk_group = k->group_id;
+                c->chunk_subgroup = k->subgroup_id;
+                c->chunk_object = k->object_id;
+                c->chunk_status = k->status;
+                c->chunk_len = 0;
+            }
+            if (k->chunk) {
+                size_t n = moq_rcbuf_len(k->chunk);
+                if (!c->chunk_open || c->chunk_len + n > sizeof(c->chunk_buf)) {
+                    orl_verifier_error(&c->ver, "object chunk outside a bounded "
+                                       "object");
+                } else {
+                    memcpy(c->chunk_buf + c->chunk_len, moq_rcbuf_data(k->chunk), n);
+                    c->chunk_len += n;
+                }
+            }
+            if (k->end && c->chunk_open) {
+                c->chunk_open = false;
+                if (k->terminal != MOQ_OBJECT_TERMINAL_NORMAL)
+                    orl_verifier_error(&c->ver, "object ended by a reset or stop");
+                else
+                    orl_object(c, c->chunk_own, c->chunk_group, c->chunk_subgroup,
+                               c->chunk_object, c->chunk_status, c->chunk_buf,
+                               c->chunk_len);
+            }
+            break;
+        }
+        case MOQ_EVENT_SUBGROUP_FINISHED: {
+            const moq_subgroup_finished_event_t *f = &ev.u.subgroup_finished;
+            orl_verifier_finished(&c->ver, moq_subscription_eq(f->sub, c->sub),
+                                  f->group_id, f->subgroup_id);
+            break;
+        }
+        case MOQ_EVENT_SUBGROUP_RESET: {
+            const moq_subgroup_reset_event_t *r = &ev.u.subgroup_reset;
+            char what[128];
+            snprintf(what, sizeof(what), "subgroup g=%" PRIu64 " sg=%" PRIu64
+                     " reset with code 0x%" PRIx64 " after %" PRIu64 " objects",
+                     r->group_id, r->subgroup_id, r->error_code,
+                     r->group_id < ORL_GROUPS ? c->ver.next_object[r->group_id] : 0);
+            orl_verifier_error(&c->ver, what);
+            break;
+        }
+        case MOQ_EVENT_SUBSCRIBE_DONE:
+            if (moq_subscription_eq(ev.u.subscribe_done.sub, c->sub))
+                orl_verifier_done(&c->ver, ev.u.subscribe_done.status_code);
+            else
+                orl_verifier_error(&c->ver, "done for another subscription");
+            break;
+        default:
+            break;
+        }
+        pthread_mutex_unlock(&c->mu);
+        moq_event_cleanup(&ev);
+    }
+    pthread_mutex_lock(&c->mu);
+    interop_sub_answers_flush(&c->answers, sess, now);
+    pthread_mutex_unlock(&c->mu);
+    return MOQ_OK;
+}
+
+/* Pump one endpoint for up to rem_us (see ep_cycle for the lock ordering). */
+static moq_result_t orl_cycle(moq_endpoint_t *ep, orl_ctx_t *c, uint64_t rem_us)
+{
+    moq_endpoint_post(ep, orl_pump_task, c);
+    return moq_endpoint_wait(ep, rem_us);
+}
+
+typedef enum { ORL_WAIT_SETUP, ORL_WAIT_NS, ORL_WAIT_SUBSCRIBED,
+               ORL_WAIT_DELIVERED } orl_wait_t;
+
+/* Pump both endpoints until the condition holds, either side ends or the
+ * deadline passes. Returns NULL on success, otherwise the reason. */
+static const char *orl_wait(moq_endpoint_t *pub_ep, orl_ctx_t *pub,
+                            moq_endpoint_t *sub_ep, orl_ctx_t *sub,
+                            orl_wait_t what, uint64_t timeout_us)
+{
+    uint64_t deadline = now_us_mono() + timeout_us;
+    for (;;) {
+        bool met = false;
+        const char *why = NULL;
+        pthread_mutex_lock(&pub->mu);
+        pthread_mutex_lock(&sub->mu);
+        switch (what) {
+        case ORL_WAIT_SETUP:
+            met = sub_ep ? sub->setup_complete : pub->setup_complete;
+            break;
+        case ORL_WAIT_NS:
+            met = pub->ns_accepted;
+            if (pub->ns_rejected) why = "namespace rejected";
+            if (pub->publish_ns_failed) why = "publish_namespace failed";
+            break;
+        case ORL_WAIT_SUBSCRIBED:
+            met = interop_publisher_verdict(pub->accept_sent && sub->subscribe_ok,
+                                            &pub->answers, &why) == INTEROP_VERDICT_PASS;
+            if (pub->accept_failed) why = "accept_subscribe failed";
+            if (sub->subscribe_error) why = "SUBSCRIBE_ERROR";
+            if (sub->subscribe_failed) why = "subscribe failed";
+            break;
+        case ORL_WAIT_DELIVERED:
+            /* Requests forwarded during delivery must be answered too. */
+            met = interop_publisher_verdict(sub->ver.done, &pub->answers, &why)
+                  == INTEROP_VERDICT_PASS;
+            if (pub->publish_failed) why = pub->publish_step;
+            break;
+        }
+        bool closed = pub->session_closed || (sub_ep && sub->session_closed);
+        pthread_mutex_unlock(&sub->mu);
+        pthread_mutex_unlock(&pub->mu);
+        /* A failure is authoritative, also when the step looks met. */
+        if (why) return why;
+        if (met) return NULL;
+        if (closed || moq_endpoint_is_closed(pub_ep) ||
+            (sub_ep && moq_endpoint_is_closed(sub_ep)))
+            return "session closed";
+        if (moq_endpoint_is_fatal(pub_ep) || (sub_ep && moq_endpoint_is_fatal(sub_ep)))
+            return "fatal";
+        if (now_us_mono() >= deadline) return "timeout";
+        if (orl_cycle(pub_ep, pub, 5000) == MOQ_ERR_CLOSED)
+            return "publisher connection closed";
+        if (sub_ep && orl_cycle(sub_ep, sub, 5000) == MOQ_ERR_CLOSED)
+            return "subscriber connection closed";
+    }
+}
+
+static void orl_tap_negotiated(const char *role, moq_endpoint_t *ep,
+                               const char *url)
+{
+    printf("# negotiated %s: draft-%u over %s (backend: %s)\n", role,
+           (unsigned)moq_endpoint_negotiated_version(ep), transport_label(url),
+           g_backend_name);
+    fflush(stdout);
+}
+
+static orl_fault_t orl_fault_from_env(void)
+{
+    const char *f = getenv("MOQ_INTEROP_OBJECT_RELAY_FAULT");
+    if (!f || !*f) return ORL_FAULT_NONE;
+    if (strcmp(f, "corrupt-byte") == 0) return ORL_FAULT_CORRUPT_BYTE;
+    if (strcmp(f, "drop-object") == 0) return ORL_FAULT_DROP_OBJECT;
+    if (strcmp(f, "extra-object") == 0) return ORL_FAULT_EXTRA_OBJECT;
+    fprintf(stderr, "MOQ_INTEROP_OBJECT_RELAY_FAULT=%s is not a known fault\n", f);
+    exit(1);
+}
+
+static int run_object_relay(const char *url, bool insecure, bool verbose)
+{
+    /* A namespace no other run shares: pid plus the monotonic clock. */
+    char run_tag[48];
+    snprintf(run_tag, sizeof(run_tag), "%ld-%" PRIu64, (long)getpid(),
+             now_us_mono());
+    moq_bytes_t ns[3] = {
+        { (const uint8_t *)"moq-test", 8 },
+        { (const uint8_t *)"object-relay", 12 },
+        { (const uint8_t *)run_tag, strlen(run_tag) },
+    };
+    moq_bytes_t track = { (const uint8_t *)"orl-track", 9 };
+
+    orl_ctx_t pub, sub;
+    orl_ctx_init(&pub, verbose, "pub", ns, 3, track);
+    orl_ctx_init(&sub, verbose, "sub", ns, 3, track);
+    pub.fault = orl_fault_from_env();
+    {
+        const char *d = getenv("MOQ_INTEROP_OBJECT_RELAY_DONE_DELAY_MS");
+        if (d && *d) pub.done_delay_us = strtoull(d, NULL, 10) * 1000u;
+    }
+
+    static const char *names[7] = {
+        "publisher setup",
+        "publisher namespace accepted",
+        "subscriber setup",
+        "SUBSCRIBE forwarded and accepted upstream",
+        "subscriber got SUBSCRIBE_OK",
+        "publisher wrote the sequence and PUBLISH_DONE",
+        "subscriber verified every object, FIN and the done",
+    };
+    bool ok[7] = { false };
+    uint64_t ms[7] = { 0 };
+    char msg[7][256];
+    for (int i = 0; i < 7; i++) snprintf(msg[i], sizeof(msg[i]), "not reached");
+    int reached = 0;
+
+    tap_plan(7);
+    printf("# object-relay: opaque object conformance (payload bytes are not "
+           "media)\n# namespace: moq-test/object-relay/%s track: orl-track\n",
+           run_tag);
+    if (pub.fault != ORL_FAULT_NONE)
+        printf("# fault injected at the publisher: %s\n",
+               getenv("MOQ_INTEROP_OBJECT_RELAY_FAULT"));
+    if (pub.done_delay_us)
+        printf("# diagnostic: PUBLISH_DONE held %" PRIu64 " ms after the last FIN\n",
+               pub.done_delay_us / 1000u);
+    fflush(stdout);
+
+    moq_endpoint_t *pub_ep = make_endpoint(url, insecure);
+    moq_endpoint_t *sub_ep = NULL;
+    const char *why;
+    uint64_t t0;
+
+    /* 1: publisher setup */
+    reached = 1;
+    t0 = now_us_mono();
+    why = pub_ep ? orl_wait(pub_ep, &pub, NULL, &sub, ORL_WAIT_SETUP, ORL_SETUP_US)
+                 : endpoint_failure("publisher");
+    ms[0] = (now_us_mono() - t0) / 1000;
+    if (why) { snprintf(msg[0], sizeof(msg[0]), "%s", why); goto emit; }
+    ok[0] = true;
+    snprintf(msg[0], sizeof(msg[0]), "MoQ setup complete");
+    orl_tap_negotiated("publisher", pub_ep, url);
+
+    /* 2: namespace accepted */
+    reached = 2;
+    pthread_mutex_lock(&pub.mu);
+    pub.req_publish_ns = true;
+    pthread_mutex_unlock(&pub.mu);
+    t0 = now_us_mono();
+    why = orl_wait(pub_ep, &pub, NULL, &sub, ORL_WAIT_NS, ORL_SETUP_US);
+    ms[1] = (now_us_mono() - t0) / 1000;
+    if (why) { snprintf(msg[1], sizeof(msg[1]), "%s", why); goto emit; }
+    ok[1] = true;
+    snprintf(msg[1], sizeof(msg[1]), "NAMESPACE_ACCEPTED received");
+
+    /* 3: subscriber setup */
+    reached = 3;
+    sub_ep = make_endpoint(url, insecure);
+    t0 = now_us_mono();
+    why = sub_ep ? orl_wait(pub_ep, &pub, sub_ep, &sub, ORL_WAIT_SETUP, ORL_SETUP_US)
+                 : endpoint_failure("subscriber");
+    ms[2] = (now_us_mono() - t0) / 1000;
+    if (why) { snprintf(msg[2], sizeof(msg[2]), "%s", why); goto emit; }
+    ok[2] = true;
+    snprintf(msg[2], sizeof(msg[2]), "MoQ setup complete");
+    orl_tap_negotiated("subscriber", sub_ep, url);
+
+    /* 4 + 5: the SUBSCRIBE reaches the publisher through the relay, is
+     * accepted there, and the relay acknowledges the subscriber. */
+    reached = 5;
+    pthread_mutex_lock(&sub.mu);
+    sub.req_subscribe = true;
+    pthread_mutex_unlock(&sub.mu);
+    t0 = now_us_mono();
+    why = orl_wait(pub_ep, &pub, sub_ep, &sub, ORL_WAIT_SUBSCRIBED, ORL_SUBSCRIBE_US);
+    ms[3] = ms[4] = (now_us_mono() - t0) / 1000;
+    pthread_mutex_lock(&pub.mu);
+    ok[3] = interop_publisher_verdict(pub.accept_sent && !pub.accept_failed,
+                                      &pub.answers, NULL) == INTEROP_VERDICT_PASS;
+    pthread_mutex_unlock(&pub.mu);
+    pthread_mutex_lock(&sub.mu);
+    ok[4] = sub.subscribe_ok;
+    pthread_mutex_unlock(&sub.mu);
+    snprintf(msg[3], sizeof(msg[3]), "%s", ok[3] ? "SUBSCRIBE accepted" :
+             (why ? why : "no SUBSCRIBE reached the publisher"));
+    snprintf(msg[4], sizeof(msg[4]), "%s", ok[4] ? "SUBSCRIBE_OK received" :
+             (why ? why : "no SUBSCRIBE_OK"));
+    if (why || !ok[3] || !ok[4]) goto emit;
+
+    /* 6 + 7: the sequence, its FINs and the done, verified end to end. */
+    reached = 7;
+    pthread_mutex_lock(&pub.mu);
+    pub.go = true;
+    pthread_mutex_unlock(&pub.mu);
+    t0 = now_us_mono();
+    why = orl_wait(pub_ep, &pub, sub_ep, &sub, ORL_WAIT_DELIVERED, ORL_DELIVERY_US);
+    ms[5] = ms[6] = (now_us_mono() - t0) / 1000;
+    pthread_mutex_lock(&pub.mu);
+    const char *answer_why = NULL;
+    ok[5] = interop_publisher_verdict(pub.done_sent && !pub.publish_failed,
+                                      &pub.answers, &answer_why) == INTEROP_VERDICT_PASS;
+    printf("# publisher wrote: %" PRIu64 " objects in %" PRIu64 " subgroup streams, "
+           "%" PRIu64 " payload bytes, done %s\n", pub.objects_written,
+           pub.streams_opened, pub.bytes_written, pub.done_sent ? "sent" : "not sent");
+    if (ok[5])
+        snprintf(msg[5], sizeof(msg[5]), "every subgroup closed with a FIN, "
+                 "PUBLISH_DONE TRACK_ENDED sent");
+    else if (pub.publish_failed)
+        snprintf(msg[5], sizeof(msg[5]), "%s (rc %d)", pub.publish_step,
+                 pub.publish_rc);
+    else if (answer_why)
+        snprintf(msg[5], sizeof(msg[5]), "%s", answer_why);
+    else if (pub.done_sent && pub.answers.n_pending != 0)
+        snprintf(msg[5], sizeof(msg[5]), "a forwarded SUBSCRIBE refusal was "
+                 "still queued at the deadline");
+    else
+        snprintf(msg[5], sizeof(msg[5]), "%s", why ? why : "not finished");
+    pthread_mutex_unlock(&pub.mu);
+    pthread_mutex_lock(&sub.mu);
+    printf("# subscriber received: %zu objects (%zu matching), %" PRIu64
+           " payload bytes verified, done %s\n", sub.ver.objects_received,
+           sub.ver.objects_ok, sub.ver.bytes_verified,
+           sub.ver.done ? "observed" : "not observed");
+    ok[6] = orl_verifier_pass(&sub.ver, msg[6], sizeof(msg[6]));
+    pthread_mutex_unlock(&sub.mu);
+    /* A wait that ended early (timeout, close) is reported even when the
+     * verifier, given what did arrive, would have more to say. */
+    if (why && !ok[6]) {
+        char tmp[256];
+        snprintf(tmp, sizeof(tmp), "%.60s; %.180s", why, msg[6]);
+        memcpy(msg[6], tmp, sizeof(tmp));
+    }
+
+emit:
+    close_endpoint(sub_ep);
+    close_endpoint(pub_ep);
+    int exit_code = 0;
+    for (int i = 0; i < 7; i++) {
+        if (i < reached) {
+            tap_result(i + 1, ok[i], names[i], ms[i], msg[i]);
+            if (!ok[i]) exit_code = 1;
+        } else {
+            tap_result_skip(i + 1, names[i], "an earlier step failed");
+        }
+    }
+    pthread_mutex_destroy(&pub.mu);
+    pthread_mutex_destroy(&sub.mu);
+    return exit_code;
+}
+
+/* ------------------------------------------------------------------ */
 /* Known test table                                                    */
 /* ------------------------------------------------------------------ */
 
@@ -1397,6 +2093,14 @@ static const test_entry_t supported_tests[] = {
     { "subscribe-error",           run_subscribe_error },
     { "announce-subscribe",        run_announce_subscribe },
     { "subscribe-before-announce", run_subscribe_before_announce },
+    { NULL, NULL },
+};
+
+/* Cases selected only by name (--test / TESTCASE), never by run-all: they
+ * need a relay that forwards Objects, which the run-all interop suite does
+ * not assume of its peers. */
+static const test_entry_t named_only_tests[] = {
+    { "object-relay",              run_object_relay },
     { NULL, NULL },
 };
 
@@ -1527,6 +2231,10 @@ int main(int argc, char **argv)
             entry = e;
             break;
         }
+    }
+    for (const test_entry_t *e = named_only_tests; !entry && e->name; e++) {
+        if (strcmp(opts.test_name, e->name) == 0)
+            entry = e;
     }
     if (!entry) {
         tap_skip(opts.test_name, "unknown test case");

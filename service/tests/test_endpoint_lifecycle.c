@@ -13,6 +13,7 @@
 #include <moq/picoquic_threaded.h>
 #include <moq/session.h>   /* moq_session_version: the endpoint/session agreement */
 #include "test_support.h"
+#include "endpoint_offer_expect.h"
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -621,7 +622,7 @@ int main(int argc, char **argv)
     }
 
     /* == Pre-session wake: the public nudge wakes a CONNECTING waiter == *
-     * A raw-QUIC client offer (AUTO = every supported version) defers the
+     * A raw-QUIC client offer (AUTO = every supported draft) defers the
      * session until ALPN negotiation; against a silent UDP peer it stays
      * session-less. The wake contract is not session-gated: the nudged
      * pump cycle must mark activity, so a parked moq_endpoint_wait()
@@ -1007,6 +1008,70 @@ int main(int argc, char **argv)
         moq_endpoint_destroy(wep);
         moq_pq_threaded_stop(wsrv);
         moq_pq_threaded_destroy(wsrv);
+    }
+
+    /* == Draft-22 end to end: the endpoint hands its owned connection
+     *    target to the managed facade, which binds the session before
+     *    it starts; the server's URI policy sees the URL's authority and
+     *    path. A peer offering only {18, 16} or {16} negotiates down.
+     *    Without picoquic's stream terminal contract a server offering
+     *    moqt-22 is refused at create with MOQ_ERR_UNSUPPORTED instead, and
+     *    the two negotiate-down rows run unchanged. == */
+    {
+        static const char *const srv22[] = { "moqt-22", "moqt-18", "moqt-16" };
+        static const char *const srv18[] = { "moqt-18", "moqt-16" };
+        static const char *const srv16[] = { "moqt-16" };
+        const struct {
+            const char *const *alpn; size_t n; moq_version_t want;
+        } rows[] = {
+            { srv22, 3, MOQ_VERSION_DRAFT_22 },
+            { srv18, 2, MOQ_VERSION_DRAFT_18 },
+            { srv16, 1, MOQ_VERSION_DRAFT_16 },
+        };
+        for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+            if (rows[i].want == MOQ_VERSION_DRAFT_22 &&
+                !TEST_DEFAULT_BACKEND_HOSTS_D22) {
+                moq_pq_threaded_cfg_t rc22;
+                moq_pq_threaded_cfg_init(&rc22);
+                rc22.alloc = moq_alloc_default();
+                rc22.perspective = MOQ_PERSPECTIVE_SERVER;
+                rc22.cert_path = cert;
+                rc22.key_path = key;
+                rc22.port = 14399;
+                rc22.on_lane_pump = server_pump;
+                rc22.alpn_list = rows[i].alpn;
+                rc22.alpn_count = rows[i].n;
+                moq_pq_threaded_t *refused = (moq_pq_threaded_t *)(uintptr_t)1;
+                MOQ_TEST_CHECK_EQ_INT((int)moq_pq_threaded_create(&rc22, &refused),
+                                      (int)MOQ_ERR_UNSUPPORTED);
+                MOQ_TEST_CHECK(refused == NULL);
+                continue;
+            }
+            int p22 = 0;
+            moq_pq_threaded_t *s22 = start_server_ex(cert, key, rows[i].alpn,
+                                                     rows[i].n, &p22);
+            MOQ_TEST_CHECK(s22 != NULL);
+            if (!s22) continue;
+            char u22[96];
+            snprintf(u22, sizeof(u22), "moqt://127.0.0.1:%d/live?room=1", p22);
+            moq_endpoint_cfg_t c22;
+            moq_endpoint_cfg_init_sized(&c22, sizeof(c22));
+            c22.url = (moq_bytes_t){ (const uint8_t *)u22, strlen(u22) };
+            c22.insecure_skip_verify = true;
+            c22.preferred_version = MOQ_VERSION_DRAFT_22;
+            moq_endpoint_t *e22 = NULL;
+            MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_connect(&c22, &e22), (int)MOQ_OK);
+            if (e22) {
+                MOQ_TEST_CHECK(wait_for_state(e22, MOQ_ENDPOINT_ESTABLISHED, 15000));
+                MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_negotiated_version(e22),
+                                      (int)rows[i].want);
+                MOQ_TEST_CHECK(!moq_endpoint_is_fatal(e22));
+                MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_stop(e22), (int)MOQ_OK);
+                moq_endpoint_destroy(e22);
+            }
+            moq_pq_threaded_stop(s22);
+            moq_pq_threaded_destroy(s22);
+        }
     }
 
     MOQ_TEST_PASS("endpoint_lifecycle");

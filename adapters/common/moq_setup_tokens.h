@@ -53,13 +53,13 @@ static inline moq_result_t moq_setup_tokens_copy(const moq_alloc_t *alloc,
 
 /* The send arena a session's SETUP is encoded into when its owner leaves
  * moq_session_cfg_t.send_buffer_size at 0 (its documented default), and the
- * room a SETUP needs besides its tokens: the message type and length and
- * every other option this library sends. */
+ * room a SETUP needs besides its tokens and its connection target: the
+ * message type and length and every other option this library sends. */
 #define MOQ_SETUP_TOKENS_DEFAULT_ARENA 4096u
 #define MOQ_SETUP_TOKENS_OTHER_OPTIONS 128u
 
-/* Whether a SETUP carrying these tokens and `target_len` further bytes of
- * connection target fits a send arena of `arena` bytes -- and so a peer
+/* Whether a SETUP carrying these tokens and a connection target of
+ * `target_len` bytes fits a send arena of `arena` bytes -- and so a peer
  * receive buffer of that size. Each token adds at most its value and 32
  * bytes (option type and length, alias type, token type: the bound
  * moq_session_create applies). A set that does not fit would be accepted

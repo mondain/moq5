@@ -5,9 +5,8 @@
  * A version constant and its ALPN are registered independently of whether a
  * profile for that version is available in the build. moq_profile_lookup()
  * returns a profile only for available versions; moq_session_create() refuses
- * a version with no available profile. draft-16 and draft-18 both have
- * profiles; an unregistered version has none and is refused. (The
- * registered-but-unavailable path is exercised with an unregistered version.)
+ * a version with no available profile. draft-16, draft-18 and draft-22 all
+ * have wire-ready profiles; an unregistered version has none and is refused.
  */
 #include <moq/moq.h>
 #include "test_support.h"
@@ -33,6 +32,34 @@ int main(void)
     /* Unregistered versions have no profile. */
     MOQ_TEST_CHECK(moq_profile_lookup((moq_version_t)17) == NULL);
     MOQ_TEST_CHECK(moq_profile_lookup((moq_version_t)99) == NULL);
+    /* Draft-22 is registered and wire-ready, so it is offered. */
+    MOQ_TEST_CHECK(moq_profile_lookup(MOQ_VERSION_DRAFT_22) != NULL);
+    MOQ_TEST_CHECK(moq_profile_lookup(MOQ_VERSION_DRAFT_22)->version == MOQ_VERSION_DRAFT_22);
+    MOQ_TEST_CHECK(moq_version_supported(MOQ_VERSION_DRAFT_22));
+
+    /* == Public supported-version queries ============================= *
+     * Newest first, only wire-ready profiles, full count even when the
+     * buffer is short, NULL buffer tolerated for sizing. */
+    MOQ_TEST_CHECK(moq_version_supported(MOQ_VERSION_DRAFT_16));
+    MOQ_TEST_CHECK(moq_version_supported(MOQ_VERSION_DRAFT_18));
+    MOQ_TEST_CHECK(!moq_version_supported((moq_version_t)17));
+    MOQ_TEST_CHECK(!moq_version_supported((moq_version_t)99));
+    {
+        moq_version_t vs[8];
+        size_t n = moq_versions_supported(vs, 8);
+        MOQ_TEST_CHECK_EQ_SIZE(n, 3);
+        MOQ_TEST_CHECK_EQ_INT((int)vs[0], (int)MOQ_VERSION_DRAFT_22);
+        MOQ_TEST_CHECK_EQ_INT((int)vs[1], (int)MOQ_VERSION_DRAFT_18);
+        MOQ_TEST_CHECK_EQ_INT((int)vs[2], (int)MOQ_VERSION_DRAFT_16);
+        MOQ_TEST_CHECK_EQ_SIZE(moq_versions_supported(NULL, 0), 3);
+        moq_version_t one[1];
+        MOQ_TEST_CHECK_EQ_SIZE(moq_versions_supported(one, 1), 3);
+        MOQ_TEST_CHECK_EQ_INT((int)one[0], (int)MOQ_VERSION_DRAFT_22);
+        /* The registry and the supported set agree on every version. */
+        for (size_t i = 0; i < n; i++)
+            MOQ_TEST_CHECK(moq_profile_lookup(vs[i]) != NULL &&
+                           moq_profile_lookup(vs[i])->wire_ready);
+    }
 
     /* == Session creation honours profile availability ================ */
     {
@@ -111,7 +138,8 @@ int main(void)
     }
     {
         const moq_version_t versions[] = { MOQ_VERSION_DRAFT_16,
-                                           MOQ_VERSION_DRAFT_18 };
+                                           MOQ_VERSION_DRAFT_18,
+                                           MOQ_VERSION_DRAFT_22 };
         for (size_t i = 0; i < sizeof(versions) / sizeof(versions[0]); i++) {
             moq_result_t rc;
             moq_session_t *s = try_create(versions[i], &rc);

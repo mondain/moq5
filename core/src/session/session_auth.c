@@ -267,13 +267,72 @@ void moq_ov_project(const moq_cache_overlay_t *ov,
  * for the duration of the call).
  */
 
+/* A suffix borrows one prepared prefix for lookup/projection only. Neither
+ * overlay retains the other, and each owns only its own preallocated values. */
+static bool ov_alias_live_after(const moq_cache_overlay_t *ov,
+    const moq_auth_txn_t *prefix, size_t count, uint64_t alias,
+    uint64_t *out_type, const uint8_t **out_val, size_t *out_len)
+{
+    for (size_t i = count; i > 0; i--) {
+        const moq_ov_entry_t *e = &ov->entries[i - 1];
+        if (e->alias != alias) continue;
+        if (e->kind == MOQ_OV_DELETE) return false;
+        if (out_type) *out_type = e->token_type;
+        if (out_val) *out_val = e->value;
+        if (out_len) *out_len = e->value_len;
+        return true;
+    }
+    return prefix
+        ? moq_ov_alias_live(&prefix->ov, alias, out_type, out_val, out_len)
+        : moq_token_cache_lookup(ov->cache, alias, out_type, out_val, out_len) == MOQ_TOKEN_OK;
+}
+
+static void ov_project_after(const moq_cache_overlay_t *ov,
+    const moq_auth_txn_t *prefix, size_t *out_bytes, size_t *out_active)
+{
+    if (!prefix) {
+        moq_ov_project(ov, out_bytes, out_active);
+        return;
+    }
+    size_t bytes, active;
+    moq_ov_project(&prefix->ov, &bytes, &active);
+    for (size_t i = 0; i < ov->count; i++) {
+        const moq_ov_entry_t *e = &ov->entries[i];
+        if (e->kind == MOQ_OV_REGISTER) {
+            size_t size = MOQ_TOKEN_ENTRY_OVERHEAD + e->value_len;
+            bytes = size < MOQ_TOKEN_ENTRY_OVERHEAD || bytes > SIZE_MAX - size
+                ? SIZE_MAX : bytes + size;
+            active++;
+        } else {
+            size_t len = 0;
+            if (ov_alias_live_after(ov, prefix, i, e->alias, NULL, NULL, &len)) {
+                size_t size = MOQ_TOKEN_ENTRY_OVERHEAD + len;
+                bytes = size <= bytes ? bytes - size : 0;
+                if (active) active--;
+            }
+        }
+    }
+    *out_bytes = bytes;
+    *out_active = active;
+}
+
 moq_result_t process_auth_tokens(moq_session_t *s,
+    const moq_decoded_auth_token_t *tokens_in, size_t tokens_in_count,
+    moq_resolved_token_t *out_tokens, size_t *out_token_count,
+    size_t max_tokens, uint64_t *out_reject_code, bool *out_staged,
+    moq_auth_txn_t *txn)
+{
+    return process_auth_tokens_after(s, tokens_in, tokens_in_count, out_tokens,
+        out_token_count, max_tokens, out_reject_code, out_staged, txn, NULL);
+}
+
+moq_result_t process_auth_tokens_after(moq_session_t *s,
     const moq_decoded_auth_token_t *tokens_in, size_t tokens_in_count,
     moq_resolved_token_t *out_tokens, size_t *out_token_count,
     size_t max_tokens,
     uint64_t *out_reject_code,
     bool *out_staged,
-    moq_auth_txn_t *txn)
+    moq_auth_txn_t *txn, const moq_auth_txn_t *prefix)
 {
     size_t token_count = 0;
     uint64_t reject_code = 0;
@@ -297,7 +356,8 @@ moq_result_t process_auth_tokens(moq_session_t *s,
         switch (tok_op) {
         case MOQ_AUTH_OP_DELETE: {
             if (use_txn) {
-                if (!moq_ov_alias_live(&txn->ov, tok_in->alias, NULL, NULL, NULL)) {
+                if (!ov_alias_live_after(&txn->ov, prefix, txn->ov.count,
+                                         tok_in->alias, NULL, NULL, NULL)) {
                     if (!reject_code) reject_code = 0x17;
                 } else if (txn->ov.count < MOQ_CACHE_OVERLAY_CAP) {
                     txn->ov.entries[txn->ov.count].kind = MOQ_OV_DELETE;
@@ -317,13 +377,14 @@ moq_result_t process_auth_tokens(moq_session_t *s,
         }
         case MOQ_AUTH_OP_REGISTER: {
             if (use_txn) {
-                if (moq_ov_alias_live(&txn->ov, tok_in->alias, NULL, NULL, NULL)) {
+                if (ov_alias_live_after(&txn->ov, prefix, txn->ov.count,
+                                        tok_in->alias, NULL, NULL, NULL)) {
                     free_staging_internal(s, out_tokens, out_staged, token_count);
                     moq_ov_free_preowned(&txn->ov, &s->alloc);
                     return close_with_error(s, 0x14, "duplicate auth token alias");
                 }
                 size_t projected_bytes, projected_active;
-                moq_ov_project(&txn->ov, &projected_bytes, &projected_active);
+                ov_project_after(&txn->ov, prefix, &projected_bytes, &projected_active);
                 size_t entry_size = MOQ_TOKEN_ENTRY_OVERHEAD + tok_value_len;
                 if (entry_size < MOQ_TOKEN_ENTRY_OVERHEAD ||
                     projected_bytes > s->peer_token_cache.max_bytes ||
@@ -367,8 +428,8 @@ moq_result_t process_auth_tokens(moq_session_t *s,
             size_t rlen;
             bool found;
             if (use_txn) {
-                found = moq_ov_alias_live(&txn->ov, tok_in->alias,
-                    &rtype, &rval, &rlen);
+                found = ov_alias_live_after(&txn->ov, prefix, txn->ov.count,
+                    tok_in->alias, &rtype, &rval, &rlen);
             } else {
                 found = (moq_token_cache_lookup(&s->peer_token_cache, tok_in->alias,
                     &rtype, &rval, &rlen) == MOQ_TOKEN_OK);
