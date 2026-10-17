@@ -715,6 +715,26 @@ jobs:
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: ctest --test-dir build/fuzz-ci -R '^cmaf_packager' --output-on-failure --no-tests=error
 
+      # The nightly deliberately disables tests. Its private D22 codec target
+      # must not depend on the test suite being enabled.
+      - name: Configure nightly fuzz configuration
+        run: >
+          cmake -B build/fuzz-nightly
+          -DMOQ_BUILD_FUZZ=ON
+          -DMOQ_REQUIRE_FUZZ=ON
+          -DMOQ_BUILD_MSF=ON
+          -DMOQ_BUILD_TESTS=OFF
+          -DMOQ_BUILD_EXAMPLES=OFF
+          -DMOQ_BUILD_SIM=OFF
+
+      - name: Build and replay nightly D22 fuzzer
+        run: |
+          cmake --build build/fuzz-nightly --target fuzz_control_d22
+          build/fuzz-nightly/fuzz/fuzz_control_d22 fuzz/corpus/control_d22 -runs=0
+
+      - name: Test nightly runner
+        run: bash scripts/run_fuzzers.sh --self-test
+
   hardening:
     name: Hardening (FORTIFY/stack-protector, Linux)
     runs-on: ubuntu-latest
