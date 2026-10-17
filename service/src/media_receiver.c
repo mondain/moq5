@@ -6119,6 +6119,7 @@ moq_result_t moq_media_receiver_unsubscribe_track(
      * that arrive before the forward=false update lands are dropped at intake. */
     obj_compact_locked(r, keep_not_track, track);
     track->has_drop_filter = false;
+    track->pending_fill = false;   /* a fill not yet sent is abandoned with the delivery it was for */
     pthread_mutex_unlock(&r->mu);
 
     moq_endpoint_wake(r->ep);

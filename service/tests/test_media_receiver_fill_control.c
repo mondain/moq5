@@ -681,6 +681,12 @@ static void fill_track_fill_update(void)
     ORIGIN_NEED(!f.track->pending_fill);
     ORIGIN_NEED(!moq_media_receiver_is_fatal(f.receiver));
     ORIGIN_NEED(f.track->local_result == MOQ_OK);
+    /* A fill still waiting to be sent is dropped by a disable. */
+    ORIGIN_NEED(moq_media_receiver_track_fill(f.receiver, f.track, &fill) == MOQ_OK);
+    ORIGIN_NEED(moq_media_receiver_unsubscribe_track(f.receiver, f.track) == MOQ_OK);
+    ORIGIN_NEED(!f.track->pending_fill);
+    ORIGIN_NEED(moq_media_receiver_subscribe_track(f.receiver, f.track, NULL) == MOQ_OK);
+    ORIGIN_NEED(moq_media_receiver_unsubscribe_track(f.receiver, f.track) == MOQ_OK);
     /* A disabled track takes no new fill. */
     ORIGIN_NEED(moq_media_receiver_unsubscribe_track(f.receiver, f.track) == MOQ_OK);
     ORIGIN_NEED(moq_media_receiver_track_fill(f.receiver, f.track, &fill) == MOQ_ERR_WRONG_STATE);
