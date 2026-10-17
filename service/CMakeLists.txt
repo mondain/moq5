@@ -679,6 +679,21 @@ if(MOQ_BUILD_TESTS)
                 COMMAND test_media_receiver_delivery_failure)
             set_tests_properties(media_receiver_delivery_failure PROPERTIES TIMEOUT 30)
 
+            add_executable(test_media_receiver_update_failure
+                tests/test_media_receiver_update_failure.c)
+            target_link_libraries(test_media_receiver_update_failure PRIVATE
+                moq-service-endpoint-test-internals moq::msf moq::sim)
+            target_include_directories(test_media_receiver_update_failure PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit)
+            if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+                target_compile_options(test_media_receiver_update_failure PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME media_receiver_update_failure
+                COMMAND test_media_receiver_update_failure)
+            set_tests_properties(media_receiver_update_failure PROPERTIES TIMEOUT 30)
+
             add_executable(test_media_receiver_metadata_copy
                 tests/test_media_receiver_metadata_copy.c)
             target_link_libraries(test_media_receiver_metadata_copy PRIVATE

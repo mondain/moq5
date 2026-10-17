@@ -2757,6 +2757,13 @@ moq_event_scratch_verdict_t setup_event_scratch_classify(
     size_t token_count);
 uint8_t *scratch_copy(moq_session_t *s, const uint8_t *data, size_t len);
 
+/* Probe only after BUFFER with occupied send bytes. Call the same typed
+ * encoder/arguments without changing the session's output scratch budget or
+ * cursor, then end the probe on every encoder result. Never queue its bytes. */
+moq_result_t send_probe_begin(moq_session_t *s, moq_buf_writer_t *probe);
+moq_result_t send_probe_end(moq_session_t *s, moq_buf_writer_t *probe,
+                            moq_result_t encoded);
+
 /* queue_send_control for a request cancellation (UNSUBSCRIBE,
  * FETCH_CANCEL): a send buffer too full now because it still holds earlier
  * output is MOQ_ERR_WOULD_BLOCK -- the buffer is released as actions are

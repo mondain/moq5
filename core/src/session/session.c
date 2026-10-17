@@ -1416,6 +1416,28 @@ moq_event_scratch_verdict_t event_scratch_classify_bytes(
 
 /* -- Send helper --------------------------------------------------- */
 
+moq_result_t send_probe_begin(moq_session_t *s, moq_buf_writer_t *probe)
+{
+    /* Same bounded envelope allowance as SETUP preflight: a 16-bit payload
+     * plus room for either profile's type and length framing. */
+    size_t cap = (size_t)UINT16_MAX + 16u;
+    if (cap > s->send_cap) cap = s->send_cap;
+    uint8_t *bytes = (uint8_t *)s->alloc.alloc(cap, s->alloc.ctx);
+    if (!bytes) return MOQ_ERR_NOMEM;
+    moq_buf_writer_init(probe, bytes, cap);
+    return MOQ_OK;
+}
+
+moq_result_t send_probe_end(moq_session_t *s, moq_buf_writer_t *probe,
+                            moq_result_t encoded)
+{
+    session_wipe(probe->data, probe->cap);
+    s->alloc.free(probe->data, probe->cap, s->alloc.ctx);
+    /* Only a successful exact encoding proves drain-retry can help. This is
+     * a local capacity classification, not a protocol-defined error code. */
+    return encoded == MOQ_OK ? MOQ_ERR_WOULD_BLOCK : encoded;
+}
+
 static moq_result_t commit_send_control_tail(moq_session_t *s, size_t len)
 {
     moq_action_t a;

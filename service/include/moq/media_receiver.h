@@ -429,11 +429,16 @@ typedef enum moq_media_track_event_kind {
                                     or dropped, and carries the fill's
                                     unreported-loss summary (below). Other
                                     tracks get it when the fill ends. */
-    MOQ_MEDIA_TRACK_DELIVERY_LOCAL_FAILURE = 10 /* local delivery capacity
+    MOQ_MEDIA_TRACK_DELIVERY_LOCAL_FAILURE = 10, /* local delivery capacity
                                     refusal, distinct from initial ACK loss.
                                     LIVE permanently fails this generation;
                                     FILL fails only the identified child.
                                     Accepted objects retain ownership. */
+    MOQ_MEDIA_TRACK_UPDATE_LOCAL_FAILURE = 11 /* a local UPDATE admission
+                                    failed permanently. Exactly once per failed
+                                    track generation; read the sized local_result.
+                                    Not a peer UPDATE error or END_OF_TRACK.
+                                    Unrelated tracks and the endpoint continue. */
 } moq_media_track_event_kind_t;
 
 /* Which receive path a coalesced MOQ_MEDIA_TRACK_PARSE_DROP came from. */
@@ -502,7 +507,9 @@ typedef struct moq_media_track_event {
     /* Appended after the complete preceding allocation, never in its padding.
      * LOCAL_FAILURE carries the exact signed MOQ_ERR_NOMEM or MOQ_ERR_BUFFER
      * from initial ACK retention. DELIVERY_LOCAL_FAILURE carries MOQ_ERR_BUFFER
-     * from facade delivery admission. Neither is a wire error code. Read
+     * from facade delivery admission. UPDATE_LOCAL_FAILURE carries the exact
+     * local UPDATE admission error, not a peer response. None is a wire error
+     * code. Read
      * only when struct_size >= offsetof(local_result) + sizeof(local_result).
      * Older/short callers still receive the event's supported prefix but must
      * not infer an error value from an absent or partial field. Zero for every
@@ -751,6 +758,10 @@ MOQ_API void moq_media_receiver_track_subscribe_cfg_init_sized(
  * rejection surfaces MOQ_MEDIA_TRACK_ENDED for that track and does not fail the
  * receiver. Failure to retain initial ACK metadata instead surfaces
  * MOQ_MEDIA_TRACK_LOCAL_FAILURE and permanently fails only that track generation.
+ * A permanent local UPDATE admission failure likewise surfaces
+ * MOQ_MEDIA_TRACK_UPDATE_LOCAL_FAILURE with its exact local_result; capacity
+ * pressure and an outstanding response remain retryable. Neither local
+ * failure reports a peer rejection or closes the shared endpoint.
  *
  * cfg lifetime: the start mode, priority, mpeg2ts_program_number and options apply ONLY when the underlying
  * subscription is first issued for this track. Any later subscribe_track call --

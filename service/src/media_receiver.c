@@ -286,9 +286,10 @@ struct moq_media_track {
     /* Data path (network-thread state). */
     moq_sub_track_t *sub_track;        /* non-NULL while subscribed */
     bool             ended;            /* TRACK_ENDED emitted */
-    /* ACK retention and LIVE delivery failure are permanent for this generation.
+    /* ACK retention, UPDATE admission and LIVE delivery failures are permanent.
      * App-visible state and its allocation-free observation are mu-protected. */
     moq_result_t     local_result;
+    moq_media_track_event_kind_t local_failure_kind;
     bool             local_failure_pending;
     bool             delivery_failed; /* preserves already-admitted objects */
     /* Coalesced parse-drop diagnostic state (all under r->mu). A malformed
@@ -342,6 +343,7 @@ struct moq_media_track {
     uint64_t         app_gen;
     uint64_t         reconciled_app_gen;
     bool             upd_notify_app;
+    bool             update_inflight;  /* includes silent flow-only updates */
     uint64_t         upd_sent_app_gen;
 
     /* Subscription lifecycle, mu-published so the public track_state accessor
@@ -2809,16 +2811,19 @@ static void receiver_mark_track_ended(moq_media_receiver_t *r,
 
 static void receiver_mark_track_local_failure(moq_media_receiver_t *r,
                                                moq_media_track_t *t,
-                                               moq_result_t result)
+                                               moq_result_t result,
+                                               moq_media_track_event_kind_t kind)
 {
     pthread_mutex_lock(&r->mu);
     bool first = t->local_result == MOQ_OK;
     if (first) {
         t->local_result = result;
+        t->local_failure_kind = kind;
         t->local_failure_pending = true;
         r->local_failure_pending_count++;
         t->desired_subscribed = false;
         t->upd_notify_app = false;
+        t->update_inflight = false;
         t->upd_sent_app_gen = 0;
         obj_compact_locked(r, keep_not_track, t);
     }
@@ -2853,10 +2858,12 @@ static void receiver_inspect_delivery_failures(moq_media_receiver_t *r)
         if (failure.owner_kind == MOQ_SUB_LOCAL_FAILURE_TRACK &&
             track->local_result == MOQ_OK) {
             track->local_result = failure.local_result;
+            track->local_failure_kind = MOQ_MEDIA_TRACK_DELIVERY_LOCAL_FAILURE;
             track->delivery_failed = true;
             track->local_failure_pending = true;
             r->local_failure_pending_count++;
             track->upd_notify_app = false;
+            track->update_inflight = false;
             track->upd_sent_app_gen = 0;
             /* Keep app intent and admitted data. Facade cancellation stops
              * new intake; an explicit app unsubscribe still purges as usual. */
@@ -2923,7 +2930,7 @@ static void receiver_inspect_ack_results(moq_media_receiver_t *r, uint64_t now_u
         moq_result_t rc = moq_sub_get_track_result(r->sub, t->sub_track,
                                                    &result, sizeof(result));
         if (rc == MOQ_ERR_NOMEM || rc == MOQ_ERR_BUFFER)
-            receiver_mark_track_local_failure(r, t, rc);
+            receiver_mark_track_local_failure(r, t, rc, MOQ_MEDIA_TRACK_LOCAL_FAILURE);
     }
 }
 
@@ -2988,6 +2995,7 @@ static void receiver_on_update_ok(void *ctx, moq_sub_track_t *track,
     pthread_mutex_lock(&r->mu);
     bool notify = t->upd_notify_app;
     t->upd_notify_app = false;
+    t->update_inflight = false;
     t->upd_sent_app_gen = 0;
     if (!notify) { pthread_mutex_unlock(&r->mu); return; }
     if (r->ev_tail - r->ev_head >= r->ev_cap) {
@@ -4338,6 +4346,7 @@ static void receiver_process_subscription_dones(moq_media_receiver_t *r,
          * SUBSCRIBE default below/at establish). */
         pthread_mutex_lock(&r->mu);
         t->upd_notify_app = false;
+        t->update_inflight = false;
         t->upd_sent_app_gen = 0;
         pthread_mutex_unlock(&r->mu);
 
@@ -4506,15 +4515,18 @@ static void receiver_reconcile_delivery(moq_media_receiver_t *r,
             pthread_mutex_unlock(&r->mu);
             continue;
         }
+        /* The initial response must establish the track before UPDATE is
+         * admissible. Preserve this pass's intent until that response lands. */
+        if (moq_sub_track_get_state(t->sub_track) == MOQ_SUB_TRACK_PENDING ||
+            t->update_inflight)
+            continue;
         moq_sub_update_cfg_t ucfg;
         moq_sub_update_cfg_init(&ucfg);
         ucfg.has_forward = true;
         ucfg.forward = t->forward_desired;
-        /* WRONG_STATE = an update is still outstanding; retry next cycle
-         * -- and change NOTHING: neither the pending update's attribution
-         * nor reconciled_app_gen. */
-        if (moq_sub_update_subscription(r->sub, t->sub_track, &ucfg,
-                                        now_us) == MOQ_OK) {
+        moq_result_t rc = moq_sub_update_subscription(r->sub, t->sub_track,
+                                                      &ucfg, now_us);
+        if (rc == MOQ_OK) {
             t->forward_sent = t->forward_desired;
             /* Attribution is decided ONCE, from the SNAPSHOT taken with
              * the target computation (the race rule above). */
@@ -4523,7 +4535,12 @@ static void receiver_reconcile_delivery(moq_media_receiver_t *r,
                                  &t->upd_notify_app,
                                  &t->reconciled_app_gen);
             t->upd_sent_app_gen = gen_snap;
+            t->update_inflight = true;
             pthread_mutex_unlock(&r->mu);
+        } else if (rc < 0 && rc != MOQ_ERR_WOULD_BLOCK &&
+                   rc != MOQ_ERR_REQUEST_BLOCKED) {
+            receiver_mark_track_local_failure(r, t, rc,
+                                               MOQ_MEDIA_TRACK_UPDATE_LOCAL_FAILURE);
         }
     }
 }
@@ -5664,14 +5681,14 @@ moq_result_t moq_media_receiver_poll_track(moq_media_receiver_t *r,
             t->local_failure_pending = false;
             r->local_failure_pending_count--;
             moq_result_t result = t->local_result;
+            moq_media_track_event_kind_t kind = t->local_failure_kind;
             bool delivery = t->delivery_failed;
             pthread_mutex_unlock(&r->mu);
 
             moq_media_track_event_t full;
             memset(&full, 0, sizeof(full));
             full.struct_size = (uint32_t)n;
-            full.kind = delivery ? MOQ_MEDIA_TRACK_DELIVERY_LOCAL_FAILURE
-                                 : MOQ_MEDIA_TRACK_LOCAL_FAILURE;
+            full.kind = kind;
             full.track = t;
             full.desc = &t->desc;
             full.local_result = (int32_t)result;

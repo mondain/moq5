@@ -1037,6 +1037,15 @@ if(TARGET moq::sim)
     target_link_libraries(test_d18_update PRIVATE moq-core-test-internals moq::sim)
     add_test(NAME d18_update COMMAND test_d18_update)
 
+    add_executable(test_update_capacity unit/test_update_capacity.c)
+    target_link_libraries(test_update_capacity PRIVATE moq-core-test-internals moq::sim)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(test_update_capacity PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME update_capacity COMMAND test_update_capacity)
+    set_tests_properties(update_capacity PROPERTIES TIMEOUT 30)
+
     add_executable(test_d18_publish_done unit/test_d18_publish_done.c)
     target_link_libraries(test_d18_publish_done PRIVATE moq-core-test-internals moq::sim)
     add_test(NAME d18_publish_done COMMAND test_d18_publish_done)

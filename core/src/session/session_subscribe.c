@@ -6183,6 +6183,14 @@ moq_result_t moq_session_update_subscription(
                          s->send_cap - s->send_len);
 
     moq_result_t rc = s->profile->encode_request_update(s, &w, &args);
+    if (rc == MOQ_ERR_BUFFER && s->send_len > 0) {
+        moq_buf_writer_t probe;
+        rc = send_probe_begin(s, &probe);
+        if (rc == MOQ_OK) {
+            rc = s->profile->encode_request_update(s, &probe, &args);
+            rc = send_probe_end(s, &probe, rc);
+        }
+    }
     if (rc < 0) {
         s->profile->abort_request(s, &req_ep);
         return rc;
