@@ -277,8 +277,8 @@ MsQuic managed lane i  ->  shard i { one moqr_bind_t, one moqr_core_t, one trace
   on or off (K=1 builds no manager, so admission storage is zero).
 - **Multi-version listener: one endpoint can serve several drafts.**
   `listener.versions` is an ordered, non-empty set of known drafts (22, 18,
-  16), most preferred first. The default is `[18, 22, 16]`: every draft the
-  core reports wire-ready, draft-18 first; `[22, 18, 16]` prefers draft-22.
+  16), most preferred first. The default is `[22, 18, 16]`: every draft the
+  core reports wire-ready, newest first.
   One listener offers `moqt-22`, `moqt-18` and `moqt-16`, and ALPN selects
   each connection's draft.
   A single entry keeps the exact-version representation for byte-stable
@@ -516,9 +516,9 @@ synchronous ALLOW and equally for an async ALLOW that resolves a parked DEFER,
 so an async-approved subscription is revalidatable, not permanently authorized.
 On each `tick`, a due grant re-invokes the hook off the control-plane clock
 (never on the object path): a renewed ALLOW reschedules, an ALLOW without a
-lease clears the grant, and a DENY/DEFER revokes — a subscribe by a wire
-SUBSCRIBE_DONE, an announce by withdrawing the namespace and cancelling it
-toward the publisher. The announce cancel is backpressure-safe: the revoked
+lease clears the grant, and a DENY/DEFER revokes — a subscribe by its profile's
+PUBLISH_DONE terminal, an announce by withdrawing the namespace and cancelling
+it toward the publisher. The announce cancel is backpressure-safe: the revoked
 grant is the durable record (peeked, not drained) and the cancel is retried on
 the next pump until it lands, so a session-queue WOULD_BLOCK never drops it. The
 denial code is preserved (the verifier's custom code, else UNAUTHORIZED), except

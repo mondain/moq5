@@ -616,8 +616,7 @@ MOQ_API const moq_media_track_desc_t *moq_media_track_desc_get(
  * out->struct_size with that size; bytes beyond it are untouched. Refusals
  * write nothing: MOQ_ERR_INVAL for a NULL receiver/track/out, an out_size
  * below MOQ_MEDIA_TRACK_DESC_V0_SIZE, or a handle `r` does not own. Never
- * allocates. Callable from any thread. An additive public function (new
- * export); existing struct layouts are unchanged. */
+ * allocates. Callable from any thread. */
 MOQ_API moq_result_t moq_media_receiver_track_desc_copy(
     const moq_media_receiver_t *r, const moq_media_track_t *track,
     moq_media_track_desc_t *out, size_t out_size);
@@ -819,7 +818,8 @@ typedef enum moq_media_track_state {
     MOQ_MEDIA_TRACK_STATE_PAUSED_APP,     /* disabled by unsubscribe_track */
     MOQ_MEDIA_TRACK_STATE_PAUSED_FLOW,    /* paused by FLOW_CONTROL backpressure */
     MOQ_MEDIA_TRACK_STATE_ENDED,          /* ended (peer reject / end-of-track) */
-    MOQ_MEDIA_TRACK_STATE_FAILED = 6      /* local ACK retention or LIVE delivery failure;
+    MOQ_MEDIA_TRACK_STATE_FAILED = 6      /* local ACK retention, LIVE delivery
+                                            or UPDATE admission failure;
                                             remains failed, never rearmed */
 } moq_media_track_state_t;
 

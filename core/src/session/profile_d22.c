@@ -5,8 +5,8 @@
  * the codec adapters that feed the shared request-stream engine, and the
  * outbound encoders for every request family. The data-plane framing is
  * draft-18's, which draft-22 did not change; those vtable slots are taken
- * from the draft-18 table at first use. Registry availability permits explicit
- * selection; it does not enable this profile in default endpoint offers.
+ * from the draft-18 table at first use. The profile is wire-ready and included
+ * in default offers when the selected transport backend can carry it.
  */
 
 #include "session_internal.h"

@@ -185,12 +185,14 @@ int main() {
 
 ### Server mode details
 
-- Session and adapter are created lazily on the network thread
-  when the first client connection fires `picoquic_callback_ready`.
+- Each client's session and adapter are created lazily on the network thread
+  when its connection becomes ready.
 - `_session()` and `_conn()` return NULL until that happens.
 - `on_lane_pump` is not called until session/adapter exist.
-- v0 supports one active server connection. Additional connections
-  are ignored by the helper without replacing the existing session.
+- Up to `cfg.max_connections` clients are accepted concurrently (0 selects
+  the default of 1024); connections beyond the cap are rejected. Iterate them
+  with `moq_pq_threaded_lane_next_conn()`. The legacy `_session()` and `_conn()`
+  accessors return the first live connection.
 - `_stop()` before any client connects is safe and clean.
 
 ### Lifecycle summary
