@@ -122,7 +122,7 @@ mergeInto(LibraryManager.library, {
       console.warn('[moq wasm_wt] connection closed: code=' + (info && info.closeCode) + ' reason=' + JSON.stringify(info && info.reason));
       if (!c.dead) M._moq_wasm_wt_on_closed(m, (info && info.closeCode) | 0, 1);
     }, function (e) {
-      console.warn('[moq wasm_wt] connection failed: ' + e);
+      console.warn('[moq wasm_wt] connection failed: ' + e + ' (url ' + url + ', protocols ' + JSON.stringify(protocols) + ', pinned certificate ' + (M.moqWasmWtCertHashes ? 'yes' : 'no') + ')');
       if (!c.dead) M._moq_wasm_wt_on_closed(m, 0, 0);
     });
   },
