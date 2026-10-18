@@ -355,7 +355,9 @@ What a one-threaded, non-blocking host changes:
 - TLS belongs to the browser: `insecure_skip_verify`, `ca_file`, a certificate
   callback and an SNI override are `MOQ_ERR_UNSUPPORTED`, and a certificate the
   browser rejects fails the connection (a local relay needs a trusted
-  certificate). RAW_QUIC is unavailable: a page has no UDP.
+  certificate, or a short-lived self-signed one pinned by hash: the page sets
+  `Module.moqWasmWtCertHashes` to a list of `{algorithm: 'sha-256', value}` before
+  connecting, which is passed as WebTransport's `serverCertificateHashes`). RAW_QUIC is unavailable: a page has no UDP.
 - Draft-22 binding facts: handshake complete, plus the datagram facts when the
   browser reports a datagram size.
 - Peer streams are redelivered under the bridge's `WOULD_BLOCK` and

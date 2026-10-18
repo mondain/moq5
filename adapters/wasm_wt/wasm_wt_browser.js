@@ -39,6 +39,8 @@ mergeInto(LibraryManager.library, {
       try {
         for (;;) {
           var rc = M._moq_wasm_wt_on_stream_bytes(m, id, kind, p, u8.length, fin ? 1 : 0);
+          // Anything but success or the two flow-control answers is a fatal result for the session: say so.
+          if (rc < 0 && rc !== -8 && rc !== -15) console.warn('[moq wasm_wt] stream ' + id + ' (' + (kind ? 'bidi' : 'uni') + ') bytes=' + u8.length + ' fin=' + fin + ' -> result ' + rc);
           if (rc !== -8 && rc !== -15) return;
           do {
             await sleep(2);
@@ -94,7 +96,12 @@ mergeInto(LibraryManager.library, {
     }
 
     try {
-      c.wt = new WebTransport(url, protocols.length ? { protocols: protocols } : {});
+      var options = protocols.length ? { protocols: protocols } : {};
+      // A relay with a self-signed certificate (local testing) is trusted by pinning its hash: the page sets
+      // Module.moqWasmWtCertHashes = [{algorithm: 'sha-256', value: <ArrayBuffer>}] before opening a connection. The
+      // browser accepts this only for a certificate valid for 14 days or less (an ECDSA P-256 key); otherwise it is ignored.
+      if (M.moqWasmWtCertHashes) options.serverCertificateHashes = M.moqWasmWtCertHashes;
+      c.wt = new WebTransport(url, options);
     } catch (e) {
       setTimeout(function () { if (!c.dead) M._moq_wasm_wt_on_failed(m, 1); }, 0);
       return;
@@ -112,8 +119,10 @@ mergeInto(LibraryManager.library, {
       if (dgramMax) datagramLoop();
     }, function () { if (!c.dead) M._moq_wasm_wt_on_failed(m, 2); });
     c.wt.closed.then(function (info) {
+      console.warn('[moq wasm_wt] connection closed: code=' + (info && info.closeCode) + ' reason=' + JSON.stringify(info && info.reason));
       if (!c.dead) M._moq_wasm_wt_on_closed(m, (info && info.closeCode) | 0, 1);
-    }, function () {
+    }, function (e) {
+      console.warn('[moq wasm_wt] connection failed: ' + e);
       if (!c.dead) M._moq_wasm_wt_on_closed(m, 0, 0);
     });
   },
