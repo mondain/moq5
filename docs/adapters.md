@@ -334,7 +334,7 @@ To build an adapter for another QUIC stack:
 `adapters/wasm_wt` carries a session over the browser's WebTransport API, so the
 service tier (`moq_endpoint_connect`, `moq_media_receiver_*`) runs in a web
 page unchanged. Build with `emcmake cmake ... -DMOQ_BUILD_SERVICE=ON
--DMOQ_BUILD_WASM_WT_MANAGED=ON`; AUTO WebTransport then resolves to
+-DMOQ_BUILD_MSF=ON -DMOQ_BUILD_MEDIA_OBJECT=ON -DMOQ_BUILD_WASM_WT_MANAGED=ON`; AUTO WebTransport then resolves to
 `MOQ_TRANSPORT_BACKEND_BROWSER`. `examples/browser` is a runnable page.
 
 What a one-threaded, non-blocking host changes:
