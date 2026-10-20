@@ -121,6 +121,9 @@ provider_apply_series() {
         for name in "${declared[@]}"; do
             if ! git -C "$dir" apply --check "$patch_dir/$name" >/dev/null 2>&1 &&
                ! git -C "$dir" apply --reverse --check "$patch_dir/$name" >/dev/null 2>&1; then
+                # Preserve Git's hunk/path diagnostic for provider-specific
+                # checkout failures (notably Windows line-ending differences).
+                git -C "$dir" apply --check --verbose "$patch_dir/$name" >&2 || :
                 provider_patches_die "$provider patch $name conflicts with $dir"
             fi
         done
